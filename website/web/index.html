@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nectar Labs</title>
+    
+    <!-- Updated Favicon Path -->
+    <link rel="icon" type="image/jpeg" href="assets/images/nectar logo.jpg">
+    
+    <link rel="stylesheet" href="css/style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+
+    <canvas id="particle-canvas"></canvas>
+
+    <header class="navbar">
+        <div class="logo">Nectar Labs<span>.GG</span></div>
+
+        <nav>
+            <a href="#" class="nav-link active" data-page="home">Home</a>
+            <a href="#" class="nav-link" data-page="features">Features</a>
+            <a href="#" class="nav-link" data-page="team">Team</a>
+        </nav>
+
+        <button class="login-btn">Discord Login</button>
+    </header>
+
+    <main>
+        <!-- HOME PAGE -->
+        <section id="home" class="page active">
+            <div class="hero">
+                <div class="hero-content">
+                    <span class="tag">Nectar Labs PLATFORM</span>
+                    <h1>Build. Create. <span class="glow-text">Compete.</span></h1>
+                    <p class="description">
+                        Nectar Labs is a cutting-edge platform designed for competitive players of BuildNow.GG. Our suite of tools and features empowers players to track their performance, find scrims, and participate in automated tournaments, all while seamlessly integrating with Discord for a streamlined experience.
+                    </p>
+                    <div class="buttons">
+                        <button class="primary-btn" onclick="switchPage('features')">Explore Features</button>
+                        <a href="https://discord.gg" target="_blank" class="secondary-btn">Join Discord</a>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- FEATURES PAGE -->
+        <section id="features" class="page">
+            <div class="features-section">
+                <h2 class="section-title"> UPCOMING CORE <span>SYSTEMS</span></h2>
+                <div class="card-grid">
+                    <div class="card">
+                        <div class="card-icon">🏆</div>
+                        <h3>Ranked System</h3>
+                        <p>Track your ELO with real-time stats directly linked from BuildNow.GG to your profile.</p>
+                    </div>
+                    <div class="card">
+                        <div class="card-icon">⚔️</div>
+                        <h3>Scrim Finder</h3>
+                        <p>Instantly find 1v1 Build Fights and Box Fights using interactive Discord and site queues.</p>
+                    </div>
+                    <div class="card">
+                        <div class="card-icon">🎯</div>
+                        <h3>Automated Tournaments</h3>
+                        <p>Compete in weekly automated cups with live bracket tracking and role rewards.</p>
+                    </div>
+                    <div class="card">
+                        <div class="card-icon">⚡</div>
+                        <h3>Tampermonkey Integration</h3>
+                        <p>Seamless client-side sync verifying match outcomes directly with our secure backend.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- TEAM PAGE -->
+        <section id="team" class="page">
+            <div class="team-section">
+                <h2 class="section-title">DEVELOPMENT <span>TEAM</span></h2>
+                <div class="card-grid team-grid">
+                    <div class="card team-card">
+                        <h3>chris</h3>
+                        <span class="role-badge senior">Senior Dev</span>
+                        <p>Backend & BuildNow.GG API Architecture</p>
+                    </div>
+                    
+                    <div class="card team-card">
+                        <h3>juju</h3>
+                        <span class="role-badge founder">Founder</span>
+                        <span class="role-badge bot">Bot Dev</span>
+                        <p>Project Director & Discord Automation</p>
+                    </div>
+
+                    <div class="card team-card">
+                        <h3>yasir</h3>
+                        <span class="role-badge web">Web Dev</span>
+                        <p>Website UI & Dashboard Integration</p>
+                    </div>
+                    
+                    <div class="card team-card">
+                        <h3>curry</h3>
+                        <span class="role-badge manager">General Dev</span>
+                        <p>Userscripts & Client Integration</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 Nectar Labs. Built for the competitive BuildNow.GG community. Established By Nectar</p>
+    </footer>
+
+    <script src="js/main.js"></script>
+</body>
+</html>
