@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>Nectar Labs</title>
+
+    <link
+        rel="icon"
+        type="image/jpeg"
+        href="assets/images/nectar logo.jpg"
+    >
+
+    <link
+        rel="stylesheet"
+        href="css/style.css"
+    >
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+
+    <link
+        href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@500;600;700&display=swap"
+        rel="stylesheet"
+    >
+</head>
+
+<body>
+
+<canvas id="particle-canvas"></canvas>
+
+
+<header class="navbar">
+
+    <div class="logo">
+        Nectar Labs<span>.GG</span>
+    </div>
+
+
+    <nav>
+
+        <a
+            href="#"
+            class="nav-link active"
+            data-page="home"
+        >
+            <img
+                src="assets/icons/50738-home.png"
+                alt=""
+                width="18"
+            >
+            Home
+        </a>
+
+
+        <a
+            href="#"
+            class="nav-link"
+            data-page="features"
+        >
+            <img
+                src="assets/icons/info-64.png"
+                alt=""
+                width="18"
+            >
+            Features
+        </a>
+
+
+        <a
+            href="#"
+            class="nav-link"
+            data-page="projects"
+        >
+            <img
+                src="assets/icons/clipboard-50.png"
+                alt=""
+                width="18"
+            >
+            Projects
+        </a>
+
+
+        <a
+            href="#"
+            class="nav-link"
+            data-page="team"
+        >
+            <img
+                src="assets/icons/607440-people.png"
+                alt=""
+                width="18"
+            >
+            Team
+        </a>
+
+    </nav>
+
+
+    <button
+        id="discordLogin"
+        class="login-btn"
+        type="button"
+    >
+        <img
+            src="assets/icons/94851-login.png"
+            alt=""
+            width="18"
+        >
+
+        <span id="loginText">
+            Discord Login
+        </span>
+    </button>
+
+</header>
+
+
+<main>
+
+
+
+
+<section
+    id="home"
+    class="page active"
+>
+
+    <div class="hero">
+
+        <div class="hero-content">
+
+            <span class="tag">
+                Nectar Labs PLATFORM
+            </span>
+
+
+            <h1>
+                Build. Create.
+                <span class="glow-text">
+                    Compete.
+                </span>
+            </h1>
+
+
+            <p class="description">
+                Nectar Labs is a cutting-edge platform
+                designed for competitive players of
+                BuildNow.GG. Our suite of tools and
+                features empowers players to track
+                their performance, find scrims, and
+                participate in automated tournaments,
+                all while seamlessly integrating with
+                Discord for a streamlined experience.
+            </p>
+
+
+            <div class="buttons">
+
+                <button
+                    class="primary-btn"
+                    type="button"
+                    onclick="switchPage('features')"
+                >
+                    Explore Features
+                </button>
+
+
+                <a
+                    href="https://discord.gg/CJWHXnGqxy"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="secondary-btn"
+                >
+                    <img
+                        src="assets/icons/3703-invite.png"
+                        alt=""
+                        width="18"
+                    >
+
+                    Join Discord
+                </a>
+
+            </div>
+
+        </div>
+
+    </div>
+
+</section>
+
+
+
+
+
+<section
+    id="features"
+    class="page"
+>
+
+    <div class="features-section">
+
+        <h2 class="section-title">
+            UPCOMING CORE
+            <span>SYSTEMS</span>
+        </h2>
+
+
+        <div class="card-grid">
+
+
+            <div class="card">
+
+                <div class="card-icon">
+
+                    <img
+                        src="assets/icons/clipboard-50.png"
+                        alt=""
+                        width="40"
+                    >
+
+                </div>
+
+                <h3>
+                    Ranked System
+                </h3>
+
+                <p>
+                    Track your ELO with real-time
+                    stats directly linked from
+                    BuildNow.GG to your profile.
+                </p>
+
+            </div>
+
+
+
+            <div class="card">
+
+                <div class="card-icon">
+
+                    <img
+                        src="assets/icons/Shield.png"
+                        alt=""
+                        width="40"
+                    >
+
+                </div>
+
+                <h3>
+                    Scrim Finder
+                </h3>
+
+                <p>
+                    Instantly find 1v1 Build Fights
+                    and Box Fights using interactive
+                    Discord and site queues.
+                </p>
+
+            </div>
+
+
+
+            <div class="card">
+
+                <div class="card-icon">
+
+                    <img
+                        src="assets/icons/race_cup.png"
+                        alt=""
+                        width="40"
+                    >
+
+                </div>
+
+                <h3>
+                    Automated Tournaments
+                </h3>
+
+                <p>
+                    Compete in weekly automated cups
+                    with live bracket tracking and
+                    role rewards.
+                </p>
+
+            </div>
+
+
+
+            <div class="card">
+
+                <div class="card-icon">
+
+                    <img
+                        src="assets/icons/9473-settings.png"
+                        alt=""
+                        width="40"
+                    >
+
+                </div>
+
+                <h3>
+                    Tampermonkey Integration
+                </h3>
+
+                <p>
+                    Seamless client-side sync verifying
+                    match outcomes directly with our
+                    secure backend.
+                </p>
+
+            </div>
+
+        </div>
+
+    </div>
+
+</section>
+
+
+
+
+
+<section
+    id="projects"
+    class="page"
+>
+
+    <div class="features-section">
+
+        <h2 class="section-title">
+            NECTAR
+            <span>PROJECTS</span>
+        </h2>
+
+
+        <div
+            id="projects-container"
+            class="card-grid"
+        >
+
+            <div class="card">
+
+                <h3>
+                    Loading Projects...
+                </h3>
+
+                <p>
+                    Connecting to Supabase...
+                </p>
+
+            </div>
+
+        </div>
+
+    </div>
+
+</section>
+
+
+
+
+
+<section
+    id="team"
+    class="page"
+>
+
+    <div class="team-section">
+
+        <h2 class="section-title">
+            DEVELOPMENT
+            <span>TEAM</span>
+        </h2>
+
+
+        <div
+            id="team-container"
+            class="card-grid team-grid"
+        >
+
+            <div class="card team-card">
+
+                <h3>
+                    Loading Team...
+                </h3>
+
+                <p>
+                    Connecting to Supabase...
+                </p>
+
+            </div>
+
+        </div>
+
+    </div>
+
+</section>
+
+</main>
+
+
+
+<footer>
+
+    <p>
+        &copy; 2026 Nectar Labs.
+        Built for the competitive BuildNow.GG community.
+        Established By Nectar
+    </p>
+
+</footer>
+
+
+
+<script
+    src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"
+></script>
+
+
+<script src="js/main.js"></script>
+
+</body>
+</html>
