@@ -2,10 +2,10 @@
 'use strict';
 
 /**
- * Photon Sniffer — Decryptor / Live Viewer (Node, zero deps)
+ * BuildNow Companion — Decryptor / Live Viewer (Node, zero deps)
  *
  * Listens on 127.0.0.1:8765 for raw Photon frames forwarded by
- * photon-sniffer.user.js and decodes them with rich ANSI-colored logging.
+ * buildnow-companion.user.js and decodes them with rich ANSI-colored logging.
  *
  * Transports (all loopback-safe, all accepted):
  *   POST http://127.0.0.1:8765/capture  {sessionId, records:[{seq,t,dir,url,rawHex}]}
@@ -297,6 +297,120 @@ function parseKillfeedText(raw) {
   else out.type = 'other';
   return out;
 }
+// --- Human sentences (synced with app/lib/gpbinary.js) ---
+const CURSCN_WHITELIST = ['lobby','game','zonewars','zw_lg','wild','wwzw','boxfights','ww'];
+function isRealisticCurScn(s){ const low=String(s||'').toLowerCase(); return CURSCN_WHITELIST.some(k=> low.includes(k)); }
+const USEFUL_PROPS_SET = new Set(['skid','BPid','pid','Party','ready','stG','bz_phase_start','bz_zone','bz_phase','bz_enabled','bz_pattern','alv','curScn','gm','gv']);
+function isUsefulMsg(msg){
+  if(!msg) return false;
+  if(msg.req && [225,226,227,230,231].includes(msg.req.opCode)) return true;
+  if(msg.ev){
+    if(msg.ev.evCode===101){
+      const d=msg.ev.params.find(p=>p.keyName==='Data');
+      return d && d.value && d.value.type==='String' && !!d.value.value;
+    }
+    if(msg.ev.evCode===254 || msg.ev.evCode===255) return true;
+    if(msg.ev.evCode===253){
+      const props=msg.ev.params.find(p=>p.keyName==='Properties');
+      if(!props || !props.value || !props.value.value) return false;
+      for(const k of Object.keys(props.value.value)) if(USEFUL_PROPS_SET.has(k)) return true;
+      return false;
+    }
+  }
+  return false;
+}
+function humanSentenceFromMsg(msg){
+  if(!msg || !isUsefulMsg(msg)) return null;
+  if(msg.req){
+    if(msg.req.opName==='Authenticate' || msg.req.opName==='AuthenticateOnce'){
+      return `Authenticate: login packet one-time use`;
+    }
+    if(msg.req.opName==='CreateRoom'){
+      const rn=msg.req.params.find(p=>p.keyName==='RoomName');
+      const code=rn && rn.value ? unwrapValue(rn.value) : null;
+      const gp=msg.req.params.find(p=>p.keyName==='GameProperties');
+      const party=gp && gp.value && gp.value.value && gp.value.value.Party ? gp.value.value.Party.value : null;
+      const partyStr=party? 'party yes':'party no';
+      return code ? `Room created: code ${code} — ${partyStr}` : `Room created — ${partyStr}`;
+    }
+    if(msg.req.opName==='JoinRoom' || msg.req.opName==='JoinRandomRoom'){
+      const gp=msg.req.params.find(p=>p.keyName==='GameProperties');
+      let gm=null; if(gp && gp.value && gp.value.value && gp.value.value.gm) gm=unwrapValue(gp.value.value.gm);
+      const pp=msg.req.params.find(p=>p.keyName==='PlayerProperties');
+      let name=null, skin=null;
+      if(pp && pp.value && pp.value.value){
+        const u=unwrapValue(pp.value);
+        name=u['255']||null; skin=u.skid||null;
+      }
+      return gm ? `Joining room for ${gm} as ${name||'player'}${skin?' wearing '+skin:''}` : `Joining room as ${name||'player'}`;
+    }
+  }
+  if(msg.ev){
+    if(msg.ev.evCode===255){
+      const a=msg.ev.params.find(p=>p.keyName==='ActorNr');
+      const actor=a ? unwrapValue(a.value) : null;
+      const props=msg.ev.params.find(p=>p.keyName==='Properties') || msg.ev.params.find(p=>p.keyName==='PlayerProperties');
+      let name=null, skin=null;
+      if(props && props.value){
+        try{
+          const u=unwrapValue(props.value);
+          name=u['255']||u.pfid||null;
+          skin=u.skid||null;
+        }catch{}
+      }
+      const skinPart=skin?` wearing ${skin}`:'';
+      return `Joined: ${name||'A player'}${skinPart} joined the room${actor?` as player ${actor}`:''}`;
+    }
+    if(msg.ev.evCode===254){
+      const a=msg.ev.params.find(p=>p.keyName==='ActorNr');
+      const actor=a ? unwrapValue(a.value) : null;
+      return actor? `Left: Player ${actor} left the room` : `Left: A player left the room`;
+    }
+    if(msg.ev.evCode===253){
+      const props=msg.ev.params.find(p=>p.keyName==='Properties');
+      if(!props || !props.value) return null;
+      const um=unwrapValue(props.value);
+      const parts=[];
+      if('skid' in um) parts.push(`skin changed to ${um.skid}`);
+      else if('pid' in um) parts.push(`pickaxe changed to ${um.pid}`);
+      if('Party' in um) parts.push(um.Party? 'now in party':'left party');
+      if('ready' in um) parts.push(um.ready? 'is ready':'not ready');
+      if('stG' in um && Number(um.stG)>=0 && Number(um.stG)<=600) parts.push(`zone starts in ${um.stG} seconds`);
+      if('bz_phase_start' in um && Number(um.bz_phase_start)>=0 && Number(um.bz_phase_start)<=600) parts.push(`zone starts in ${um.bz_phase_start} seconds`);
+      if('bz_zone' in um) parts.push(`zone ${um.bz_zone}`);
+      if('bz_phase' in um && !('bz_zone' in um)) parts.push(`phase ${um.bz_phase}`);
+      if('alv' in um) {
+        // Try to get actor name for precise logging
+        let actorName = null;
+        try{
+          const a = msg?.ev?.params?.find(p=>p.keyName==='ActorNr');
+          if(a && a.value) {
+            const aNum = unwrapValue(a.value);
+            if(um['255']) actorName = um['255'];
+            if(!actorName && aNum!=null) actorName = `Player ${aNum}`;
+          }
+        }catch{}
+        const namePart = actorName ? `${actorName} ` : '';
+        parts.push(`${namePart}${um.alv ? 'is alive' : 'is eliminated'}`);
+      }
+      if('curScn' in um && isRealisticCurScn(um.curScn)) parts.push(`scene is now ${um.curScn}`);
+      else if('curScn' in um) return null;
+      if('gm' in um && !('curScn' in um)) parts.push(`mode is now ${um.gm}`);
+      if(!parts.length) return null;
+      return `Props changed: ${parts.join(', ')}`;
+    }
+    if(msg.ev.evCode===101){
+      const d=msg.ev.params.find(p=>p.keyName==='Data');
+      if(d && d.value && d.value.type==='String'){
+        const kf=parseKillfeedText(d.value.value);
+        if(kf.type==='kill') return `Killfeed: ${kf.killer} killed ${kf.victim}`;
+        if(kf.type==='knock') return `Killfeed: ${kf.killer} knocked ${kf.victim}`;
+        return `Killfeed: ${kf.text}`;
+      }
+    }
+  }
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // Pretty-print helpers
@@ -398,86 +512,52 @@ function logPacket(rec) {
     if (msg && (msg.typeName === 'InitRequest' || msg.typeName === 'InitResponse')) return;
   } catch (e) { err = e.message; totalErr++; warnings.push(err); }
 
-  const sum = msg ? summarize(rec, msg) : (err ? COL.err(` decode error: ${err}`) : COL.dim(' (empty)'));
-
-  const dirCol = rec.dir === 'in' ? COL.in : COL.out;
-  console.log(`${tStr} ${dirTag} ${lblTag} ${seqStr} ${dirCol(rec.dir.toUpperCase().padEnd(4))} ${B}${String(bytes).padStart(4)}B${R}  ${encPreview}  ${sum}  ${D}${rec.url}${R}`);
-  if (warnings.length) console.log(`  ${COL.warn('⚠ warnings:')} ${warnings.join('; ')}`);
-
-  if (msg) {
-    let plainSummary = null;
-    try {
-      if (msg.req) plainSummary = { kind: msg.req.opName, params: Object.fromEntries(msg.req.params.map(p=>[p.keyName, unwrapValue(p.value)])) };
-      else if (msg.resp) plainSummary = { kind: msg.resp.opName, ret: msg.resp.returnCode, params: Object.fromEntries(msg.resp.params.map(p=>[p.keyName, unwrapValue(p.value)])) };
-      else if (msg.ev) plainSummary = { kind: msg.ev.evName, params: Object.fromEntries(msg.ev.params.map(p=>[p.keyName, unwrapValue(p.value)])) };
-    } catch {}
-    const verbose = process.argv.includes('--verbose');
-
-    if (msg.req) {
-      seenOps.set(msg.req.opName, (seenOps.get(msg.req.opName) || 0) + 1);
-      if (verbose) {
-        for (const p of msg.req.params) {
-          const isInteresting = ['RoomName', 'GameProperties', 'PlayerProperties', 'Address', 'Token'].includes(p.keyName);
-          const bullet = isInteresting ? c(251, 146, 60, '●') : D + '·' + R;
-          console.log(`  ${bullet} ${c(253, 186, 116, p.keyName.padEnd(16))} ${D}(${p.value.type})${R} = ${prettyValue(p.value, 4)}`);
-        }
-      }
-      // human-readable JSON — default view
-      if (plainSummary && Object.keys(plainSummary.params).length) {
-        const j = JSON.stringify(plainSummary.params, null, 2);
-        console.log(`  ${c(251,191,36,'▶ JSON')} ${D}${msg.req.opName}:${R}\n${c(250, 204, 255, j.split('\n').map(l=>'    '+l).join('\n'))}`);
-        if (plainSummary.params.GameProperties && plainSummary.params.GameProperties.gm) {
-          console.log(`  ${B}${c(251,191,36,'★ gm = "'+plainSummary.params.GameProperties.gm+'"')}${R}`);
-        }
-      }
-    } else if (msg.resp) {
-      seenOps.set(msg.resp.opName, (seenOps.get(msg.resp.opName) || 0) + 1);
-      if (msg.resp.debugMsg) console.log(`  ${COL.info('debugMsg:')} "${msg.resp.debugMsg}"`);
-      if (verbose) {
-        for (const p of msg.resp.params) {
-          const bullet = p.keyName === 'RoomName' || p.keyName === 'Address' ? c(16, 185, 129, '●') : D + '·' + R;
-          console.log(`  ${bullet} ${c(110, 231, 183, p.keyName.padEnd(16))} ${D}(${p.value.type})${R} = ${prettyValue(p.value, 4)}`);
-        }
-      }
-      if (plainSummary && Object.keys(plainSummary.params).length) {
-        const j = JSON.stringify(plainSummary.params, null, 2);
-        console.log(`  ${c(16,185,129,'▶ JSON')} ${D}${msg.resp.opName} response:${R}\n${c(156,163,175, j.split('\n').map(l=>'    '+l).join('\n'))}`);
-      }
-    } else if (msg.ev) {
-      seenEvs.set(msg.ev.evName, (seenEvs.get(msg.ev.evName) || 0) + 1);
-      if (verbose) {
-        for (const p of msg.ev.params) {
-          console.log(`  ${c(216, 180, 254, p.keyName.padEnd(16))} ${D}(${p.value.type})${R} = ${prettyValue(p.value, 4)}`);
-        }
-      }
-      if (plainSummary && Object.keys(plainSummary.params).length) {
-        const j = JSON.stringify(plainSummary.params, null, 2);
-        // highlight killfeed / gm
-        let extra = '';
-        if (plainSummary.params.Data && typeof plainSummary.params.Data === 'string') {
-          const kf = parseKillfeedText(plainSummary.params.Data);
-          if (kf.type==='kill') extra = c(248,113,113,`  ☠ ${kf.killer} killed ${kf.victim}`);
-        }
-        if (plainSummary.params.Properties && plainSummary.params.Properties.gm) extra += c(251,191,36,`  ★ gm=${plainSummary.params.Properties.gm}`);
-        console.log(`  ${c(244,114,182,'▶ JSON')} ${D}${msg.ev.evName}:${R}\n${c(230, 210, 255, j.split('\n').map(l=>'    '+l).join('\n'))}${extra}`);
-      }
-    } else {
-      console.log(`  ${D}rawTail:${R} ${COL.hex((msg.rawTail || '').slice(0, 80))}`);
-    }
+  // Track seen for summary
+  if(msg){
+    if(msg.req) seenOps.set(msg.req.opName, (seenOps.get(msg.req.opName)||0)+1);
+    else if(msg.ev) seenEvs.set(msg.ev.evName, (seenEvs.get(msg.ev.evName)||0)+1);
   }
-
-  const interesting = msg && ((msg.ev && [101, 253, 255, 254].includes(msg.ev.evCode)) || (msg.req && [225, 226, 227].includes(msg.req.opCode)));
-  if (interesting || bytes <= 32) {
-    // no hex dump for human-readable mode — show only if --hex flag (keep concise)
-    if (process.argv.includes('--hex')) console.log(hexDump(rec.rawHex, 16));
+  const verbose = process.argv.includes('--verbose');
+  const sentence = msg ? humanSentenceFromMsg(msg) : null;
+  const isUseful = msg ? isUsefulMsg(msg) : false;
+  if(sentence){
+    console.log(`${tStr} ${dirTag} ${lblTag} ${seqStr} ${COL.ok(sentence)}  ${D}${rec.url}${R}`);
+  } else if(isUseful){
+    // fallback if humanSentence returned null but isUseful true (e.g. unrealistic curScn) — still show minimal
+    const sum = msg ? summarize(rec, msg) : (err ? COL.err(` decode error: ${err}`) : COL.dim(' (empty)'));
+    console.log(`${tStr} ${dirTag} ${lblTag} ${seqStr} ${COL.dim(sum)}  ${D}${rec.url}${R}`);
   } else {
-    if (process.argv.includes('--hex')) {
-      const preview = rec.rawHex.slice(0, 96) + (rec.rawHex.length > 96 ? D + ` … +${rec.rawHex.length - 96} hex chars` + R : '');
-      console.log(`  ${D}hex:${R} ${COL.hex(preview)}  ${D}ascii:${R} ${COL.ascii(asciiStr(hexToBytes(rec.rawHex), 64))}`);
+    // Noise — only show when verbose
+    if(verbose){
+      const sum = msg ? summarize(rec, msg) : (err ? COL.err(` decode error: ${err}`) : COL.dim(' (empty)'));
+      console.log(`${tStr} ${dirTag} ${lblTag} ${seqStr} ${COL.dim(sum + ' — noise')}  ${D}${rec.url}${R}`);
+      if(warnings.length) console.log(`  ${COL.warn('⚠ warnings:')} ${warnings.join('; ')}`);
+      if(plainSummaryNeeded(msg) && verbose) logVerboseDetails(msg);
+    } else {
+      // silent for noise — only count
+      // keep minimal dim line only if useful check wants audit? per spec, noise is silent
     }
   }
-
-  console.log(D + '─'.repeat(88) + R);
+  function plainSummaryNeeded(m){ return !!m && (m.req||m.ev); }
+  function logVerboseDetails(m){
+    let plainSummary=null;
+    try{
+      if(m.req) plainSummary={kind:m.req.opName, params:Object.fromEntries(m.req.params.map(p=>[p.keyName, unwrapValue(p.value)]))};
+      else if(m.ev) plainSummary={kind:m.ev.evName, params:Object.fromEntries(m.ev.params.map(p=>[p.keyName, unwrapValue(p.value)]))};
+    }catch{}
+    if(!plainSummary) return;
+    const j=JSON.stringify(plainSummary.params,null,2);
+    console.log(`  ${c(244,114,182,'▶ JSON')} ${D}${plainSummary.kind}:${R}\n${c(230,210,255, j.split('\n').map(l=>'    '+l).join('\n'))}`);
+  }
+  if(verbose && process.argv.includes('--hex')){
+    if((isUseful || bytes<=32)){
+      console.log(hexDump(rec.rawHex,16));
+    } else {
+      const preview=rec.rawHex.slice(0,96)+(rec.rawHex.length>96? D+` … +${rec.rawHex.length-96} hex chars`+R:'');
+      console.log(`  ${D}hex:${R} ${COL.hex(preview)}  ${D}ascii:${R} ${COL.ascii(asciiStr(hexToBytes(rec.rawHex),64))}`);
+    }
+  }
+  if(sentence || verbose) console.log(D + '─'.repeat(88) + R);
 }
 
 // ---------------------------------------------------------------------------
@@ -531,16 +611,16 @@ const SESS_RE = /^[A-Za-z0-9-]{8,64}$/;
 
 function banner() {
   const art = `
-  ${c(124,58,237, '  ██████╗ ██╗  ██╗ ██████╗ ████████╗ ██████╗ ███╗   ██╗')}   ${B}PHOTON SNIFFER${R}  ${D}decryptor v1.0.0${R}
+   ${c(124,58,237, '  ██████╗ ██╗  ██╗ ██████╗ ████████╗ ██████╗ ███╗   ██╗')}   ${B}BUILDNOW COMPANION${R}  ${D}decryptor v2.0.0${R}
   ${c(124,58,237, '  ██╔══██╗██║  ██║██╔═══██╗╚══██╔══╝██╔═══██╗████╗  ██║')}   ${COL.info('listening on')} ${B}http://127.0.0.1:${PORT}${R}  ${D}and${R}  ${B}http://localhost:${PORT}${R}
   ${c(124,58,237, '  ██████╔╝███████║██║   ██║   ██║   ██║   ██║██╔██╗ ██║')}   ${D}transports: POST /capture  +  WS /ws${R}
   ${c(124,58,237, '  ██╔═══╝ ██╔══██║██║   ██║   ██║   ██║   ██║██║╚██╗██║')}   ${COL.dim('zero deps — ANSI colors — GpBinaryV16 decoder — live hexdump')}
   ${c(124,58,237, '  ██║     ██║  ██║╚██████╔╝   ██║   ╚██████╔╝██║ ╚████║')}
-  ${c(124,58,237, '  ╚═╝     ╚═╝  ╚═╝ ╚═════╝    ╚═╝    ╚═════╝ ╚═╝  ╚═══╝')}   ${COL.ok('CONNECT userscript →')} ${B}tampermonkey photon-sniffer.user.js${R}
+  ${c(124,58,237, '  ╚═╝     ╚═╝  ╚═╝ ╚═════╝    ╚═╝    ╚═════╝ ╚═╝  ╚═══╝')}   ${COL.ok('CONNECT userscript →')} ${B}companion/buildnow-companion.user.js${R}
   `;
   console.log(art);
   console.log(`${TAG.SYS} ${COL.info('Photon targets:')}  ${c(96,165,250,'ns.exitgames.com:19093')}  ${c(244,114,182,'gcams*.exitgames.com:1909*')}  ${D}app=${'30773790-f9fe-487c-92c2-19517c5c39ad'.slice(0,8)}…${R}`);
-  console.log(`${TAG.SYS} ${COL.info('Tip:')} filter console by ${B}[PHOTON]${R} in DevTools — every packet is %c-colored on the page too`);
+  console.log(`${TAG.SYS} ${COL.info('Tip:')} filter console by ${B}[BNC]${R} in DevTools — every packet is %c-colored on the page too`);
   console.log(`${TAG.SYS} ${COL.info('Offline:')} ${D}node decryptor.js captures/foo.jsonl${R}  ${D}|${R}  ${D}node decryptor.js --json foo.jsonl > decoded.json${R}`);
   console.log(D + '─'.repeat(88) + R);
 }
@@ -563,40 +643,68 @@ function validateBatch(body) {
     if (typeof r.rawHex !== 'string' || !r.rawHex.length || r.rawHex.length > MAX_HEX || !HEX_RE.test(r.rawHex) || r.rawHex.length % 2 !== 0) details[`${at}.rawHex`] = `even lowercase hex 1-${MAX_HEX}`;
   });
   if (Object.keys(details).length) return { error: 'Invalid records', details };
-  return { ok: true, sessionId: body.sessionId, records: body.records };
+  return { ok: true, sessionId: body.sessionId, authSessionId: body.authSessionId || null, token: body.token || null, req_token: body.req_token || null, discord_id: body.discord_id || null, records: body.records };
 }
 
 // ---------------------------------------------------------------------------
 // Rich Presence — derived from essential packets (for Discord)
 // ---------------------------------------------------------------------------
+const SKIN_BASE = 'https://buildnow-api.netlify.app/skins';
 const presence = {
   updatedAt: null,
   status: 'idle',
   room: null,
   region: null,
-  self: { name: null, actorNr: null, kills: 0, deaths: 0, alive: null, skin: null, pickaxe: null, gameId: null },
+  self: { name: null, actorNr: null, kills: 0, deaths: 0, alive: null, skin: null, skinUrl: null, pickaxe: null, gameId: null },
   players: [],
   playersCount: 0,
   maxPlayers: 12,
   gameMode: null,
-  gameVariant: null, // gv: "duo" → Duo {mode}
+  gameVariant: null,
   inParty: false,
-  scene: { curScn: null, gm: null, gv: null, stG: null },
+  scene: { curScn: null, gm: null, gv: null, stG: null, bz_phase_start: null, bz_zone: null, bz_phase: null, bz_enabled: null, bz_pattern: null },
   lastKillfeed: null,
   lastKnocked: null,
+  zoneTime: null,
+  zonePhase: null,
+  matchElapsed: 0,
   raw: { lastOp: null, lastEvent: null },
 };
+function skinUrlFor(name){ if(!name) return null; return `${SKIN_BASE}/${encodeURIComponent(name)}.png`; }
 let lastPacketAt = Date.now();
-// auto-reset to idle when tab closed — no packets for 12s → clear presence (so Discord clears too)
+function isRealisticZoneTime(v){
+  const n = Number(v);
+  return Number.isFinite(n) && n >=0 && n <= 600; // seconds, ignore 1M garbage like 1191535
+}
 setInterval(()=>{
+  if (playStart) presence.matchElapsed = Math.floor((Date.now()-playStart.t)/1000);
+  if (presence.scene.stG != null && isRealisticZoneTime(presence.scene.stG)) presence.zoneTime = presence.scene.stG;
+  // also prefer bz_phase_start if realistic
+  if (presence.scene.bz_phase_start != null && isRealisticZoneTime(presence.scene.bz_phase_start)) presence.zoneTime = presence.scene.bz_phase_start;
   if (Date.now() - lastPacketAt > 12000 && presence.status !== 'idle') {
     presence.status = 'idle';
     presence.players = []; presence.playersCount = 0;
     presence.gameMode = null; presence.gameVariant = null; presence.scene.curScn = null;
+    presence.zoneTime = null; presence.zonePhase = null; presence.matchElapsed = 0;
     presence.updatedAt = new Date().toISOString();
   }
+}, 1000);
+let lastZoneLog=0;
+setInterval(()=>{
+  if(Date.now()-lastZoneLog<5000) return;
+  lastZoneLog=Date.now();
+  const mode=presence.gameMode||presence.scene.curScn||'-';
+  const gmLow=String(mode).toLowerCase();
+  const isAllowedGm=gmLow==='zw_lg' || gmLow==='wwzw';
+  if(!isAllowedGm) return;
+  if(presence.status!=='in_game') return;
+  const zt=presence.zoneTime!=null?`${presence.zoneTime}s`:'-';
+  const zp=presence.zonePhase!=null?presence.zonePhase:(presence.scene.bz_zone??presence.scene.bz_phase??'-');
+  const pc=`${presence.playersCount}/${presence.maxPlayers}`;
+  const teams=presence.inParty?'party':'solo';
+  console.log(`${ts()} ${TAG.SYS} ${COL.sys(`ZONE tick gm=${mode} phase=${zp} time=${zt} players=${pc} teams=${teams} alive=${presence.self.alive}`)}`);
 }, 5000);
-const BOT_API = process.env.BOT_API || 'http://127.0.0.1:8766';
+const BOT_API = process.env.BOT_API || process.env.SERVER_API || 'http://127.0.0.1:3000'; // server is local API (bot is Discord-only)
 let sessionToken = null;
 let playStart = null; // {gm, t}
 function botPost(path, body){
@@ -615,6 +723,11 @@ function updatePresenceFromPacket(rec, msg) {
   try {
     lastPacketAt = Date.now();
     presence.updatedAt = new Date().toISOString();
+    if (msg && msg.req && (msg.req.opName==='Authenticate' || msg.req.opName==='AuthenticateOnce')) {
+      presence.status='in_lobby';
+      presence.scene.curScn='MainLobby';
+      console.log(`[AUTH] Authenticate packet → set lobby`);
+    }
     if (msg && msg.req) {
       presence.raw.lastOp = `${msg.req.opName}(${msg.req.opCode})`;
       const rn = msg.req.params.find(p => p.keyName === 'RoomName');
@@ -624,6 +737,8 @@ function updatePresenceFromPacket(rec, msg) {
       if (gp && gp.value && gp.value.value) {
         const gm = gp.value.value.gm; if (gm && gm.value) { presence.gameMode = gm.value; presence.scene.gm = gm.value; }
         const gv = gp.value.value.gv; if (gv && gv.value) { presence.gameVariant = gv.value; presence.scene.gv = gv.value; }
+        // Duo Wild West → wwzw (same as zone wars, normally duo)
+        if((String(presence.gameMode||'').toLowerCase().includes('ww')||String(presence.gameMode||'').toLowerCase().includes('wild')) && String(presence.gameVariant||'').toLowerCase()==='duo'){ presence.gameMode='wwzw'; presence.scene.gm='wwzw'; }
         const party = gp.value.value.Party; if (party && party.value != null) presence.inParty = !!party.value;
         const maxP = gp.value.value['255']; if (maxP && maxP.value != null) presence.maxPlayers = Number(maxP.value) || 12;
         // mode picked → count as 1/Max even before Join event
@@ -633,7 +748,7 @@ function updatePresenceFromPacket(rec, msg) {
       if (pProps && pProps.value && pProps.value.value) {
         const pp = pProps.value.value;
         if (pp['255'] && pp['255'].value) presence.self.name = pp['255'].value || presence.self.name;
-        if (pp['skid'] && pp['skid'].value) presence.self.skin = pp['skid'].value;
+        if (pp['skid'] && pp['skid'].value) { presence.self.skin = pp['skid'].value; presence.self.skinUrl = skinUrlFor(pp['skid'].value); }
         if (pp['pid'] && pp['pid'].value) presence.self.pickaxe = pp['pid'].value;
         if (pp['pfid'] && pp['pfid'].value) presence.self.gameId = pp['pfid'].value;
         if (sessionToken && (pp['255']||pp['skid']||pp['pid']||pp['pfid'])) {
@@ -654,27 +769,40 @@ function updatePresenceFromPacket(rec, msg) {
     }
     if (msg && msg.ev) {
       presence.raw.lastEvent = `${msg.ev.evName}(${msg.ev.evCode})`;
-      if (msg.ev.evCode === 255) { // Join — player joined
+      if (msg.ev.evCode === 255) { // Join — player joined (real username from 255, not Player X)
         presence.status = 'in_game';
-        let actorNr = null, name = null;
+        let actorNr = null, name = null, skin = null;
         for (const p of msg.ev.params) {
           if (p.keyName === 'ActorNr' && p.value.value != null) actorNr = p.value.value;
-          if (p.keyName === 'Properties' && p.value.value) {
-            for (const [k,v] of Object.entries(p.value.value)) if (k==='255' && v.value) name=v.value;
+          if ((p.keyName === 'Properties' || p.keyName === 'PlayerProperties') && p.value.value) {
+            for (const [k,v] of Object.entries(p.value.value)) {
+              if (k==='255' && v.value) name=v.value;
+              if (k==='skid' && v.value) skin=v.value;
+            }
           }
         }
         if (actorNr==null) actorNr = presence.players.length+1;
         if (!presence.players.find(pl=>pl.actorNr===actorNr)) {
-          presence.players.push({ actorNr, name: name||`Player ${actorNr}`, kills:0, deaths:0, alive:true });
+          presence.players.push({ actorNr, name: name||`Player ${actorNr}`, skin: skin||null, kills:0, deaths:0, alive:true });
+        } else {
+          // update name/skin if we now have real one (was generic before)
+          const existing = presence.players.find(pl=>pl.actorNr===actorNr);
+          if(existing && name && existing.name.startsWith('Player ')) existing.name = name;
+          if(existing && skin) existing.skin = skin;
         }
         presence.playersCount = presence.players.length;
         if (actorNr && !presence.self.actorNr) presence.self.actorNr = actorNr;
         if (name && !presence.self.name) presence.self.name = name;
+        if (skin && !presence.self.skin) { presence.self.skin = skin; presence.self.skinUrl = skinUrlFor(skin); }
       }
       if (msg.ev.evCode === 254) { // Leave
         let actorNr=null;
         for (const p of msg.ev.params) if (p.keyName==='ActorNr' && p.value.value!=null) actorNr=p.value.value;
-        if (actorNr!=null) presence.players = presence.players.filter(pl=>pl.actorNr!==actorNr);
+        if (actorNr!=null) {
+          presence.players = presence.players.filter(pl=>pl.actorNr!==actorNr);
+          // mark that actor as dead for stats
+          const wasAlive = presence.players.find(p=>p.actorNr===actorNr)?.alive;
+        }
         presence.playersCount = presence.players.length;
         if (presence.playersCount===0) presence.status='in_lobby';
       }
@@ -685,34 +813,77 @@ function updatePresenceFromPacket(rec, msg) {
               if (k === 'curScn' && v.value) {
                 const prev = presence.status;
                 presence.scene.curScn = v.value;
-                const low = String(v.value).toLowerCase();
-                if (low.includes('lobby')) presence.status='in_lobby';
-                else if (low.includes('game') || low.includes('zonewars') || low.includes('zw_lg') || low.includes('boxfights')) presence.status='in_game';
-                if (!presence.gameMode && /bf2v2|boxfights.*2v2/i.test(v.value)) presence.gameMode='BF2V2';
+                // Infer gm from curScn if not yet known (fixes gm not coming from curScn)
+                if(!presence.gameMode || presence.gameMode==='unknown'){
+                  const cs=String(v.value).toLowerCase();
+                  let inferred=null;
+                  if(cs.includes('lategame')||cs.includes('zw_lg')) inferred='zw_lg';
+                  else if(cs.includes('wildwest')||cs.includes('wild west')||cs.includes('wwzw')) inferred='wwzw';
+                  else if(cs.includes('zonewars')||cs.includes('zone wars')) inferred='zw';
+                  else if(cs.includes('boxfights')&&cs.includes('2v2')) inferred='BF2V2';
+                  else if(cs.includes('boxfights')) inferred='BF';
+                  else if(cs.includes('mainworld')) inferred='DF';
+                  else if(cs.includes('wild')) inferred='WW';
+                  if(inferred){ presence.gameMode=inferred; presence.scene.gm=inferred; console.log(`[GAMEMODE] inferred ${inferred} from curScn "${v.value}"`); }
+                }
+                // Per spec: MainLobby => lobby, else if curScn != MainLobby && gm != unknown => game
+                if (String(v.value)==="MainLobby") presence.status='in_lobby';
+                else if (String(v.value)!=="MainLobby" && presence.gameMode && presence.gameMode!=='unknown' && presence.gameMode!==null) presence.status='in_game';
+                else if (String(v.value)!=="MainLobby") {
+                  // if gm not yet known, stay in lobby until gm is known
+                  // keep current status
+                }
+                console.log(`[CURSCN] decryptor "${v.value}" → status=${presence.status} gm=${presence.gameMode}`);
+                // also log for server analysis
+                try{ console.log(`[PLAYER_STATE] decryptor ${presence.status} curScn=${v.value} gm=${presence.gameMode}`);}catch{}
+                if (!presence.gameMode && /wild\s*west|wildwest|wwzw/i.test(v.value) && String(presence.gameVariant||'').toLowerCase()==='duo') presence.gameMode='wwzw';
+                else if (!presence.gameMode && /wild\s*west|wildwest/i.test(v.value)) presence.gameMode='WW';
+                else if (!presence.gameMode && /bf2v2|boxfights.*2v2/i.test(v.value)) presence.gameMode='BF2V2';
                 else if (!presence.gameMode && /boxfights/i.test(v.value)) presence.gameMode='BF';
                 else if (!presence.gameMode && /zw_lg|lategame/i.test(v.value)) presence.gameMode='zw_lg';
                 else if (!presence.gameMode && /zonewars/i.test(v.value)) presence.gameMode='zw';
+                if((String(presence.gameMode||'').toLowerCase().includes('ww')||String(presence.gameMode||'').toLowerCase().includes('wild')) && String(presence.gameVariant||'').toLowerCase()==='duo') presence.gameMode='wwzw';
                 // lobby → 0/0, but if mode already picked keep 1/max
                 if (presence.status==='in_lobby') {
                   if (presence.gameMode) { presence.playersCount = 1; if(!presence.players.length) presence.players=[{actorNr:1,name:presence.self.name||'You',kills:0,deaths:0,alive:true}]; }
                   else { presence.playersCount = 0; presence.players = []; }
                 }
-                // playtime: leaving game
+                // playtime: leaving game — win disabled until real victory packet captured (curScn "Victory" or last-alive)
+                // Previous heuristic (alive → win) caused false wins every lobby return (gm=unknown).
                 if (prev==='in_game' && presence.status==='in_lobby' && playStart) {
                   const secs = Math.floor((Date.now()-playStart.t)/1000);
                   if (secs>5) botPost('/api/playtime', { token: sessionToken, gm: playStart.gm, seconds: secs });
-                  // win if still alive at exit
-                  if (presence.self.alive) botPost('/api/event', { token: sessionToken, type:'win', gm: playStart.gm });
-                  else botPost('/api/event', { token: sessionToken, type:'defeat', gm: playStart.gm });
+                  // Only count win if we have explicit victory evidence:
+                  //  - curScn contains victory/win, OR alive && we were last player (players.length===1 before clear)
+                  const victory = /victory|you win|#1|winner/i.test(String(v.value));
+                  const lastAliveWin = presence.self.alive && presence.players.length===1 && presence.players[0]?.actorNr===presence.self.actorNr;
+                  if (victory || lastAliveWin) botPost('/api/event', { token: sessionToken, type:'win', gm: playStart.gm });
+                  else if (!presence.self.alive) botPost('/api/event', { token: sessionToken, type:'defeat', gm: playStart.gm });
+                  // else: alive but not victory → no win/defeat (just playtime) to avoid false positives like "WIN gm=unknown"
                   playStart=null;
                 } else if (prev!=='in_game' && presence.status==='in_game' && !playStart) {
+                  // wwzw same as zone wars — track playtime with gm=wwzw
                   playStart={ gm: presence.gameMode||'unknown', t:Date.now() };
                 }
+                // ensure wwzw also counts as zone wars for status
+                if(String(presence.gameMode).toLowerCase()==='wwzw') presence.status='in_game';
               }
-              if (k === 'gm' && v.value!=null) { presence.scene.gm = v.value; presence.gameMode = v.value; }
-              if (k === 'gv' && v.value!=null) { presence.scene.gv = v.value; presence.gameVariant = v.value; }
+              if (k === 'gm' && v.value!=null) { presence.scene.gm = v.value; presence.gameMode = v.value; if((String(v.value).toLowerCase().includes('ww')||String(v.value).toLowerCase().includes('wild')) && String(presence.gameVariant||'').toLowerCase()==='duo') presence.gameMode='wwzw'; }
+              if (k === 'gv' && v.value!=null) { presence.scene.gv = v.value; presence.gameVariant = v.value; if((String(presence.gameMode||'').toLowerCase().includes('ww')||String(presence.gameMode||'').toLowerCase().includes('wild')) && String(v.value).toLowerCase()==='duo') presence.gameMode='wwzw'; }
               if (k === 'Party' && v.value!=null) presence.inParty = !!v.value;
-              if (k === 'stG' && v.value!=null) presence.scene.stG = v.value;
+              if (k === 'stG' && v.value!=null) {
+                presence.scene.stG = v.value; if(isRealisticZoneTime(v.value)) presence.zoneTime = v.value;
+                const isDuoWW = (String(presence.gameMode||'').toLowerCase().includes('ww') || String(presence.gameMode||'').toLowerCase().includes('wild')) && String(presence.gameVariant||'').toLowerCase()==='duo';
+                if(isDuoWW && isRealisticZoneTime(v.value)) presence.zonePhase = v.value;
+              }
+              if (k === 'bz_phase_start' && v.value!=null) {
+                presence.scene.bz_phase_start = v.value;
+                if(isRealisticZoneTime(v.value)) presence.zoneTime = v.value;
+              }
+              if (k === 'bz_zone' && v.value!=null) { presence.zonePhase = v.value; presence.scene.bz_zone = v.value; }
+              if (k === 'bz_phase' && v.value!=null) presence.scene.bz_phase = v.value;
+              if (k === 'bz_enabled' && v.value!=null) presence.scene.bz_enabled = v.value;
+              if (k === 'bz_pattern' && v.value!=null) presence.scene.bz_pattern = v.value;
               if (k === 'dh' && v.value!=null) {
                 const nd = Number(v.value)||0;
                 if (nd > (presence.self.deaths||0) && sessionToken) botPost('/api/event', { token: sessionToken, type:'death', gm: presence.gameMode||'unknown' });
@@ -738,6 +909,11 @@ function updatePresenceFromPacket(rec, msg) {
             if (sessionToken) botPost('/api/event', { token: sessionToken, type:'knock', gm: presence.gameMode||'unknown' });
           } else if (kf.type === 'kill') {
             presence.lastKillfeed = kf;
+            // per-player kills for /currentmatch
+            const killerPl = presence.players.find(pl=>pl.name===kf.killer);
+            if(killerPl) killerPl.kills = (killerPl.kills||0)+1;
+            const victimPl = presence.players.find(pl=>pl.name===kf.victim);
+            if(victimPl){ victimPl.alive=false; victimPl.deaths=(victimPl.deaths||0)+1; }
             if (kf.killer && presence.self.name && kf.killer === presence.self.name) {
               presence.self.kills++;
               if (sessionToken) botPost('/api/event', { token: sessionToken, type:'kill', gm: presence.gameMode||'unknown' });
@@ -779,9 +955,23 @@ function handleBatch(parsed, sock) {
     try { msg = parseMessage(hexToBytes(r.rawHex), warnings); } catch {}
     if (msg) updatePresenceFromPacket(r, msg);
     logPacket(r);
-    // attach decoded essential summary to record for file
+    // attach decoded essential summary to record for file + for server mirror
+    const dec = msg ? (msg.req ? { kind: msg.req.opName, code: msg.req.opCode } : msg.ev ? { kind: msg.ev.evName, code: msg.ev.evCode } : null) : null;
+    r.decoded = dec;
     r._decoded = msg ? { typeName: msg.typeName, req: msg.req ? { opName: msg.req.opName, opCode: msg.req.opCode } : undefined, ev: msg.ev ? { evName: msg.ev.evName, evCode: msg.ev.evCode } : undefined } : null;
   }
+  // mirror to server :3000 — capture uses session id only, secret stays server-side
+  try{
+    const authId = v.authSessionId || parsed?.authSessionId || null;
+    const capToken = authId ? undefined : (v.token || parsed?.token || sessionToken);
+    const payload=JSON.stringify({ sessionId: v.sessionId, authSessionId: authId, token: capToken, records: v.records });
+    const target=(process.env.SERVER_API||process.env.BOT_API||'http://127.0.0.1:3000')+'/api/capture';
+    const u=new URL(target);
+    const opts={ method:'POST', hostname:u.hostname, port:u.port, path:u.pathname, headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(payload)} };
+    const req=http.request(opts, res=>{ res.on('data',()=>{}); if(res.statusCode!==204) console.log(`${TAG.SYS} mirror ${target} → ${res.statusCode}`); });
+    req.on('error',(e)=>{ console.log(`${TAG.ERR} mirror ${target} failed ${e.message} — is app/dev.js :3000 running?`); });
+    req.write(payload); req.end();
+  }catch(e){ console.log(`${TAG.ERR} mirror exception ${e.message}`); }
   try {
     fs.mkdirSync(CAPTURES_DIR, { recursive: true });
     const fp = path.join(CAPTURES_DIR, `${v.sessionId}.jsonl`);
@@ -837,7 +1027,7 @@ const server = http.createServer((req,res)=>{
   if ((req.headers.upgrade||'').toLowerCase()==='websocket'){ handleWsUpgrade(req,res); return; }
   if (req.method==='OPTIONS'){ res.writeHead(204); res.end(); return; }
   if (req.method==='GET' && (req.url==='/' || req.url==='/status')){
-    sendJson(res,200,{ ok:true, service:'photon-sniffer decryptor', port:PORT, uptime:process.uptime(), totalIn, totalOut, totalDecoded, totalErr, seenOps:Object.fromEntries(seenOps), seenEvs:Object.fromEntries(seenEvs), presence });
+    sendJson(res,200,{ ok:true, service:'buildnow-companion decryptor', port:PORT, uptime:process.uptime(), totalIn, totalOut, totalDecoded, totalErr, seenOps:Object.fromEntries(seenOps), seenEvs:Object.fromEntries(seenEvs), presence });
     return;
   }
   if (req.method==='GET' && req.url==='/presence'){

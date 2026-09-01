@@ -1,9 +1,12 @@
 {
-  "name": "photon-game-data-capture",
-  "version": "1.0.0",
+  "name": "buildnow-companion",
+  "version": "2.0.0",
   "private": true,
-  "description": "Photon WebSocket capture decoder and Discord Rich Presence bridge",
+  "description": "BuildNow Companion — Photon WebSocket capture, decrypt & Discord Rich Presence",
   "scripts": {
+    "dev": "concurrently \"node app/dev.js\" \"node companion/decryptor.js\"",
+    "server": "node app/dev.js",
+    "decryptor": "node companion/decryptor.js",
     "discord": "node discord-bridge.js",
     "decode": "node decode.js",
     "debug": "node debug-collector.js",
@@ -13,5 +16,9 @@
   "dependencies": {
     "axios": "^1.20.0",
     "discord-rpc": "^4.0.1"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.5",
+    "dotenv": "^17.4.2"
   }
 }

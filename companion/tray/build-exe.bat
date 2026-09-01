@@ -8,11 +8,11 @@ if not exist "node_modules\discord-rpc" (
   call npm install
 )
 pyinstaller --onefile --noconsole --name BuildNowTray --icon=NONE ^
-  --add-data "photon-sniffer/decryptor.js;photon-sniffer" ^
-  --add-data "photon-sniffer/discord-presence.js;photon-sniffer" ^
+  --add-data "companion/decryptor.js;companion" ^
+  --add-data "companion/discord-presence.js;companion" ^
   --add-data "node_modules;node_modules" ^
-  --add-data "photon-sniffer/captures;photon-sniffer/captures" ^
+  --add-data "companion/captures;companion/captures" ^
   --hidden-import=pystray --hidden-import=PIL ^
-  photon-sniffer/tray/tray_app.py
+  companion/tray/tray_app.py
 echo Built dist/BuildNowTray.exe — runs headless in tray.
 echo If 8765 still fails, check %USERPROFILE%\.buildnow-tray.log

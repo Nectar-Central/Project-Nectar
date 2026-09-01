@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * BuildNow GG — Real Discord Rich Presence
- * Reads photon-sniffer decryptor's /presence and shows on your Discord profile:
+ * BuildNow Companion — Discord Rich Presence
+ * Reads companion decryptor's /presence and shows on your Discord profile:
  *   • Game mode (gm: DF, BR etc) — human readable
  *   • In Lobby / In Game / Loading
  *   • Players in game / max (255 from GameProperties)
@@ -12,8 +12,8 @@
  *  1. Create app at https://discord.com/developers/applications → New Application
  *     → Rich Presence → add images:  buildnow  (512x512) , lobby / ingame
  *  2. Copy Application ID
- *  3. Run:  set DISCORD_CLIENT_ID=123456789012345678 && node photon-sniffer/discord-presence.js
- *     or:  node photon-sniffer/discord-presence.js --client-id 123...
+ *  3. Run:  set DISCORD_CLIENT_ID=123456789012345678 && node companion/discord-presence.js
+ *     or:  node companion/discord-presence.js --client-id 123...
  *  4. Keep decryptor + game + Discord desktop running
  *
  * Polls http://127.0.0.1:8765/presence every 1.5s (decryptor must be running)
@@ -35,8 +35,8 @@ const CLIENT_ID = process.env.DISCORD_CLIENT_ID || argVal('--client-id') || argV
 if (!CLIENT_ID || CLIENT_ID==='0') {
   console.error('[presence] Missing DISCORD_CLIENT_ID');
   console.error('  Create app: https://discord.com/developers/applications');
-  console.error('  Then: set DISCORD_CLIENT_ID=YOUR_APP_ID && node photon-sniffer/discord-presence.js');
-  console.error('  Or:   node photon-sniffer/discord-presence.js --client-id YOUR_APP_ID');
+  console.error('  Then: set DISCORD_CLIENT_ID=YOUR_APP_ID && node companion/discord-presence.js');
+  console.error('  Or:   node companion/discord-presence.js --client-id YOUR_APP_ID');
   process.exit(1);
 }
 
@@ -47,10 +47,15 @@ const GM_NAMES = {
   DF: 'Free Mode',
   zw_lg: 'Lategame Zone Wars',
   zw: 'Zone Wars',
+  wwzw: 'Zone Wars — Duo Wild West',
   BF: 'Boxfights',
   BF2V2: 'Boxfights 2v2',
   bf: 'Boxfights',
   bf2v2: 'Boxfights 2v2',
+  WW: 'Wild West',
+  ww: 'Wild West',
+  wildwest: 'Wild West',
+  wild_west: 'Wild West',
   br: 'Battle Royale',
   BR: 'Battle Royale',
   TDM: 'Team Deathmatch',
@@ -85,14 +90,17 @@ async function buildActivity(p){
   let gm = p.gameMode || p.scene?.gm || null;
   const gv = p.gameVariant || p.scene?.gv || p.raw?.gv || null; // "duo" → Duo {mode}
   const curScn = p.scene?.curScn || '';
-  if (!gm && /bf2v2|boxfights.*2v2/i.test(curScn)) gm = 'BF2V2';
+  if (gm==='wwzw') { /* already */ }
+  else if (!gm && /wild\s*west|wildwest|wwzw/i.test(curScn) && String(gv||'').toLowerCase()==='duo') gm = 'wwzw';
+  else if (!gm && /wild\s*west|wildwest/i.test(curScn)) gm = 'WW';
+  else if (!gm && /bf2v2|boxfights.*2v2/i.test(curScn)) gm = 'BF2V2';
   else if (!gm && /boxfights/i.test(curScn)) gm = 'BF';
   else if (!gm && /zw_lg|lategame.*zone.*wars/i.test(curScn)) gm = 'zw_lg';
   else if (!gm && /zone.*wars/i.test(curScn)) gm = 'zw';
   const mode = gmLabel(gm, gv);
   const status = p.status || 'idle';
   const inLobby = status==='in_lobby' || /lobby/i.test(curScn);
-  const inGame = status==='in_game' || /game|zonewars|free|boxfights/i.test(curScn);
+  const inGame = status==='in_game' || /game|zonewars|wwzw|free|boxfights|wild.*west/i.test(curScn);
   const inParty = p.inParty === true || p.Party === true;
 
   let details = mode;

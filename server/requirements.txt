@@ -1,0 +1,7 @@
+# Python backend for BNGC — clean, spaced, well-logged
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+supabase==2.7.0
+redis==5.0.3
+python-dotenv==1.0.1
+pydantic==2.6.0
