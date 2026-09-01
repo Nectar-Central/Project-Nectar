@@ -13,8 +13,6 @@ if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing from .env")
 
 intents = discord.Intents.default()
-# Note: If you want member counts to always be 100% accurate, 
-# you may need to enable intents.members = True here and in your Discord Developer Portal.
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
@@ -23,8 +21,8 @@ tree = app_commands.CommandTree(client)
 @client.event
 async def on_ready():
     await tree.sync()
-    print(f"✅ Logged in as {client.user}")
-    print("🚀 Nectar Central bot is online!")
+    print(f"Logged in as {client.user}")
+    print("Nectar Central bot is online!")
 
 
 @tree.command(name="ping", description="Check if the bot is online")
@@ -66,7 +64,7 @@ async def serverinfo(interaction: discord.Interaction):
     guild = interaction.guild
     
     embed = discord.Embed(
-        title=f"📊 Server Info: {guild.name}",
+        title=f" Server Info: {guild.name}",
         color=discord.Color.gold()
     )
     
@@ -75,7 +73,7 @@ async def serverinfo(interaction: discord.Interaction):
         
     embed.add_field(name="Server ID", value=guild.id, inline=True)
     embed.add_field(name="Owner", value=f"<@{guild.owner_id}>", inline=True)
-    embed.add_field(name="Members", value=f"👥 {guild.member_count}", inline=True)
+    embed.add_field(name="Members", value=f" {guild.member_count}", inline=True)
     embed.add_field(name="Created On", value=f"<t:{int(guild.created_at.timestamp())}:F>", inline=False)
     
     await interaction.response.send_message(embed=embed)
@@ -87,7 +85,7 @@ async def avatar(interaction: discord.Interaction, user: discord.Member = None):
     target_user = user or interaction.user
     
     embed = discord.Embed(
-        title=f"🖼️ {target_user.display_name}'s Avatar",
+        title=f" {target_user.display_name}'s Avatar",
         color=discord.Color.gold()
     )
     embed.set_image(url=target_user.display_avatar.url)
