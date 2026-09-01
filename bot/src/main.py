@@ -13,6 +13,8 @@ if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing from .env")
 
 intents = discord.Intents.default()
+# Note: If you want member counts to always be 100% accurate, 
+# you may need to enable intents.members = True here and in your Discord Developer Portal.
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
@@ -52,6 +54,44 @@ async def coinflip(interaction: discord.Interaction):
         description=f"<:165460coin:1543709235278516374> The coin landed on **{result}**!",
         color=discord.Color.gold()
     )
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="serverinfo", description="Displays information about the current server")
+async def serverinfo(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command can only be used inside a server!", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    
+    embed = discord.Embed(
+        title=f"📊 Server Info: {guild.name}",
+        color=discord.Color.gold()
+    )
+    
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+        
+    embed.add_field(name="Server ID", value=guild.id, inline=True)
+    embed.add_field(name="Owner", value=f"<@{guild.owner_id}>", inline=True)
+    embed.add_field(name="Members", value=f"👥 {guild.member_count}", inline=True)
+    embed.add_field(name="Created On", value=f"<t:{int(guild.created_at.timestamp())}:F>", inline=False)
+    
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="avatar", description="Displays a user's avatar")
+@app_commands.describe(user="The user whose avatar you want to see (leave blank for yourself)")
+async def avatar(interaction: discord.Interaction, user: discord.Member = None):
+    target_user = user or interaction.user
+    
+    embed = discord.Embed(
+        title=f"🖼️ {target_user.display_name}'s Avatar",
+        color=discord.Color.gold()
+    )
+    embed.set_image(url=target_user.display_avatar.url)
+    
     await interaction.response.send_message(embed=embed)
 
 
