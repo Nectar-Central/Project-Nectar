@@ -485,102 +485,6 @@ async def currentmatch_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
     await _match_logic(interaction)
 
-async def _players_logic(interaction: discord.Interaction):
-    did = str(interaction.user.id)
-
-    # Try engine first
-    sid = await get_active_session(did)
-    state = await get_session_state(sid) if sid else None
-
-    if state:
-        # room-scoped: players are from current room (proxy), but also expose rooms dict
-        players = state.get("players") or {}
-        me = state.get("me") or {}
-        gm = state.get("game_mode") or "?"
-        rooms = state.get("rooms") or {}
-        current_room_id = state.get("current_room_id")
-        room = state.get("room") or {}
-        if rooms and current_room_id and current_room_id in rooms:
-            room = rooms[current_room_id]
-            # use room's gm if top-level empty
-            if gm == "?" and room.get("game_mode"):
-                gm = room.get("game_mode")
-
-        if not players:
-            return await interaction.followup.send("No players in room yet. Join a match first.")
-
-        lines = []
-        for p in sorted(players.values(), key=lambda x: (not x.get("is_alive", True), x.get("username", ""))):
-            name = p.get("username", "?")
-            skin = p.get("skin")
-            gid = p.get("game_id")
-            alive = "alive" if p.get("is_alive", True) else "dead"
-            is_self = " (you)" if p.get("is_self") else ""
-            skin_str = f" | [{skin}](https://buildnow-api.netlify.app/skins/{skin}.png)" if skin else ""
-            gid_str = f" | `{str(gid)[:6]}`" if gid else ""
-            lines.append(f"**{name}**{is_self} — {alive}{skin_str}{gid_str}")
-
-        e = discord.Embed(title=f"Players — {gm}", color=0x7c3aed, description="\n".join(lines)[:4096])
-        footer_room = room.get("code") or room.get("room_id") or current_room_id
-        if footer_room:
-            e.set_footer(text=f"Room {str(footer_room)[:12]} | {len(rooms)} room(s) in session")
-        return await interaction.followup.send(embed=e)
-
-    # Fallback: Supabase events (old format)
-    players = []
-    try:
-        if db.USE_SUPABASE and db.supabase:
-            r = db.supabase.table("bngc_game_events").select("*").eq("discord_id", did).in_("event_type", ["killfeed"]).order("created_at", desc=True).limit(20).execute()
-            seen = set()
-            for ev in (r.data or []):
-                gd = ev.get("event_data") or {}
-                for name in [gd.get("instigator"), gd.get("instigated")]:
-                    if name and name not in seen:
-                        seen.add(name)
-                        players.append(name)
-    except Exception as e:
-        print(f"[players] fallback failed {e}")
-
-    if not players:
-        return await interaction.followup.send("No players found. Start a game first (link token in userscript).")
-
-    embed = discord.Embed(title="Players in room", color=0x7c3aed, description="\n".join(f"{i+1}. {p}" for i,p in enumerate(players[:20])))
-    await interaction.followup.send(embed=embed)
-
-@bot.tree.command(name="players", description="List players in current room with skins and alive status")
-async def players_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=False)
-    await _players_logic(interaction)
-
-@bot.tree.command(name="rooms", description="List all rooms in your current session")
-async def rooms_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=False)
-    did = str(interaction.user.id)
-    sid = await get_active_session(did)
-    state = await get_session_state(sid) if sid else None
-    if not state or not state.get("rooms"):
-        return await interaction.followup.send("No rooms found. Play a match to create one (CreateRoom/JoinRoom).")
-    rooms = state.get("rooms") or {}
-    cur = state.get("current_room_id")
-    lines = []
-    for rid, rv in rooms.items():
-        is_cur = " ← current" if rid == cur else ""
-        gm = rv.get("game_mode") or "?"
-        cnt = rv.get("players_count", 0)
-        maxp = rv.get("max_players") or "?"
-        state_v = rv.get("state", "?")
-        kills = len(rv.get("recent_kills", []))
-        code = rv.get("code") or rid
-        lines.append(f"`{str(code)[:8]}` {gm} {cnt}/{maxp} {state_v} {kills} kills{is_cur}")
-    e = discord.Embed(title=f"Rooms — Session {sid[:12]}", color=0x7c3aed, description="\n".join(lines)[:4096])
-    e.set_footer(text=f"{len(rooms)} room(s) | current: {str(cur)[:8] if cur else '?'}")
-    await interaction.followup.send(embed=e)
-
-@bot.tree.command(name="list", description="Alias for /players")
-async def list_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=False)
-    await _players_logic(interaction)
-
 @bot.tree.command(name="skin", description="Show your or another user's current skin")
 async def skin_cmd(interaction: discord.Interaction, user: discord.User = None):
     target = user or interaction.user
@@ -646,172 +550,72 @@ async def sessions_cmd(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, view=view)
 
 
-@bot.tree.command(name="replay", description="Show a human-readable replay of a match with zone phases and events")
+@bot.tree.command(name="replay", description="Show replay for a match")
 async def replay_cmd(interaction: discord.Interaction, matchid: str):
     await interaction.response.defer(ephemeral=False)
     did = str(interaction.user.id)
-
     full_sid = await db.get_match_by_short_id(did, matchid)
     if not full_sid:
-        return await interaction.followup.send(f"No match found starting with `{matchid}`. Use /matches to see IDs.")
-
+        return await interaction.followup.send(f"No match found for `{matchid}`. Try /sessions or /matches.", ephemeral=True)
     events = await db.get_match_events(full_sid, did)
     if not events:
-        return await interaction.followup.send(f"No events found for match `{full_sid[:12]}`.")
-
-    lines = []
-    me_name = None
-    # Try to find self name from kill/death events
-    for ev in events:
-        et = ev.get("event_type")
-        gd = ev.get("event_data") or {}
-        if et == "kill":
-            # We are the instigator
-            me_name = me_name or interaction.user.display_name
-        elif et == "death":
-            # We are the victim — instigator is the killer
-            pass
-
-    for ev in events:
-        et = ev.get("event_type", "?")
-        gd = ev.get("event_data") or {}
-        ts = ""
-        if ev.get("created_at"):
-            try:
-                from datetime import datetime
-                dt = datetime.fromisoformat(ev["created_at"].replace("Z", "+00:00"))
-                ts = dt.strftime("%H:%M:%S")
-            except Exception:
-                ts = ev["created_at"][11:19]
-
-        if et == "killfeed":
-            kf_type = gd.get("kill_type", "killed")
-            ig = gd.get("instigator", "?")
-            ed = gd.get("instigated", "?")
-            if kf_type == "killed":
-                lines.append(f"`{ts}` {ig} eliminated {ed}")
-            elif kf_type == "knocked":
-                lines.append(f"`{ts}` {ig} knocked {ed}")
-            elif kf_type == "left":
-                lines.append(f"`{ts}` {ig} left the match")
-        elif et == "zone_change":
-            phase = gd.get("phase", "?")
-            t = gd.get("time")
-            time_str = f" ({t}s)" if t is not None else ""
-            lines.append(f"`{ts}` Zone Phase {phase} begins{time_str}")
-        elif et == "win":
-            gm = gd.get("gm", "")
-            lines.append(f"`{ts}` **Victory!** Won the match ({gm})")
-        elif et == "defeat":
-            gm = gd.get("gm", "")
-            lines.append(f"`{ts}` **Defeated.** Eliminated from the match ({gm})")
-        elif et == "kill":
-            victim = gd.get("victim", "?")
-            lines.append(f"`{ts}` You eliminated {victim}")
-        elif et == "death":
-            killer = gd.get("killer", "?")
-            lines.append(f"`{ts}` You were eliminated by {killer}")
-
-    if not lines:
-        return await interaction.followup.send(f"No replay data for match `{full_sid[:12]}`.")
-
-    sid_short = full_sid[:12]
-    e = discord.Embed(title=f"Match Replay — {sid_short}", color=0x7c3aed)
-    text = "\n".join(lines)
-    if len(text) <= 1024:
-        e.description = text
+        return await interaction.followup.send("No events for this match.")
+    # Per-match grouping — don't merge all kills flat
+    grouped = await db.get_match_events_grouped(full_sid, did)
+    if len(grouped) > 1:
+        lines: list[str] = []
+        for idx, (rid, evs) in enumerate(grouped.items(), 1):
+            gm = next((fmt.format_game_mode((ev.get("event_data") or {}).get("gm")) for ev in evs if (ev.get("event_data") or {}).get("gm")), f"Match {idx}")
+            lines.append(f"**Match {idx} — {gm}**")
+            lines.extend(views.replay_lines_for_events(evs))
+        footer = f"{len(events)} events · {len(grouped)} matches"
     else:
-        chunks = []
-        current = []
-        current_len = 0
-        for line in lines:
-            if current_len + len(line) + 1 > 1000:
-                chunks.append("\n".join(current))
-                current = [line]
-                current_len = len(line)
-            else:
-                current.append(line)
-                current_len += len(line) + 1
-        if current:
-            chunks.append("\n".join(current))
-        for i, chunk in enumerate(chunks[:4]):
-            e.add_field(name=f"Part {i+1}" if i > 0 else "Events", value=chunk[:1024], inline=False)
-
-    kills = sum(1 for ev in events if ev.get("event_type") == "kill")
-    deaths = sum(1 for ev in events if ev.get("event_type") == "death")
-    kf = [ev for ev in events if ev.get("event_type") == "killfeed"]
-    zones = sum(1 for ev in events if ev.get("event_type") == "zone_change")
-    wins = sum(1 for ev in events if ev.get("event_type") == "win")
-    e.set_footer(text=f"{len(kf)} kills in lobby | {zones} zone changes | You: {kills}K {deaths}D {'WIN' if wins else ''}")
-    await interaction.followup.send(embed=e)
+        lines = views.replay_lines_for_events(events)
+        footer = f"{len(events)} events"
+    if not lines:
+        return await interaction.followup.send("No replay data.")
+    # Use paginated view if many lines
+    if len(lines) <= 12:
+        e = views.paged_embed("Replay", lines, 0x7C3AED, footer, page=0)
+        await interaction.followup.send(embed=e)
+    else:
+        view = views.SimplePagedView("Replay", lines, 0x7C3AED, footer)
+        await interaction.followup.send(embed=view.current_embed(), view=view)
 
 
-@bot.tree.command(name="killfeed", description="Show the kill feed from a match (all players)")
+@bot.tree.command(name="killfeed", description="Show eliminations for a match")
 async def killfeed_cmd(interaction: discord.Interaction, matchid: str):
     await interaction.response.defer(ephemeral=False)
     did = str(interaction.user.id)
-
     full_sid = await db.get_match_by_short_id(did, matchid)
     if not full_sid:
-        return await interaction.followup.send(f"No match found starting with `{matchid}`. Use /matches to see IDs.")
-
+        return await interaction.followup.send(f"No match found for `{matchid}`. Try /sessions or /matches.", ephemeral=True)
     events = await db.get_match_events(full_sid, did, event_types=["killfeed"])
     if not events:
-        return await interaction.followup.send(f"No killfeed events found for match `{full_sid[:12]}`.")
-
-    lines = []
-    for ev in events:
-        gd = ev.get("event_data") or {}
-        ts = ""
-        if ev.get("created_at"):
-            try:
-                from datetime import datetime
-                dt = datetime.fromisoformat(ev["created_at"].replace("Z", "+00:00"))
-                ts = dt.strftime("%H:%M:%S")
-            except Exception:
-                ts = ev["created_at"][11:19]
-
-        kf_type = gd.get("kill_type", "killed")
-        ig = gd.get("instigator", "?")
-        ed = gd.get("instigated")
-
-        if kf_type == "killed" and ed:
-            lines.append(f"`{ts}` {ig} killed {ed}")
-        elif kf_type == "knocked" and ed:
-            lines.append(f"`{ts}` {ig} knocked {ed}")
-        elif kf_type == "left":
-            lines.append(f"`{ts}` {ig} left the match")
-
-    if not lines:
-        return await interaction.followup.send(f"No killfeed for match `{full_sid[:12]}`.")
-
-    sid_short = full_sid[:12]
-    e = discord.Embed(title=f"Killfeed — {sid_short}", color=0xdc2626)
-    text = "\n".join(lines)
-    if len(text) <= 1024:
-        e.description = text
+        return await interaction.followup.send("No eliminations in this match.")
+    grouped = await db.get_match_events_grouped(full_sid, did)
+    # Only keep killfeed events grouped
+    kill_groups = {rid: [ev for ev in evs if ev.get("event_type") == "killfeed"] for rid, evs in grouped.items()}
+    # Filter empty
+    kill_groups = {k: v for k, v in kill_groups.items() if v}
+    if len(kill_groups) > 1:
+        lines: list[str] = []
+        for idx, (rid, evs) in enumerate(kill_groups.items(), 1):
+            gm = next((fmt.format_game_mode((ev.get("event_data") or {}).get("gm")) for ev in evs if (ev.get("event_data") or {}).get("gm")), f"Match {idx}")
+            lines.append(f"**Match {idx} — {gm}**")
+            lines.extend(views.killfeed_lines_for_events(evs))
+        footer = f"{len(events)} eliminations · {len(kill_groups)} matches"
     else:
-        chunks = []
-        current = []
-        current_len = 0
-        for line in lines:
-            if current_len + len(line) + 1 > 1000:
-                chunks.append("\n".join(current))
-                current = [line]
-                current_len = len(line)
-            else:
-                current.append(line)
-                current_len += len(line) + 1
-        if current:
-            chunks.append("\n".join(current))
-        for i, chunk in enumerate(chunks[:4]):
-            e.add_field(name=f"Feed {i+1}" if i > 0 else "Feed", value=chunk[:1024], inline=False)
-
-    total_kills = sum(1 for ev in events if (ev.get("event_data") or {}).get("kill_type") == "killed")
-    total_knocks = sum(1 for ev in events if (ev.get("event_data") or {}).get("kill_type") == "knocked")
-    total_left = sum(1 for ev in events if (ev.get("event_data") or {}).get("kill_type") == "left")
-    e.set_footer(text=f"{total_kills} killed | {total_knocks} knocked | {total_left} left")
-    await interaction.followup.send(embed=e)
+        lines = views.killfeed_lines_for_events(events)
+        footer = f"{len(lines)} eliminations"
+    if not lines:
+        return await interaction.followup.send("No eliminations.")
+    if len(lines) <= 12:
+        e = views.paged_embed("Killfeed", lines, 0xDC2626, footer, page=0)
+        await interaction.followup.send(embed=e)
+    else:
+        view = views.SimplePagedView("Killfeed", lines, 0xDC2626, footer)
+        await interaction.followup.send(embed=view.current_embed(), view=view)
 
 if __name__ == "__main__":
     if not TOKEN:

@@ -347,3 +347,44 @@ class MatchActionsView(discord.ui.View):
         for child in self.children:
             if isinstance(child, discord.ui.Button) and child.label in ("◀ Prev", "Next ▶"):
                 child.disabled = total_pages <= 1 or (child.label == "◀ Prev" and self.page == 0) or (child.label == "Next ▶" and self.page >= total_pages - 1)
+
+
+class SimplePagedView(discord.ui.View):
+    """Prev/Next pagination for standalone /killfeed and /replay."""
+
+    def __init__(self, title: str, lines: list[str], color: int, footer: str, per_page: int = 12, timeout: float = 120):
+        super().__init__(timeout=timeout)
+        self.title = title
+        self.lines = lines
+        self.color = color
+        self.footer = footer
+        self.per_page = per_page
+        self.page = 0
+        self._refresh_buttons()
+
+    def current_embed(self) -> discord.Embed:
+        return paged_embed(self.title, self.lines, self.color, self.footer, page=self.page, per_page=self.per_page)
+
+    def _refresh_buttons(self):
+        total_pages = max(1, (len(self.lines) + self.per_page - 1) // self.per_page)
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                if child.label == "◀ Prev":
+                    child.disabled = self.page == 0 or total_pages <= 1
+                elif child.label == "Next ▶":
+                    child.disabled = self.page >= total_pages - 1 or total_pages <= 1
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+    async def prev(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        self.page = max(0, self.page - 1)
+        self._refresh_buttons()
+        await interaction.edit_original_response(embed=self.current_embed(), view=self)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+    async def nxt(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        total_pages = max(1, (len(self.lines) + self.per_page - 1) // self.per_page)
+        self.page = min(total_pages - 1, self.page + 1)
+        self._refresh_buttons()
+        await interaction.edit_original_response(embed=self.current_embed(), view=self)
