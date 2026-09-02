@@ -47,63 +47,62 @@ warnings = load_warnings()
 
 
 @bot.event
-    async def on_ready():
-      try:
-          if GUILD_ID and GUILD_ID.isdigit():
-              await tree.sync(guild=discord.Object(id=int(GUILD_ID)))
-              print(f"Synced commands to guild {GUILD_ID}")
-          else:
-              await tree.sync()
-              print("Synced global commands")
-      except discord.HTTPException as exc:
-          print(f"Command sync failed: {exc}")
-      print(f"Logged in as {bot.user}")
-      print("Nectar Central is online!")
+async def on_ready():
+    try:
+        if GUILD_ID and GUILD_ID.isdigit():
+            await tree.sync(guild=discord.Object(id=int(GUILD_ID)))
+            print(f"Synced commands to guild {GUILD_ID}")
+        else:
+            await tree.sync()
+            print("Synced global commands")
+    except discord.HTTPException as exc:
+        print(f"Command sync failed: {exc}")
+    print(f"Logged in as {bot.user}")
+    print("Nectar Central is online!")
 
 
-    @tree.error
-    async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-      print(f"Command error in {getattr(interaction.command, 'name', 'unknown')}: {error}")
-      message = "Something went wrong while running that command. Please try again."
-      if isinstance(error, app_commands.MissingPermissions):
-          message = "You do not have permission to use that command."
-      elif isinstance(error, app_commands.CommandOnCooldown):
-          message = "That command is on cooldown. Please try again shortly."
-      if interaction.response.is_done():
-          await interaction.followup.send(message, ephemeral=True)
-      else:
-          await interaction.response.send_message(message, ephemeral=True)
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    print(f"Command error in {getattr(interaction.command, 'name', 'unknown')}: {error}")
+    message = "Something went wrong while running that command. Please try again."
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "You do not have permission to use that command."
+    elif isinstance(error, app_commands.CommandOnCooldown):
+        message = "That command is on cooldown. Please try again shortly."
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+def save_registered_player(discord_id: int, username: str, display_name: str, game_handle: str, avatar_url: str):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing")
+    payload = {
+        "id": str(discord_id),
+        "username": username,
+        "display_name": display_name,
+        "game_handle": game_handle,
+        "avatar_url": avatar_url,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    request = Request(
+        f"{SUPABASE_URL}/rest/v1/players?on_conflict=id",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=10) as response:
+            if response.status not in (200, 201, 204):
+                raise RuntimeError(f"Supabase returned HTTP {response.status}")
+    except HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")[:300]
+        raise RuntimeError(f"Supabase returned HTTP {exc.code}: {details}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Supabase request failed: {exc.reason}") from exc
 
 
-    def save_registered_player(discord_id: int, username: str, display_name: str, game_handle: str, avatar_url: str):
-      if not SUPABASE_URL or not SUPABASE_KEY:
-          raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing")
-      payload = {
-          "id": str(discord_id),
-          "username": username,
-          "display_name": display_name,
-          "game_handle": game_handle,
-          "avatar_url": avatar_url,
-          "updated_at": datetime.now(timezone.utc).isoformat(),
-      }
-      request = Request(
-          f"{SUPABASE_URL}/rest/v1/players?on_conflict=id",
-          data=json.dumps(payload).encode("utf-8"),
-          headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal"},
-          method="POST",
-      )
-      try:
-          with urlopen(request, timeout=10) as response:
-              if response.status not in (200, 201, 204):
-                  raise RuntimeError(f"Supabase returned HTTP {response.status}")
-      except HTTPError as exc:
-          details = exc.read().decode("utf-8", errors="replace")[:300]
-          raise RuntimeError(f"Supabase returned HTTP {exc.code}: {details}") from exc
-      except URLError as exc:
-          raise RuntimeError(f"Supabase request failed: {exc.reason}") from exc
-
-
-    @tree.command(name="register", description="Create or update your Nectar player profile")
+@tree.command(name="register", description="Create or update your Nectar player profile")
 @app_commands.describe(game_handle="Your in-game handle")
 async def register(interaction: discord.Interaction, game_handle: app_commands.Range[str, 1, 32]):
     clean_handle = str(game_handle).strip()
