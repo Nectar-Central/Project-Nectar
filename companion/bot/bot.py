@@ -393,17 +393,11 @@ async def stats_cmd(interaction: discord.Interaction, user: discord.User = None)
         e.add_field(name="Game mode", value=fmt.format_game_mode(row["game_mode"]), inline=True)
     await interaction.response.send_message(embed=e)
 
-@bot.tree.command(name="currentmatch", description="Show current match info (mode, players, kills, zone, alive/dead)")
-async def currentmatch_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=False)
+async def _match_logic(interaction: discord.Interaction):
     did = str(interaction.user.id)
-
-    # 1. Find active sessions (try each until engine has state)
     sids = await get_active_sessions(did, limit=5)
     if not sids:
-        return await interaction.followup.send("No active session found. Start a game first (link token in userscript).")
-
-    # 2. Fetch live state from engine — try each sid until one works
+        return await interaction.followup.send("No active match found. Start a game first.")
     state = None
     sid = None
     for cand in sids:
@@ -413,102 +407,82 @@ async def currentmatch_cmd(interaction: discord.Interaction):
             sid = cand
             break
     if not state:
-        # No engine state for any active session — likely server restarted.
-        # Show DB fallback with recent match info.
         sid = sids[0]
         row = await db.get_by_discord(did)
         if row:
-            # Try to show last match from DB events
             try:
                 events = await db.get_match_events(sid, did)
-                alive_hint = f"{len(events)} events logged" if events else "No events yet"
+                hint = f"{len(events)} events" if events else "No events yet"
             except:
-                alive_hint = "No events yet"
-            e = discord.Embed(title="Session Active (engine offline)", color=0x2b2d31)
-            e.add_field(name="Session", value=f"`{sid[:12]}`", inline=True)
-            e.add_field(name="Status", value=alive_hint, inline=True)
+                hint = "No events yet"
+            e = discord.Embed(title="Match in Progress", color=0x2b2d31, description="Connection lost — showing saved data.")
+            thumb = fmt.skin_url(row.get("skin"))
+            if thumb: e.set_thumbnail(url=thumb)
+            e.add_field(name="Status", value=hint, inline=True)
             if row.get("skin"):
-                skin_url = f"https://buildnow-api.netlify.app/skins/{row['skin']}.png"
-                e.set_thumbnail(url=skin_url)
-            e.add_field(name="Tip", value="Restart Python server or play a match to repopulate engine. DB data is still available via /matches.", inline=False)
-            e.set_footer(text=f"Engine 404 for {sid[:8]} — tried {len(sids)} session(s)")
+                e.add_field(name="Skin", value=fmt.skin_display(row.get("skin")), inline=True)
+            e.set_footer(text="Try again in a moment")
             return await interaction.followup.send(embed=e)
-        return await interaction.followup.send(f"Engine offline and no user data. Tried sessions: {', '.join(s[:8] for s in sids)}")
+        return await interaction.followup.send("No active match — start a game first.")
 
-    # 3. Build embed from engine state (room-scoped)
     me = state.get("me") or {}
-    # rooms dict is new structure: Session → rooms[room_id]
     rooms = state.get("rooms") or {}
-    current_room_id = state.get("current_room_id")
-    # back-compat: top-level proxies to current room
     players = state.get("players") or {}
     state_val = state.get("state", "lobby")
-    gm = state.get("game_mode") or "?"
-    cur_scn = state.get("cur_scn") or "?"
+    gm = fmt.format_game_mode(state.get("game_mode"))
+    cur_scn = (state.get("cur_scn") or "?").replace("_", " ")
     zone = state.get("zone") or {}
     players_count = state.get("players_count", 0)
     max_players = state.get("max_players") or "?"
     party = state.get("party") or {}
-    # room code from RoomView
-    room_code = None
-    if rooms and current_room_id and current_room_id in rooms:
-        room_code = rooms[current_room_id].get("code") or current_room_id
-    elif state.get("room", {}).get("code"):
-        room_code = state["room"]["code"]
-
-    gm_map = {"DF":"Free Mode","zw_lg":"Lategame Zone Wars","zw":"Zone Wars","wwzw":"Duo Wild West","WW":"Wild West","BF":"Boxfights","BF2V2":"Boxfights 2v2"}
-    gm_label = gm_map.get(gm) or gm_map.get(str(gm).lower()) or gm
-
     skin = me.get("skin")
-    skin_url = f"https://buildnow-api.netlify.app/skins/{skin}.png" if skin else None
+    thumb = fmt.skin_url(skin)
 
     if state_val == "lobby":
         e = discord.Embed(title="In Lobby", color=0x2b2d31)
-        if skin_url: e.set_thumbnail(url=skin_url)
+        if thumb: e.set_thumbnail(url=thumb)
         e.add_field(name="Status", value="In Lobby", inline=True)
-        e.add_field(name="Game mode", value=gm_label, inline=True)
+        e.add_field(name="Game mode", value=gm, inline=True)
         e.add_field(name="Scene", value=cur_scn, inline=True)
-        if room_code: e.add_field(name="Room", value=f"`{str(room_code)[:8]}`", inline=True)
-        if rooms: e.add_field(name="Rooms in session", value=str(len(rooms)), inline=True)
-        if skin: e.add_field(name="Skin", value=f"[{skin}]({skin_url})", inline=True)
+        if rooms: e.add_field(name="Matches in session", value=str(len(rooms)), inline=True)
+        if skin: e.add_field(name="Skin", value=fmt.skin_display(skin), inline=True)
         if party.get("is_party"): e.add_field(name="Party", value="In Party", inline=True)
-        e.set_footer(text=f"Session {sid[:12]} | Room {str(room_code)[:8] if room_code else '?'}")
         return await interaction.followup.send(embed=e)
 
-    # In match
     alive_count = sum(1 for p in players.values() if p.get("is_alive", True))
     dead_count = len(players) - alive_count
-
-    # Player list sorted by alive status
     player_lines = []
     for p in sorted(players.values(), key=lambda x: (not x.get("is_alive", True), x.get("username", ""))):
         name = p.get("username", "?")
         alive = "alive" if p.get("is_alive", True) else "dead"
         is_self = " (you)" if p.get("is_self") else ""
         player_lines.append(f"{name} — {alive}{is_self}")
-
-    kills_lines = "\n".join(player_lines[:12]) or "No data"
-
-    zone_time = zone.get("time")
-    zone_phase = zone.get("phase")
-    zone_str = f"Phase {zone_phase}" if zone_phase else "—"
-    if zone_time is not None:
-        zone_str += f" ({zone_time}s)"
+    kills_lines = "\n".join(player_lines[:12]) or "No players"
 
     e = discord.Embed(title="Current Match", color=0x7c3aed)
-    if skin_url: e.set_thumbnail(url=skin_url)
-    e.add_field(name="Game mode", value=gm_label, inline=True)
+    if thumb: e.set_thumbnail(url=thumb)
+    e.add_field(name="Game mode", value=gm, inline=True)
     e.add_field(name="Players", value=f"{players_count}/{max_players}", inline=True)
-    e.add_field(name="Zone", value=zone_str, inline=True)
+    e.add_field(name="Zone", value=fmt.format_zone(zone), inline=True)
     e.add_field(name="Alive / Dead", value=f"{alive_count} alive, {dead_count} dead", inline=True)
     e.add_field(name="Scene", value=cur_scn, inline=True)
-    if room_code: e.add_field(name="Room", value=f"`{str(room_code)[:8]}`", inline=True)
-    if rooms: e.add_field(name="Rooms", value=f"{len(rooms)} in session", inline=True)
+    if rooms: e.add_field(name="Matches", value=f"{len(rooms)} in session", inline=True)
     if party.get("is_party"): e.add_field(name="Party", value="In Party", inline=True)
-    if skin: e.add_field(name="Skin", value=f"[{skin}]({skin_url})", inline=True)
+    if skin: e.add_field(name="Skin", value=fmt.skin_display(skin), inline=True)
     e.add_field(name="Players", value=kills_lines[:1024], inline=False)
-    e.set_footer(text=f"Live from engine | Session {sid[:12]} | Room {str(room_code)[:8] if room_code else '?'}")
     await interaction.followup.send(embed=e)
+
+
+@bot.tree.command(name="match", description="Show current match info")
+async def match_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    await _match_logic(interaction)
+
+
+@bot.tree.command(name="currentmatch", description="Show current match info (alias for /match)")
+async def currentmatch_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    await _match_logic(interaction)
 
 async def _players_logic(interaction: discord.Interaction):
     did = str(interaction.user.id)
