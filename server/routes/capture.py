@@ -48,12 +48,15 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
         if not sess:
             return JSONResponse({"error": "Invalid auth session"}, status_code=401)
         if sess.get("is_locked"):
+            scope = str(sess.get("lock_scope") or ("admin" if sess.get("is_admin_locked") else "default")).lower()
+            is_admin = scope == "admin" or bool(sess.get("is_admin_locked"))
             try:
                 create_alert(sess.get("discord_id") or discord_id, "locked", request,
-                    details={"reason": sess.get("lock_reason") or "capture while locked", "ip": ip}, severity="critical")
+                    details={"reason": sess.get("lock_reason") or "capture while locked", "ip": ip, "scope": scope}, severity="critical")
             except Exception:
                 pass
-            return JSONResponse({"error": "Account locked"}, status_code=403)
+            msg = "Account admin-locked" if is_admin else "Account locked"
+            return JSONResponse({"error": msg, "lock_scope": scope, "is_admin_locked": is_admin}, status_code=403)
         if req_token:
             if sess.get("discord_id") != discord_id:
                 return JSONResponse({"error": "Session mismatch"}, status_code=403)

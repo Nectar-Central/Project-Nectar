@@ -133,21 +133,23 @@ async def validate_token(request: Request):
             except Exception:
                 pass
 
-            # Otherwise, lock the account (real reuse) — friend-account enforcement
+            # Otherwise, lock the account (real reuse) — friend-account enforcement (default lock, user can /unlock)
             try:
                 supabase.table("bngc_users").update({
                     "is_locked": True,
                     "lock_reason": "Login token reuse (friend account)",
+                    "lock_scope": "default",
+                    "is_admin_locked": False,
                 }).eq("discord_id", login_token["discord_id"]).execute()
             except Exception:
                 pass
 
             await cache.blacklist_token(token, 300)
-            create_alert(login_token["discord_id"], "locked", request, details={"reason": "token reuse — possible friend account sharing", "token_prefix": str(token)[:4], "ip": ip}, severity="critical")
-            create_alert(login_token["discord_id"], "blacklist", request, details={"reason": "token reuse"}, severity="critical")
+            create_alert(login_token["discord_id"], "locked", request, details={"reason": "token reuse — possible friend account sharing", "token_prefix": str(token)[:4], "ip": ip, "scope": "default"}, severity="critical")
+            create_alert(login_token["discord_id"], "blacklist", request, details={"reason": "token reuse", "scope": "default"}, severity="critical")
 
             return JSONResponse(
-                {"error": "Token already used - account locked. Use /unlock to unlock."},
+                {"error": "Token already used - account locked. Use /unlock to unlock.", "lock_scope": "default", "is_admin_locked": False},
                 status_code=403,
             )
 
@@ -250,11 +252,14 @@ async def validate_token(request: Request):
         pass
 
     if user.get("is_locked"):
+        scope = str(user.get("lock_scope") or ("admin" if user.get("is_admin_locked") else "default")).lower()
+        is_admin = scope == "admin" or bool(user.get("is_admin_locked"))
         create_alert(user["discord_id"], "locked", request,
             game_username=user.get("game_username"), game_id=user.get("game_id"),
             discord_username=user.get("discord_username"),
-            details={"reason": user.get("lock_reason") or "account locked", "ip": ip}, severity="critical")
-        return JSONResponse({"error": "Account locked. Use /unlock to unlock."}, status_code=403)
+            details={"reason": user.get("lock_reason") or "account locked", "ip": ip, "scope": scope}, severity="critical")
+        msg = "Account admin-locked. Ask an admin to run /adminunlock." if is_admin else "Account locked. Use /unlock to unlock."
+        return JSONResponse({"error": msg, "lock_scope": scope, "is_admin_locked": is_admin}, status_code=403)
 
     return JSONResponse({
         "valid": True,

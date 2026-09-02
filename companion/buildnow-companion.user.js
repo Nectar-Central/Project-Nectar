@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BuildNow Companion Live Capture (game-frame only)
 // @namespace    buildnow-companion.local
-// @version      2.2.0
-// @description  BuildNow Companion v2.2 — login-enforced, alerts, locked overlay, no guest, full logs + stG.
+// @version      2.3.0
+// @description  BuildNow Companion v2.3 — two-tier lock (default/admin), enforced login, no guest, full logs + stG.
 // @author       @cis6led
 // @match        https://buildnow-gg.game-files.crazygames.com/*
 // @all-frames   true
@@ -94,9 +94,9 @@
   } else if(loginToken){
     setTimeout(()=> apiPost('/api/validate-token', {token: loginToken}, (ok, txt)=>{
       if(!ok){
-        let reason=''; try{ reason=JSON.parse(txt||'{}').error||''; }catch{}
+        let reason=''; let scope='default'; try{ const _p=JSON.parse(txt||'{}'); reason=_p.error||''; scope=_p.lock_scope||(_p.is_admin_locked?'admin':'default'); }catch{}
         if(String(reason).toLowerCase().includes('locked')){
-          showLockedPanel(reason || 'Account locked');
+          showLockedPanel(reason || 'Account locked', scope);
           return;
         }
         cleanTokenStorage(); hasWelcomed=false; setTimeout(()=>{ showTokenPrompt(); showToast('Session expired — enter new token', true); }, 800);
@@ -153,7 +153,7 @@
             if(lowerErr.includes('locked') || lowerErr.includes('account locked')){
               isLocked = true; queue=[]; flushTimer=null;
               logErr(`locked via ${path}: ${j.error}`);
-              showLockedPanel(j.error);
+              showLockedPanel(j.error, j.lock_scope);
             } else if(j.error && String(j.error).toLowerCase().includes('replay')){
               if(j.current) { currentReqToken=j.current; GMSet('bnc_req_token', currentReqToken); logInfo(`replay sync token → ${String(currentReqToken).slice(0,4)}…`); }
               else if(j.new_req_token) storeSession(j);
@@ -228,14 +228,17 @@
       setTimeout(()=>{ if(!toastReady){ toastReady=true; toastLoading=false; doShow(); } },2000);
     }catch{ toastReady=true; toastLoading=false; doShow(); }
   }
-  function showLockedPanel(reason){
+  function showLockedPanel(reason, scope){
     if(document.getElementById('bnc-locked')) return;
+    const isAdmin = String(scope||'').toLowerCase()==='admin';
+    const title = isAdmin ? 'Admin-locked' : 'Account locked';
+    const help = isAdmin ? 'This is an <b style="color:#fff">admin lock</b> — only an admin can run <b style="color:#fff">/adminunlock</b> on you. Disable the tracker to play normally.' : 'Use <b style="color:#fff">/unlock</b> in Discord or ask an admin. Disable the tracker to play normally.';
     const wrap=document.createElement('div');
     wrap.id='bnc-locked';
     Object.assign(wrap.style,{position:'fixed',inset:'0',zIndex:'2147483647',background:'rgba(0,0,0,0.82)',display:'flex',alignItems:'center',justifyContent:'center',padding:'24px',fontFamily:'Inter, system-ui, sans-serif'});
     const card=document.createElement('div');
     Object.assign(card.style,{background:'#0a0a0a',border:'1px solid #991b1b',borderRadius:'14px',padding:'28px',width:'420px',textAlign:'center',boxShadow:'0 8px 32px rgba(239,68,68,0.25)'});
-    card.innerHTML = `<div style="font-size:44px;margin-bottom:8px">🔒</div><div style="font-size:18px;font-weight:800;color:#fff;margin-bottom:6px">Account locked</div><div style="font-size:13px;color:#fca5a5;margin-bottom:6px;word-break:break-word">${String(reason||'Token reuse or sharing detected — friend account use is blocked.').replace(/</g,'&lt;')}</div><div style="font-size:12px;color:#9ca3af;margin-bottom:16px">Use <b style=\"color:#fff\">/unlock</b> in Discord or ask an admin. Disable the tracker to play normally.</div><div style="display:flex;gap:8px;justify-content:center"><button id="bnc-locked-disable" style="flex:1;height:40px;border:0;border-radius:8px;background:#fff;color:#000;font-weight:700;cursor:pointer">Disable & Reload</button><button id="bnc-locked-retry" style="flex:1;height:40px;border:1px solid #374151;border-radius:8px;background:#1f2937;color:#e5e7eb;font-weight:600;cursor:pointer">Retry</button></div><div style="margin-top:10px;font-size:11px;color:#6b7280">BNC is disabled while locked — no capture or API calls.</div>`;
+    card.innerHTML = `<div style="font-size:44px;margin-bottom:8px">${isAdmin?'⛔':'🔒'}</div><div style="font-size:18px;font-weight:800;color:#fff;margin-bottom:6px">${title}</div><div style="font-size:13px;color:#fca5a5;margin-bottom:6px;word-break:break-word">${String(reason||'Token reuse or sharing detected — friend account use is blocked.').replace(/</g,'&lt;')}</div><div style="font-size:12px;color:#9ca3af;margin-bottom:16px">${help}</div><div style="display:flex;gap:8px;justify-content:center"><button id="bnc-locked-disable" style="flex:1;height:40px;border:0;border-radius:8px;background:#fff;color:#000;font-weight:700;cursor:pointer">Disable & Reload</button><button id="bnc-locked-retry" style="flex:1;height:40px;border:1px solid #374151;border-radius:8px;background:#1f2937;color:#e5e7eb;font-weight:600;cursor:pointer">Retry</button></div><div style="margin-top:10px;font-size:11px;color:#6b7280">BNC is disabled while locked — no capture or API calls.</div>`;
     wrap.appendChild(card);
     // block game input
     wrap.addEventListener('click', e=> e.stopPropagation());
@@ -387,8 +390,8 @@
       submitBtn.style.opacity='0.6';
       msg.textContent='Checking…';
       apiPost('/api/validate-token', {token: tok}, (ok, txt)=>{
-        let lockedReason=''; try{ lockedReason=JSON.parse(txt||'{}').error||''; }catch{}
-        if(!ok && String(lockedReason).toLowerCase().includes('locked')){ document.removeEventListener('keydown', escHandler, true); closeModal(); showLockedPanel(lockedReason); return; }
+          let lockedReason=''; let lockedScope='default'; try{ const _p=JSON.parse(txt||'{}'); lockedReason=_p.error||''; lockedScope=_p.lock_scope||(_p.is_admin_locked?'admin':'default'); }catch{}
+        if(!ok && String(lockedReason).toLowerCase().includes('locked')){ document.removeEventListener('keydown', escHandler, true); closeModal(); showLockedPanel(lockedReason, lockedScope); return; }
         if(!ok){ msg.textContent='Token incorrect — try again'; submitBtn.textContent='Link'; submitBtn.style.opacity='1'; linking=false; showToast('Token incorrect',true); return; }
         try{
           const j=JSON.parse(txt);
@@ -892,11 +895,12 @@
         }catch(e){ feedLog('decrypted', {err:e.message}); }
         feedLog('sent', {count:batch.length, ok:true});
       } else {
+        let _lockScope='default'; try{ const _j=JSON.parse(txt||'{}'); if(_j.lock_scope) _lockScope=_j.lock_scope; if(_j.is_admin_locked) _lockScope='admin'; }catch{}
         const lower = String(txt).toLowerCase();
         if(lower.includes('locked') || lower.includes('account locked')){
           isLocked = true; queue=[]; flushTimer=null;
-          logErr(`account locked — blocking game ${String(txt).slice(0,120)}`);
-          showLockedPanel(String(txt).includes('locked') ? 'Account locked' : txt);
+          logErr(`account locked — blocking game ${String(txt).slice(0,120)} scope=${_lockScope}`);
+          showLockedPanel(String(txt).toLowerCase().includes('admin')? 'Account admin-locked' : 'Account locked', _lockScope);
           return;
         }
         logErr(`capture failed — requeue ${batch.length} txt=${String(txt).slice(0,120)}`);

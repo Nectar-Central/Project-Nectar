@@ -30,6 +30,9 @@ create table if not exists public.bngc_users (
   lock_reason text,
   locked_at timestamptz,
   locked_ip text,
+  -- two-tier lockout: default (user can /unlock) vs admin (only admin can unlock)
+  lock_scope text not null default 'default', -- 'default' | 'admin'
+  is_admin_locked boolean not null default false,
   registered_at timestamptz not null default now(),
   last_seen timestamptz
 );
@@ -82,6 +85,10 @@ create table if not exists public.bngc_security_logs (
   severity text not null default 'info',
   created_at timestamptz not null default now()
 );
+
+-- Backfill for existing deployments (idempotent)
+alter table public.bngc_users add column if not exists lock_scope text not null default 'default';
+alter table public.bngc_users add column if not exists is_admin_locked boolean not null default false;
 
 -- Alert inbox for bot DMs: login / locked / cheat / warning / blacklist
 create table if not exists public.bngc_alerts (

@@ -302,36 +302,72 @@ async def refresh_token_cmd(interaction: discord.Interaction):
     except: pass
     await interaction.response.send_message(f"New token sent to DMs: **{new_token}** (old token still valid 5 min)", ephemeral=True)
 
-@bot.tree.command(name="unlock", description="Unlock your account if it was locked for security")
+@bot.tree.command(name="lock", description="Lock a user's account (default — user can /unlock)")
+@app_commands.describe(user="User to lock", reason="Reason for lock")
+@app_commands.default_permissions(administrator=True)
+async def lock_cmd(interaction: discord.Interaction, user: discord.User, reason: str = "No reason"):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("Administrator only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    await db.lock_user(str(user.id), reason, ip=None, scope="default")
+    try:
+        await user.send(f"🔒 Your BuildNow account was locked: **{reason}**\nUse **/unlock** in the server to unlock.")
+    except: pass
+    await interaction.followup.send(f"🔒 Locked {user.mention} (default — they can /unlock). Reason: {reason}", ephemeral=True)
+
+@bot.tree.command(name="adminlock", description="Admin-lock a user (only admins can unlock)")
+@app_commands.describe(user="User to admin-lock", reason="Reason for admin lock")
+@app_commands.default_permissions(administrator=True)
+async def adminlock_cmd(interaction: discord.Interaction, user: discord.User, reason: str = "No reason"):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("Administrator only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    await db.lock_user(str(user.id), reason, ip=None, scope="admin")
+    try:
+        await user.send(f"⛔ Your BuildNow account was **admin-locked**: **{reason}**\nOnly an admin can unlock it with **/adminunlock**. Disable the tracker to play normally.")
+    except: pass
+    await interaction.followup.send(f"⛔ Admin-locked {user.mention}. Only admins can unlock. Reason: {reason}", ephemeral=True)
+
+@bot.tree.command(name="adminunlock", description="Unlock any user (admin only, bypasses admin-lock)")
+@app_commands.describe(user="User to unlock")
+@app_commands.default_permissions(administrator=True)
+async def adminunlock_cmd(interaction: discord.Interaction, user: discord.User):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("Administrator only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    ok, _ = await db.unlock_user(str(user.id), force_admin=True)
+    try:
+        await user.send("🔓 An admin unlocked your BuildNow account. You can continue.")
+    except: pass
+    await interaction.followup.send(f"🔓 Admin-unlocked {user.mention}.", ephemeral=True)
+
+@bot.tree.command(name="unlock", description="Unlock your account if it was default-locked")
 async def unlock_cmd(interaction: discord.Interaction):
     did = str(interaction.user.id)
     row = await db.get_by_discord(did)
     if not row:
         return await interaction.response.send_message("No account found. Use /register.", ephemeral=True)
     locked = row.get("is_locked") if isinstance(row.get("is_locked"), bool) else bool(row.get("is_locked"))
-    # supabase stores boolean, sqlite int
+    # check admin vs default scope
+    scope = str(row.get("lock_scope") or "default").lower()
+    is_admin = bool(row.get("is_admin_locked")) or scope == "admin"
     if not locked:
-        # also check via helper for supabase sync
         try:
             if await db.is_locked(did) is False:
                 return await interaction.response.send_message("Your account is not locked.", ephemeral=True)
         except: pass
         if not locked:
             return await interaction.response.send_message("Your account is not locked.", ephemeral=True)
-    await db.unlock_user(did)
+    if is_admin:
+        return await interaction.response.send_message("⛔ This is an **admin lock** — only an admin can run **/adminunlock** on you. Disable the userscript to play without tracking.", ephemeral=True)
+    ok, blocked = await db.unlock_user(did, force_admin=False)
+    if not ok and blocked == "admin":
+        return await interaction.response.send_message("⛔ Admin lock — ask an admin to run **/adminunlock**.", ephemeral=True)
     # DM confirmation
     try:
         await interaction.user.send("🔓 Your BuildNow account has been unlocked. You can continue playing or use /register for a new token.")
     except: pass
     await interaction.response.send_message("🔓 Account unlocked. You can continue now.", ephemeral=True)
-    # also clear Vercel lock if using Supabase directly
-    try:
-        import os as _os
-        from supabase import create_client as _cc
-        url=_os.getenv("SUPABASE_URL"); key=_os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-        if url and key:
-            _cc(url,key).table("bngc_users").update({"is_locked": False, "lock_reason": None}).eq("discord_id", did).execute()
-    except: pass
 
 @bot.tree.command(name="unregister", description="Delete your linked data")
 async def unregister_cmd(interaction: discord.Interaction):

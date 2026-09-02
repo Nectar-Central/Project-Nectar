@@ -40,6 +40,8 @@ CREATE TABLE IF NOT EXISTS users (
   lock_reason TEXT,
   locked_at INTEGER,
   locked_ip TEXT,
+  lock_scope TEXT DEFAULT 'default',
+  is_admin_locked INTEGER DEFAULT 0,
   registered_at INTEGER,
   last_seen INTEGER
 );
@@ -69,6 +71,8 @@ async def init_db():
             "ALTER TABLE users ADD COLUMN lock_reason TEXT",
             "ALTER TABLE users ADD COLUMN locked_at INTEGER",
             "ALTER TABLE users ADD COLUMN locked_ip TEXT",
+            "ALTER TABLE users ADD COLUMN lock_scope TEXT DEFAULT 'default'",
+            "ALTER TABLE users ADD COLUMN is_admin_locked INTEGER DEFAULT 0",
         ]:
             try: await db.execute(ddl)
             except: pass
@@ -228,31 +232,65 @@ async def add_playtime(token, gm, seconds: int):
                              (seconds, json.dumps(pg), int(time.time()), token))
             await db.commit()
 
-async def lock_user(discord_id: str, reason: str, ip: str = None):
+async def lock_user(discord_id: str, reason: str, ip: str = None, *, scope: str = "default"):
+    """
+    scope: "default" => user can /unlock; "admin" => only admin can unlock
+    """
+    scope = "admin" if str(scope).lower() == "admin" else "default"
+    is_admin = 1 if scope == "admin" else 0
     if USE_SUPABASE:
         try:
             from datetime import datetime, timezone
-            supabase.table("bngc_users").update({"is_locked": True, "lock_reason": reason, "locked_at": datetime.now(timezone.utc).isoformat(), "locked_ip": ip}).eq("discord_id", discord_id).execute()
-            try: supabase.table("bngc_security_logs").insert({"discord_id": discord_id, "event_type": "account_locked", "ip_address": ip, "details": {"reason": reason}, "severity": "critical"}).execute()
+            supabase.table("bngc_users").update({
+                "is_locked": True, "lock_reason": reason, "locked_at": datetime.now(timezone.utc).isoformat(),
+                "locked_ip": ip, "lock_scope": scope, "is_admin_locked": bool(is_admin),
+            }).eq("discord_id", discord_id).execute()
+            try: supabase.table("bngc_security_logs").insert({"discord_id": discord_id, "event_type": "account_locked", "ip_address": ip, "details": {"reason": reason, "scope": scope}, "severity": "critical"}).execute()
+            except: pass
+            try:
+                supabase.table("bngc_alerts").insert({
+                    "discord_id": discord_id, "alert_type": "locked", "ip_address": ip,
+                    "details": {"reason": reason, "scope": scope}, "severity": "critical",
+                }).execute()
             except: pass
         except: pass
         return
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET is_locked=1, lock_reason=?, locked_at=?, locked_ip=? WHERE discord_id=?", (reason, int(time.time()), ip, discord_id))
+        await db.execute("UPDATE users SET is_locked=1, lock_reason=?, locked_at=?, locked_ip=?, lock_scope=?, is_admin_locked=? WHERE discord_id=?", (reason, int(time.time()), ip, scope, is_admin, discord_id))
         await db.commit()
 
-async def unlock_user(discord_id: str):
+async def unlock_user(discord_id: str, *, force_admin: bool = False):
+    """
+    Returns (ok, reason_if_blocked). If locked scope is admin and force_admin is False, blocked.
+    """
+    # Check scope first (supabase)
     if USE_SUPABASE:
         try:
-            supabase.table("bngc_users").update({"is_locked": False, "lock_reason": None, "locked_at": None, "locked_ip": None}).eq("discord_id", discord_id).execute()
-            try: supabase.table("bngc_security_logs").insert({"discord_id": discord_id, "event_type": "account_unlocked", "details": {"by": "self"}, "severity": "info"}).execute()
+            r = supabase.table("bngc_users").select("lock_scope,is_admin_locked,is_locked").eq("discord_id", discord_id).limit(1).execute()
+            if r.data:
+                row = r.data[0]
+                is_admin = bool(row.get("is_admin_locked")) or str(row.get("lock_scope")).lower() == "admin"
+                if is_admin and not force_admin:
+                    return False, "admin"
+        except Exception:
+            pass
+        try:
+            supabase.table("bngc_users").update({"is_locked": False, "lock_reason": None, "locked_at": None, "locked_ip": None, "lock_scope": "default", "is_admin_locked": False}).eq("discord_id", discord_id).execute()
+            try: supabase.table("bngc_security_logs").insert({"discord_id": discord_id, "event_type": "account_unlocked", "details": {"by": "admin" if force_admin else "self"}, "severity": "info"}).execute()
             except: pass
         except: pass
-        return True
+        return True, None
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET is_locked=0, lock_reason=NULL, locked_at=NULL, locked_ip=NULL WHERE discord_id=?", (discord_id,))
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT is_admin_locked, lock_scope, is_locked FROM users WHERE discord_id=?", (discord_id,)) as cur:
+            row = await cur.fetchone()
+            if row:
+                is_admin = bool(row["is_admin_locked"]) or str(row["lock_scope"] or "default").lower() == "admin"
+                if row["is_locked"] and is_admin and not force_admin:
+                    return False, "admin"
+        await db.execute("UPDATE users SET is_locked=0, lock_reason=NULL, locked_at=NULL, locked_ip=NULL, lock_scope='default', is_admin_locked=0 WHERE discord_id=?", (discord_id,))
         await db.commit()
-        return db.total_changes > 0
+        return db.total_changes > 0, None
 
 async def is_locked(discord_id: str) -> bool:
     if USE_SUPABASE:
