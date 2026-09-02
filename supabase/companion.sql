@@ -1,6 +1,16 @@
 -- Supabase schema for the active companion bot and its game-data commands.
 -- Apply this in the connected Supabase project's SQL editor.
 
+create table if not exists public.players (
+  id text primary key,
+  username text not null,
+  display_name text not null,
+  game_handle text not null,
+  avatar_url text,
+  registered_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
 create table if not exists public.bngc_users (
   discord_id text primary key,
   discord_username text not null,
