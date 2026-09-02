@@ -793,6 +793,40 @@ class Engine:
             room.recent_knocks.append(KillInfo(instigator=packet.killer, instigated=packet.victim, event_type="knocked"))
             if len(room.recent_knocks) > 100:
                 room.recent_knocks = room.recent_knocks[-100:]
+        # ---- DEFEAT via kill victim (pcount>1, no stG/alv) — covers missing alv=false
+        # When killfeed says victim == me during MATCH with >1 players, that's a loss even if alv never flips
+        if packet.is_kill and packet.victim and room.state == State.MATCH and room.players_count > 1:
+            is_me_victim = False
+            if view.me and packet.victim == view.me.username:
+                is_me_victim = True
+            elif room.me and packet.victim == room.me.username:
+                is_me_victim = True
+            # also team: if victim is teammate in BF2V2/wwzw and team now empty, engine already handles via alv team path — keep kill fallback only for solo
+            gm_low_k = room.game_mode.value.lower() if room.game_mode else ""
+            if is_me_victim and gm_low_k != "df" and room.last_defeat_version != room.match_version:
+                # only if we haven't already defeated via alv
+                room.last_defeat_version = room.match_version
+                log_engine("defeat", session_id[:8], gm=room.game_mode.value if room.game_mode else "?", room=room.room_id[:8], via="kill victim", victim=packet.victim, version=room.match_version)
+                room.recent_kills.append(KillInfo(instigator=packet.killer or "system", instigated=packet.victim, event_type="defeat"))
+                # mark me dead for processor fallback consistency
+                if view.me and view.me.username == packet.victim:
+                    view.me.is_alive = False
+                if room.me and room.me.username == packet.victim:
+                    room.me.is_alive = False
+                for p in room.players.values():
+                    if p.username == packet.victim:
+                        p.is_alive = False
+                        break
+                if room.players_count > 0:
+                    room.players_count = max(0, room.players_count - 1)
+        # Leave as defeat: me left during MATCH
+        if packet.packet_type == PacketType.LEAVE and packet.player_name and room.state == State.MATCH:
+            is_me_leave = (view.me and packet.player_name == view.me.username) or (room.me and packet.player_name == room.me.username)
+            gm_low_l = room.game_mode.value.lower() if room.game_mode else ""
+            if is_me_leave and gm_low_l != "df" and room.last_defeat_version != room.match_version:
+                room.last_defeat_version = room.match_version
+                log_engine("defeat", session_id[:8], gm=room.game_mode.value if room.game_mode else "?", room=room.room_id[:8], via="leave", version=room.match_version)
+                room.recent_kills.append(KillInfo(instigator=packet.player_name, instigated="", event_type="defeat"))
 
         # ---- SOLO WIN via last alive (zw_lg/wwzw solo) — set winner for any last alive
         # Guard: avoid early win right after join when only 1 player ever seen and no kills yet

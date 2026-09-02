@@ -237,6 +237,22 @@ async def process_batch(
                             }).execute()
                             log_sys(f"PROCESSOR DEATH by {instigator} session={session_id[:8]} deaths {user.get('deaths',0)}->{new_deaths}")
                             user["deaths"] = new_deaths
+                            # Defeat fallback: kill victim is me while pcount>1 and no stG — alv may be missing
+                            # Set defeat immediately even without alv=false, so we never miss a loss
+                            try:
+                                gm_low_death = str(eff_gm or "").lower()
+                                if gm_low_death and gm_low_death != "df":
+                                    room_obj = view.rooms.get(pkt_room_id) if pkt_room_id else None
+                                    # fallback to current room if packet room not found
+                                    if not room_obj:
+                                        room_obj = view.current_room
+                                    if room_obj and room_obj.state.value == "match" and room_obj.players_count > 1:
+                                        if room_obj.last_defeat_version != room_obj.match_version:
+                                            room_obj.last_defeat_version = room_obj.match_version
+                                            log_sys(f"PROCESSOR DEFEAT via kill gm={eff_gm} room={str(pkt_room_id or '')[:8]} victim=me")
+                                            room_obj.recent_kills.append(__import__("server.lib.photon_engine.models", fromlist=["KillInfo"]).KillInfo(instigator=instigator, instigated=me_name, event_type="defeat"))
+                            except Exception as e_kd:
+                                log_err(f"processor defeat-via-kill failed {e_kd}")
 
             # --- Join events (new player joined room) — persist so lobby history is visible ---
             if is_join or pkt_type in ("join", "JOIN", "Join", "create_room", "join_room", "join_random_room"):
@@ -317,6 +333,22 @@ async def process_batch(
                     except Exception:
                         pass
                     log_sys(f"PROCESSOR LEAVE {leaver} session={session_id[:8]} gm={eff_gm}")
+                    # Defeat via leave: did I leave / get kicked during MATCH with pcount>1
+                    # Without alv=false, this is the only signal for early leave-loss
+                    try:
+                        if leaver == me_name:
+                            gm_low_lv = str(eff_gm or "").lower()
+                            if gm_low_lv and gm_low_lv != "df":
+                                room_obj2 = view.rooms.get(pkt_room_id) if pkt_room_id else None
+                                if not room_obj2:
+                                    room_obj2 = view.current_room
+                                if room_obj2 and room_obj2.state.value == "match" and room_obj2.players_count > 0:
+                                    if room_obj2.last_defeat_version != room_obj2.match_version:
+                                        room_obj2.last_defeat_version = room_obj2.match_version
+                                        log_sys(f"PROCESSOR DEFEAT via leave gm={eff_gm} room={str(pkt_room_id or '')[:8]}")
+                                        room_obj2.recent_kills.append(__import__("server.lib.photon_engine.models", fromlist=["KillInfo"]).KillInfo(instigator=leaver, instigated="", event_type="defeat"))
+                    except Exception as e_ld:
+                        log_err(f"processor defeat-via-leave failed {e_ld}")
 
             # --- Zone phase changes (compare to last seen) ---
             # Only valid bz_* zone phases, ignore stG-derived huge times for zw_lg
@@ -407,21 +439,25 @@ async def process_batch(
                     continue
 
             # Fallback solo last alive for zw_lg/wwzw (if winner not set but players_count==1 and me alive)
+            # Guard: avoid early win when only 1 player ever seen and zero kills (mirror engine.py:798)
             if gm_low_room in ("zw", "zw_lg", "wwzw", "ww", "wwzw") and room.state.value == "match":
                 if view.me and view.me.is_alive and room.players_count == 1:
-                    only = next(iter(room.players.values()), None)
-                    if only and only.username == view.me.username and room.last_win_version != room.match_version:
-                        new_wins = (user.get("wins") or 0) + 1
-                        supabase.table("bngc_users").update({"wins": new_wins}).eq("discord_id", discord_id).execute()
-                        supabase.table("bngc_game_events").insert({
-                            "discord_id": discord_id,
-                            "session_id": session_id,
-                            "event_type": "win",
-                            "event_data": {"gm": gm, "room_id": room_id, "short_code": room.short_code, "match_version": room.match_version}, 
-                        }).execute()
-                        log_sys(f"PROCESSOR WIN gm={gm} room={room_id[:8]} session={session_id[:8]} wins {user.get('wins',0)}->{new_wins}")
-                        user["wins"] = new_wins
-                        room.last_win_version = room.match_version
+                    if len(room.players) <= 1 and len(room.recent_kills) == 0:
+                        pass  # early — not a real win
+                    else:
+                        only = next(iter(room.players.values()), None)
+                        if only and only.username == view.me.username and room.last_win_version != room.match_version:
+                            new_wins = (user.get("wins") or 0) + 1
+                            supabase.table("bngc_users").update({"wins": new_wins}).eq("discord_id", discord_id).execute()
+                            supabase.table("bngc_game_events").insert({
+                                "discord_id": discord_id,
+                                "session_id": session_id,
+                                "event_type": "win",
+                                "event_data": {"gm": gm, "room_id": room_id, "short_code": room.short_code, "match_version": room.match_version}, 
+                            }).execute()
+                            log_sys(f"PROCESSOR WIN gm={gm} room={room_id[:8]} session={session_id[:8]} wins {user.get('wins',0)}->{new_wins}")
+                            user["wins"] = new_wins
+                            room.last_win_version = room.match_version
 
             # Per-room defeat via RoomView.last_defeat_version (alv immediate, team elimination)
             for room_id2, room2 in view.rooms.items():
