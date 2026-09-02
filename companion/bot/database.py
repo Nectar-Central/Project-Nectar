@@ -410,3 +410,19 @@ async def get_match_by_short_id(discord_id: str, short_id: str):
     except Exception as e:
         print(f"[db] get_match_by_short_id failed: {e}")
         return None
+
+
+async def get_match_events_grouped(session_id: str, discord_id: str) -> dict[str, list[dict]]:
+    """Group events for a session by match/room id.
+
+    Uses event_data.room_id / code if present, else falls back to session_id.
+    Returns {room_id: [events...]} with events sorted by created_at.
+    """
+    events = await get_match_events(session_id, discord_id)
+    groups: dict[str, list[dict]] = {}
+    for ev in events:
+        gd = ev.get("event_data") or {}
+        rid = gd.get("room_id") or gd.get("room") or gd.get("code") or session_id
+        rid = str(rid)
+        groups.setdefault(rid, []).append(ev)
+    return groups
