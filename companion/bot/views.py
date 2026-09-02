@@ -17,8 +17,11 @@ def sessions_overview_embed(sessions: list[dict]) -> discord.Embed:
         sid = s["session_id"]
         gms = s.get("game_modes") or []
         gm_label = ", ".join(fmt.format_game_mode(g) for g in gms[:2]) or "Unknown"
-        ts = fmt.fmt_date(s.get("created_at"))
+        # Prefer last_played over created_at
+        ts = fmt.fmt_date(s.get("last_played") or s.get("created_at"))
         stats = f"K:{s.get('kills',0)} D:{s.get('deaths',0)} W:{s.get('wins',0)} L:{s.get('defeats',0)}"
+        if s.get("match_count"):
+            stats += f" · {s['match_count']} match{'es' if s['match_count']!=1 else ''}"
         # No raw IDs — show human session label
         e.add_field(name=f"{i+1}. {ts} — {gm_label}", value=stats, inline=False)
     e.set_footer(text="Use the menu below to pick a session")
@@ -58,12 +61,20 @@ def matches_in_session_embed(session_id: str, events: list[dict], session_meta: 
         if session_meta:
             e.set_footer(text=f"{fmt.fmt_date(session_meta.get('created_at'))} · {len(events)} events")
         return e
-    # Multiple matches in session — list each
+    # Multiple matches in session — list each (with last played per match)
     for idx, (rid, evs) in enumerate(list(groups.items())[:10], 1):
         gms = list({(ev.get("event_data") or {}).get("gm") for ev in evs if (ev.get("event_data") or {}).get("gm")})
         gm_label = ", ".join(fmt.format_game_mode(g) for g in gms[:1]) or "Match"
         kills = sum(1 for ev in evs if ev.get("event_type") == "killfeed" and (ev.get("event_data") or {}).get("kill_type") == "killed")
-        e.add_field(name=f"Match {idx} — {gm_label}", value=f"{kills} eliminations · {len(evs)} events", inline=False)
+        # last played for this match = most recent event in group
+        last_ts = None
+        try:
+            # evs are not ordered here; find max created_at
+            last_ev = max(evs, key=lambda x: x.get("created_at") or "")
+            last_ts = fmt.fmt_date(last_ev.get("created_at"))
+        except: pass
+        suffix = f" · {last_ts}" if last_ts else ""
+        e.add_field(name=f"Match {idx} — {gm_label}", value=f"{kills} eliminations · {len(evs)} events{suffix}", inline=False)
     e.set_footer(text=f"{len(groups)} matches in this session — pick one below")
     return e
 
@@ -358,12 +369,28 @@ class MatchActionsView(discord.ui.View):
     @discord.ui.button(label="Players", style=discord.ButtonStyle.secondary, emoji="👥")
     async def players_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        # Build players embed from events
+        # Build players embed from events — scoped to current room_id so matches don't merge
         seen: dict[str, str] = {}
-        for ev in self.events:
+        # Filter events to current room if room_id set (composite key supported)
+        src_events = self.events
+        if self.room_id:
+            def _ev_key(ev):
+                gd = ev.get("event_data") or {}
+                r = str(gd.get("room_id") or gd.get("code") or gd.get("short_code") or "")
+                mv = gd.get("match_version")
+                if mv is not None:
+                    try: r = f"{r}_{int(mv)}"
+                    except Exception: r = f"{r}_{mv}"
+                return r
+            has_composite = any(_ev_key(ev) == self.room_id for ev in src_events)
+            if has_composite:
+                src_events = [ev for ev in src_events if _ev_key(ev) == self.room_id]
+            else:
+                src_events = [ev for ev in src_events if str((ev.get("event_data") or {}).get("room_id") or "") == self.room_id or str((ev.get("event_data") or {}).get("code") or "") == self.room_id or str((ev.get("event_data") or {}).get("short_code") or "") == self.room_id or not (ev.get("event_data") or {}).get("room_id")]
+        for ev in src_events:
             gd = ev.get("event_data") or {}
-            # killfeed instigator/instigated
-            for k in ("instigator", "instigated", "victim", "killer"):
+            # killfeed instigator/instigated + join/leave player
+            for k in ("instigator", "instigated", "victim", "killer", "player", "player_name"):
                 name = gd.get(k)
                 if name and name not in seen:
                     seen[name] = name

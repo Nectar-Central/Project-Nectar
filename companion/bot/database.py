@@ -329,11 +329,12 @@ async def get_recent_matches(discord_id: str, limit: int = 10):
         return []
 
     try:
-        # Get sessions for this user — no last_used_at column, just get session_ids
+        # Get sessions for this user — ordered by most recent
         sess_res = (
             supabase.table("bngc_sessions")
-            .select("session_id")
+            .select("session_id, created_at")
             .eq("discord_id", discord_id)
+            .order("created_at", desc=True)
             .limit(limit * 2)
             .execute()
         )
@@ -346,13 +347,14 @@ async def get_recent_matches(discord_id: str, limit: int = 10):
             sid = sess.get("session_id")
             if not sid:
                 continue
-            # Get event counts for this session
+            # Get event counts for this session — ordered so last is most recent
             try:
                 ev_res = (
                     supabase.table("bngc_game_events")
                     .select("event_type, event_data, created_at")
                     .eq("discord_id", discord_id)
                     .eq("session_id", sid)
+                    .order("created_at", desc=True)
                     .execute()
                 )
                 events = ev_res.data or []
@@ -368,20 +370,43 @@ async def get_recent_matches(discord_id: str, limit: int = 10):
             defeats = sum(1 for e in events if e.get("event_type") == "defeat")
             gms = list({e.get("event_data", {}).get("gm") for e in events if e.get("event_data", {}).get("gm")})
 
-            # Use earliest event created_at as match time
+            # Last played = most recent event time (not earliest)
+            # Compute distinct matches inside this session for badge
+            groups = {}
+            for ev in events:
+                gd = ev.get("event_data") or {}
+                rid = gd.get("room_id") or gd.get("code") or gd.get("short_code") or sid
+                rid = str(rid)
+                mv = gd.get("match_version")
+                if mv is not None:
+                    try: key = f"{rid}_{int(mv)}"
+                    except: key = f"{rid}_{mv}"
+                    groups[key] = True
+                else:
+                    groups[rid] = True
+            match_count = len(groups)
+            # events are desc ordered, so first is latest
             created_at = events[0].get("created_at") if events else None
+            # keep original earliest as fallback if needed, but last played is latest
+            last_played = created_at
 
             results.append({
                 "session_id": sid,
-                "created_at": created_at,
+                "created_at": last_played,
+                "last_played": last_played,
                 "event_count": len(events),
                 "kills": kills,
                 "deaths": deaths,
                 "wins": wins,
                 "defeats": defeats,
                 "game_modes": gms,
+                "match_count": match_count,
             })
 
+        # Sort by last played most recent first
+        try:
+            results.sort(key=lambda x: x.get("last_played") or "", reverse=True)
+        except: pass
         return results
 
     except Exception as e:

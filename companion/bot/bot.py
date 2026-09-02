@@ -130,15 +130,46 @@ async def on_ready():
 @app_commands.describe(game_handle="Optional in-game handle for the Nectar dashboard")
 async def register_cmd(interaction: discord.Interaction, game_handle: app_commands.Range[str, 1, 32] | None = None):
     await interaction.response.defer(ephemeral=True)
+    try:
+        row = await db.get_by_discord(str(interaction.user.id))
+    except: row = None
+    if row:
+        # Already registered — do not issue new token, point to /refresh-token
+        try:
+            sessions = await db.get_recent_matches(str(interaction.user.id), limit=10)
+            total_sessions = len(sessions)
+            total_matches = sum(s.get("match_count", 1) for s in sessions) if sessions else 0
+            last_played = fmt.fmt_date((sessions[0].get("last_played") or sessions[0].get("created_at")) if sessions else None) if sessions else "—"
+            last_sid_short = sessions[0].get("session_id","")[:8] if sessions else "—"
+            # Still handle dashboard game_handle update even when already registered
+            profile_error = None
+            if game_handle:
+                clean_handle = str(game_handle).strip()
+                try:
+                    display_name = getattr(interaction.user, "global_name", None) or interaction.user.display_name
+                    await asyncio.to_thread(save_registered_player, interaction.user.id, interaction.user.name, display_name, clean_handle, interaction.user.display_avatar.url)
+                except Exception as exc:
+                    profile_error = exc
+                    print(f"Player profile save failed for {interaction.user.id}: {exc}")
+            msg = f"You are already registered. Use **/refresh-token** to get a new login token.\n"
+            msg += f"**{total_sessions} sessions · {total_matches} matches · last played {last_played} ({last_sid_short})**"
+            if game_handle and profile_error is None:
+                msg += f"\nDashboard profile updated for **{game_handle}**."
+            elif game_handle:
+                msg += "\nI could not save the dashboard profile yet; run the Supabase schema and try again."
+            return await interaction.followup.send(msg, ephemeral=True)
+        except Exception as exc:
+            print(f"register already-registered path failed: {exc}")
+            return await interaction.followup.send("You are already registered. Use **/refresh-token** for a new token.", ephemeral=True)
+
+    # Not registered — issue first token
     token = gen_token()
     try:
         for _ in range(5):
             if not await db.get_login_token(token) and not await db.get_by_token(token):
                 break
             token = gen_token()
-        row = await db.get_by_discord(str(interaction.user.id))
-        if not row:
-            await db.upsert_user(str(interaction.user.id), str(interaction.user), token)
+        await db.upsert_user(str(interaction.user.id), str(interaction.user), token)
         await db.create_login_token(str(interaction.user.id), token, expires_in=300)
     except Exception as exc:
         print(f"Registration token creation failed: {exc}")
@@ -593,28 +624,6 @@ async def skin_cmd(interaction: discord.Interaction, user: discord.User = None):
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="matches", description="List your recent matches")
-async def matches_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=False)
-    did = str(interaction.user.id)
-    matches = await db.get_recent_matches(did, limit=10)
-    if not matches:
-        return await interaction.followup.send("No matches found. Play a game first so events get logged.")
-
-    e = discord.Embed(title="Recent Matches", color=0x06b6d4)
-    for i, m in enumerate(matches[:10]):
-        sid_short = m["session_id"][:12]
-        ts = fmt.fmt_date(m.get("created_at"))
-        gms_raw = m.get("game_modes", [])[:2]
-        gms = ", ".join(fmt.format_game_mode(g) for g in gms_raw) or "Unknown"
-        stats = f"K:{m['kills']} D:{m['deaths']} W:{m['wins']} L:{m['defeats']}"
-        value = f"`{sid_short}` — {gms}\n{stats}"
-        e.add_field(name=f"{i+1}. {ts}", value=value, inline=False)
-
-    e.set_footer(text="Tip: use /sessions for a guided picker, or /replay <id> /killfeed <id>")
-    await interaction.followup.send(embed=e)
-
-
 @bot.tree.command(name="sessions", description="Browse your sessions and matches")
 async def sessions_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
@@ -633,7 +642,7 @@ async def replay_cmd(interaction: discord.Interaction, matchid: str):
     did = str(interaction.user.id)
     full_sid = await db.get_match_by_short_id(did, matchid)
     if not full_sid:
-        return await interaction.followup.send(f"No match found for `{matchid}`. Try /sessions or /matches.", ephemeral=True)
+        return await interaction.followup.send(f"No match found for `{matchid}`. Try **/sessions**.", ephemeral=True)
     events = await db.get_match_events(full_sid, did)
     if not events:
         return await interaction.followup.send("No events for this match.")
@@ -666,7 +675,7 @@ async def killfeed_cmd(interaction: discord.Interaction, matchid: str):
     did = str(interaction.user.id)
     full_sid = await db.get_match_by_short_id(did, matchid)
     if not full_sid:
-        return await interaction.followup.send(f"No match found for `{matchid}`. Try /sessions or /matches.", ephemeral=True)
+        return await interaction.followup.send(f"No match found for `{matchid}`. Try **/sessions**.", ephemeral=True)
     events = await db.get_match_events(full_sid, did, event_types=["killfeed"])
     if not events:
         return await interaction.followup.send("No eliminations in this match.")
