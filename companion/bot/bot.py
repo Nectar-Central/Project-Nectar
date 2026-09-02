@@ -12,6 +12,7 @@ from discord import app_commands
 from discord.ext import commands
 import database as db
 import formatters as fmt
+import views
 try:
     import aiohttp
 except: aiohttp = None
@@ -622,21 +623,27 @@ async def matches_cmd(interaction: discord.Interaction):
     e = discord.Embed(title="Recent Matches", color=0x06b6d4)
     for i, m in enumerate(matches[:10]):
         sid_short = m["session_id"][:12]
-        ts = ""
-        if m.get("created_at"):
-            try:
-                from datetime import datetime
-                dt = datetime.fromisoformat(m["created_at"].replace("Z", "+00:00"))
-                ts = dt.strftime("%b %d %H:%M")
-            except Exception:
-                ts = m["created_at"][:16]
-        gms = ", ".join(m.get("game_modes", [])[:2]) or "?"
+        ts = fmt.fmt_date(m.get("created_at"))
+        gms_raw = m.get("game_modes", [])[:2]
+        gms = ", ".join(fmt.format_game_mode(g) for g in gms_raw) or "Unknown"
         stats = f"K:{m['kills']} D:{m['deaths']} W:{m['wins']} L:{m['defeats']}"
         value = f"`{sid_short}` — {gms}\n{stats}"
         e.add_field(name=f"{i+1}. {ts}", value=value, inline=False)
 
-    e.set_footer(text="Use /replay <matchID> or /killfeed <matchID> with the short ID")
+    e.set_footer(text="Tip: use /sessions for a guided picker, or /replay <id> /killfeed <id>")
     await interaction.followup.send(embed=e)
+
+
+@bot.tree.command(name="sessions", description="Browse your sessions and matches")
+async def sessions_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    did = str(interaction.user.id)
+    sessions = await db.get_recent_matches(did, limit=10)
+    if not sessions:
+        return await interaction.followup.send("No sessions yet. Play a match first.")
+    embed = views.sessions_overview_embed(sessions)
+    view = views.SessionSelectView(sessions, did)
+    await interaction.followup.send(embed=embed, view=view)
 
 
 @bot.tree.command(name="replay", description="Show a human-readable replay of a match with zone phases and events")
