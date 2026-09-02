@@ -413,16 +413,25 @@ async def get_match_by_short_id(discord_id: str, short_id: str):
 
 
 async def get_match_events_grouped(session_id: str, discord_id: str) -> dict[str, list[dict]]:
-    """Group events for a session by match/room id.
+    """Group events for a session by match/room id + match_version.
 
-    Uses event_data.room_id / code if present, else falls back to session_id.
-    Returns {room_id: [events...]} with events sorted by created_at.
+    Uses event_data.room_id / code / short_code if present, plus match_version to split
+    private zw_lg multi-match on same room_id (stG 3→1). Fallback to session_id for legacy.
+    Returns {composite_id: [events...]} with events sorted by created_at.
     """
     events = await get_match_events(session_id, discord_id)
     groups: dict[str, list[dict]] = {}
     for ev in events:
         gd = ev.get("event_data") or {}
-        rid = gd.get("room_id") or gd.get("room") or gd.get("code") or session_id
+        rid = gd.get("room_id") or gd.get("room") or gd.get("code") or gd.get("short_code") or session_id
         rid = str(rid)
-        groups.setdefault(rid, []).append(ev)
+        mv = gd.get("match_version")
+        if mv is not None:
+            try:
+                key = f"{rid}_{int(mv)}"
+            except Exception:
+                key = f"{rid}_{mv}"
+        else:
+            key = rid
+        groups.setdefault(key, []).append(ev)
     return groups

@@ -43,6 +43,11 @@ class EnginePacket:
     is_eliminated: bool = False
     is_alive: bool = False
     sentence: str | None = None
+    room_id: str | None = None
+    room_code: str | None = None
+    short_code: str | None = None
+    match_version: int | None = None
+    room_gm: str | None = None
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {
@@ -64,6 +69,11 @@ class EnginePacket:
             "is_eliminated": self.is_eliminated,
             "sentence": self.sentence,
             "raw_hex": self.raw_hex,
+            "room_id": self.room_id,
+            "room_code": self.room_code,
+            "short_code": self.short_code,
+            "match_version": self.match_version,
+            "room_gm": self.room_gm,
         }
         if self.is_kill or self.is_knock:
             d["kill"] = {
@@ -785,18 +795,23 @@ class Engine:
                 room.recent_knocks = room.recent_knocks[-100:]
 
         # ---- SOLO WIN via last alive (zw_lg/wwzw solo) — set winner for any last alive
+        # Guard: avoid early win right after join when only 1 player ever seen and no kills yet
         if room.game_mode and room.game_mode.value in ("zw_lg", "wwzw", "zw", "WW", "WWZW") and room.state == State.MATCH and room.players_count == 1:
-            alive = [p for p in room.players.values() if p.is_alive]
-            if len(alive) == 1:
-                winner = alive[0].username
-                room.winner = winner
-                # Win for me only if I am winner
-                if winner == (room.me.username if room.me else None) and room.me and room.me.is_alive and room.last_win_version != room.match_version:
-                    room.last_win_version = room.match_version
-                    log_engine("win", session_id[:8], gm=room.game_mode.value, room=room.room_id[:8], via="last alive", winner=winner, version=room.match_version)
-                    room.recent_kills.append(KillInfo(instigator="system", instigated=winner, event_type="win"))
-                elif winner != (room.me.username if room.me else None):
-                    log_engine("win", session_id[:8], gm=room.game_mode.value, room=room.room_id[:8], via="last alive", winner=winner, version=room.match_version)
+            # Early guard: need at least 2 players ever seen or at least one kill, else it's just lobby join
+            if len(room.players) <= 1 and len(room.recent_kills) == 0:
+                pass
+            else:
+                alive = [p for p in room.players.values() if p.is_alive]
+                if len(alive) == 1:
+                    winner = alive[0].username
+                    room.winner = winner
+                    # Win for me only if I am winner
+                    if winner == (room.me.username if room.me else None) and room.me and room.me.is_alive and room.last_win_version != room.match_version:
+                        room.last_win_version = room.match_version
+                        log_engine("win", session_id[:8], gm=room.game_mode.value, room=room.room_id[:8], via="last alive", winner=winner, version=room.match_version)
+                        room.recent_kills.append(KillInfo(instigator="system", instigated=winner, event_type="win"))
+                    elif winner != (room.me.username if room.me else None):
+                        log_engine("win", session_id[:8], gm=room.game_mode.value, room=room.room_id[:8], via="last alive", winner=winner, version=room.match_version)
 
         # ---- WINNER determination (per room, not just me) ----
         # For any MATCH, if only one player/team remains alive, set room.winner (used for bot)
@@ -882,6 +897,16 @@ class Engine:
         # (tick handled at top of next feed; also update on state change)
         if view.playtime.last_state != room.state.value:
             view.playtime.last_state = room.state.value
+
+        # Stamp packet with room context for processor (per-packet gm/room, avoids batch-final gm)
+        packet.room_id = room.room_id
+        packet.room_code = room.code
+        packet.short_code = room.short_code
+        packet.match_version = room.match_version
+        packet.room_gm = room.game_mode.value if room.game_mode else None
+        # Prefer room gm over packet gm for killfeed grouping
+        if not packet.game_mode and room.game_mode:
+            packet.game_mode = room.game_mode
 
         return packet
 

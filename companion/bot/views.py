@@ -31,13 +31,21 @@ def matches_in_session_embed(session_id: str, events: list[dict], session_meta: 
     if not events:
         e.description = "No matches found in this session."
         return e
-    # Try to group by room_id if present
+    # Try to group by room_id + match_version (private zw_lg multi-match)
     groups: dict[str, list[dict]] = {}
     for ev in events:
         gd = ev.get("event_data") or {}
-        rid = gd.get("room_id") or gd.get("room") or gd.get("code") or session_id
-        rid = str(rid)[:12]
-        groups.setdefault(rid, []).append(ev)
+        rid = gd.get("room_id") or gd.get("room") or gd.get("code") or gd.get("short_code") or session_id
+        rid = str(rid)
+        mv = gd.get("match_version")
+        if mv is not None:
+            try:
+                key = f"{rid}_{int(mv)}"
+            except Exception:
+                key = f"{rid}_{mv}"
+        else:
+            key = rid
+        groups.setdefault(key, []).append(ev)
     # If no real grouping (all same), show single match summary
     if len(groups) <= 1:
         gms = list({(ev.get("event_data") or {}).get("gm") for ev in events if (ev.get("event_data") or {}).get("gm")})
@@ -60,9 +68,22 @@ def matches_in_session_embed(session_id: str, events: list[dict], session_meta: 
     return e
 
 def match_detail_embed(session_id: str, events: list[dict], room_id: str | None = None) -> discord.Embed:
-    # Filter to room if provided
+    # Filter to room if provided (supports composite room_id_version)
     if room_id:
-        events = [ev for ev in events if str((ev.get("event_data") or {}).get("room_id") or session_id) == room_id or str((ev.get("event_data") or {}).get("code") or "") == room_id]
+        def _ev_composite(ev):
+            gd = ev.get("event_data") or {}
+            r = str(gd.get("room_id") or gd.get("code") or gd.get("short_code") or session_id)
+            mv = gd.get("match_version")
+            if mv is not None:
+                try: r = f"{r}_{int(mv)}"
+                except Exception: r = f"{r}_{mv}"
+            return r
+        filtered = [ev for ev in events if _ev_composite(ev) == room_id]
+        if filtered:
+            events = filtered
+        else:
+            # legacy fallback where room_id is plain without version
+            events = [ev for ev in events if str((ev.get("event_data") or {}).get("room_id") or session_id) == room_id or str((ev.get("event_data") or {}).get("code") or "") == room_id or str((ev.get("event_data") or {}).get("short_code") or "") == room_id]
     gms = list({(ev.get("event_data") or {}).get("gm") for ev in events if (ev.get("event_data") or {}).get("gm")})
     gm_label = ", ".join(fmt.format_game_mode(g) for g in gms[:2]) or "Unknown"
     kills = [ev for ev in events if ev.get("event_type") == "killfeed" and (ev.get("event_data") or {}).get("kill_type") == "killed"]
@@ -88,7 +109,20 @@ def match_detail_embed(session_id: str, events: list[dict], room_id: str | None 
 
 def killfeed_lines_for_events(events: list[dict], room_id: str | None = None) -> list[str]:
     if room_id:
-        events = [ev for ev in events if str((ev.get("event_data") or {}).get("room_id") or "") == room_id or str((ev.get("event_data") or {}).get("code") or "") == room_id or not (ev.get("event_data") or {}).get("room_id")]
+        def _ev_key(ev):
+            gd = ev.get("event_data") or {}
+            r = str(gd.get("room_id") or gd.get("code") or gd.get("short_code") or "")
+            mv = gd.get("match_version")
+            if mv is not None:
+                try: r = f"{r}_{int(mv)}"
+                except Exception: r = f"{r}_{mv}"
+            return r
+        # composite match: try exact composite first, else legacy plain room_id fallback
+        has_composite = any(_ev_key(ev) == room_id for ev in events)
+        if has_composite:
+            events = [ev for ev in events if _ev_key(ev) == room_id]
+        else:
+            events = [ev for ev in events if str((ev.get("event_data") or {}).get("room_id") or "") == room_id or str((ev.get("event_data") or {}).get("code") or "") == room_id or str((ev.get("event_data") or {}).get("short_code") or "") == room_id or not (ev.get("event_data") or {}).get("room_id")]
     # Only killfeed events, sorted already by created_at
     lines = []
     for ev in events:
@@ -109,15 +143,26 @@ def killfeed_lines_for_events(events: list[dict], room_id: str | None = None) ->
 
 def replay_lines_for_events(events: list[dict], room_id: str | None = None) -> list[str]:
     if room_id:
-        # filter if room_id present
-        filtered = []
-        for ev in events:
+        def _ev_key(ev):
             gd = ev.get("event_data") or {}
-            rid = str(gd.get("room_id") or gd.get("code") or "")
-            if rid and rid != room_id:
-                continue
-            filtered.append(ev)
-        events = filtered
+            r = str(gd.get("room_id") or gd.get("code") or gd.get("short_code") or "")
+            mv = gd.get("match_version")
+            if mv is not None:
+                try: r = f"{r}_{int(mv)}"
+                except Exception: r = f"{r}_{mv}"
+            return r
+        has_composite = any(_ev_key(ev) == room_id for ev in events)
+        if has_composite:
+            events = [ev for ev in events if _ev_key(ev) == room_id]
+        else:
+            filtered = []
+            for ev in events:
+                gd = ev.get("event_data") or {}
+                rid = str(gd.get("room_id") or gd.get("code") or gd.get("short_code") or "")
+                if rid and rid != room_id:
+                    continue
+                filtered.append(ev)
+            events = filtered
     lines = []
     for ev in events:
         et = ev.get("event_type", "?")
@@ -197,8 +242,12 @@ class SessionSelectView(discord.ui.View):
         groups: dict[str, list[dict]] = {}
         for ev in events:
             gd = ev.get("event_data") or {}
-            rid = gd.get("room_id") or gd.get("code") or sid
+            rid = gd.get("room_id") or gd.get("code") or gd.get("short_code") or sid
             rid = str(rid)
+            mv = gd.get("match_version")
+            if mv is not None:
+                try: rid = f"{rid}_{int(mv)}"
+                except Exception: rid = f"{rid}_{mv}"
             groups.setdefault(rid, []).append(ev)
         if len(groups) <= 1:
             detail = match_detail_embed(sid, events)
@@ -214,10 +263,21 @@ class MatchSelectView(discord.ui.View):
         self.session_id = session_id
         self.discord_id = discord_id
         self.events = events
-        # Build options per room
+        # Build options per room (room_ids are composite keys like room_id or room_id_version)
         options = []
         for idx, rid in enumerate(room_ids[:25], 1):
-            evs = [ev for ev in events if str((ev.get("event_data") or {}).get("room_id") or session_id) == rid or str((ev.get("event_data") or {}).get("code") or "") == rid]
+            def _ev_key(ev):
+                gd = ev.get("event_data") or {}
+                r = str(gd.get("room_id") or gd.get("code") or gd.get("short_code") or session_id)
+                mv = gd.get("match_version")
+                if mv is not None:
+                    try: r = f"{r}_{int(mv)}"
+                    except Exception: r = f"{r}_{mv}"
+                return r
+            evs = [ev for ev in events if _ev_key(ev) == rid]
+            # Fallback for legacy events without match_version where rid is plain room_id
+            if not evs and "_" not in rid:
+                evs = [ev for ev in events if str((ev.get("event_data") or {}).get("room_id") or session_id) == rid or str((ev.get("event_data") or {}).get("code") or "") == rid or str((ev.get("event_data") or {}).get("short_code") or "") == rid]
             gms = list({(ev.get("event_data") or {}).get("gm") for ev in evs if (ev.get("event_data") or {}).get("gm")})
             gm_label = fmt.format_game_mode(gms[0]) if gms else f"Match {idx}"
             kills = sum(1 for ev in evs if ev.get("event_type") == "killfeed" and (ev.get("event_data") or {}).get("kill_type") == "killed")

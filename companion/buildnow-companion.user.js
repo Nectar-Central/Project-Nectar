@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BuildNow Companion Live Capture (game-frame only)
 // @namespace    buildnow-companion.local
-// @version      2.0.0
-// @description  BuildNow Companion hooks BuildNow GG WebSocket inside the game frame, filters essential packets and forwards raw hex to api-compbng.vercel.app for live stats.
+// @version      2.1.0
+// @description  BuildNow Companion v2.1 — merged-match fix, live HUD, player panel (Ctrl+Shift+I), keybinds (Ctrl+Shift+K), ranked overlay, improved console/toast.
 // @author       @cis6led
 // @match        https://buildnow-gg.game-files.crazygames.com/*
 // @all-frames   true
@@ -73,10 +73,14 @@
   const PAL_EARLY = { bgInfo: 'background:#1f2937;color:#e5e7eb;padding:1px 6px;border-radius:3px' };
   function logInfoEarly(msg, ...rest) { console.log(`%c[BNC]%c %c[INF]%c ${msg}`, 'color:#6b7280;font-weight:800', '', PAL_EARLY.bgInfo, '', ...rest); }
   const PAL = { bgSys: 'background:#7c3aed;color:#fff;padding:1px 6px;border-radius:3px;font-weight:900', bgOk: 'background:#10b981;color:#002018;padding:1px 6px;border-radius:3px;font-weight:800', bgErr: 'background:#ef4444;color:#fff;padding:1px 6px;border-radius:3px;font-weight:900', bgInfo: 'background:#1f2937;color:#e5e7eb;padding:1px 6px;border-radius:3px' };
-  function logSys(msg, ...rest) { console.log(`%c[BNC]%c %c[SYS]%c ${msg}`, 'color:#7c3aed;font-weight:900', '', PAL.bgSys, '', ...rest); }
-  function logOk(msg, ...rest) { console.log(`%c[BNC]%c %c[OK]%c ${msg}`, 'color:#10b981;font-weight:900', '', PAL.bgOk, '', ...rest); }
-  function logErr(msg, ...rest) { console.warn(`%c[BNC]%c %c[ERR]%c ${msg}`, 'color:#ef4444;font-weight:900', '', PAL.bgErr, '', ...rest); }
-  function logInfo(msg, ...rest) { console.log(`%c[BNC]%c %c[INF]%c ${msg}`, 'color:#6b7280;font-weight:800', '', PAL.bgInfo, '', ...rest); }
+  function _ts(){ return new Date().toLocaleTimeString('en-GB',{hour12:false})+'.'+String(Date.now()%1000).padStart(3,'0'); }
+  function logSys(msg, ...rest) { console.log(`%c[BNC]%c %c[SYS]%c ${_ts()} ${msg}`, 'color:#7c3aed;font-weight:900', '', PAL.bgSys, '', ...rest); }
+  function logOk(msg, ...rest) { console.log(`%c[BNC]%c %c[OK]%c ${_ts()} ${msg}`, 'color:#10b981;font-weight:900', '', PAL.bgOk, '', ...rest); }
+  function logErr(msg, ...rest) { console.warn(`%c[BNC]%c %c[ERR]%c ${_ts()} ${msg}`, 'color:#ef4444;font-weight:900', '', PAL.bgErr, '', ...rest); }
+  function logInfo(msg, ...rest) { console.log(`%c[BNC]%c %c[INF]%c ${_ts()} ${msg}`, 'color:#6b7280;font-weight:800', '', PAL.bgInfo, '', ...rest); }
+  function logGroup(label, fn){
+    try{ console.groupCollapsed(`%c[BNC] ${label}`, 'color:#7c3aed;font-weight:700'); fn(); console.groupEnd(); }catch{ fn(); }
+  }
 
   // session restore
   if(sessionId && currentReqToken && !isGuest){
@@ -169,8 +173,22 @@
     if(!doFetch(url, true)) doFetch(url, false);
   }
 
-  // toast helpers (minimal)
+  // toast helpers + welcome toast per page load (once per session, deduped 30 min)
   let lastToastAt=0, lastToastText='', toastReady=false, toastLoading=false;
+  let lastWelcomeAt = Number(GMGet('bnc_welcome_at', 0)||0);
+  function showWelcomeToast(){
+    const now = Date.now();
+    if(now - lastWelcomeAt < 30*60*1000) return;
+    lastWelcomeAt = now; GMSet('bnc_welcome_at', now);
+    // delay to let toastReady load
+    setTimeout(()=>{
+      if(isGuest) showToast('BuildNow Companion — Guest mode', false);
+      else if(sessionId) showToast(`BuildNow Companion — Linked${discordUsername? ' as '+discordUsername:''}`, false);
+      else showToast('BuildNow Companion — Ready', false);
+    }, 900);
+  }
+  // fire welcome once per load
+  setTimeout(showWelcomeToast, 700);
   function showToast(text, isError){
     const now=Date.now(); if(text===lastToastText && now-lastToastAt<3000) return;
     lastToastText=text; lastToastAt=now;
@@ -521,14 +539,15 @@
     }
   }
 
-  // --- LOG FEED (bottom, passthrough + pause + decrypted hex) ---
-  let feedEnabled = GMGet('bnc_feed_enabled', GMGet('bn_feed_enabled', true));
+  // --- LOG FEED (bottom, passthrough + pause + decrypted hex) — dev only, hidden by default in v2 ---
+  const DEV_MODE = !!GMGet('bnc_dev_mode', false);
+  let feedEnabled = DEV_MODE && GMGet('bnc_feed_enabled', GMGet('bn_feed_enabled', false));
   let feedPaused = GMGet('bnc_feed_paused', GMGet('bn_feed_paused', false));
   const feedWrap = document.createElement('div');
   feedWrap.id = 'bnc-log-wrap';
   Object.assign(feedWrap.style, {
     position: 'fixed', bottom: '0', left: '0', right: '0', zIndex: '2147483645',
-    display: feedEnabled ? 'block' : 'none', pointerEvents: 'none'
+    display: (DEV_MODE && feedEnabled) ? 'block' : 'none', pointerEvents: 'none'
   });
   const feedBar = document.createElement('div');
   Object.assign(feedBar.style, {
@@ -602,6 +621,101 @@
       feedLog('info', {msg: feedPaused ? 'paused' : 'resumed'});
     };
   }, 800);
+
+  // --- PLAYER INFO PANEL (v2: skin, name, discord, game_id, stats, state, game_mode, zone, playtime) ---
+  let infoPanel = null, infoUpdateTimer=null;
+  function createInfoPanel(){
+    if(document.getElementById('bnc-info-panel')) return;
+    infoPanel = document.createElement('div');
+    infoPanel.id='bnc-info-panel';
+    Object.assign(infoPanel.style, {position:'fixed', top:'8px', right:'8px', zIndex:'2147483645', width:'260px', background:'rgba(0,0,0,0.92)', color:'#e5e7eb', border:'1px solid rgba(255,255,255,0.12)', borderRadius:'10px', padding:'10px 12px', fontFamily:'Inter, system-ui, sans-serif', fontSize:'12px', lineHeight:'1.4', backdropFilter:'blur(6px)', display:'none'});
+    infoPanel.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><span style="font-weight:700;color:#fff">Player</span><span style="opacity:0.6;font-size:10px">Ctrl+Shift+I</span><button id="bnc-info-close" style="background:transparent;border:0;color:#9ca3af;cursor:pointer">✕</button></div><div id="bnc-info-body" style="opacity:0.9">Loading…</div>`;
+    (document.body||document.documentElement).appendChild(infoPanel);
+    infoPanel.querySelector('#bnc-info-close').onclick=()=>{ infoPanel.style.display='none'; GMSet('bnc_info_open', false); };
+    // draggable
+    let drag=false, sx=0, sy=0, ox=0, oy=0;
+    const hdr = infoPanel.firstChild;
+    hdr.style.cursor='move';
+    hdr.addEventListener('mousedown', (e)=>{ drag=true; sx=e.clientX; sy=e.clientY; const r=infoPanel.getBoundingClientRect(); ox=r.left; oy=r.top; e.preventDefault(); });
+    document.addEventListener('mousemove', (e)=>{ if(!drag) return; infoPanel.style.left = (ox + e.clientX - sx)+'px'; infoPanel.style.top = (oy + e.clientY - sy)+'px'; infoPanel.style.right='auto'; });
+    document.addEventListener('mouseup', ()=> drag=false);
+  }
+  function renderInfoPanel(){
+    if(!infoPanel) createInfoPanel();
+    const body = document.getElementById('bnc-info-body');
+    if(!body) return;
+    const uname = GMGet('bnc_game_username', discordUsername || '-') || '-';
+    const gid = GMGet('bnc_game_id', '-') || '-';
+    const dname = discordUsername || '-';
+    const gm = GMGet('bnc_session_gm', '-') || '-';
+    const skin = GMGet('bnc_skin', '-') || '-';
+    const discord = discordUsername ? `${discordUsername} (${discordId? discordId.slice(0,6)+'…' : '-'})` : '-';
+    const nameLine = `<div><b style="color:#fff">${uname}</b> <span style="opacity:0.6">${gid!=='-'? '('+gid.slice(0,8)+'…)' : ''}</span></div>`;
+    const sub = `<div style="opacity:0.7">Discord: ${discord} · GM: ${gm} · Skin: ${String(skin).slice(0,22)}</div>`;
+    const hint = `<div style="margin-top:6px;opacity:0.6;font-size:10px">Stats & insights from /stats in Discord</div>`;
+    body.innerHTML = nameLine + sub + hint;
+  }
+  function toggleInfoPanel(){
+    if(!infoPanel) createInfoPanel();
+    const isOpen = infoPanel.style.display !== 'none';
+    if(isOpen){ infoPanel.style.display='none'; GMSet('bnc_info_open', false); }
+    else { renderInfoPanel(); infoPanel.style.display='block'; GMSet('bnc_info_open', true); }
+  }
+  if(GMGet('bnc_info_open', false)){ setTimeout(()=>{ createInfoPanel(); renderInfoPanel(); if(infoPanel) infoPanel.style.display='block'; }, 1200); }
+
+  // --- KEYBINDS / SETTINGS MENU (Ctrl+Shift+K) ---
+  let keybindOverlay=null;
+  function createKeybindOverlay(){
+    if(document.getElementById('bnc-keys')) return;
+    const ov=document.createElement('div');
+    ov.id='bnc-keys';
+    Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483646', background:'rgba(0,0,0,0.54)', display:'none', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif'});
+    ov.innerHTML = `<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:20px;min-width:360px;max-width:520px;color:#e5e7eb"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><b style="font-size:15px;color:#fff">BuildNow Companion — Shortcuts & Settings</b><button id="bnc-keys-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 8px;cursor:pointer">Close</button></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;line-height:1.6"><div><code>Ctrl+Shift+C</code> — Collect toggle<br><code>Ctrl+Shift+S</code> — Save collected<br><code>Ctrl+Shift+L</code> — Load file<br><code>Ctrl+Shift+R</code> — Replay</div><div><code>Ctrl+Shift+F</code> — Feed (dev only)<br><code>Ctrl+Shift+P</code> — Pause feed<br><code>Ctrl+Shift+I</code> — Player info<br><code>Ctrl+Shift+K</code> — This menu</div></div><div style="margin-top:14px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);font-size:11px;opacity:0.7">Settings: <label style="cursor:pointer"><input type="checkbox" id="bnc-dev-toggle"> Dev mode (feed)</label> · <label style="cursor:pointer"><input type="checkbox" id="bnc-info-auto"> Show player info on start</label></div></div>`;
+    (document.body||document.documentElement).appendChild(ov);
+    ov.addEventListener('click', (e)=>{ if(e.target===ov) ov.style.display='none'; });
+    ov.querySelector('#bnc-keys-close').onclick=()=> ov.style.display='none';
+    const devT = ov.querySelector('#bnc-dev-toggle');
+    devT.checked = !!GMGet('bnc_dev_mode', false);
+    devT.onchange=()=>{ GMSet('bnc_dev_mode', devT.checked); showToast(devT.checked? 'Dev mode ON':'Dev mode OFF', false); if(devT.checked){ feedEnabled=true; feedWrap.style.display='block'; } else feedWrap.style.display='none'; };
+    const autoT = ov.querySelector('#bnc-info-auto');
+    autoT.checked = !!GMGet('bnc_info_open', false);
+    autoT.onchange=()=> GMSet('bnc_info_open', autoT.checked);
+    keybindOverlay=ov;
+  }
+  function toggleKeybinds(){ if(!keybindOverlay) createKeybindOverlay(); keybindOverlay.style.display = keybindOverlay.style.display==='none' || !keybindOverlay.style.display ? 'flex' : 'none'; }
+  // Hotkeys: Ctrl+Shift+I info panel, Ctrl+Shift+K keybinds (guard modal focus)
+  document.addEventListener('keydown', (e)=>{
+    if (isModalOrInputFocused()) return;
+    if(e.ctrlKey && e.shiftKey){
+      const k=(e.key||'').toUpperCase();
+      if(k==='I'){ e.preventDefault(); e.stopPropagation(); toggleInfoPanel(); }
+      else if(k==='K'){ e.preventDefault(); e.stopPropagation(); toggleKeybinds(); }
+    }
+  }, true);
+
+  // --- RANKED HUD (only when joining private room with short_code / pID) ---
+  let rankedHUD=null; let rankedShort=null;
+  function createRankedHUD(){
+    if(document.getElementById('bnc-ranked')) return;
+    rankedHUD=document.createElement('div');
+    rankedHUD.id='bnc-ranked';
+    Object.assign(rankedHUD.style,{position:'fixed', top:'52px', left:'50%', transform:'translateX(-50%)', zIndex:'2147483645', background:'linear-gradient(135deg,#7c3aed 0%,#4f46e5 100%)', color:'#fff', padding:'6px 14px', borderRadius:'999px', fontFamily:'Inter, system-ui, sans-serif', fontSize:'12px', fontWeight:'800', letterSpacing:'0.3px', display:'none', boxShadow:'0 4px 16px rgba(124,58,237,0.45)', border:'1px solid rgba(255,255,255,0.12)'});
+    rankedHUD.textContent='RANKED — private lobby';
+    (document.body||document.documentElement).appendChild(rankedHUD);
+  }
+  function showRankedHUD(code){
+    if(!rankedHUD) createRankedHUD();
+    rankedShort=code;
+    rankedHUD.textContent = `RANKED — ${code}`;
+    rankedHUD.style.display='block';
+    // also update info panel gm hint
+    if(code) GMSet('bnc_session_gm', 'ranked_'+code);
+    setTimeout(()=>{ /* keep visible */ }, 0);
+  }
+  function hideRankedHUD(){ if(rankedHUD) rankedHUD.style.display='none'; rankedShort=null; }
+  // expose for API capture response to trigger
+  window.__BNC_SHOW_RANKED__ = showRankedHUD;
+  window.__BNC_HIDE_RANKED__ = hideRankedHUD;
 
   function isPhotonUrl(url){ if(!url) return false; const u=String(url); if(u.includes(APP_ID)) return true; for(const h of PHOTON_HOSTS) if(u.toLowerCase().includes(h)) return true; if(u.includes('wss://')&&u.includes('exitgames')) return true; return false; }
   function shortUrl(url){ return String(url).replace(/^wss?:\/\//,'').replace(/\?libversion.*$/,'').slice(0,80); }
@@ -678,10 +792,22 @@
               if(p.player_name) fields.player=p.player_name;
               if(p.zone_time!=null) fields.zone_time=p.zone_time;
               if(p.zone_phase!=null) fields.zone_phase=p.zone_phase;
+              if(p.short_code) fields.code=p.short_code;
+              if(p.room_gm) fields.gm=p.room_gm;
               if(gpbStr) fields.gpb = gpbStr + (JSON.stringify(dec).length>180 ? '…' : '');
               feedLog('decrypted', fields);
               feedLog('hex', {seq:p.seq, hex:(p.rawHex||'').slice(0,24)+'..'});
+              // Ranked HUD: only show when joining private room with short_code (5-char code) — not every packet
+              if(p.short_code && /^[A-Z0-9]{5}$/i.test(String(p.short_code))){ showRankedHUD(String(p.short_code).toUpperCase()); }
+              else if(p.room_gm && String(p.room_gm).toLowerCase().includes('ranked') && p.short_code){ showRankedHUD(String(p.short_code).toUpperCase()); }
             }
+            // Also check session for private ranked room
+            try{
+              const sess = j.session;
+              if(sess && sess.rooms){
+                for(const rv of Object.values(sess.rooms)){ if(rv.short_code && /^[A-Z0-9]{5}$/i.test(rv.short_code)){ showRankedHUD(rv.short_code); break; } }
+              }
+            }catch{}
           }
         }catch(e){ feedLog('decrypted', {err:e.message}); }
         feedLog('sent', {count:batch.length, ok:true});

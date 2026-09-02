@@ -428,24 +428,55 @@ async def _match_logic(interaction: discord.Interaction):
 
     me = state.get("me") or {}
     rooms = state.get("rooms") or {}
-    players = state.get("players") or {}
-    state_val = state.get("state", "lobby")
-    gm = fmt.format_game_mode(state.get("game_mode"))
-    cur_scn = (state.get("cur_scn") or "?").replace("_", " ")
-    zone = state.get("zone") or {}
-    players_count = state.get("players_count", 0)
-    max_players = state.get("max_players") or "?"
-    party = state.get("party") or {}
-    skin = me.get("skin")
+    # Determine active match room: prefer rooms where state == "match" and not lobby
+    # Filter out lobby room, then pick match room with highest players_count or most recent
+    non_lobby_rooms = {rid: rv for rid, rv in rooms.items() if rid != "lobby" and (rv.get("state") != "lobby" or rv.get("game_mode"))}
+    match_rooms = {rid: rv for rid, rv in non_lobby_rooms.items() if rv.get("state") == "match"}
+    # Choose display room: current room if it's a match, else best match_rooms, else first non-lobby
+    display_room = None
+    display_rid = None
+    cur_id = state.get("current_room_id")
+    if cur_id and cur_id in rooms and rooms[cur_id].get("state") == "match":
+        display_room = rooms[cur_id]
+        display_rid = cur_id
+    elif match_rooms:
+        # pick room with most players or newest (last in dict)
+        display_rid, display_room = max(match_rooms.items(), key=lambda kv: (kv[1].get("players_count", 0), kv[1].get("match_version", 0)))
+    elif non_lobby_rooms:
+        display_rid, display_room = next(iter(non_lobby_rooms.items()))
+    # Use display_room if exists, else fallback to top-level state (legacy)
+    if display_room:
+        players = display_room.get("players") or {}
+        state_val = display_room.get("state", "lobby")
+        gm = fmt.format_game_mode(display_room.get("game_mode") or state.get("game_mode"))
+        cur_scn = (display_room.get("cur_scn") or state.get("cur_scn") or "?").replace("_", " ")
+        zone = display_room.get("zone") or {}
+        players_count = display_room.get("players_count", 0)
+        max_players = display_room.get("max_players") or "?"
+        party = display_room.get("party") or {}
+        # keep session me skin
+        skin = (me.get("skin") or display_room.get("me", {}).get("skin"))
+    else:
+        players = state.get("players") or {}
+        state_val = state.get("state", "lobby")
+        gm = fmt.format_game_mode(state.get("game_mode"))
+        cur_scn = (state.get("cur_scn") or "?").replace("_", " ")
+        zone = state.get("zone") or {}
+        players_count = state.get("players_count", 0)
+        max_players = state.get("max_players") or "?"
+        party = state.get("party") or {}
+        skin = me.get("skin")
     thumb = fmt.skin_url(skin)
 
-    if state_val == "lobby":
+    # Only show lobby if truly no match room exists and top-level is lobby
+    if state_val == "lobby" and not match_rooms:
         e = discord.Embed(title="In Lobby", color=0x2b2d31)
         if thumb: e.set_thumbnail(url=thumb)
         e.add_field(name="Status", value="In Lobby", inline=True)
         e.add_field(name="Game mode", value=gm, inline=True)
         e.add_field(name="Scene", value=cur_scn, inline=True)
-        if rooms: e.add_field(name="Matches in session", value=str(len(rooms)), inline=True)
+        if non_lobby_rooms: e.add_field(name="Matches in session", value=str(len(non_lobby_rooms)), inline=True)
+        elif rooms: e.add_field(name="Matches in session", value=str(len(rooms)), inline=True)
         if skin: e.add_field(name="Skin", value=fmt.skin_display(skin), inline=True)
         if party.get("is_party"): e.add_field(name="Party", value="In Party", inline=True)
         return await interaction.followup.send(embed=e)
@@ -467,7 +498,11 @@ async def _match_logic(interaction: discord.Interaction):
     e.add_field(name="Zone", value=fmt.format_zone(zone), inline=True)
     e.add_field(name="Alive / Dead", value=f"{alive_count} alive, {dead_count} dead", inline=True)
     e.add_field(name="Scene", value=cur_scn, inline=True)
-    if rooms: e.add_field(name="Matches", value=f"{len(rooms)} in session", inline=True)
+    # Only count non-lobby matches in footer
+    match_count = len(non_lobby_rooms) if non_lobby_rooms else (len(rooms) if rooms else 0)
+    if match_count: e.add_field(name="Matches", value=f"{match_count} in session", inline=True)
+    if display_rid and display_rid != "lobby":
+        e.add_field(name="Match ID", value=f"`{display_rid[:8]}`", inline=True)
     if party.get("is_party"): e.add_field(name="Party", value="In Party", inline=True)
     if skin: e.add_field(name="Skin", value=fmt.skin_display(skin), inline=True)
     e.add_field(name="Players", value=kills_lines[:1024], inline=False)

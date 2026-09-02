@@ -131,6 +131,17 @@ async def process_batch(
     me_name = view.me.username if view.me else None
     gm_val = view.game_mode.value if view.game_mode else None
     last_zone_phase = getattr(view, "_lastZonePhase", None)
+    # helper: validate zone_time 0-600, cap 299 for zw_lg like engine
+    def _valid_zone_time(v, gm_hint):
+        try:
+            iv = int(float(v))
+            if 0 <= iv <= 600:
+                if iv == 300 and str(gm_hint or "").lower() in ("zw_lg", "wwzw"):
+                    return 299
+                return iv
+        except Exception:
+            pass
+        return None
 
     # -------------------------------------------------------------------
     # Sync user fields from SessionView (so /info, /stats are live)
@@ -163,7 +174,18 @@ async def process_batch(
     for pkt in packets:
         pkt_type, instigator, instigated, kill_type, player_name, zone_time, zone_phase, cur_scn, is_leave, is_kill, is_knock, is_join = _extract_fields(pkt)
 
-        log_sys(f"PROCESSOR pkt type={pkt_type} ig={instigator} ed={instigated} kill={is_kill} knock={is_knock} leave={is_leave} me={me_name}")
+        # Per-packet room context stamped by Engine (avoids batch-final gm merging)
+        pkt_room_id = pkt.get("room_id") or pkt.get("room_code") if isinstance(pkt, dict) else getattr(pkt, "room_id", None)
+        pkt_short = pkt.get("short_code") if isinstance(pkt, dict) else getattr(pkt, "short_code", None)
+        pkt_match_ver = pkt.get("match_version") if isinstance(pkt, dict) else getattr(pkt, "match_version", None)
+        pkt_room_gm = pkt.get("room_gm") if isinstance(pkt, dict) else getattr(pkt, "room_gm", None)
+        # Fallback chain: packet game_mode -> room_gm -> global gm_val
+        pkt_gm = pkt.get("game_mode") if isinstance(pkt, dict) else getattr(pkt, "game_mode", None)
+        if isinstance(pkt_gm, dict):
+            pkt_gm = pkt_gm.get("value") if "value" in pkt_gm else str(pkt_gm)
+        eff_gm = pkt_gm or pkt_room_gm or gm_val
+
+        log_sys(f"PROCESSOR pkt type={pkt_type} ig={instigator} ed={instigated} kill={is_kill} knock={is_knock} leave={is_leave} me={me_name} gm={eff_gm} room={str(pkt_room_id or '')[:8]}")
 
         try:
             # --- Killfeed: kill or knock (entire lobby) ---
@@ -176,10 +198,14 @@ async def process_batch(
                         "session_id": session_id,
                         "event_type": "killfeed",
                         "event_data": {
-                            "gm": gm_val,
+                            "gm": eff_gm,
                             "instigator": instigator,
                             "instigated": instigated,
                             "kill_type": kf_type,
+                            "room_id": pkt_room_id,
+                            "code": pkt_short,
+                            "short_code": pkt_short,
+                            "match_version": pkt_match_ver,
                         },
                         
                     }).execute()
@@ -193,10 +219,10 @@ async def process_batch(
                                 "discord_id": discord_id,
                                 "session_id": session_id,
                                 "event_type": "kill",
-                                "event_data": {"gm": gm_val, "victim": instigated},
+                                "event_data": {"gm": eff_gm, "victim": instigated, "room_id": pkt_room_id, "code": pkt_short, "match_version": pkt_match_ver},
                                 
                             }).execute()
-                            log_sys(f"PROCESSOR KILL by self gm={gm_val} victim={instigated} session={session_id[:8]} kills {user.get('kills',0)}->{new_kills}")
+                            log_sys(f"PROCESSOR KILL by self gm={eff_gm} victim={instigated} session={session_id[:8]} kills {user.get('kills',0)}->{new_kills}")
                             user["kills"] = new_kills
 
                         elif instigated == me_name:
@@ -206,7 +232,7 @@ async def process_batch(
                                 "discord_id": discord_id,
                                 "session_id": session_id,
                                 "event_type": "death",
-                                "event_data": {"gm": gm_val, "killer": instigator},
+                                "event_data": {"gm": eff_gm, "killer": instigator, "room_id": pkt_room_id, "code": pkt_short, "match_version": pkt_match_ver},
                                 
                             }).execute()
                             log_sys(f"PROCESSOR DEATH by {instigator} session={session_id[:8]} deaths {user.get('deaths',0)}->{new_deaths}")
@@ -221,30 +247,48 @@ async def process_batch(
                         "session_id": session_id,
                         "event_type": "killfeed",
                         "event_data": {
-                            "gm": gm_val,
+                            "gm": eff_gm,
                             "instigator": leaver,
                             "instigated": None,
                             "kill_type": "left",
+                            "room_id": pkt_room_id,
+                            "code": pkt_short,
+                            "match_version": pkt_match_ver,
                         },
                         
                     }).execute()
-                    log_sys(f"PROCESSOR LEAVE {leaver} session={session_id[:8]}")
+                    log_sys(f"PROCESSOR LEAVE {leaver} session={session_id[:8]} gm={eff_gm}")
 
             # --- Zone phase changes (compare to last seen) ---
-            if zone_phase is not None and str(zone_phase) != str(last_zone_phase):
-                supabase.table("bngc_game_events").insert({
-                    "discord_id": discord_id,
-                    "session_id": session_id,
-                    "event_type": "zone_change",
-                    "event_data": {
-                        "gm": gm_val,
-                        "phase": str(zone_phase),
-                        "time": zone_time,
-                    },
-                    
-                }).execute()
-                log_sys(f"PROCESSOR ZONE phase {last_zone_phase}→{zone_phase} session={session_id[:8]}")
-                last_zone_phase = zone_phase
+            # Only valid bz_* zone phases, ignore stG-derived huge times for zw_lg
+            if zone_phase is not None:
+                # Validate time 0-600; huge stG values like 3949545 are dropped
+                vt = _valid_zone_time(zone_time, eff_gm) if zone_time is not None else None
+                # If zone_time is huge and gm is zw_lg/wwzw, it's stG not zone — skip time but still track phase if phase is sane 0-5
+                try:
+                    phase_int = int(float(str(zone_phase).strip()))
+                    sane_phase = 0 <= phase_int <= 10
+                except Exception:
+                    sane_phase = True
+                if sane_phase and str(zone_phase) != str(last_zone_phase):
+                    supabase.table("bngc_game_events").insert({
+                        "discord_id": discord_id,
+                        "session_id": session_id,
+                        "event_type": "zone_change",
+                        "event_data": {
+                            "gm": eff_gm,
+                            "phase": str(zone_phase),
+                            "time": vt,
+                            "room_id": pkt_room_id,
+                            "code": pkt_short,
+                            "match_version": pkt_match_ver,
+                        },
+                        
+                    }).execute()
+                    log_sys(f"PROCESSOR ZONE phase {last_zone_phase}→{zone_phase} time={vt} gm={eff_gm} session={session_id[:8]}")
+                    last_zone_phase = zone_phase
+                elif not sane_phase:
+                    log_sys(f"PROCESSOR ZONE ignore insane phase {zone_phase} time={zone_time}")
 
         except Exception as exc:
             log_err(f"processor packet write failed {exc}")
