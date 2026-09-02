@@ -75,31 +75,31 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         await interaction.response.send_message(message, ephemeral=True)
 
 def save_registered_player(discord_id: int, username: str, display_name: str, game_handle: str, avatar_url: str):
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing")
-    payload = {
-        "id": str(discord_id),
-        "username": username,
-        "display_name": display_name,
-        "game_handle": game_handle,
-        "avatar_url": avatar_url,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    request = Request(
-        f"{SUPABASE_URL}/rest/v1/players?on_conflict=id",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal"},
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=10) as response:
-            if response.status not in (200, 201, 204):
-                raise RuntimeError(f"Supabase returned HTTP {response.status}")
-    except HTTPError as exc:
-        details = exc.read().decode("utf-8", errors="replace")[:300]
-        raise RuntimeError(f"Supabase returned HTTP {exc.code}: {details}") from exc
-    except URLError as exc:
-        raise RuntimeError(f"Supabase request failed: {exc.reason}") from exc
+  if not SUPABASE_URL or not SUPABASE_KEY:
+      raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing")
+  payload = {
+      "id": str(discord_id),
+      "username": username,
+      "display_name": display_name,
+      "game_handle": game_handle,
+      "avatar_url": avatar_url,
+      "updated_at": datetime.now(timezone.utc).isoformat(),
+  }
+  request = Request(
+      f"{SUPABASE_URL}/rest/v1/players?on_conflict=id",
+      data=json.dumps(payload).encode("utf-8"),
+      headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal"},
+      method="POST",
+  )
+  try:
+      with urlopen(request, timeout=10) as response:
+          if response.status not in (200, 201, 204):
+              raise RuntimeError(f"Supabase returned HTTP {response.status}")
+  except HTTPError as exc:
+      details = exc.read().decode("utf-8", errors="replace")[:300]
+      raise RuntimeError(f"Supabase returned HTTP {exc.code}: {details}") from exc
+  except URLError as exc:
+      raise RuntimeError(f"Supabase request failed: {exc.reason}") from exc
 
 
 @tree.command(name="register", description="Create or update your Nectar player profile")
