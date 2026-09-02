@@ -47,7 +47,12 @@ create table if not exists public.bngc_sessions (
   session_id text primary key,
   discord_id text not null references public.bngc_users(discord_id) on delete cascade,
   created_at timestamptz not null default now(),
-  is_active boolean not null default true
+  is_active boolean not null default true,
+  session_key text,
+  req_secret text,
+  current_token text,
+  token_counter integer not null default 0,
+  last_used_at timestamptz
 );
 
 create table if not exists public.bngc_game_events (
@@ -56,6 +61,7 @@ create table if not exists public.bngc_game_events (
   discord_id text not null references public.bngc_users(discord_id) on delete cascade,
   event_type text not null,
   event_data jsonb not null default '{}'::jsonb,
+  is_valid boolean not null default true,
   created_at timestamptz not null default now()
 );
 

@@ -181,7 +181,7 @@ async def process_batch(
                             "instigated": instigated,
                             "kill_type": kf_type,
                         },
-                        "is_valid": True,
+                        
                     }).execute()
 
                     # Self-specific kill/death for bngc_users stat tracking
@@ -194,7 +194,7 @@ async def process_batch(
                                 "session_id": session_id,
                                 "event_type": "kill",
                                 "event_data": {"gm": gm_val, "victim": instigated},
-                                "is_valid": True,
+                                
                             }).execute()
                             log_sys(f"PROCESSOR KILL by self gm={gm_val} victim={instigated} session={session_id[:8]} kills {user.get('kills',0)}->{new_kills}")
                             user["kills"] = new_kills
@@ -207,7 +207,7 @@ async def process_batch(
                                 "session_id": session_id,
                                 "event_type": "death",
                                 "event_data": {"gm": gm_val, "killer": instigator},
-                                "is_valid": True,
+                                
                             }).execute()
                             log_sys(f"PROCESSOR DEATH by {instigator} session={session_id[:8]} deaths {user.get('deaths',0)}->{new_deaths}")
                             user["deaths"] = new_deaths
@@ -226,7 +226,7 @@ async def process_batch(
                             "instigated": None,
                             "kill_type": "left",
                         },
-                        "is_valid": True,
+                        
                     }).execute()
                     log_sys(f"PROCESSOR LEAVE {leaver} session={session_id[:8]}")
 
@@ -241,7 +241,7 @@ async def process_batch(
                         "phase": str(zone_phase),
                         "time": zone_time,
                     },
-                    "is_valid": True,
+                    
                 }).execute()
                 log_sys(f"PROCESSOR ZONE phase {last_zone_phase}→{zone_phase} session={session_id[:8]}")
                 last_zone_phase = zone_phase
@@ -295,7 +295,7 @@ async def process_batch(
                         "discord_id": discord_id,
                         "session_id": session_id,
                         "event_type": "win",
-                        "event_data": {"gm": gm, "room_id": room_id, "short_code": room.short_code, "match_version": room.match_version, "winner": room.winner}, "is_valid": True,
+                        "event_data": {"gm": gm, "room_id": room_id, "short_code": room.short_code, "match_version": room.match_version, "winner": room.winner}, 
                     }).execute()
                     log_sys(f"PROCESSOR WIN gm={gm} room={room_id[:8]} short={room.short_code} winner={room.winner} session={session_id[:8]} wins {user.get('wins',0)}->{new_wins}")
                     user["wins"] = new_wins
@@ -314,7 +314,7 @@ async def process_batch(
                             "discord_id": discord_id,
                             "session_id": session_id,
                             "event_type": "win",
-                            "event_data": {"gm": gm, "room_id": room_id, "short_code": room.short_code, "match_version": room.match_version}, "is_valid": True,
+                            "event_data": {"gm": gm, "room_id": room_id, "short_code": room.short_code, "match_version": room.match_version}, 
                         }).execute()
                         log_sys(f"PROCESSOR WIN gm={gm} room={room_id[:8]} session={session_id[:8]} wins {user.get('wins',0)}->{new_wins}")
                         user["wins"] = new_wins
@@ -336,7 +336,7 @@ async def process_batch(
                             "discord_id": discord_id,
                             "session_id": session_id,
                             "event_type": "defeat",
-                            "event_data": {"gm": gm2, "room_id": room_id2, "short_code": room2.short_code, "match_version": room2.match_version}, "is_valid": True,
+                            "event_data": {"gm": gm2, "room_id": room_id2, "short_code": room2.short_code, "match_version": room2.match_version}, 
                         }).execute()
                         log_sys(f"PROCESSOR DEFEAT gm={gm2} room={room_id2[:8]} session={session_id[:8]} defeats {user.get('defeats',0)}->{new_def}")
                         user["defeats"] = new_def
@@ -353,7 +353,7 @@ async def process_batch(
                                 "discord_id": discord_id,
                                 "session_id": session_id,
                                 "event_type": "defeat",
-                                "event_data": {"gm": gm2, "room_id": room_id2, "short_code": room2.short_code, "match_version": room2.match_version}, "is_valid": True,
+                                "event_data": {"gm": gm2, "room_id": room_id2, "short_code": room2.short_code, "match_version": room2.match_version}, 
                             }).execute()
                             log_sys(f"PROCESSOR DEFEAT gm={gm2} room={room_id2[:8]} session={session_id[:8]} defeats {user.get('defeats',0)}->{new_def}")
                             user["defeats"] = new_def
