@@ -16,6 +16,7 @@ from ..lib.redis_client import cache
 from ..lib.tokens import generate_request_token, validate_request_token
 from ..lib.logger import log_sys, log_err
 from ..lib.photon_engine import Engine
+from ..lib.alerts import create_alert
 
 router = APIRouter()
 
@@ -47,6 +48,11 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
         if not sess:
             return JSONResponse({"error": "Invalid auth session"}, status_code=401)
         if sess.get("is_locked"):
+            try:
+                create_alert(sess.get("discord_id") or discord_id, "locked", request,
+                    details={"reason": sess.get("lock_reason") or "capture while locked", "ip": ip}, severity="critical")
+            except Exception:
+                pass
             return JSONResponse({"error": "Account locked"}, status_code=403)
         if req_token:
             if sess.get("discord_id") != discord_id:

@@ -21,6 +21,7 @@ from ..lib.supabase_client import supabase, db
 from ..lib.redis_client import cache
 from ..lib.tokens import generate_request_token
 from ..lib.logger import log_sys, log_ok, log_err
+from ..lib.alerts import create_alert
 
 router = APIRouter()
 
@@ -59,6 +60,13 @@ async def validate_token(request: Request):
 
     if await cache.is_token_blacklisted(token):
         log_err(f"validate reuse {str(token)[:4]}…")
+        # blacklist alert if we can resolve discord_id via token lookup
+        try:
+            _lt = supabase.table("bngc_login_tokens").select("discord_id").eq("token", token).single().execute().data if supabase else None
+            if _lt and _lt.get("discord_id"):
+                create_alert(_lt["discord_id"], "blacklist", request, details={"reason": "blacklisted token reuse", "token_prefix": str(token)[:4]}, severity="critical")
+        except Exception:
+            pass
         return JSONResponse(
             {"error": "Token already used - account locked. Use /unlock to unlock."},
             status_code=403,
@@ -125,16 +133,18 @@ async def validate_token(request: Request):
             except Exception:
                 pass
 
-            # Otherwise, lock the account (real reuse)
+            # Otherwise, lock the account (real reuse) — friend-account enforcement
             try:
                 supabase.table("bngc_users").update({
                     "is_locked": True,
-                    "lock_reason": "Login token reuse",
+                    "lock_reason": "Login token reuse (friend account)",
                 }).eq("discord_id", login_token["discord_id"]).execute()
             except Exception:
                 pass
 
             await cache.blacklist_token(token, 300)
+            create_alert(login_token["discord_id"], "locked", request, details={"reason": "token reuse — possible friend account sharing", "token_prefix": str(token)[:4], "ip": ip}, severity="critical")
+            create_alert(login_token["discord_id"], "blacklist", request, details={"reason": "token reuse"}, severity="critical")
 
             return JSONResponse(
                 {"error": "Token already used - account locked. Use /unlock to unlock."},
@@ -196,6 +206,17 @@ async def validate_token(request: Request):
         except Exception:
             user = None
 
+        # Login alert DM (country + username + game_id)
+        try:
+            create_alert(login_token["discord_id"], "login", request,
+                game_username=user.get("game_username") if user else None,
+                game_id=user.get("game_id") if user else None,
+                discord_username=user.get("discord_username") if user else None,
+                details={"ip": ip, "session_id": session_id},
+                severity="info")
+        except Exception:
+            pass
+
         return JSONResponse({
             "valid": True,
             "discord_username": (user.get("discord_username") if user else login_token["discord_id"]),
@@ -229,6 +250,10 @@ async def validate_token(request: Request):
         pass
 
     if user.get("is_locked"):
+        create_alert(user["discord_id"], "locked", request,
+            game_username=user.get("game_username"), game_id=user.get("game_id"),
+            discord_username=user.get("discord_username"),
+            details={"reason": user.get("lock_reason") or "account locked", "ip": ip}, severity="critical")
         return JSONResponse({"error": "Account locked. Use /unlock to unlock."}, status_code=403)
 
     return JSONResponse({

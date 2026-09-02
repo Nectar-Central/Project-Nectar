@@ -13,6 +13,7 @@ from discord.ext import commands
 import database as db
 import formatters as fmt
 import views
+import alerts as alert_mod
 try:
     import aiohttp
 except: aiohttp = None
@@ -118,6 +119,11 @@ async def on_ready():
     except Exception as exc:
         print(f"Command sync failed: {exc}")
     print(f"Bot ready as {bot.user} — {len(bot.tree.get_commands())} commands loaded")
+    # start alert DM loop (login / locked / cheat / warning / blacklist)
+    try:
+        bot.loop.create_task(alert_mod.alert_loop(bot))
+    except Exception as e:
+        print(f"[alerts] failed to start loop: {e}")
 
 
 @bot.tree.command(name="register", description="Get a login token and optionally publish your game profile")
@@ -651,6 +657,31 @@ async def killfeed_cmd(interaction: discord.Interaction, matchid: str):
     else:
         view = views.SimplePagedView("Killfeed", lines, 0xDC2626, footer)
         await interaction.followup.send(embed=view.current_embed(), view=view)
+
+@bot.tree.command(name="alerts", description="List recent security alerts (admin)")
+@app_commands.describe(limit="How many alerts (1-20)")
+@app_commands.default_permissions(administrator=True)
+async def alerts_cmd(interaction: discord.Interaction, limit: int = 5):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("Admin only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    rows = await alert_mod.fetch_unnotified(limit=50)  # reuse fetch, but also include notified
+    # fetch recent regardless of notified
+    try:
+        if db.USE_SUPABASE and db.supabase:
+            r = db.supabase.table("bngc_alerts").select("*").order("created_at", desc=True).limit(max(1, min(20, limit))).execute()
+            rows = r.data or []
+    except Exception:
+        pass
+    if not rows:
+        return await interaction.followup.send("No alerts.", ephemeral=True)
+    e = discord.Embed(title="Recent alerts", color=0x7C3AED)
+    for a in rows[:limit]:
+        t = a.get("alert_type", "?")
+        who = f"<@{a.get('discord_id')}>"
+        where = f"{a.get('country') or '?'} {a.get('ip_address') or ''}".strip()
+        e.add_field(name=f"#{a['id']} {t} — {fmt.fmt_date(a.get('created_at'))}", value=f"{who} {where}\n{(a.get('details') or {}).get('reason','')[:200]}", inline=False)
+    await interaction.followup.send(embed=e, ephemeral=True)
 
 if __name__ == "__main__":
     if not TOKEN:

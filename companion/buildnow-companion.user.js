@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BuildNow Companion Live Capture (game-frame only)
 // @namespace    buildnow-companion.local
-// @version      2.1.0
-// @description  BuildNow Companion v2.1 — merged-match fix, live HUD, player panel (Ctrl+Shift+I), keybinds (Ctrl+Shift+K), ranked overlay, improved console/toast.
+// @version      2.2.0
+// @description  BuildNow Companion v2.2 — login-enforced, alerts, locked overlay, no guest, full logs + stG.
 // @author       @cis6led
 // @match        https://buildnow-gg.game-files.crazygames.com/*
 // @all-frames   true
@@ -32,6 +32,11 @@
   const GMGet = (k,d=null)=>{ try{ return typeof GM_getValue!=='undefined'? GM_getValue(k,d) : d; }catch{ return d; } };
   const GMSet = (k,v)=>{ try{ if(typeof GM_setValue!=='undefined') GM_setValue(k,v); }catch{} };
   const GMDel = (k)=>{ try{ if(typeof GM_deleteValue!=='undefined') GM_deleteValue(k); else if(typeof GM_setValue!=='undefined') GM_setValue(k, undefined); }catch{} };
+  // Enforce login: if user sets bnc_disabled, script is inert — play normally
+  if (GMGet('bnc_disabled', false)) {
+    console.log('%c[BNC] disabled — play normally (reenable via GMSet bnc_disabled false)', 'color:#6b7280');
+    return;
+  }
 
   // api-compbng.vercel.app is primary. Local dev override: GMSet('bnc_api_base','http://127.0.0.1:8000') or 'https://api-compbng.vercel.app'
   const VERCEL_API = GMGet('bnc_api_base', GMGet('bn_api_base', null)) || null;
@@ -45,13 +50,14 @@
   }
   function cleanTokenStorage(){
     ['bnc_token','bn_token','bnc_guest','bn_guest','bnc_discord_username','bn_discord_username','bnc_discord_id','bn_discord_id','bnc_first_seen','bn_first_seen','bnc_game_username','bn_game_username','bnc_game_id','bn_game_id','bnc_welcomed','bn_welcomed','bnc_session_gm','bn_session_gm','bnc_session_id','bn_session_id','bnc_req_secret','bn_req_secret','bnc_req_token','bn_req_token','bnc_req_counter','bn_req_counter'].forEach(GMDel);
-    loginToken=null; isGuest=true; discordUsername=null; hasWelcomed=false;
+    loginToken=null; discordUsername=null; hasWelcomed=false;
     sessionId=null; currentReqToken=null; reqCounter=0; discordId=null;
     try{ localStorage.removeItem('bnc_token'); localStorage.removeItem('bn_token'); sessionStorage.removeItem('bnc_token'); sessionStorage.removeItem('bn_token'); }catch{}
   }
   let loginToken = GMGet('bnc_token', GMGet('bn_token', null));
-  let isGuest = !!GMGet('bnc_guest', GMGet('bn_guest', false));
-  if(!loginToken && !isGuest) isGuest = false;
+  // guest removed: login is mandatory, otherwise play without tracker by disabling script
+  let isGuest = false;
+  let isLocked = false;
   let discordUsername = GMGet('bnc_discord_username', GMGet('bn_discord_username', null));
   let hasWelcomed = !!GMGet('bnc_welcomed', GMGet('bn_welcomed', false));
   let sessionId = GMGet('bnc_session_id', GMGet('bn_session_id', null));
@@ -66,7 +72,7 @@
     else if(j.new_req_token){ currentReqToken=j.new_req_token; GMSet('bnc_req_token', currentReqToken); reqCounter=Number(j.new_counter??reqCounter+1); GMSet('bnc_req_counter', reqCounter); }
     else if(j.new_counter!=null){ reqCounter=j.new_counter; GMSet('bnc_req_counter', reqCounter); }
     if(j.discord_id){ discordId=j.discord_id; GMSet('bnc_discord_id', discordId); }
-    if(j.session_id) { loginToken=null; GMDel('bnc_token'); GMDel('bn_token'); isGuest=false; GMDel('bnc_guest'); GMDel('bn_guest'); }
+    if(j.session_id) { loginToken=null; GMDel('bnc_token'); GMDel('bn_token'); GMDel('bnc_guest'); GMDel('bn_guest'); }
     GMDel('bnc_req_secret'); GMDel('bn_req_secret');
   }
 
@@ -82,13 +88,19 @@
     try{ console.groupCollapsed(`%c[BNC] ${label}`, 'color:#7c3aed;font-weight:700'); fn(); console.groupEnd(); }catch{ fn(); }
   }
 
-  // session restore
-  if(sessionId && currentReqToken && !isGuest){
-    isGuest=false;
+  // session restore — login required, no guest capture
+  if(sessionId && currentReqToken){
     logInfoEarly(`session restored ${String(sessionId).slice(0,8)}… counter=${reqCounter}`);
-  } else if(loginToken && !isGuest){
+  } else if(loginToken){
     setTimeout(()=> apiPost('/api/validate-token', {token: loginToken}, (ok, txt)=>{
-      if(!ok){ cleanTokenStorage(); hasWelcomed=false; setTimeout(()=>{ showTokenPrompt(); showToast('Session expired — enter new token', true); }, 800); }
+      if(!ok){
+        let reason=''; try{ reason=JSON.parse(txt||'{}').error||''; }catch{}
+        if(String(reason).toLowerCase().includes('locked')){
+          showLockedPanel(reason || 'Account locked');
+          return;
+        }
+        cleanTokenStorage(); hasWelcomed=false; setTimeout(()=>{ showTokenPrompt(); showToast('Session expired — enter new token', true); }, 800);
+      }
       else { try{ const j=JSON.parse(txt); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.session_id) storeSession(j); }catch{} }
     }), 600);
   }
@@ -137,7 +149,12 @@
         } else {
           try{
             const j=JSON.parse(txt);
-            if(j.error && String(j.error).toLowerCase().includes('replay')){
+            const lowerErr = String(j.error||'').toLowerCase();
+            if(lowerErr.includes('locked') || lowerErr.includes('account locked')){
+              isLocked = true; queue=[]; flushTimer=null;
+              logErr(`locked via ${path}: ${j.error}`);
+              showLockedPanel(j.error);
+            } else if(j.error && String(j.error).toLowerCase().includes('replay')){
               if(j.current) { currentReqToken=j.current; GMSet('bnc_req_token', currentReqToken); logInfo(`replay sync token → ${String(currentReqToken).slice(0,4)}…`); }
               else if(j.new_req_token) storeSession(j);
               if(!retried){
@@ -182,9 +199,9 @@
     lastWelcomeAt = now; GMSet('bnc_welcome_at', now);
     // delay to let toastReady load
     setTimeout(()=>{
-      if(isGuest) showToast('BuildNow Companion — Guest mode', false);
-      else if(sessionId) showToast(`BuildNow Companion — Linked${discordUsername? ' as '+discordUsername:''}`, false);
-      else showToast('BuildNow Companion — Ready', false);
+      if(sessionId) showToast(`BuildNow Companion — Linked${discordUsername? ' as '+discordUsername:''}`, false);
+      else if(loginToken) showToast('BuildNow Companion — Ready', false);
+      else showToast('BuildNow Companion — Login required', true);
     }, 900);
   }
   // fire welcome once per load
@@ -211,8 +228,38 @@
       setTimeout(()=>{ if(!toastReady){ toastReady=true; toastLoading=false; doShow(); } },2000);
     }catch{ toastReady=true; toastLoading=false; doShow(); }
   }
+  function showLockedPanel(reason){
+    if(document.getElementById('bnc-locked')) return;
+    const wrap=document.createElement('div');
+    wrap.id='bnc-locked';
+    Object.assign(wrap.style,{position:'fixed',inset:'0',zIndex:'2147483647',background:'rgba(0,0,0,0.82)',display:'flex',alignItems:'center',justifyContent:'center',padding:'24px',fontFamily:'Inter, system-ui, sans-serif'});
+    const card=document.createElement('div');
+    Object.assign(card.style,{background:'#0a0a0a',border:'1px solid #991b1b',borderRadius:'14px',padding:'28px',width:'420px',textAlign:'center',boxShadow:'0 8px 32px rgba(239,68,68,0.25)'});
+    card.innerHTML = `<div style="font-size:44px;margin-bottom:8px">🔒</div><div style="font-size:18px;font-weight:800;color:#fff;margin-bottom:6px">Account locked</div><div style="font-size:13px;color:#fca5a5;margin-bottom:6px;word-break:break-word">${String(reason||'Token reuse or sharing detected — friend account use is blocked.').replace(/</g,'&lt;')}</div><div style="font-size:12px;color:#9ca3af;margin-bottom:16px">Use <b style=\"color:#fff\">/unlock</b> in Discord or ask an admin. Disable the tracker to play normally.</div><div style="display:flex;gap:8px;justify-content:center"><button id="bnc-locked-disable" style="flex:1;height:40px;border:0;border-radius:8px;background:#fff;color:#000;font-weight:700;cursor:pointer">Disable & Reload</button><button id="bnc-locked-retry" style="flex:1;height:40px;border:1px solid #374151;border-radius:8px;background:#1f2937;color:#e5e7eb;font-weight:600;cursor:pointer">Retry</button></div><div style="margin-top:10px;font-size:11px;color:#6b7280">BNC is disabled while locked — no capture or API calls.</div>`;
+    wrap.appendChild(card);
+    // block game input
+    wrap.addEventListener('click', e=> e.stopPropagation());
+    wrap.addEventListener('keydown', e=> e.stopPropagation(), true);
+    // freeze capture
+    try{ queue=[]; flushTimer=null; }catch{}
+    (document.body||document.documentElement).appendChild(wrap);
+    // prevent game hotkeys
+    const blocker=(e)=>{ e.stopPropagation(); if(e.stopImmediatePropagation) e.stopImmediatePropagation(); };
+    ['keydown','keyup','keypress'].forEach(ev=> window.addEventListener(ev, blocker, true));
+    document.getElementById('bnc-locked-disable').onclick=()=>{
+      GMSet('bnc_disabled', true);
+      try{ GMDel('bnc_session_id'); GMDel('bnc_req_token'); }catch{}
+      showToast('BNC disabled — reload to play normally', false);
+      setTimeout(()=>{ try{ window.top.location.reload(); }catch{ location.reload(); } }, 600);
+    };
+    document.getElementById('bnc-locked-retry').onclick=()=>{
+      wrap.remove();
+      ['keydown','keyup','keypress'].forEach(ev=> window.removeEventListener(ev, blocker, true));
+      location.reload();
+    };
+  }
   function showTokenPrompt(){
-    if (loginToken || isGuest) return;
+    if (loginToken || sessionId) return;
     const old=document.getElementById('bnc-login-wrap'); if(old) old.remove();
 
     const wrap=document.createElement('div');
@@ -247,20 +294,25 @@
     submitBtn.textContent='Link';
     Object.assign(submitBtn.style,{flex:'1',height:'42px',border:'0',borderRadius:'8px',background:'#000',color:'#fff',cursor:'pointer',fontSize:'14px',fontWeight:'600'});
 
-    const skipBtn=document.createElement('button');
-    skipBtn.textContent='Guest';
-    Object.assign(skipBtn.style,{flex:'1',height:'42px',border:'1px solid rgba(0,0,0,0.1)',borderRadius:'8px',background:'#fff',cursor:'pointer',fontSize:'14px',fontWeight:'500'});
+    const disableBtn=document.createElement('button');
+    disableBtn.textContent='Disable';
+    Object.assign(disableBtn.style,{flex:'1',height:'42px',border:'1px solid rgba(0,0,0,0.1)',borderRadius:'8px',background:'#fff',cursor:'pointer',fontSize:'14px',fontWeight:'500'});
+    disableBtn.title='Disable tracker and play normally';
 
     const msg=document.createElement('div');
     Object.assign(msg.style,{marginTop:'12px',fontSize:'13px',color:'rgba(0,0,0,0.64)',minHeight:'18px'});
+    const hint=document.createElement('div');
+    hint.innerHTML='No token? Disable the userscript in Tampermonkey to play normally.';
+    Object.assign(hint.style,{marginTop:'8px',fontSize:'11px',color:'#6b7280',textAlign:'center'});
 
     btnRow.appendChild(submitBtn);
-    btnRow.appendChild(skipBtn);
+    btnRow.appendChild(disableBtn);
     card.appendChild(title);
     card.appendChild(sub);
     card.appendChild(input);
     card.appendChild(btnRow);
     card.appendChild(msg);
+    card.appendChild(hint);
     wrap.appendChild(card);
     (document.body||document.documentElement).appendChild(wrap);
 
@@ -335,15 +387,17 @@
       submitBtn.style.opacity='0.6';
       msg.textContent='Checking…';
       apiPost('/api/validate-token', {token: tok}, (ok, txt)=>{
+        let lockedReason=''; try{ lockedReason=JSON.parse(txt||'{}').error||''; }catch{}
+        if(!ok && String(lockedReason).toLowerCase().includes('locked')){ document.removeEventListener('keydown', escHandler, true); closeModal(); showLockedPanel(lockedReason); return; }
         if(!ok){ msg.textContent='Token incorrect — try again'; submitBtn.textContent='Link'; submitBtn.style.opacity='1'; linking=false; showToast('Token incorrect',true); return; }
         try{
           const j=JSON.parse(txt);
           if(j.discord_username) GMSet('bnc_discord_username', j.discord_username);
           if(j.game_username) GMSet('bnc_game_username', j.game_username);
           if(j.session_id || j.initial_token) storeSession(j);
-          else { GMSet('bnc_token', tok); GMSet('bnc_guest', false); loginToken=tok; }
+          else { GMSet('bnc_token', tok); loginToken=tok; }
         }catch{
-          GMSet('bnc_token', tok); GMSet('bnc_guest', false); loginToken=tok;
+          GMSet('bnc_token', tok); loginToken=tok;
         }
         document.removeEventListener('keydown', escHandler, true);
         closeModal();
@@ -352,7 +406,12 @@
       });
     };
 
-    skipBtn.onclick=()=>{ GMSet('bnc_guest',true); isGuest=true; document.removeEventListener('keydown', escHandler, true); closeModal(); showToast('Playing as guest',false); };
+    disableBtn.onclick=()=>{
+      GMSet('bnc_disabled', true);
+      document.removeEventListener('keydown', escHandler, true); closeModal();
+      showToast('BNC disabled — reload to play normally', false);
+      setTimeout(()=>{ try{ window.top.location.reload(); }catch{ location.reload(); } }, 500);
+    };
     submitBtn.onclick=doSubmit;
     // Enter submits, Backspace/Delete must work — handled by guard not blocking default
     input.addEventListener('keydown',(e)=>{
@@ -370,10 +429,10 @@
 
     setTimeout(()=>{ try{ input.focus(); input.select(); }catch{} },80);
   }
-  if (!loginToken && !isGuest && !sessionId) {
+  if (!loginToken && !sessionId) {
     if (document.readyState==='loading') document.addEventListener('DOMContentLoaded', showTokenPrompt, {once:true});
     else setTimeout(showTokenPrompt, 600);
-    setTimeout(()=>{ if(!loginToken && !isGuest && !sessionId && !document.getElementById('bnc-login-wrap')) showTokenPrompt(); }, 1500);
+    setTimeout(()=>{ if(!loginToken && !sessionId && !document.getElementById('bnc-login-wrap')) showTokenPrompt(); }, 1500);
   }
 
   // --- Packet sender only ---
@@ -742,9 +801,10 @@
   let lastCaptureBlockedLog=0;
 
   function enqueue(dir, bytes, url){
+    if(isLocked) return;
     if(!bytes||!bytes.length) return;
-    if(isGuest || !sessionId || !currentReqToken){
-      if(Date.now()-lastCaptureBlockedLog>5000){ lastCaptureBlockedLog=Date.now(); logInfo('capture skipped — no session'); feedLog('skip', {reason:'no session', dir}); }
+    if(!sessionId || !currentReqToken){
+      if(Date.now()-lastCaptureBlockedLog>5000){ lastCaptureBlockedLog=Date.now(); logInfo('capture skipped — no session (login required)'); }
       return;
     }
     const isEssential = isEssentialBytes(bytes);
@@ -773,8 +833,9 @@
   function ensureHex(rec){ if(rec.rawHex) return rec.rawHex; try{ rec.rawHex=hexOf(rec._bytes); delete rec._bytes; }catch{ rec.rawHex=''; } return rec.rawHex; }
   function scheduleFlush(){ if(flushTimer) return; if(queue.length>=BATCH_MAX) flush(); else flushTimer=setTimeout(flush, FLUSH_MS); }
   function flush(){
+    if(isLocked) { flushTimer=null; queue=[]; return; }
     if(!queue.length){ flushTimer=null; return; }
-    if(isGuest || !sessionId || !currentReqToken){ flushTimer=null; queue=[]; return; }
+    if(!sessionId || !currentReqToken){ flushTimer=null; queue=[]; return; }
     if(flushInFlight){ if(!flushTimer) flushTimer=setTimeout(flush, FLUSH_MS); return; }
     flushTimer=null;
     const batch=queue.splice(0,BATCH_MAX);
@@ -831,6 +892,13 @@
         }catch(e){ feedLog('decrypted', {err:e.message}); }
         feedLog('sent', {count:batch.length, ok:true});
       } else {
+        const lower = String(txt).toLowerCase();
+        if(lower.includes('locked') || lower.includes('account locked')){
+          isLocked = true; queue=[]; flushTimer=null;
+          logErr(`account locked — blocking game ${String(txt).slice(0,120)}`);
+          showLockedPanel(String(txt).includes('locked') ? 'Account locked' : txt);
+          return;
+        }
         logErr(`capture failed — requeue ${batch.length} txt=${String(txt).slice(0,120)}`);
         feedLog('err', {count:batch.length, ok:false, txt:String(txt).slice(0,120)});
         if(String(txt).includes('Invalid req_token') || String(txt).includes('expired')){
