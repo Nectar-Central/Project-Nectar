@@ -11,6 +11,7 @@ except: pass
 from discord import app_commands
 from discord.ext import commands
 import database as db
+import formatters as fmt
 try:
     import aiohttp
 except: aiohttp = None
@@ -272,7 +273,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 async def token_cmd(interaction: discord.Interaction):
     row = await db.get_by_discord(str(interaction.user.id))
     if not row: return await interaction.response.send_message("Not registered. Use /register first.", ephemeral=True)
-    await interaction.response.send_message(f"Your token: **{row['token']}**", ephemeral=True)
+    await interaction.response.send_message(f"Your token: {fmt.censor_token(row.get('token'))}", ephemeral=True)
 
 @bot.tree.command(name="refresh-token", description="Generate a new login token (old one stays valid for 5 min)")
 async def refresh_token_cmd(interaction: discord.Interaction):
@@ -334,7 +335,6 @@ async def unregister_cmd(interaction: discord.Interaction):
 async def info_cmd(interaction: discord.Interaction):
     row = await db.get_by_discord(str(interaction.user.id))
     if not row: return await interaction.response.send_message("Not registered.")
-    # Prefer Engine live data if available (view.me is authoritative, DB is synced by processor)
     live_me = None
     try:
         sid = await get_active_session(str(interaction.user.id))
@@ -343,22 +343,21 @@ async def info_cmd(interaction: discord.Interaction):
             live_me = st.get("me")
     except: pass
     game_username = (live_me.get("username") if live_me else None) or row.get("game_username") or "-"
-    game_id = (live_me.get("game_id") if live_me else None) or row.get("game_id") or "-"
     skin_val = (live_me.get("skin") if live_me else None) or row.get("skin")
     pickaxe_val = (live_me.get("pickaxe") if live_me else None) or row.get("pickaxe") or "-"
-    gm_val = (st.get("game_mode") if 'st' in locals() and st else None) or row.get("game_mode") or "-"
-    skin_url = f"https://buildnow-api.netlify.app/skins/{skin_val}.png" if skin_val else None
+    gm_raw = (st.get("game_mode") if 'st' in locals() and st else None) or row.get("game_mode") or None
+    gm_val = fmt.format_game_mode(gm_raw)
+    thumb = fmt.skin_url(skin_val)
     e = discord.Embed(title="Your BuildNow Link", color=0x7c3aed)
-    if skin_url: e.set_thumbnail(url=skin_url)
-    e.add_field(name="Discord", value=row["discord_username"])
-    e.add_field(name="Token", value=f"`{row['token']}`")
-    e.add_field(name="Game username", value=game_username)
-    e.add_field(name="Game ID", value=game_id)
-    e.add_field(name="Skin", value=f"[{skin_val}]({skin_url})" if skin_url else "-")
-    e.add_field(name="Pickaxe", value=pickaxe_val)
-    e.add_field(name="Game mode", value=gm_val)
-    if live_me:
-        e.set_footer(text="Live from Engine • DB synced")
+    if thumb: e.set_thumbnail(url=thumb)
+    e.add_field(name="Discord", value=row["discord_username"], inline=True)
+    e.add_field(name="Token", value=fmt.censor_token(row.get("token")), inline=True)
+    e.add_field(name="Game username", value=game_username, inline=True)
+    if skin_val:
+        e.add_field(name="Skin", value=fmt.skin_display(skin_val), inline=True)
+    if pickaxe_val and pickaxe_val != "-":
+        e.add_field(name="Pickaxe", value=fmt.format_skin_name(pickaxe_val), inline=True)
+    e.add_field(name="Game mode", value=gm_val, inline=True)
     await interaction.response.send_message(embed=e)
 
 @bot.tree.command(name="stats", description="Show your BuildNow stats")
@@ -368,7 +367,6 @@ async def stats_cmd(interaction: discord.Interaction, user: discord.User = None)
     if not row: return await interaction.response.send_message(f"No data for {target.mention}. They need /register.")
     import json as _json
     pp = _json.loads(row["playtime_per_gm"] or "{}")
-    # Merge live username/skin from Engine if available (processor syncs DB, but engine is fresher)
     try:
         sid = await get_active_session(str(target.id))
         st = await get_session_state(sid) if sid else None
@@ -379,19 +377,20 @@ async def stats_cmd(interaction: discord.Interaction, user: discord.User = None)
             if live_me.get("skin"):
                 row["skin"] = live_me.get("skin")
     except: pass
-    skin_url = f"https://buildnow-api.netlify.app/skins/{row['skin']}.png" if row.get("skin") else None
+    thumb = fmt.skin_url(row.get("skin"))
     e = discord.Embed(title=f"Stats — {row['discord_username']}", color=0x06b6d4)
-    if skin_url: e.set_thumbnail(url=skin_url)
-    e.add_field(name="Kills", value=str(row["kills"]))
-    e.add_field(name="Deaths", value=str(row["deaths"]))
-    e.add_field(name="Wins", value=str(row["wins"]))
-    e.add_field(name="Defeats", value=str(row["defeats"]))
-    e.add_field(name="Playtime global", value=f"{row['playtime_global']//60}m {row['playtime_global']%60}s")
-    per = "\n".join(f"{k}: {v//60}m" for k,v in pp.items()) or "-"
-    e.add_field(name="Per mode", value=per, inline=False)
-    e.add_field(name="Game username", value=row["game_username"] or "-")
+    if thumb: e.set_thumbnail(url=thumb)
+    e.add_field(name="Kills", value=str(row["kills"]), inline=True)
+    e.add_field(name="Deaths", value=str(row["deaths"]), inline=True)
+    e.add_field(name="Wins", value=str(row["wins"]), inline=True)
+    e.add_field(name="Defeats", value=str(row["defeats"]), inline=True)
+    e.add_field(name="Playtime", value=fmt.format_playtime(row.get("playtime_global") or 0), inline=True)
+    per = fmt.format_playtime_per_mode(pp)
+    e.add_field(name="Per mode", value=per[:1024] or "—", inline=False)
+    if row.get("game_username"):
+        e.add_field(name="Game username", value=row["game_username"], inline=True)
     if row.get("game_mode"):
-        e.add_field(name="Game mode", value=row["game_mode"], inline=True)
+        e.add_field(name="Game mode", value=fmt.format_game_mode(row["game_mode"]), inline=True)
     await interaction.response.send_message(embed=e)
 
 @bot.tree.command(name="currentmatch", description="Show current match info (mode, players, kills, zone, alive/dead)")
@@ -630,11 +629,11 @@ async def skin_cmd(interaction: discord.Interaction, user: discord.User = None):
 
     if not skin:
         return await interaction.response.send_message(f"No skin found for {target.mention}. Play a match so it gets captured.", ephemeral=True)
-    skin_url = f"https://buildnow-api.netlify.app/skins/{skin}.png"
-    embed = discord.Embed(title=f"Skin — {target.display_name}", color=0x7c3aed)
-    embed.set_image(url=skin_url)
-    embed.add_field(name="Skin ID", value=f"`{skin}`", inline=True)
-    embed.add_field(name="Preview", value=f"[Open]({skin_url})", inline=True)
+    url = fmt.skin_url(skin)
+    name = fmt.format_skin_name(skin)
+    embed = discord.Embed(title=f"Skin — {target.display_name}", color=0x7c3aed, description=f"**{name}**")
+    embed.set_image(url=url)
+    embed.add_field(name="Preview", value=f"[Open]({url})", inline=True)
     await interaction.response.send_message(embed=embed)
 
 
