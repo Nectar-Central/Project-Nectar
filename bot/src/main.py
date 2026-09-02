@@ -84,24 +84,24 @@ def save_registered_player(discord_id: int, username: str, display_name: str, ga
           raise RuntimeError(f"Supabase request failed: {exc.reason}") from exc
 
 
-    @tree.command(name="register", description="Create or update your Nectar player profile")
-    @app_commands.describe(game_handle="Your in-game handle")
-    async def register(interaction: discord.Interaction, game_handle: app_commands.Range[str, 1, 32]):
-      clean_handle = str(game_handle).strip()
-      if not clean_handle:
-          return await interaction.response.send_message("Please provide a valid game handle.", ephemeral=True)
-      await interaction.response.defer(ephemeral=True)
-      user = interaction.user
-      display_name = getattr(user, "global_name", None) or user.display_name
-      try:
-          await asyncio.to_thread(save_registered_player, user.id, user.name, display_name, clean_handle, user.display_avatar.url)
-      except Exception as exc:
-          print(f"Registration failed for {user.id}: {exc}")
-          return await interaction.followup.send("I could not save your profile yet. Please try again in a moment.", ephemeral=True)
-      await interaction.followup.send(f"Registered {display_name} with game handle {clean_handle}. Your profile is live.", ephemeral=True)
+@tree.command(name="register", description="Create or update your Nectar player profile")
+@app_commands.describe(game_handle="Your in-game handle")
+async def register(interaction: discord.Interaction, game_handle: app_commands.Range[str, 1, 32]):
+    clean_handle = str(game_handle).strip()
+    if not clean_handle:
+        return await interaction.response.send_message("Please provide a valid game handle.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    user = interaction.user
+    display_name = getattr(user, "global_name", None) or user.display_name
+    try:
+        await asyncio.to_thread(save_registered_player, user.id, user.name, display_name, clean_handle, user.display_avatar.url)
+    except Exception as exc:
+        print(f"Registration failed for {user.id}: {exc}")
+        return await interaction.followup.send("I could not save your profile yet. Please try again in a moment.", ephemeral=True)
+    await interaction.followup.send(f"Registered {display_name} with game handle {clean_handle}. Your profile is live.", ephemeral=True)
 
 
-    @tree.command(name="ping", description="Check if the bot is online")
+@tree.command(name="ping", description="Check if the bot is online")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("🏓 Pong!")
 
