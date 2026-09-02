@@ -1,6 +1,10 @@
 import json
 import os
+import asyncio
 import random
+from datetime import datetime, timezone
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import discord
 from discord import app_commands
@@ -9,9 +13,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN = os.getenv("DISCORD_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
+GUILD_ID = os.getenv("DISCORD_GUILD_ID")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is missing from the .env file")
+    raise RuntimeError("DISCORD_TOKEN or DISCORD_BOT_TOKEN is missing")
 
 
 intents = discord.Intents.default()
@@ -40,12 +47,61 @@ warnings = load_warnings()
 
 @bot.event
 async def on_ready():
-    await tree.sync()
+    if GUILD_ID and GUILD_ID.isdigit():
+        await tree.sync(guild=discord.Object(id=int(GUILD_ID)))
+        print(f"Synced commands to guild {GUILD_ID}")
+    else:
+        await tree.sync()
     print(f"Logged in as {bot.user}")
     print("Nectar Central is online!")
 
 
-@tree.command(name="ping", description="Check if the bot is online")
+def save_registered_player(discord_id: int, username: str, display_name: str, game_handle: str, avatar_url: str):
+      if not SUPABASE_URL or not SUPABASE_KEY:
+          raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing")
+      payload = {
+          "id": str(discord_id),
+          "username": username,
+          "display_name": display_name,
+          "game_handle": game_handle,
+          "avatar_url": avatar_url,
+          "updated_at": datetime.now(timezone.utc).isoformat(),
+      }
+      request = Request(
+          f"{SUPABASE_URL}/rest/v1/players?on_conflict=id",
+          data=json.dumps(payload).encode("utf-8"),
+          headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal"},
+          method="POST",
+      )
+      try:
+          with urlopen(request, timeout=10) as response:
+              if response.status not in (200, 201, 204):
+                  raise RuntimeError(f"Supabase returned HTTP {response.status}")
+      except HTTPError as exc:
+          details = exc.read().decode("utf-8", errors="replace")[:300]
+          raise RuntimeError(f"Supabase returned HTTP {exc.code}: {details}") from exc
+      except URLError as exc:
+          raise RuntimeError(f"Supabase request failed: {exc.reason}") from exc
+
+
+    @tree.command(name="register", description="Create or update your Nectar player profile")
+    @app_commands.describe(game_handle="Your in-game handle")
+    async def register(interaction: discord.Interaction, game_handle: app_commands.Range[str, 1, 32]):
+      clean_handle = str(game_handle).strip()
+      if not clean_handle:
+          return await interaction.response.send_message("Please provide a valid game handle.", ephemeral=True)
+      await interaction.response.defer(ephemeral=True)
+      user = interaction.user
+      display_name = getattr(user, "global_name", None) or user.display_name
+      try:
+          await asyncio.to_thread(save_registered_player, user.id, user.name, display_name, clean_handle, user.display_avatar.url)
+      except Exception as exc:
+          print(f"Registration failed for {user.id}: {exc}")
+          return await interaction.followup.send("I could not save your profile yet. Please try again in a moment.", ephemeral=True)
+      await interaction.followup.send(f"Registered {display_name} with game handle {clean_handle}. Your profile is live.", ephemeral=True)
+
+
+    @tree.command(name="ping", description="Check if the bot is online")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("🏓 Pong!")
 
