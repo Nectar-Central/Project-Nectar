@@ -238,8 +238,50 @@ async def process_batch(
                             log_sys(f"PROCESSOR DEATH by {instigator} session={session_id[:8]} deaths {user.get('deaths',0)}->{new_deaths}")
                             user["deaths"] = new_deaths
 
+            # --- Join events (new player joined room) — persist so lobby history is visible ---
+            if is_join or pkt_type in ("join", "JOIN", "Join", "create_room", "join_room", "join_random_room"):
+                joiner = player_name or instigator or pkt.get("player_name") if isinstance(pkt, dict) else getattr(pkt, "player_name", None)
+                # _extract_fields already gave player_name for join; fallback to instigator
+                joiner = joiner or player_name or instigator
+                if joiner and pkt_type in ("join", "JOIN", "Join", "create_room", "join_room", "join_random_room"):
+                    # Deduplicate: only if joiner not already inserted in last batch for same room
+                    try:
+                        supabase.table("bngc_game_events").insert({
+                            "discord_id": discord_id,
+                            "session_id": session_id,
+                            "event_type": "join",
+                            "event_data": {
+                                "gm": eff_gm,
+                                "player": joiner,
+                                "player_name": joiner,
+                                "room_id": pkt_room_id,
+                                "code": pkt_short,
+                                "short_code": pkt_short,
+                                "match_version": pkt_match_ver,
+                            },
+                        }).execute()
+                        # Also as killfeed joined for replay visibility
+                        supabase.table("bngc_game_events").insert({
+                            "discord_id": discord_id,
+                            "session_id": session_id,
+                            "event_type": "killfeed",
+                            "event_data": {
+                                "gm": eff_gm,
+                                "instigator": joiner,
+                                "instigated": None,
+                                "kill_type": "joined",
+                                "room_id": pkt_room_id,
+                                "code": pkt_short,
+                                "short_code": pkt_short,
+                                "match_version": pkt_match_ver,
+                            },
+                        }).execute()
+                        log_sys(f"PROCESSOR JOIN {joiner} session={session_id[:8]} gm={eff_gm} room={str(pkt_room_id or '')[:8]}")
+                    except Exception as exc_j:
+                        log_err(f"processor join write failed {joiner}: {exc_j}")
+
             # --- Leave events (from packet.is_leave or leave type) ---
-            elif is_leave or pkt_type in ("leave", "LEAVE", "Leave"):
+            if is_leave or pkt_type in ("leave", "LEAVE", "Leave"):
                 leaver = player_name or instigator
                 if leaver:
                     supabase.table("bngc_game_events").insert({
@@ -257,6 +299,23 @@ async def process_batch(
                         },
                         
                     }).execute()
+                    # Also as discrete leave event
+                    try:
+                        supabase.table("bngc_game_events").insert({
+                            "discord_id": discord_id,
+                            "session_id": session_id,
+                            "event_type": "leave",
+                            "event_data": {
+                                "gm": eff_gm,
+                                "player": leaver,
+                                "player_name": leaver,
+                                "room_id": pkt_room_id,
+                                "code": pkt_short,
+                                "match_version": pkt_match_ver,
+                            },
+                        }).execute()
+                    except Exception:
+                        pass
                     log_sys(f"PROCESSOR LEAVE {leaver} session={session_id[:8]} gm={eff_gm}")
 
             # --- Zone phase changes (compare to last seen) ---

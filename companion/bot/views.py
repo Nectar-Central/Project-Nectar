@@ -139,6 +139,8 @@ def killfeed_lines_for_events(events: list[dict], room_id: str | None = None) ->
             lines.append(f"`{ts}` {ig} knocked {ed}")
         elif kf_type == "left":
             lines.append(f"`{ts}` {ig} left")
+        elif kf_type == "joined":
+            lines.append(f"`{ts}` {ig} joined")
     return lines
 
 def replay_lines_for_events(events: list[dict], room_id: str | None = None) -> list[str]:
@@ -178,6 +180,8 @@ def replay_lines_for_events(events: list[dict], room_id: str | None = None) -> l
                 lines.append(f"`{ts}` {ig} knocked {ed}")
             elif kf_type == "left":
                 lines.append(f"`{ts}` {ig} left")
+            elif kf_type == "joined":
+                lines.append(f"`{ts}` {ig} joined")
         elif et == "zone_change":
             phase = gd.get("phase", "?")
             t = gd.get("time")
@@ -195,6 +199,12 @@ def replay_lines_for_events(events: list[dict], room_id: str | None = None) -> l
         elif et == "death":
             killer = gd.get("killer", "?")
             lines.append(f"`{ts}` You were eliminated by {killer}")
+        elif et == "join":
+            p = gd.get("player") or gd.get("player_name") or "?"
+            lines.append(f"`{ts}` {p} joined")
+        elif et == "leave":
+            p = gd.get("player") or gd.get("player_name") or "?"
+            lines.append(f"`{ts}` {p} left")
     return lines
 
 def paged_embed(title: str, lines: list[str], color: int, footer: str, page: int = 0, per_page: int = 12) -> discord.Embed:

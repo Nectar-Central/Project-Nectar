@@ -579,15 +579,20 @@
     if(!feedEnabled) return;
     if(feedPaused) return;
     const ts = new Date().toLocaleTimeString('en-GB', {hour12:false}) + '.' + String(Date.now()%1000).padStart(3,'0');
-    const color = {join:'#10b981', leave:'#f59e0b', killfeed:'#ef4444', zone:'#a855f7', alv:'#3b82f6', collect:'#7c3aed', capture:'#10b981', decrypted:'#38bdf8', hex:'#fbbf24', info:'#9ca3af', sent:'#10b981', err:'#ef4444', filtered:'#6b7280'}[evt] || '#9ca3af';
+    const color = {join:'#10b981', leave:'#f59e0b', killfeed:'#ef4444', zone:'#a855f7', stg:'#f97316', alv:'#3b82f6', collect:'#7c3aed', capture:'#10b981', decrypted:'#38bdf8', hex:'#fbbf24', info:'#9ca3af', sent:'#10b981', err:'#ef4444', filtered:'#6b7280'}[evt] || '#9ca3af';
     const fieldStr = Object.entries(fields).map(([k,v])=> {
-      if(k==='gpb' && typeof v==='object') return `${k}=${JSON.stringify(v).slice(0,140)}${JSON.stringify(v).length>140?'…':''}`;
-      if(k==='decrypted' && typeof v==='object') return `${k}=${JSON.stringify(v).slice(0,140)}…`;
-      return `${k}=${v}`;
+      // no truncation — full payload, but cap single field at 4000 chars to avoid DOM kill
+      let s;
+      if(typeof v==='object' && v!==null) s = JSON.stringify(v);
+      else s = String(v);
+      if(s.length>4000) s = s.slice(0,4000)+' …(+'+(s.length-4000)+' chars)';
+      // escape html
+      s = s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      return `${k}=${s}`;
     }).join(' ');
-    const line = `<div><span style="opacity:0.45">${ts}</span> <span style="color:${color};font-weight:700">${evt}</span> <span style="opacity:0.9">${fieldStr}</span></div>`;
+    const line = `<div style="white-space:pre-wrap;word-break:break-all"><span style="opacity:0.45">${ts}</span> <span style="color:${color};font-weight:700">${evt}</span> <span style="opacity:0.9">${fieldStr}</span></div>`;
     feedLines.push(line);
-    if(feedLines.length>70) feedLines.shift();
+    if(feedLines.length>300) feedLines.shift();
     const wasAtBottom = feedEl.scrollTop + feedEl.clientHeight >= feedEl.scrollHeight - 20;
     feedEl.innerHTML = feedLines.join('');
     if(wasAtBottom) feedEl.scrollTop = feedEl.scrollHeight;
@@ -786,7 +791,7 @@
           if(j.packets && j.packets.length){
             for(const p of j.packets){
               const dec = p.decrypted_hex || p.raw || {};
-              const gpbStr = dec ? JSON.stringify(dec).slice(0,180) : '';
+              // full decrypted payload — no truncation
               const fields = {packet:p.packet || p.packet_type, seq:p.seq, dir:p.dir, human:p.human || ''};
               if(p.killer || p.victim) { fields.killer=p.killer; fields.victim=p.victim; }
               if(p.player_name) fields.player=p.player_name;
@@ -794,9 +799,23 @@
               if(p.zone_phase!=null) fields.zone_phase=p.zone_phase;
               if(p.short_code) fields.code=p.short_code;
               if(p.room_gm) fields.gm=p.room_gm;
-              if(gpbStr) fields.gpb = gpbStr + (JSON.stringify(dec).length>180 ? '…' : '');
+              if(p.room_id) fields.room_id=p.room_id.slice(0,12);
+              if(p.match_version!=null) fields.ver=p.match_version;
+              // stG change — explicit log (full props, no truncation)
+              try{
+                const stg = dec && (dec.properties ? dec.properties.stG : dec.stG);
+                const lastStg = p._lastStg !== undefined ? p._lastStg : null;
+                if(stg!=null) fields.stG = stg;
+                // engine already updates last_stg; we also emit dedicated stg line when present
+                if(dec && dec.properties && 'stG' in dec.properties){
+                  feedLog('stg', {seq:p.seq, stG: dec.properties.stG, gm: p.room_gm || p.game_mode || '', room: (p.room_id||'').slice(0,8), curScn: p.cur_scn || '', human: p.human || '', full: dec.properties});
+                }
+              }catch{}
+              // full gpb — no slice
+              if(dec && Object.keys(dec).length) fields.gpb = dec;
+              // full hex — no truncation
               feedLog('decrypted', fields);
-              feedLog('hex', {seq:p.seq, hex:(p.rawHex||'').slice(0,24)+'..'});
+              feedLog('hex', {seq:p.seq, hex:p.rawHex||''});
               // Ranked HUD: only show when joining private room with short_code (5-char code) — not every packet
               if(p.short_code && /^[A-Z0-9]{5}$/i.test(String(p.short_code))){ showRankedHUD(String(p.short_code).toUpperCase()); }
               else if(p.room_gm && String(p.room_gm).toLowerCase().includes('ranked') && p.short_code){ showRankedHUD(String(p.short_code).toUpperCase()); }
