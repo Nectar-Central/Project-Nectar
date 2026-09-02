@@ -19,6 +19,22 @@ from __future__ import annotations
 
 from server.lib.supabase_client import supabase, db
 from server.lib.logger import log_sys, log_err
+from server.lib.gpbinary import _strip_color_tags
+
+def _norm_name(n: str | None) -> str:
+    if not n:
+        return ""
+    # effective color tag parse — use same as gpbinary for truncated tags, hex colors, etc.
+    s = _strip_color_tags(str(n)).strip()
+    # game username comparison — strip dc: prefix if present so "dc: cis6led" matches killfeed "cis6led"
+    if s.lower().startswith("dc:"):
+        s = s[3:].strip()
+    return s
+def _names_equal(a, b) -> bool:
+    na = _norm_name(a)
+    nb = _norm_name(b)
+    # game username comparison without color tags — case-sensitive as stored, but allow case-insensitive fallback
+    return bool(na and nb and na == nb) or bool(na and nb and na.lower() == nb.lower())
 
 # For type hints only — not imported at runtime to avoid cycle
 from typing import TYPE_CHECKING
@@ -127,6 +143,8 @@ async def process_batch(
         return
 
     log_sys(f"PROCESSOR user={discord_id[:6]} kills={user.get('kills',0)} deaths={user.get('deaths',0)} wins={user.get('wins',0)}")
+    # dedup for deaths via alv+killfeed per match_version (if one misses, other helps)
+    death_counted_for_match = set()
 
     me_name = view.me.username if view.me else None
     gm_val = view.game_mode.value if view.game_mode else None
@@ -212,7 +230,7 @@ async def process_batch(
 
                     # Self-specific kill/death for bngc_users stat tracking
                     if me_name:
-                        if instigator == me_name:
+                        if _names_equal(instigator, me_name):
                             new_kills = (user.get("kills") or 0) + 1
                             supabase.table("bngc_users").update({"kills": new_kills}).eq("discord_id", discord_id).execute()
                             supabase.table("bngc_game_events").insert({
@@ -222,21 +240,26 @@ async def process_batch(
                                 "event_data": {"gm": eff_gm, "victim": instigated, "room_id": pkt_room_id, "code": pkt_short, "match_version": pkt_match_ver},
                                 
                             }).execute()
-                            log_sys(f"PROCESSOR KILL by self gm={eff_gm} victim={instigated} session={session_id[:8]} kills {user.get('kills',0)}->{new_kills}")
+                            log_sys(f"PROCESSOR KILL by self gm={eff_gm} victim={instigated} session={session_id[:8]} kills {user.get('kills',0)}->{new_kills} via_norm {_norm_name(instigator)}=={_norm_name(me_name)}")
                             user["kills"] = new_kills
 
-                        elif instigated == me_name:
-                            new_deaths = (user.get("deaths") or 0) + 1
-                            supabase.table("bngc_users").update({"deaths": new_deaths}).eq("discord_id", discord_id).execute()
-                            supabase.table("bngc_game_events").insert({
-                                "discord_id": discord_id,
-                                "session_id": session_id,
-                                "event_type": "death",
-                                "event_data": {"gm": eff_gm, "killer": instigator, "room_id": pkt_room_id, "code": pkt_short, "match_version": pkt_match_ver},
-                                
-                            }).execute()
-                            log_sys(f"PROCESSOR DEATH by {instigator} session={session_id[:8]} deaths {user.get('deaths',0)}->{new_deaths}")
-                            user["deaths"] = new_deaths
+                        elif _names_equal(instigated, me_name):
+                            # death via killfeed + alv fallback — if one misses, other helps (dedup per match_version)
+                            dedup_key = (discord_id, pkt_match_ver if pkt_match_ver is not None else pkt_room_id)
+                            if dedup_key not in death_counted_for_match:
+                                new_deaths = (user.get("deaths") or 0) + 1
+                                supabase.table("bngc_users").update({"deaths": new_deaths}).eq("discord_id", discord_id).execute()
+                                supabase.table("bngc_game_events").insert({
+                                    "discord_id": discord_id,
+                                    "session_id": session_id,
+                                    "event_type": "death",
+                                    "event_data": {"gm": eff_gm, "killer": instigator, "via": "killfeed", "room_id": pkt_room_id, "code": pkt_short, "match_version": pkt_match_ver},
+                                }).execute()
+                                log_sys(f"PROCESSOR DEATH via killfeed self session={session_id[:8]} deaths {user.get('deaths',0)}->{new_deaths} killer={instigator}")
+                                user["deaths"] = new_deaths
+                                death_counted_for_match.add(dedup_key)
+                            else:
+                                log_sys(f"PROCESSOR DEATH via killfeed dedup skip already counted for {dedup_key}")
                             # Defeat fallback: kill victim is me while pcount>1 and no stG — alv may be missing
                             # Set defeat immediately even without alv=false, so we never miss a loss
                             try:
@@ -253,6 +276,49 @@ async def process_batch(
                                             room_obj.recent_kills.append(__import__("server.lib.photon_engine.models", fromlist=["KillInfo"]).KillInfo(instigator=instigator, instigated=me_name, event_type="defeat"))
                             except Exception as e_kd:
                                 log_err(f"processor defeat-via-kill failed {e_kd}")
+
+            # --- Death via alv (self elims not in killfeed) — per user use alv ===
+            if pkt_type in ("alive", "eliminated", "ALIVE", "ELIMINATED"):
+                try:
+                    # alv packet for self: is_alive false or is_eliminated true
+                    alv_is_alive = pkt.get("is_alive") if isinstance(pkt, dict) else getattr(pkt, "is_alive", None)
+                    alv_is_elim = pkt.get("is_eliminated") if isinstance(pkt, dict) else getattr(pkt, "is_eliminated", None)
+                    alv_player = pkt.get("player_name") or player_name or instigator
+                    # also try TargetActorNr mapping via room's player lookup if name missing
+                    if not alv_player and pkt_room_id and isinstance(pkt, dict) and pkt.get("is_alive") is False:
+                        # try to resolve via view's player map for this room
+                        try:
+                            _room_alv = view.rooms.get(pkt_room_id) if pkt_room_id else view.current_room
+                            if _room_alv and me_name:
+                                for _pp in _room_alv.players.values():
+                                    if _names_equal(_pp.username, me_name) and not _pp.is_alive:
+                                        alv_player = me_name
+                                        alv_is_alive = False
+                                        break
+                        except: pass
+                    is_dead_alv = (alv_is_alive is False) or bool(alv_is_elim)
+                    if is_dead_alv and me_name and alv_player and _names_equal(alv_player, me_name):
+                        dedup_key_alv = (discord_id, pkt_match_ver if pkt_match_ver is not None else pkt_room_id)
+                        if dedup_key_alv not in death_counted_for_match:
+                            room_obj_alv = view.rooms.get(pkt_room_id) if pkt_room_id else view.current_room
+                            if room_obj_alv and room_obj_alv.last_defeat_version != room_obj_alv.match_version:
+                                new_deaths_alv = (user.get("deaths") or 0) + 1
+                                supabase.table("bngc_users").update({"deaths": new_deaths_alv}).eq("discord_id", discord_id).execute()
+                                supabase.table("bngc_game_events").insert({
+                                    "discord_id": discord_id,
+                                    "session_id": session_id,
+                                    "event_type": "death",
+                                    "event_data": {"gm": eff_gm, "killer": None, "via": "alv", "room_id": pkt_room_id, "code": pkt_short, "match_version": pkt_match_ver},
+                                }).execute()
+                                log_sys(f"PROCESSOR DEATH via alv self session={session_id[:8]} deaths {user.get('deaths',0)}->{new_deaths_alv} alv_player={alv_player}")
+                                user["deaths"] = new_deaths_alv
+                                death_counted_for_match.add(dedup_key_alv)
+                            else:
+                                log_sys(f"PROCESSOR DEATH via alv dedup skip already defeated for {dedup_key_alv}")
+                        else:
+                            log_sys(f"PROCESSOR DEATH via alv dedup skip already counted for {dedup_key_alv}")
+                except Exception as e_alv:
+                    log_err(f"processor alv death failed {e_alv}")
 
             # --- Join events (new player joined room) — persist so lobby history is visible ---
             if is_join or pkt_type in ("join", "JOIN", "Join", "create_room", "join_room", "join_random_room"):
@@ -320,7 +386,7 @@ async def process_batch(
                     # Defeat via leave: did I leave / get kicked during MATCH with pcount>1
                     # Without alv=false, this is the only signal for early leave-loss
                     try:
-                        if leaver == me_name:
+                        if _names_equal(leaver, me_name):
                             gm_low_lv = str(eff_gm or "").lower()
                             if gm_low_lv and gm_low_lv != "df":
                                 room_obj2 = view.rooms.get(pkt_room_id) if pkt_room_id else None
@@ -422,27 +488,6 @@ async def process_batch(
                     room.last_win_version = -1  # mark drained
                     continue
 
-            # Fallback solo last alive for zw_lg/wwzw (if winner not set but players_count==1 and me alive)
-            # Guard: avoid early win when only 1 player ever seen and zero kills (mirror engine.py:798)
-            if gm_low_room in ("zw", "zw_lg", "wwzw", "ww", "wwzw") and room.state.value == "match":
-                if view.me and view.me.is_alive and room.players_count == 1:
-                    if len(room.players) <= 1 and len(room.recent_kills) == 0:
-                        pass  # early — not a real win
-                    else:
-                        only = next(iter(room.players.values()), None)
-                        if only and only.username == view.me.username and room.last_win_version != room.match_version:
-                            new_wins = (user.get("wins") or 0) + 1
-                            supabase.table("bngc_users").update({"wins": new_wins}).eq("discord_id", discord_id).execute()
-                            supabase.table("bngc_game_events").insert({
-                                "discord_id": discord_id,
-                                "session_id": session_id,
-                                "event_type": "win",
-                                "event_data": {"gm": gm, "room_id": room_id, "short_code": room.short_code, "match_version": room.match_version}, 
-                            }).execute()
-                            log_sys(f"PROCESSOR WIN gm={gm} room={room_id[:8]} session={session_id[:8]} wins {user.get('wins',0)}->{new_wins}")
-                            user["wins"] = new_wins
-                            room.last_win_version = room.match_version
-
             # Per-room defeat via RoomView.last_defeat_version (alv immediate, team elimination)
             for room_id2, room2 in view.rooms.items():
                 if room2.room_id == "lobby":
@@ -465,22 +510,6 @@ async def process_batch(
                         user["defeats"] = new_def
                         room2.last_defeat_version = -1
                     continue
-                # Fallback: if me is dead and room has multiple players, count once per room
-                if view.me and not view.me.is_alive and room2.players_count > 1 and room2.state.value == "match":
-                    # Check if this room is where me died (me in this room's players)
-                    if any(p.username == view.me.username for p in room2.players.values()):
-                        if room2.last_defeat_version != room2.match_version:
-                            new_def = (user.get("defeats") or 0) + 1
-                            supabase.table("bngc_users").update({"defeats": new_def}).eq("discord_id", discord_id).execute()
-                            supabase.table("bngc_game_events").insert({
-                                "discord_id": discord_id,
-                                "session_id": session_id,
-                                "event_type": "defeat",
-                                "event_data": {"gm": gm2, "room_id": room_id2, "short_code": room2.short_code, "match_version": room2.match_version}, 
-                            }).execute()
-                            log_sys(f"PROCESSOR DEFEAT gm={gm2} room={room_id2[:8]} session={session_id[:8]} defeats {user.get('defeats',0)}->{new_def}")
-                            user["defeats"] = new_def
-                            room2.last_defeat_version = room2.match_version
             # Competitive handling — private party with short_code, host is me (CreateRoom)
             try:
                 for room_id3, room3 in view.rooms.items():

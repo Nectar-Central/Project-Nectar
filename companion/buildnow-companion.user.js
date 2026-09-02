@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BuildNow Companion Live Capture (game-frame only)
 // @namespace    buildnow-companion.local
-// @version      2.8.1
-// @description  BuildNow Companion v2.8.1 — welcome back toast on first Authenticate, lobby music + volume.
+// @version      2.8.8
+// @description  BuildNow Companion v2.8.8 — audio logs, off-screen hidden audio fix.
 // @author       @cis6led
 // @match        https://buildnow-gg.game-files.crazygames.com/*
 // @all-frames   true
@@ -32,9 +32,9 @@
   const GMGet = (k,d=null)=>{ try{ return typeof GM_getValue!=='undefined'? GM_getValue(k,d) : d; }catch{ return d; } };
   const GMSet = (k,v)=>{ try{ if(typeof GM_setValue!=='undefined') GM_setValue(k,v); }catch{} };
   const GMDel = (k)=>{ try{ if(typeof GM_deleteValue!=='undefined') GM_deleteValue(k); else if(typeof GM_setValue!=='undefined') GM_setValue(k, undefined); }catch{} };
-  // Enforce login: if user sets bnc_disabled, script is inert — play normally
+  // Enforce login: if user sets bnc_disabled, script is inert - play normally
   if (GMGet('bnc_disabled', false)) {
-    console.log('%c[BNC] disabled — play normally (reenable via GMSet bnc_disabled false)', 'color:#6b7280');
+    console.log('%c[BNC] disabled - play normally (reenable via GMSet bnc_disabled false)', 'color:#6b7280');
     return;
   }
 
@@ -89,7 +89,7 @@
     try{ console.groupCollapsed(`%c[BNC] ${label}`, 'color:#7c3aed;font-weight:700'); fn(); console.groupEnd(); }catch{ fn(); }
   }
 
-  // session restore — login required, no guest capture
+  // session restore - login required, no guest capture
   if(sessionId && currentReqToken){
     logInfoEarly(`session restored ${String(sessionId).slice(0,8)}… counter=${reqCounter}`);
   } else if(loginToken){
@@ -100,7 +100,7 @@
           showLockedPanel(reason || 'Account locked', scope);
           return;
         }
-        cleanTokenStorage(); hasWelcomed=false; setTimeout(()=>{ showTokenPrompt(); showToast('Session expired — enter new token', true); }, 800);
+        cleanTokenStorage(); hasWelcomed=false; setTimeout(()=>{ showTokenPrompt(); showToast('Session expired - enter new token', true); }, 800);
       }
       else { try{ const j=JSON.parse(txt); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.session_id) storeSession(j); }catch{} }
     }), 600);
@@ -126,7 +126,7 @@
         body = { ...body, session_id: sessionId, discord_id: discordId, req_token: currentReqToken };
       }
     } else if(path!=='/api/validate-token' && !sessionId){
-      logErr(`apiPost ${path} skipped — no session`);
+      logErr(`apiPost ${path} skipped - no session`);
       try{cb(false,'no session');}catch{}
       apiBusy = false; setTimeout(processApiQueue, 10); return;
     }
@@ -159,14 +159,14 @@
               if(j.current) { currentReqToken=j.current; GMSet('bnc_req_token', currentReqToken); logInfo(`replay sync token → ${String(currentReqToken).slice(0,4)}…`); }
               else if(j.new_req_token) storeSession(j);
               if(!retried){
-                logInfo(`replay detected for ${path} — retry`);
+                logInfo(`replay detected for ${path} - retry`);
                 apiQueue.unshift({path, body: {...origBody, _retried:true}, cb, retried:true});
                 apiBusy = false; setTimeout(processApiQueue, 30); return;
               }
             }
             if(j.error && String(j.error).toLowerCase().includes('invalid')){
               if(j.current){ currentReqToken=j.current; GMSet('bnc_req_token', currentReqToken); logInfo(`mismatch sync token → ${String(currentReqToken).slice(0,4)}…`); if(!retried){ logInfo(`mismatch retry ${path}`); apiQueue.unshift({path, body: {...origBody, _retried:true}, cb, retried:true}); apiBusy=false; setTimeout(processApiQueue,30); return; } }
-              else { logErr(`req_token rejected — clearing session`); cleanTokenStorage(); }
+              else { logErr(`req_token rejected - clearing session`); cleanTokenStorage(); }
             }
           }catch{}
         }
@@ -200,9 +200,9 @@
     lastWelcomeAt = now; GMSet('bnc_welcome_at', now);
     // delay to let toastReady load
     setTimeout(()=>{
-      if(sessionId) showToast(`BuildNow Companion — Linked${discordUsername? ' as '+discordUsername:''}`, false);
-      else if(loginToken) showToast('BuildNow Companion — Ready', false);
-      else showToast('BuildNow Companion — Login required', true);
+      if(sessionId) showToast(`BuildNow Companion - Linked${discordUsername? ' as '+discordUsername:''}`, false);
+      else if(loginToken) showToast('BuildNow Companion - Ready', false);
+      else showToast('BuildNow Companion - Login required', true);
     }, 900);
   }
   // fire welcome once per load
@@ -233,13 +233,13 @@
     if(document.getElementById('bnc-locked')) return;
     const isAdmin = String(scope||'').toLowerCase()==='admin';
     const title = isAdmin ? 'Admin-locked' : 'Account locked';
-    const help = isAdmin ? 'This is an <b style="color:#fff">admin lock</b> — only an admin can run <b style="color:#fff">/adminunlock</b> on you. Disable the tracker to play normally.' : 'Use <b style="color:#fff">/unlock</b> in Discord or ask an admin. Disable the tracker to play normally.';
+    const help = isAdmin ? 'This is an <b style="color:#fff">admin lock</b> - only an admin can run <b style="color:#fff">/adminunlock</b> on you. Disable the tracker to play normally.' : 'Use <b style="color:#fff">/unlock</b> in Discord or ask an admin. Disable the tracker to play normally.';
     const wrap=document.createElement('div');
     wrap.id='bnc-locked';
     Object.assign(wrap.style,{position:'fixed',inset:'0',zIndex:'2147483647',background:'rgba(0,0,0,0.82)',display:'flex',alignItems:'center',justifyContent:'center',padding:'24px',fontFamily:'Inter, system-ui, sans-serif'});
     const card=document.createElement('div');
     Object.assign(card.style,{background:'#0a0a0a',border:'1px solid #991b1b',borderRadius:'14px',padding:'28px',width:'420px',textAlign:'center',boxShadow:'0 8px 32px rgba(239,68,68,0.25)'});
-    card.innerHTML = `<div style="font-size:44px;margin-bottom:8px">${isAdmin?'⛔':'🔒'}</div><div style="font-size:18px;font-weight:800;color:#fff;margin-bottom:6px">${title}</div><div style="font-size:13px;color:#fca5a5;margin-bottom:6px;word-break:break-word">${String(reason||'Token reuse or sharing detected — friend account use is blocked.').replace(/</g,'&lt;')}</div><div style="font-size:12px;color:#9ca3af;margin-bottom:16px">${help}</div><div style="display:flex;gap:8px;justify-content:center"><button id="bnc-locked-disable" style="flex:1;height:40px;border:0;border-radius:8px;background:#fff;color:#000;font-weight:700;cursor:pointer">Disable & Reload</button><button id="bnc-locked-retry" style="flex:1;height:40px;border:1px solid #374151;border-radius:8px;background:#1f2937;color:#e5e7eb;font-weight:600;cursor:pointer">Retry</button></div><div style="margin-top:10px;font-size:11px;color:#6b7280">BNC is disabled while locked — no capture or API calls.</div>`;
+    card.innerHTML = `<div style="font-size:44px;margin-bottom:8px">${isAdmin?'⛔':'🔒'}</div><div style="font-size:18px;font-weight:800;color:#fff;margin-bottom:6px">${title}</div><div style="font-size:13px;color:#fca5a5;margin-bottom:6px;word-break:break-word">${String(reason||'Token reuse or sharing detected - friend account use is blocked.').replace(/</g,'&lt;')}</div><div style="font-size:12px;color:#9ca3af;margin-bottom:16px">${help}</div><div style="display:flex;gap:8px;justify-content:center"><button id="bnc-locked-disable" style="flex:1;height:40px;border:0;border-radius:8px;background:#fff;color:#000;font-weight:700;cursor:pointer">Disable & Reload</button><button id="bnc-locked-retry" style="flex:1;height:40px;border:1px solid #374151;border-radius:8px;background:#1f2937;color:#e5e7eb;font-weight:600;cursor:pointer">Retry</button></div><div style="margin-top:10px;font-size:11px;color:#6b7280">BNC is disabled while locked - no capture or API calls.</div>`;
     wrap.appendChild(card);
     // block game input
     wrap.addEventListener('click', e=> e.stopPropagation());
@@ -253,7 +253,7 @@
     document.getElementById('bnc-locked-disable').onclick=()=>{
       GMSet('bnc_disabled', true);
       try{ GMDel('bnc_session_id'); GMDel('bnc_req_token'); }catch{}
-      showToast('BNC disabled — reload to play normally', false);
+      showToast('BNC disabled - reload to play normally', false);
       setTimeout(()=>{ try{ window.top.location.reload(); }catch{ location.reload(); } }, 600);
     };
     document.getElementById('bnc-locked-retry').onclick=()=>{
@@ -325,7 +325,7 @@
     // stopping propagation at the input element is too late (capture goes top-down).
     // We install a higher-priority guard on window/document in capture phase
     // that checks if focus/target is inside the modal and then kills the event
-    // before the game sees it. We do NOT preventDefault — let the input handle it.
+    // before the game sees it. We do NOT preventDefault - let the input handle it.
     const isInModal = (evTarget) => {
       const ae = document.activeElement;
       try {
@@ -342,7 +342,7 @@
       // allow Tab navigation inside modal, but block game from seeing the key
       e.stopPropagation();
       if (e.stopImmediatePropagation) e.stopImmediatePropagation();
-      // do not call preventDefault — input needs Backspace/Delete/Enter/Arrows
+      // do not call preventDefault - input needs Backspace/Delete/Enter/Arrows
     };
     const guardEvents = ['keydown','keyup','keypress','beforeinput','input','paste','cut','compositionstart','compositionupdate','compositionend'];
     const guardTargets = [window, document, document.documentElement];
@@ -374,7 +374,7 @@
     input.addEventListener('focus',()=>{ input.style.borderColor='#000'; });
     input.addEventListener('blur',()=>{ input.style.borderColor='rgba(0,0,0,0.15)'; });
 
-    // Backdrop click closes — but not input/card clicks
+    // Backdrop click closes - but not input/card clicks
     wrap.addEventListener('click',(e)=>{ if(e.target===wrap) closeModal(); });
     // Escape closes
     const escHandler = (e) => { if (e.key === 'Escape') closeModal(); };
@@ -393,7 +393,7 @@
       apiPost('/api/validate-token', {token: tok}, (ok, txt)=>{
           let lockedReason=''; let lockedScope='default'; try{ const _p=JSON.parse(txt||'{}'); lockedReason=_p.error||''; lockedScope=_p.lock_scope||(_p.is_admin_locked?'admin':'default'); }catch{}
         if(!ok && String(lockedReason).toLowerCase().includes('locked')){ document.removeEventListener('keydown', escHandler, true); closeModal(); showLockedPanel(lockedReason, lockedScope); return; }
-        if(!ok){ msg.textContent='Token incorrect — try again'; submitBtn.textContent='Link'; submitBtn.style.opacity='1'; linking=false; showToast('Token incorrect',true); return; }
+        if(!ok){ msg.textContent='Token incorrect - try again'; submitBtn.textContent='Link'; submitBtn.style.opacity='1'; linking=false; showToast('Token incorrect',true); return; }
         try{
           const j=JSON.parse(txt);
           if(j.discord_username) GMSet('bnc_discord_username', j.discord_username);
@@ -413,11 +413,11 @@
     disableBtn.onclick=()=>{
       GMSet('bnc_disabled', true);
       document.removeEventListener('keydown', escHandler, true); closeModal();
-      showToast('BNC disabled — reload to play normally', false);
+      showToast('BNC disabled - reload to play normally', false);
       setTimeout(()=>{ try{ window.top.location.reload(); }catch{ location.reload(); } }, 500);
     };
     submitBtn.onclick=doSubmit;
-    // Enter submits, Backspace/Delete must work — handled by guard not blocking default
+    // Enter submits, Backspace/Delete must work - handled by guard not blocking default
     input.addEventListener('keydown',(e)=>{
       if(e.key==='Enter'){ e.preventDefault(); doSubmit(); }
       // prevent game hotkeys while typing (Ctrl+Shift combos are handled globally, ignore here)
@@ -559,7 +559,7 @@
     reader.readAsText(file);
   }
 
-  // Hotkeys: Ctrl+Shift+C = toggle collect, etc — disable when modal/input focused
+  // Hotkeys: Ctrl+Shift+C = toggle collect, etc - disable when modal/input focused
   function isModalOrInputFocused(){
     const ae = document.activeElement;
     return !!(ae && (ae.id === 'bnc-token-field' || ae.closest && ae.closest('#bnc-login-wrap')) || document.getElementById('bnc-login-wrap')?.contains(ae));
@@ -602,7 +602,7 @@
     }
   }
 
-  // --- LOG FEED (bottom, passthrough + pause + decrypted hex) — dev only, hidden by default in v2 ---
+  // --- LOG FEED (bottom, passthrough + pause + decrypted hex) - dev only, hidden by default in v2 ---
   const DEV_MODE = !!GMGet('bnc_dev_mode', false);
   let feedEnabled = DEV_MODE && GMGet('bnc_feed_enabled', GMGet('bn_feed_enabled', false));
   let feedPaused = GMGet('bnc_feed_paused', GMGet('bn_feed_paused', false));
@@ -617,7 +617,7 @@
     display: 'flex', gap: '6px', padding: '2px 6px', background: 'rgba(0,0,0,0.92)', borderTop: '1px solid rgba(255,255,255,0.12)',
     fontFamily: 'monospace', fontSize: '10px', pointerEvents: 'auto'
   });
-  feedBar.innerHTML = `<span style="opacity:0.5">BNC feed — zone/stG/alv full</span><button id="bnc-feed-pause" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:0 6px;cursor:pointer">${feedPaused?'▶ Resume':'⏸ Pause'}</button><button id="bnc-feed-expand" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:0 6px;cursor:pointer">⤢ Expand</button><span style="opacity:0.5">Ctrl+Shift+F toggle · Ctrl+Shift+P pause · hover to scroll · drag top edge to resize</span>`;
+  feedBar.innerHTML = `<span style="opacity:0.5">BNC feed - zone/stG/alv full</span><button id="bnc-feed-pause" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:0 6px;cursor:pointer">${feedPaused?'▶ Resume':'⏸ Pause'}</button><button id="bnc-feed-expand" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:0 6px;cursor:pointer">⤢ Expand</button><span style="opacity:0.5">Ctrl+Shift+F toggle · Ctrl+Shift+P pause · hover to scroll · drag top edge to resize</span>`;
   const feedEl = document.createElement('div');
   feedEl.id = 'bnc-log-feed';
   Object.assign(feedEl.style, {
@@ -644,7 +644,7 @@
     const ts = new Date().toLocaleTimeString('en-GB', {hour12:false}) + '.' + String(Date.now()%1000).padStart(3,'0');
     const color = {join:'#10b981', leave:'#f59e0b', killfeed:'#ef4444', zone:'#a855f7', stg:'#f97316', alv:'#3b82f6', collect:'#7c3aed', capture:'#10b981', decrypted:'#38bdf8', hex:'#fbbf24', info:'#9ca3af', sent:'#10b981', err:'#ef4444', filtered:'#6b7280'}[evt] || '#9ca3af';
     const fieldStr = Object.entries(fields).map(([k,v])=> {
-      // zone: full dump (up to 12k) — wwzw spams multiple zone ticks with huge floats per phase, need full view
+      // zone: full dump (up to 12k) - wwzw spams multiple zone ticks with huge floats per phase, need full view
       const cap = (evt==='zone' || evt==='stg' || (evt==='decrypted' && fields.packet==='zone')) ? 12000 : 4000;
       let s;
       if(typeof v==='object' && v!==null) s = JSON.stringify(v);
@@ -701,10 +701,10 @@
 
   // --- PLAYER DRAWER (left overlay, skin, discord, game_id, game_mode, stats polled /api/stats 15s) ---
   const GM_NAMES_DRAWER = {zw_lg:'Late Game Zonewars', zw:'Zone Wars', wwzw:'Wild West Zonewars', ww:'Wild West', WW:'Wild West', bf:'Boxfights', BF:'Boxfights', bf2v2:'Boxfights 2v2', BF2V2:'Boxfights 2v2', df:'Free Build', DF:'Free Build', lobby:'Lobby'};
-  function fmtGmDrawer(raw){ if(!raw) return '—'; const k=String(raw).trim(); if(GM_NAMES_DRAWER[k]) return GM_NAMES_DRAWER[k]; const low=k.toLowerCase(); if(GM_NAMES_DRAWER[low]) return GM_NAMES_DRAWER[low]; return k.replace(/[_-]+/g,' ').replace(/\b\w/g,s=>s.toUpperCase()); }
-  function fmtPlaytimeDrawer(s){ if(s==null) return '—'; s=Math.max(0,Math.floor(Number(s)||0)); const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), sec=s%60; if(h) return `${h}h ${m}m`; if(m) return `${m}m ${sec}s`; return `${sec}s`; }
+  function fmtGmDrawer(raw){ if(!raw) return '-'; const k=String(raw).trim(); if(GM_NAMES_DRAWER[k]) return GM_NAMES_DRAWER[k]; const low=k.toLowerCase(); if(GM_NAMES_DRAWER[low]) return GM_NAMES_DRAWER[low]; return k.replace(/[_-]+/g,' ').replace(/\b\w/g,s=>s.toUpperCase()); }
+  function fmtPlaytimeDrawer(s){ if(s==null) return '-'; s=Math.max(0,Math.floor(Number(s)||0)); const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), sec=s%60; if(h) return `${h}h ${m}m`; if(m) return `${m}m ${sec}s`; return `${sec}s`; }
   function skinUrlDrawer(id){ if(!id || id==='-' ) return null; return `https://buildnow-api.netlify.app/skins/${encodeURIComponent(String(id).trim())}.png`; }
-  // keybind for drawer — customizable via button in drawer
+  // keybind for drawer - customizable via button in drawer
   function getDrawerKeybind(){
     try{
       const raw=GMGet('bnc_drawer_keybind', null);
@@ -740,15 +740,40 @@
   function ensureLobbyAudio(){
     if(lobbyAudio) return lobbyAudio;
     try{
+      logInfo('[AUDIO] ensureLobbyAudio create hidden tag');
       lobbyAudio=document.createElement('audio');
       lobbyAudio.id='bnc-lobby-audio';
       lobbyAudio.loop=true;
+      lobbyAudio.autoplay=true;
+      lobbyAudio.setAttribute('autoplay','');
+      lobbyAudio.setAttribute('playsinline','');
       lobbyAudio.preload='auto';
       lobbyAudio.crossOrigin='anonymous';
-      lobbyAudio.style.display='none';
+      // hidden audio tag that auto plays — use off-screen instead of display:none (some browsers block display:none audio)
+      lobbyAudio.style.position='fixed';
+      lobbyAudio.style.left='-9999px';
+      lobbyAudio.style.width='1px';
+      lobbyAudio.style.height='1px';
+      lobbyAudio.style.opacity='0';
+      lobbyAudio.style.pointerEvents='none';
       lobbyAudio.volume=Math.max(0,Math.min(1, Number(GMGet('bnc_lobby_volume', 0.5))));
+      // detailed audio event logs
+      try{
+        ['loadstart','canplay','canplaythrough','playing','pause','ended','error','stalled','suspend','volumechange','emptied'].forEach(ev=>{
+          lobbyAudio.addEventListener(ev, ()=>{
+            const st = `src=${String(lobbyAudio.src||'')} vol=${lobbyAudio.volume.toFixed(2)} paused=${lobbyAudio.paused} loop=${lobbyAudio.loop} err=${lobbyAudio.error? lobbyAudio.error.code:''} readyState=${lobbyAudio.readyState} networkState=${lobbyAudio.networkState}`;
+            if(ev==='error') logErr(`[AUDIO] event ${ev} ${st} ${lobbyAudio.error? lobbyAudio.error.message:''}`);
+            else if(ev==='playing') logOk(`[AUDIO] event ${ev} ${st}`);
+            else logInfo(`[AUDIO] event ${ev} ${st}`);
+            try{ feedLog(ev==='error'?'err': ev==='playing'?'ok':'info', {audio:ev, src:String(lobbyAudio.src||''), vol:lobbyAudio.volume, paused:lobbyAudio.paused}); }catch{}
+          });
+        });
+      }catch{}
       (document.body||document.documentElement).appendChild(lobbyAudio);
-    }catch{}
+      logInfo(`[AUDIO] appended hidden tag vol=${lobbyAudio.volume} loop=${lobbyAudio.loop} autoplay=${lobbyAudio.autoplay}`);
+      // try resume on user gesture (drawer open)
+      try{ const resume=()=>{ logInfo('[AUDIO] click resume try'); try{ if(lobbyAudio && lobbyAudio.paused && lobbyAudio.src) lobbyAudio.play().then(()=> logOk('[AUDIO] resume playing')).catch(e=> logErr(`[AUDIO] resume blocked ${e.message||e}`)); }catch(e){ logErr(`[AUDIO] resume err ${e.message}`);} }; document.addEventListener('click', resume, {once:true}); }catch{}
+    }catch(e){ logErr(`[AUDIO] ensure failed ${e.message}`); }
     return lobbyAudio;
   }
   function updateLobbyMusic(){
@@ -756,23 +781,33 @@
       const sc=statsCache;
       const sess=sc && sc.session;
       const isLobby = !sess || String(sess.state||'').toLowerCase()!=='match';
-      const url = sc && sc.lobby_music_url;
+      const rawUrl = sc && sc.lobby_music_url; const url = rawUrl ? (rawUrl.startsWith('http') ? rawUrl : 'https://mnpwvwjqawmuqmickteu.supabase.co/storage/v1/object/public/lobby-music/'+rawUrl.replace(/^music\//,'')).replace(/\?$/,'') : null;
       const audio=ensureLobbyAudio();
-      if(!audio) return;
+      if(!audio){ logErr('[AUDIO] update no audio'); return; }
       // volume from GM
       const vol = Math.max(0,Math.min(1, Number(GMGet('bnc_lobby_volume', 0.5))));
       audio.volume = vol;
+      logInfo(`[AUDIO] update isLobby=${isLobby} hasUrl=${!!url} url=${String(url||'')} src=${String(audio.src||'')} vol=${vol.toFixed(2)} paused=${audio.paused} readyState=${audio.readyState} networkState=${audio.networkState} state=${sess? sess.state:'no-sess'}`);
+      try{ feedLog('info', {audio:'update', isLobby, hasUrl:!!url, vol, paused:audio.paused, state:sess? sess.state:null}); }catch{}
       if(!url || !isLobby){
-        try{ audio.pause(); if(audio.src) { audio.removeAttribute('src'); audio.load(); } }catch{}
+        logInfo(`[AUDIO] pause (no url or not lobby) url=${!!url} isLobby=${isLobby}`);
+        try{ audio.pause(); if(audio.src) { audio.removeAttribute('src'); audio.load(); logInfo('[AUDIO] paused and src cleared'); } }catch(e){ logErr(`[AUDIO] pause err ${e.message}`); }
         return;
       }
-      // avoid reloading same src
-      if(audio.src !== url){
-        try{ audio.src=url; audio.load(); }catch{}
+      // force-reload when src changed, or browser dropped source (networkState=3 NO_SOURCE / error)
+      const needsReload = audio.src !== url || audio.networkState === 3 || (audio.error && audio.error.code);
+      if(needsReload){
+        logInfo(`[AUDIO] src reload src_changed=${audio.src!==url} networkState=${audio.networkState} errCode=${audio.error? audio.error.code:'none'} url=${String(url)}`);
+        try{ audio.src=url; audio.load(); logInfo('[AUDIO] load called'); }catch(e){ logErr(`[AUDIO] load err ${e.message}`); }
+      } else {
+        logInfo('[AUDIO] src same, skip load');
       }
       // try play (may need user gesture - drawer open is gesture)
+      logInfo(`[AUDIO] play() try vol=${vol} loop=${audio.loop} autoplay=${audio.autoplay}`);
       const p = audio.play();
-      if(p && p.catch) p.catch(()=>{});
+      if(p && p.then) p.then(()=> logOk('[AUDIO] play() ok playing')).catch(e=> logErr(`[AUDIO] play() blocked ${e.message||e} — need user click on page/drawer`));
+      else if(p && p.catch) p.catch(e=> logErr(`[AUDIO] play() blocked ${e.message||e}`));
+      else logInfo('[AUDIO] play() no promise');
     }catch{}
   }
   function startBgLobbyPoll(){ if(bgLobbyPollTimer) return; bgLobbyPollTimer=setInterval(()=>{ if(sessionId) fetchStats(false); }, 15000); }
@@ -782,7 +817,7 @@
     // cleanup legacy handle (removed per request)
     try{ const _oldH=document.getElementById('bnc-drawer-handle'); if(_oldH) _oldH.remove(); }catch{}
     if(document.getElementById('bnc-drawer')) return;
-    // backdrop — blocks game clicks when drawer open, non-passthrough
+    // backdrop - blocks game clicks when drawer open, non-passthrough
     drawerBackdrop=document.createElement('div');
     drawerBackdrop.id='bnc-drawer-backdrop';
     Object.assign(drawerBackdrop.style,{position:'fixed', inset:'0', zIndex:'2147483644', background:'rgba(0,0,0,0.42)', backdropFilter:'blur(2px)', display:'none', pointerEvents:'auto'});
@@ -792,10 +827,10 @@
     drawerBackdrop.addEventListener('mousemove', e=> e.stopPropagation());
     (document.body||document.documentElement).appendChild(drawerBackdrop);
 
-    // drawer — left overlay (centered content, no cards-in-cards)
+    // drawer - left overlay (centered content, no cards-in-cards)
     infoPanel=document.createElement('div');
     infoPanel.id='bnc-drawer';
-    Object.assign(infoPanel.style,{position:'fixed', left:'0', top:'0', bottom:'0', zIndex:'2147483645', width:'340px', maxWidth:'84vw', background:'#0f0f0f', color:'#e5e7eb', borderRight:'1px solid rgba(255,255,255,0.10)', display:'flex', flexDirection:'column', transform:'translateX(-100%)', transition:'transform 220ms cubic-bezier(0.22,1,0.36,1)', pointerEvents:'auto', fontFamily:'Inter, system-ui, sans-serif', boxShadow:'8px 0 32px rgba(0,0,0,0.45)', overflow:'hidden'});
+    Object.assign(infoPanel.style,{position:'fixed', left:'0', top:'0', bottom:'0', zIndex:'2147483645', width:'380px', maxWidth:'88vw', background:'#0f0f0f', color:'#e5e7eb', borderRight:'1px solid rgba(255,255,255,0.10)', display:'flex', flexDirection:'column', transform:'translateX(-100%)', transition:'transform 220ms cubic-bezier(0.22,1,0.36,1)', pointerEvents:'auto', fontFamily:'Inter, system-ui, sans-serif', boxShadow:'8px 0 32px rgba(0,0,0,0.45)', overflow:'hidden'});
     infoPanel.innerHTML=`
       <div style="display:flex;align-items:center;justify-content:flex-end;padding:10px 10px 0 10px;flex-shrink:0">
         <button id="bnc-drawer-close" style="width:28px;height:28px;border:1px solid rgba(255,255,255,0.12);background:#1a1a1a;color:#9ca3af;border-radius:8px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px">✕</button>
@@ -804,7 +839,7 @@
         <div style="opacity:0.7;font-size:12px">Loading…</div>
       </div>
       <div id="bnc-drawer-footer" style="padding:10px 14px;border-top:1px solid rgba(255,255,255,0.06);display:flex;justify-content:space-between;align-items:center;flex-shrink:0;font-size:11px;color:#6b7280">
-        <span id="bnc-drawer-version">v2.8.1</span>
+        <span id="bnc-drawer-version">v2.8.8</span>
         <span id="bnc-drawer-api" style="display:flex;align-items:center;gap:6px"><span id="bnc-drawer-dot" style="width:8px;height:8px;border-radius:50%;background:#6b7280;display:inline-block"></span><span id="bnc-drawer-api-text">Offline</span></span>
       </div>`;
     // non-passthrough: stop game from seeing wheel/keys inside drawer
@@ -836,6 +871,23 @@
     if(drawerOpen){
       infoPanel.style.transform='translateX(0)';
       drawerBackdrop.style.display='block';
+      // hidden audio tag that auto plays - trigger within user gesture (fixes browser autoplay block)
+      try{
+        const sc=statsCache;
+        const sess=sc && sc.session;
+        const isLobby = !sess || String(sess.state||'').toLowerCase()!=='match';
+        if(isLobby && sc && sc.lobby_music_url){
+          const aud=ensureLobbyAudio();
+          if(aud){
+            const rawUrl=sc.lobby_music_url||''; const fullUrl=(rawUrl.startsWith('http')? rawUrl: 'https://mnpwvwjqawmuqmickteu.supabase.co/storage/v1/object/public/lobby-music/'+rawUrl.replace(/^music\//,'')).replace(/\?$/,'');
+            if(aud.src !== fullUrl || aud.networkState===3 || (aud.error && aud.error.code)){ try{ aud.src=fullUrl; aud.load(); logInfo(`[AUDIO] drawer open src set ${fullUrl}`); }catch{} }
+            aud.volume=Math.max(0,Math.min(1, Number(GMGet('bnc_lobby_volume',0.5))));
+            const p=aud.play(); if(p&&p.catch) p.catch(()=>{});
+          }
+        } else {
+          ensureLobbyAudio();
+        }
+      }catch{}
       fetchStats(true);
       startStatsPoll();
       startBgLobbyPoll();
@@ -887,7 +939,7 @@
   }
   function startPlayersPoll(){ stopPlayersPoll(); fetchPlayers(false); playersPollTimer=setInterval(()=> fetchPlayers(false), 15000); }
   function stopPlayersPoll(){ if(playersPollTimer){ clearInterval(playersPollTimer); playersPollTimer=null; } }
-  // centered drawer — skin top, username, discord — game_id, state — gm, separator, stats, footer, keybind button + tabs
+  // centered drawer - skin top, username, discord - game_id, state - gm, separator, stats, footer, keybind button + tabs
   function renderInfoPanel(){
     if(!infoPanel) createInfoPanel();
     const body=document.getElementById('bnc-drawer-body');
@@ -906,7 +958,7 @@
     const pGlobal = sc? sc.playtime_global : null;
     const sess = sc && sc.session ? sc.session : null;
     const gmLive = sess && sess.game_mode ? fmtGmDrawer(sess.game_mode) : fmtGmDrawer(gmRaw);
-    // state: Lobby vs In Match — spec says show "In Lobby" when no game mode
+    // state: Lobby vs In Match - spec says show "In Lobby" when no game mode
     let stateLabel='In Lobby';
     if(sess && sess.state){ stateLabel = String(sess.state).toLowerCase()==='match' ? 'In Match' : 'In Lobby'; }
     else if(sess && sess.cur_scn){ stateLabel = String(sess.cur_scn).toLowerCase().includes('lobby') ? 'In Lobby' : 'In Match'; }
@@ -924,17 +976,30 @@
       ? `<img src="${skinUrl}" alt="${String(skin).slice(0,24)}" style="width:112px;height:112px;object-fit:contain;background:radial-gradient(140px 90px at 50% 20%, rgba(255,255,255,0.06), transparent 70%), #111;border:1px solid rgba(255,255,255,0.08);border-radius:16px;image-rendering:pixelated;flex-shrink:0" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div style="display:none;width:112px;height:112px;align-items:center;justify-content:center;background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:16px;font-size:32px;flex-shrink:0">▣</div>`
       : `<div style="width:112px;height:112px;display:flex;align-items:center;justify-content:center;background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:16px;font-size:32px;flex-shrink:0">▣</div>`;
     const kbLabel = formatKeybind(getDrawerKeybind());
-    const row = (label,val)=> `<div style="display:flex;justify-content:space-between;align-items:center;width:100%;max-width:240px;font-size:13px"><span style="color:#9ca3af">${label}</span><span style="font-weight:700;color:#fff">${val==null? '—' : val}</span></div>`;
-    const hasGm = gmLive && gmLive !== '—' && gmLive !== '-' && gmLive.toLowerCase() !== 'unknown' && gmLive.toLowerCase() !== 'lobby';
-    const stateGmLine = hasGm && stateLabel.toLowerCase() !== gmLive.toLowerCase() ? `${stateLabel} — ${gmLive}` : stateLabel;
-    const perGmRow = hasGm && perGmCurrent!=null ? row('Playtime ('+gmLive+')', fmtPlaytimeDrawer(perGmCurrent)) : '';
-    // tab bar
-    const tabBar = `<div style="display:flex;gap:6px;justify-content:center;width:100%;margin-bottom:4px"><button id="bnc-tab-stats" style="flex:1;max-width:120px;padding:6px 0;border-radius:999px;border:1px solid ${drawerTab==='stats'?'#fff':'rgba(255,255,255,0.12)'};background:${drawerTab==='stats'?'#fff':'#171717'};color:${drawerTab==='stats'?'#000':'#9ca3af'};font-size:12px;font-weight:700;cursor:pointer">Stats</button><button id="bnc-tab-players" style="flex:1;max-width:120px;padding:6px 0;border-radius:999px;border:1px solid ${drawerTab==='players'?'#fff':'rgba(255,255,255,0.12)'};background:${drawerTab==='players'?'#fff':'#171717'};color:${drawerTab==='players'?'#000':'#9ca3af'};font-size:12px;font-weight:700;cursor:pointer">Players</button></div>`;
+    const row = (label,val)=> `<div style="display:flex;justify-content:space-between;align-items:center;width:100%;max-width:240px;font-size:13px"><span style="color:#9ca3af">${label}</span><span style="font-weight:700;color:#fff">${val==null? '-' : val}</span></div>`;
+    const hasGm = gmLive && gmLive !== '-' && gmLive !== '-' && gmLive.toLowerCase() !== 'unknown' && gmLive.toLowerCase() !== 'lobby';
+    const stateGmLine = hasGm && stateLabel.toLowerCase() !== gmLive.toLowerCase() ? `${stateLabel} - ${gmLive}` : stateLabel;
+    const smallRow = (label,val)=> `<div style="display:flex;justify-content:space-between;align-items:center;width:100%;max-width:240px;font-size:11px"><span style="color:#9ca3af">${label}</span><span style="font-weight:600;color:#fff">${val==null? '-' : val}</span></div>`;
+    const perGmRow = hasGm && perGmCurrent!=null ? smallRow('Playtime ('+gmLive+')', fmtPlaytimeDrawer(perGmCurrent)) : '';
+    const isLobbyTab = stateLabel === 'In Lobby';
+    if(isLobbyTab){
+      // clean up stale player list when back in lobby (fixes not refreshing)
+      if(playersCache){ playersCache=null; }
+      if(drawerTab==='players'){
+        drawerTab='stats';
+        try{ GMSet('bnc_drawer_tab', drawerTab); }catch{}
+        stopPlayersPoll();
+      }
+    }
+    // tab bar - hide Players when in lobby per request
+    const tabBar = isLobbyTab
+      ? `<div style="display:flex;gap:6px;justify-content:center;width:100%;margin-bottom:4px"><button id="bnc-tab-stats" style="flex:1;max-width:120px;padding:6px 0;border-radius:999px;border:1px solid #fff;background:#fff;color:#000;font-size:12px;font-weight:700;cursor:pointer">Stats</button></div>`
+      : `<div style="display:flex;gap:6px;justify-content:center;width:100%;margin-bottom:4px"><button id="bnc-tab-stats" style="flex:1;max-width:120px;padding:6px 0;border-radius:999px;border:1px solid ${drawerTab==='stats'?'#fff':'rgba(255,255,255,0.12)'};background:${drawerTab==='stats'?'#fff':'#171717'};color:${drawerTab==='stats'?'#000':'#9ca3af'};font-size:12px;font-weight:700;cursor:pointer">Stats</button><button id="bnc-tab-players" style="flex:1;max-width:120px;padding:6px 0;border-radius:999px;border:1px solid ${drawerTab==='players'?'#fff':'rgba(255,255,255,0.12)'};background:${drawerTab==='players'?'#fff':'#171717'};color:${drawerTab==='players'?'#000':'#9ca3af'};font-size:12px;font-weight:700;cursor:pointer">Players</button></div>`;
     const statsHtml = `
       <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;width:100%;padding:10px 0 6px 0">
         ${skinImg}
         <div style="font-size:19px;font-weight:800;color:#fff;text-align:center;word-break:break-word;max-width:240px">${String(uname).replace(/</g,'&lt;')}</div>
-        <div style="font-size:12px;color:#9ca3af;text-align:center;word-break:break-all;max-width:240px">${String(dname).replace(/</g,'&lt;')} — ${String(gid).replace(/</g,'&lt;')}</div>
+        <div style="font-size:12px;color:#9ca3af;text-align:center;word-break:break-all;max-width:240px">${String(dname).replace(/</g,'&lt;')} - ${String(gid).replace(/</g,'&lt;')}</div>
         <div style="font-size:13px;color:#e5e7eb;text-align:center;margin-top:2px">${stateGmLine}</div>
         <div style="width:48px;height:1px;background:rgba(255,255,255,0.12);margin:10px 0"></div>
         <div style="display:flex;flex-direction:column;gap:7px;align-items:center;width:100%">
@@ -963,30 +1028,26 @@
     if(drawerTab==='players'){
       const pc = playersCache;
       if(!sessionId){
-        playersHtml = `<div style="padding:20px 0;color:#9ca3af;font-size:12px">No session — join a match</div>`;
+        playersHtml = `<div style="padding:20px 0;color:#9ca3af;font-size:12px">No session - join a match</div>`;
       } else if(!pc){
         playersHtml = `<div style="padding:20px 0;color:#9ca3af;font-size:12px">Loading players…</div>`;
       } else if(!pc.players || pc.players.length===0){
         playersHtml = `<div style="padding:20px 0;color:#9ca3af;font-size:12px">No players in game</div>`;
       } else {
         const count = pc.count || pc.players.length;
-        const header = `<div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:8px;text-align:center">Players in Game — ${count}${pc.game_mode? ' · '+fmtGmDrawer(pc.game_mode):''}</div>`;
+        const header = `<div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:8px;text-align:center">Players in Game - ${count}${pc.game_mode? ' · '+fmtGmDrawer(pc.game_mode):''}</div>`;
         const rows = pc.players.map(pl=>{
-          const hasSkin = pl.skin!=null && String(pl.skin).trim()!=='' && String(pl.skin).toLowerCase()!=='nan' && String(pl.skin).toLowerCase()!=='null';
-          const skinP = hasSkin ? skinUrlDrawer(pl.skin) : null;
-          const img = skinP ? `<img src="${skinP}" style="width:36px;height:36px;object-fit:contain;background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:8px;flex-shrink:0" onerror="this.style.display='none'">` : `<div style="width:36px;height:36px;display:flex;align-items:center;justify-content:center;background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:8px;font-size:14px;flex-shrink:0">▣</div>`;
+          const skinId = (pl.skin!=null && String(pl.skin).trim()!=='' && String(pl.skin).toLowerCase()!=='nan' && String(pl.skin).toLowerCase()!=='null') ? pl.skin : 'cct_0_default';
+          const skinP = skinUrlDrawer(skinId);
+          const inDb = !!pl.in_db;
+          const img = `<div style="position:relative;width:36px;height:36px;flex-shrink:0"><img src="${skinP}" style="width:36px;height:36px;object-fit:contain;background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:8px;flex-shrink:0" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div style="display:none;width:36px;height:36px;align-items:center;justify-content:center;background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:8px;font-size:14px;flex-shrink:0">▣</div><span style="position:absolute;bottom:-2px;right:-2px;width:10px;height:10px;border-radius:50%;background:${inDb?'#10b981':'#4b5563'};border:2px solid #0f0f0f;display:inline-block" title="${inDb?'In DB':'Not in DB'}"></span></div>`;
           const esc=(v)=> String(v).replace(/</g,'&lt;');
           const toNaN=(v)=> (v==null || String(v).trim()==='' || String(v).toLowerCase()==='null' || String(v).toLowerCase()==='undefined') ? 'NaN' : esc(v);
           const titleName = pl.username!=null ? esc(pl.username) : 'NaN';
           const nameLine = `<div style="font-size:13px;font-weight:700;color:#fff;word-break:break-word">${titleName}</div>`;
-          // essential detail line — human readable, full game_id, NaN for unknowns
           const gidFull = pl.game_id!=null ? String(pl.game_id) : 'NaN';
-          const ptVal = pl.pt!=null ? String(pl.pt) : 'NaN';
-          const aliveVal = pl.is_alive==null ? 'NaN' : (pl.is_alive ? 'Alive' : 'Dead');
-          const selfVal = pl.is_self==null ? 'NaN' : (pl.is_self ? 'You' : 'Other');
-          const skinVal = hasSkin ? String(pl.skin) : 'NaN';
           const discordVal = pl.discord_username!=null ? String(pl.discord_username) : 'NaN';
-          const detailLine = `Game ID: ${toNaN(gidFull)} · Discord: ${toNaN(discordVal)} · Team: ${toNaN(ptVal)} · ${aliveVal} · ${selfVal} · Skin: ${toNaN(skinVal)}`;
+          const detailLine = `Discord: ${toNaN(discordVal)} · Game ID: ${toNaN(gidFull)}`;
           const detailDiv = `<div style="font-size:11px;color:#9ca3af;word-break:break-word;white-space:normal;line-height:1.35">${detailLine}</div>`;
           return `<div style="display:flex;gap:10px;align-items:center;width:100%;max-width:300px;padding:8px 10px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px"><div style="flex-shrink:0">${img}</div><div style="flex:1;min-width:0;text-align:left;display:flex;flex-direction:column;gap:2px">${nameLine}${detailDiv}</div></div>`;
         }).join('');
@@ -1036,14 +1097,16 @@
       const syncVol=()=>{
         const v=Math.max(0,Math.min(100, Number(volSlider.value)));
         GMSet('bnc_lobby_volume', v/100);
+        logInfo(`[AUDIO] volume slider ${v}%`);
+        try{ feedLog('info', {audio:'volume', vol:v/100}); }catch{}
         if(volLabel) volLabel.textContent=v+'%';
         const aud=ensureLobbyAudio();
-        if(aud) aud.volume=v/100;
+        if(aud){ aud.volume=v/100; logInfo(`[AUDIO] volume set to ${aud.volume.toFixed(2)}`); }
       };
       volSlider.oninput=syncVol;
       volSlider.onchange=syncVol;
     }
-    try{ updateLobbyMusic(); }catch{}
+    try{ updateLobbyMusic(); }catch(e){ logErr(`[AUDIO] update after render err ${e.message}`); }
   }
   function fetchStats(forceRender){
     if(!sessionId && !discordId) { if(forceRender) renderInfoPanel(); return; }
@@ -1055,13 +1118,13 @@
       if(useGM && GM){
         try{
           GM({method:'GET', url, headers:{'Content-Type':'application/json'}, timeout:8000,
-            onload: r=>{ if(r.status>=200&&r.status<300){ try{ const j=JSON.parse(r.responseText); statsCache=j; apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } renderInfoPanel(); }catch{ apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ const d=document.getElementById('bnc-drawer-dot'); const t=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background=apiOnline?'#10b981':'#6b7280'; if(t) t.textContent=apiOnline?'Online':'Offline'; }catch{} },
+            onload: r=>{ if(r.status>=200&&r.status<300){ try{ const j=JSON.parse(r.responseText); statsCache=j; logInfo(`[AUDIO] stats fetched lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } renderInfoPanel(); }catch(e){ logErr(`[AUDIO] stats parse err ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ const d=document.getElementById('bnc-drawer-dot'); const t=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background=apiOnline?'#10b981':'#6b7280'; if(t) t.textContent=apiOnline?'Online':'Offline'; }catch{} },
             onerror: ()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const t=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(t) t.textContent='Offline'; }catch{} },
             ontimeout: ()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const t=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(t) t.textContent='Offline'; }catch{} }});
           return;
         }catch{}
       }
-      fetch(url, {method:'GET'}).then(r=>r.text().then(t=>{ if(r.ok){ try{ const j=JSON.parse(t); statsCache=j; apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } renderInfoPanel(); }catch{ apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background=apiOnline?'#10b981':'#6b7280'; if(tt) tt.textContent=apiOnline?'Online':'Offline'; }catch{} }).catch(()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(tt) tt.textContent='Offline'; }catch{} })).catch(()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(tt) tt.textContent='Offline'; }catch{} });
+      fetch(url, {method:'GET'}).then(r=>r.text().then(t=>{ if(r.ok){ try{ const j=JSON.parse(t); statsCache=j; logInfo(`[AUDIO] stats fetched (fetch) lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats-fetch', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } renderInfoPanel(); }catch(e){ logErr(`[AUDIO] stats parse err (fetch) ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background=apiOnline?'#10b981':'#6b7280'; if(tt) tt.textContent=apiOnline?'Online':'Offline'; }catch{} }).catch(()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(tt) tt.textContent='Offline'; }catch{} })).catch(()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(tt) tt.textContent='Offline'; }catch{} });
     };
     doFetch(true);
   }
@@ -1071,8 +1134,8 @@
     statsPollTimer=setInterval(()=> fetchStats(false), 15000);
   }
   function stopStatsPoll(){ if(statsPollTimer){ clearInterval(statsPollTimer); statsPollTimer=null; } }
-  // auto-create drawer shell immediately so handle is visible
-  setTimeout(()=>{ createInfoPanel(); renderInfoPanel(); if(drawerOpen){ startStatsPoll(); if(drawerTab==='players') startPlayersPoll(); } if(sessionId) startBgLobbyPoll(); }, 700);
+  // auto-create drawer shell immediately so handle is visible + hidden audio tag that auto plays
+  setTimeout(()=>{ ensureLobbyAudio(); createInfoPanel(); renderInfoPanel(); if(drawerOpen){ startStatsPoll(); if(drawerTab==='players') startPlayersPoll(); } if(sessionId) startBgLobbyPoll(); }, 700);
   // refresh when session established after login
   const _origStoreSession = storeSession;
   // wrap storeSession to trigger render
@@ -1087,7 +1150,7 @@
     const ov=document.createElement('div');
     ov.id='bnc-keys';
     Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483646', background:'rgba(0,0,0,0.54)', display:'none', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif'});
-    ov.innerHTML = `<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:20px;min-width:360px;max-width:520px;color:#e5e7eb"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><b style="font-size:15px;color:#fff">BuildNow Companion — Shortcuts & Settings</b><button id="bnc-keys-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 8px;cursor:pointer">Close</button></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;line-height:1.6"><div><code>Ctrl+Shift+C</code> — Collect toggle<br><code>Ctrl+Shift+S</code> — Save collected<br><code>Ctrl+Shift+L</code> — Load file<br><code>Ctrl+Shift+R</code> — Replay</div><div><code>Ctrl+Shift+F</code> — Feed (dev only)<br><code>Ctrl+Shift+P</code> — Pause feed<br><code id="bnc-keys-drawer-label">Ctrl+Shift+I</code> — Player info<br><code>Ctrl+Shift+K</code> — This menu</div></div><div style="margin-top:14px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);font-size:11px;opacity:0.7">Settings: <label style="cursor:pointer"><input type="checkbox" id="bnc-dev-toggle"> Dev mode (feed)</label> · <label style="cursor:pointer"><input type="checkbox" id="bnc-info-auto"> Show player info on start</label></div></div>`;
+    ov.innerHTML = `<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:20px;min-width:360px;max-width:520px;color:#e5e7eb"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><b style="font-size:15px;color:#fff">BuildNow Companion - Shortcuts & Settings</b><button id="bnc-keys-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 8px;cursor:pointer">Close</button></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;line-height:1.6"><div><code>Ctrl+Shift+C</code> - Collect toggle<br><code>Ctrl+Shift+S</code> - Save collected<br><code>Ctrl+Shift+L</code> - Load file<br><code>Ctrl+Shift+R</code> - Replay</div><div><code>Ctrl+Shift+F</code> - Feed (dev only)<br><code>Ctrl+Shift+P</code> - Pause feed<br><code id="bnc-keys-drawer-label">Ctrl+Shift+I</code> - Player info<br><code>Ctrl+Shift+K</code> - This menu</div></div><div style="margin-top:14px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);font-size:11px;opacity:0.7">Settings: <label style="cursor:pointer"><input type="checkbox" id="bnc-dev-toggle"> Dev mode (feed)</label> · <label style="cursor:pointer"><input type="checkbox" id="bnc-info-auto"> Show player info on start</label></div></div>`;
     (document.body||document.documentElement).appendChild(ov);
     ov.addEventListener('click', (e)=>{ if(e.target===ov) ov.style.display='none'; });
     ov.querySelector('#bnc-keys-close').onclick=()=> ov.style.display='none';
@@ -1116,13 +1179,13 @@
     rankedHUD=document.createElement('div');
     rankedHUD.id='bnc-ranked';
     Object.assign(rankedHUD.style,{position:'fixed', top:'52px', left:'50%', transform:'translateX(-50%)', zIndex:'2147483645', background:'linear-gradient(135deg,#7c3aed 0%,#4f46e5 100%)', color:'#fff', padding:'6px 14px', borderRadius:'999px', fontFamily:'Inter, system-ui, sans-serif', fontSize:'12px', fontWeight:'800', letterSpacing:'0.3px', display:'none', boxShadow:'0 4px 16px rgba(124,58,237,0.45)', border:'1px solid rgba(255,255,255,0.12)'});
-    rankedHUD.textContent='RANKED — private lobby';
+    rankedHUD.textContent='RANKED - private lobby';
     (document.body||document.documentElement).appendChild(rankedHUD);
   }
   function showRankedHUD(code){
     if(!rankedHUD) createRankedHUD();
     rankedShort=code;
-    rankedHUD.textContent = `RANKED — ${code}`;
+    rankedHUD.textContent = `RANKED - ${code}`;
     rankedHUD.style.display='block';
     // also update info panel gm hint
     if(code) GMSet('bnc_session_gm', 'ranked_'+code);
@@ -1156,7 +1219,7 @@
     if(isLocked) return;
     if(!bytes||!bytes.length) return;
     if(!sessionId || !currentReqToken){
-      if(Date.now()-lastCaptureBlockedLog>5000){ lastCaptureBlockedLog=Date.now(); logInfo('capture skipped — no session (login required)'); }
+      if(Date.now()-lastCaptureBlockedLog>5000){ lastCaptureBlockedLog=Date.now(); logInfo('capture skipped - no session (login required)'); }
       return;
     }
     const isEssential = isEssentialBytes(bytes);
@@ -1204,7 +1267,7 @@
           if(j.packets && j.packets.length){
             for(const p of j.packets){
               const dec = p.decrypted_hex || p.raw || {};
-              // full decrypted payload — no truncation
+              // full decrypted payload - no truncation
               const fields = {packet:p.packet || p.packet_type, seq:p.seq, dir:p.dir, human:p.human || ''};
               if(p.killer || p.victim) { fields.killer=p.killer; fields.victim=p.victim; }
               if(p.player_name) fields.player=p.player_name;
@@ -1214,7 +1277,7 @@
               if(p.room_gm) fields.gm=p.room_gm;
               if(p.room_id) fields.room_id=p.room_id.slice(0,12);
               if(p.match_version!=null) fields.ver=p.match_version;
-              // stG change — explicit log (full props, no truncation)
+              // stG change - explicit log (full props, no truncation)
               try{
                 const stg = dec && (dec.properties ? dec.properties.stG : dec.stG);
                 const lastStg = p._lastStg !== undefined ? p._lastStg : null;
@@ -1224,12 +1287,12 @@
                   feedLog('stg', {seq:p.seq, stG: dec.properties.stG, gm: p.room_gm || p.game_mode || '', room: (p.room_id||'').slice(0,8), curScn: p.cur_scn || '', human: p.human || '', full: dec.properties});
                 }
               }catch{}
-              // full gpb — no slice
+              // full gpb - no slice
               if(dec && Object.keys(dec).length) fields.gpb = dec;
-              // full hex — no truncation
+              // full hex - no truncation
               feedLog('decrypted', fields);
               feedLog('hex', {seq:p.seq, hex:p.rawHex||''});
-              // dedicated ZONE log — full fields, non-truncated (wwzw spams 3-4 ticks per phase with huge floats)
+              // dedicated ZONE log - full fields, non-truncated (wwzw spams 3-4 ticks per phase with huge floats)
               const isZonePkt = (p.packet==='zone' || p.packet_type==='zone' || p.zone_time!=null || (dec && dec.properties && ('bz_phase_start' in dec.properties || 'bz_zone' in dec.properties || 'bz_phase' in dec.properties)));
               if(isZonePkt){
                 const zoneFields = {seq:p.seq, dir:p.dir, gm:p.room_gm || p.game_mode || '', zone_time:p.zone_time, zone_phase:p.zone_phase, code:p.short_code||'', room:(p.room_id||'').slice(0,8), ver:p.match_version, curScn:p.cur_scn||'', zone:p.zone||null, rawHex:(p.rawHex||'').slice(0,1200), gpb:dec};
@@ -1241,7 +1304,7 @@
                   logGroup(`ZONE seq=${p.seq} time=${p.zone_time} phase=${p.zone_phase}`, ()=>{ console.log('packet', p); console.log('decrypted', dec); console.log('hex', p.rawHex); });
                 }catch{}
               }
-              // Ranked HUD: only show when joining private room with short_code (5-char code) — not every packet
+              // Ranked HUD: only show when joining private room with short_code (5-char code) - not every packet
               if(p.short_code && /^[A-Z0-9]{5}$/i.test(String(p.short_code))){ showRankedHUD(String(p.short_code).toUpperCase()); }
               else if(p.room_gm && String(p.room_gm).toLowerCase().includes('ranked') && p.short_code){ showRankedHUD(String(p.short_code).toUpperCase()); }
             }
@@ -1260,14 +1323,14 @@
         const lower = String(txt).toLowerCase();
         if(lower.includes('locked') || lower.includes('account locked')){
           isLocked = true; queue=[]; flushTimer=null;
-          logErr(`account locked — blocking game ${String(txt).slice(0,120)} scope=${_lockScope}`);
+          logErr(`account locked - blocking game ${String(txt).slice(0,120)} scope=${_lockScope}`);
           showLockedPanel(String(txt).toLowerCase().includes('admin')? 'Account admin-locked' : 'Account locked', _lockScope);
           return;
         }
-        logErr(`capture failed — requeue ${batch.length} txt=${String(txt).slice(0,120)}`);
+        logErr(`capture failed - requeue ${batch.length} txt=${String(txt).slice(0,120)}`);
         feedLog('err', {count:batch.length, ok:false, txt:String(txt).slice(0,120)});
         if(String(txt).includes('Invalid req_token') || String(txt).includes('expired')){
-          queue=[]; feedLog('err', {msg:'token error — re-link'});
+          queue=[]; feedLog('err', {msg:'token error - re-link'});
         } else {
           queue=batch.concat(queue).slice(0,BATCH_MAX*4);
         }
@@ -1415,6 +1478,6 @@
     // legacy alias
     window.__PHOTON_SNIFFER__=api;
     if(typeof unsafeWindow!=='undefined'&&unsafeWindow!==window){ unsafeWindow.__BUILDNOW_COMPANION__=api; unsafeWindow.__BNC__=api; unsafeWindow.__PHOTON_SNIFFER__=api; }
-    logSys('ready — BuildNow Companion active (api-compbng.vercel.app) · COLLECT Ctrl+Shift+C/S/L/R');
+    logSys('ready - BuildNow Companion active (api-compbng.vercel.app) · COLLECT Ctrl+Shift+C/S/L/R');
   }catch{}
 })();

@@ -732,45 +732,68 @@ async def alerts_cmd(interaction: discord.Interaction, limit: int = 5):
 @bot.tree.command(name="set-lobby-music", description="Upload a looped MP3 for lobby (max 10MB)")
 @app_commands.describe(file="MP3 file, max 10MB, will loop in lobby and stop in game")
 async def set_lobby_music_cmd(interaction: discord.Interaction, file: discord.Attachment):
-    await interaction.response.defer(ephemeral=True)
     did = str(interaction.user.id)
     row = await db.get_by_discord(did)
     if not row:
-        return await interaction.followup.send("Not registered. Use /register first.", ephemeral=True)
-    # validate mp3
+        return await interaction.response.send_message("Not registered. Use /register first.", ephemeral=True)
     fname = (file.filename or "").lower()
     if not fname.endswith(".mp3"):
-        return await interaction.followup.send("Only .mp3 files allowed.", ephemeral=True)
+        return await interaction.response.send_message("Only .mp3 files allowed.", ephemeral=True)
     if file.size and file.size > 10 * 1024 * 1024:
-        return await interaction.followup.send("File too large — max 10MB.", ephemeral=True)
-    # content type check (allow mp3/mpeg/audio)
+        return await interaction.response.send_message("File too large — max 10MB.", ephemeral=True)
     ctype = (file.content_type or "").lower()
     if ctype and "mpeg" not in ctype and "mp3" not in ctype and "audio" not in ctype:
-        # still allow if extension is mp3
         pass
+    if not db.USE_SUPABASE or not db.supabase:
+        return await interaction.response.send_message("Supabase not configured.", ephemeral=True)
+    # loading state — non-ephemeral embed visible to channel
+    loading = discord.Embed(
+        title="🎵 Uploading lobby music…",
+        description=f"Uploading `{file.filename}` ({(file.size or 0)/1024/1024:.2f}MB) — please wait…",
+        color=0x7c3aed,
+    )
+    loading.add_field(name="Status", value="⏳ Uploading to storage…", inline=False)
+    await interaction.response.send_message(embed=loading)
     try:
         data = await file.read()
     except Exception as exc:
-        return await interaction.followup.send(f"Failed to read file: {exc}", ephemeral=True)
+        err = discord.Embed(title="❌ Read failed", description=str(exc)[:1000], color=0xef4444)
+        return await interaction.edit_original_response(embed=err)
     if len(data) > 10 * 1024 * 1024:
-        return await interaction.followup.send("File too large — max 10MB.", ephemeral=True)
-    if not db.USE_SUPABASE or not db.supabase:
-        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+        err = discord.Embed(title="❌ Too large", description="Max 10MB.", color=0xef4444)
+        return await interaction.edit_original_response(embed=err)
     try:
         path = f"{did}.mp3"
-        # remove old to allow upsert (supabase-py upsert option varies by version)
+        # show uploading -> processing state
+        prog = discord.Embed(title="🎵 Processing…", description=f"`{file.filename}` received, saving…", color=0x7c3aed)
+        prog.add_field(name="Status", value="⏳ Saving…", inline=False)
+        await interaction.edit_original_response(embed=prog)
+        # ensure bucket exists
+        try:
+            buckets = db.supabase.storage.list_buckets()
+            bucket_ids = [b.id for b in buckets] if hasattr(buckets, '__iter__') else []
+            if "lobby-music" not in bucket_ids:
+                db.supabase.storage.create_bucket("lobby-music", options={"public": True})
+        except Exception as bucket_exc:
+            print(f"bucket check/create failed: {bucket_exc}")
+
         try:
             db.supabase.storage.from_("lobby-music").remove([path])
         except Exception:
             pass
-        # upload - supabase-py expects bytes
-        # try with file_options dict
+        upload_ok = False
         try:
             db.supabase.storage.from_("lobby-music").upload(path, data, {"content-type": "audio/mpeg", "upsert": "true"})
+            upload_ok = True
         except TypeError:
-            # fallback for older supabase-py signature
             db.supabase.storage.from_("lobby-music").upload(path, data, file_options={"content-type": "audio/mpeg", "upsert": True})
-        # get public url (handle both string and dict returns)
+            upload_ok = True
+        except Exception as upload_exc:
+            print(f"storage upload failed for {did}: {upload_exc}")
+
+        if not upload_ok:
+            raise Exception("File upload to Supabase storage failed. Check bucket 'lobby-music' exists and is public.")
+
         pub = db.supabase.storage.from_("lobby-music").get_public_url(path)
         if isinstance(pub, str):
             url = pub
@@ -778,17 +801,22 @@ async def set_lobby_music_cmd(interaction: discord.Interaction, file: discord.At
             url = pub.get("publicUrl") or pub.get("public_url") or pub.get("data", {}).get("publicUrl") or str(pub)
         else:
             url = str(pub)
-        # ensure url looks like https
         if url and not url.startswith("http"):
-            # fallback construct via SUPABASE_URL
             base = os.getenv("SUPABASE_URL", "").rstrip("/")
             if base:
                 url = f"{base}/storage/v1/object/public/lobby-music/{path}"
         db.supabase.table("bngc_users").update({"lobby_music_url": url}).eq("discord_id", did).execute()
-        await interaction.followup.send(f"✅ Lobby music set! Will loop in lobby (stop in game). Max 10MB. Adjust volume with slider in drawer.\n{url}", ephemeral=True)
+        done = discord.Embed(
+            title="✅ Lobby music set!",
+            description="Will **loop in lobby** and **stop in game**. Adjust volume with the slider in the drawer.",
+            color=0x10b981,
+        )
+        done.add_field(name="File", value=f"`{file.filename}` • {len(data)/1024/1024:.2f}MB", inline=False)
+        await interaction.edit_original_response(embed=done)
     except Exception as exc:
         print(f"lobby music upload failed for {did}: {exc}")
-        await interaction.followup.send(f"Upload failed: {exc}", ephemeral=True)
+        err = discord.Embed(title="❌ Upload failed", description=str(exc)[:1000], color=0xef4444)
+        await interaction.edit_original_response(embed=err)
 
 
 @bot.tree.command(name="remove-lobby-music", description="Remove your lobby music")

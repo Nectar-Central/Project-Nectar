@@ -1,12 +1,23 @@
 from dataclasses import dataclass
 from typing import Any
 
-from ..gpbinary import parse_gpbinary, parse_killfeed_text
+from ..gpbinary import parse_gpbinary, parse_killfeed_text, _strip_color_tags
 from ..logger import log_engine
 
 from .enums import GameMode, PacketType, State
 from .models import KillInfo, Player, SessionView
 
+
+def _norm_name(n: str | None) -> str:
+    if not n:
+        return ""
+    s = _strip_color_tags(str(n)).strip()
+    if s.lower().startswith("dc:"):
+        s = s[3:].strip()
+    return s
+def _names_equal(a, b) -> bool:
+    na = _norm_name(a); nb = _norm_name(b)
+    return bool(na and nb and na == nb) or bool(na and nb and na.lower() == nb.lower())
 
 def _is_valid_pid(v: str | None) -> str | None:
     """Validate 5-char private join code (e.g. PBS05) — rejects ghost 'n'."""
@@ -160,9 +171,18 @@ class Engine:
             except Exception:
                 room_name = None
 
-        # If this is a room-creating op, ensure that room exists before mutating
         is_first_join = gpb and gpb.get("opName") in ("CreateRoom", "JoinRoom", "JoinRandomRoom")
-        if is_first_join and room_name:
+        # Prefer packet's room_id (e.g., 5c02c34a...) for curScn/zone packets which have no RoomName — fixes scene detection
+        pkt_room_hint = getattr(packet, "room_id", None) or getattr(packet, "room_code", None)
+        if not pkt_room_hint and packet.raw and isinstance(packet.raw, dict):
+            try:
+                _rm = packet.raw.get("room")
+                if isinstance(_rm, dict) and _rm.get("code"):
+                    pkt_room_hint = _rm.get("code")
+            except: pass
+        if pkt_room_hint and str(pkt_room_hint) != "lobby":
+            room = _ensure_room(str(pkt_room_hint))
+        elif is_first_join and room_name:
             room = _ensure_room(room_name)
         else:
             room = _ensure_room(None)
@@ -428,22 +448,48 @@ class Engine:
         if packet.game_mode and not room.game_mode:
             room.game_mode = packet.game_mode
 
-        # State from curScn (room-scoped) + playtime bookkeeping
+        # State from curScn + packets — per user spec with diff check
+        # Lobby->Match via curScn!=MainLobby / killfeed / stG 1 ; Match->Lobby via authenticate / leave
+        # Only switch if current state != target, else ignore
         if cur_scn:
             old_state = room.state
             room.cur_scn = cur_scn
-            if cur_scn != "MainLobby" and room.game_mode:
-                if room.state != State.MATCH:
-                    log_engine("state", session_id[:8], old=room.state.value, new=State.MATCH.value, gm=room.game_mode.value, room=room.room_id[:8])
-                room.state = State.MATCH
-                if old_state != State.MATCH:
-                    view.playtime.last_state = State.MATCH.value
-            elif cur_scn == "MainLobby":
-                if room.state != State.LOBBY:
-                    log_engine("state", session_id[:8], old=room.state.value, new=State.LOBBY.value, room=room.room_id[:8])
-                room.state = State.LOBBY
-                if old_state != State.LOBBY:
-                    view.playtime.last_state = State.LOBBY.value
+            target_state = None
+            if cur_scn == "MainLobby":
+                target_state = State.LOBBY
+            elif cur_scn != "MainLobby":
+                target_state = State.MATCH
+            if target_state and room.state != target_state:
+                log_engine("state", session_id[:8], old=room.state.value, new=target_state.value, room=room.room_id[:8], curScn=cur_scn, via="curScn")
+                room.state = target_state
+                view.playtime.last_state = target_state.value
+                if target_state == State.LOBBY:
+                    room.zone_match_active = False
+            elif target_state and room.state == target_state:
+                pass  # same state packet, ignore per user
+
+        # Additional state transitions per user spec (diff check)
+        # Determine packet's target state
+        pkt_target_state = None
+        # Match -> Lobby via authenticate or leave (self)
+        is_auth_pkt = gpb and gpb.get("opName") in ("Authenticate", "AuthenticateOnce")
+        is_leave_self = packet.packet_type == PacketType.LEAVE and packet.player_name and _names_equal(packet.player_name, view.me.username if view.me else "")
+        # Lobby -> Match via killfeed, stG 1, curScn already handled above, but also stG1
+        is_killfeed_pkt = packet.is_kill or packet.is_knock
+        is_stg1_pkt = gpb and gpb.get("properties") and str(gpb["properties"].get("stG")) == "1"
+        if room.state == State.MATCH and (is_auth_pkt or is_leave_self):
+            pkt_target_state = State.LOBBY
+        elif room.state == State.LOBBY and (is_killfeed_pkt or is_stg1_pkt):
+            pkt_target_state = State.MATCH
+        # For curScn we already handled, but also check if curScn packet arrived and state diff already handled
+        if pkt_target_state and room.state != pkt_target_state:
+            log_engine("state", session_id[:8], old=room.state.value, new=pkt_target_state.value, room=room.room_id[:8], via="packet", pkt=packet.packet_type.value if packet.packet_type else "?")
+            room.state = pkt_target_state
+            view.playtime.last_state = pkt_target_state.value
+            if pkt_target_state == State.LOBBY:
+                room.zone_match_active = False
+        elif pkt_target_state and room.state == pkt_target_state:
+            pass  # ignore same state packet per user
 
         # Zone (room-scoped) — hard 4:59 (299) for zw_lg/wwzw, stG is match marker not zone
         def _valid_zone_time(v):
@@ -457,95 +503,47 @@ class Engine:
         if is_stg_packet:
             try:
                 stg = int(float(gpb["properties"]["stG"]))
-                if room.last_stg is not None and room.last_stg != stg and room.game_mode and room.game_mode.value in ("zw_lg", "wwzw", "zw", "WW", "WWZW"):
-                    if stg == 1 and room.last_stg == 3:
-                        # Determine winner as last alive player/team at match end (even if not me)
-                        alive_players = [p for p in room.players.values() if p.is_alive]
-                        if len(alive_players) == 1:
-                            room.winner = alive_players[0].username
-                        elif room.teams:
-                            alive_teams = [t for t in room.teams.values() if any(any(p.username==m and p.is_alive for p in room.players.values()) for m in t.members)]
-                            if len(alive_teams) == 1:
-                                room.winner = alive_teams[0].team_id
-                        # Win for me if no defeat and me is winner
-                        if room.last_defeat_version != room.match_version and room.me and room.me.is_alive:
-                            if room.winner == room.me.username or (room.teams and room.get_team(room.me.username) and room.winner == room.get_team(room.me.username).team_id):
-                                if room.last_win_version != room.match_version:
-                                    room.last_win_version = room.match_version
-                                    log_engine("win", session_id[:8], gm=room.game_mode.value, room=room.room_id[:8], via="stG 3→1 no defeat", winner=room.winner)
-                                    room.recent_kills.append(KillInfo(instigator="system", instigated=room.me.username, event_type="win"))
-                        # Log actual winner even if not me (e.g. yt hollow won, an slim eliminated)
-                        if room.winner and room.winner != (room.me.username if room.me else None):
-                            log_engine("win", session_id[:8], gm=room.game_mode.value, room=room.room_id[:8], via="stG 3→1", winner=room.winner)
-                        if room.party.is_party or room.short_code:
-                            room.match_version += 1
-                            if len(room.recent_kills) > 20:
-                                room.recent_kills = room.recent_kills[-10:]
-                            room.recent_knocks = []
-                            log_engine("match", session_id[:8], action="new_version", version=room.match_version, room=room.room_id[:8])
-                    elif stg == 3 and room.last_stg != 3 and room.state == State.MATCH:
-                        # per user: stG=3 always at game end for wwzw/zw_lg — evaluate immediately (like zone second tick)
-                        me_name3 = (view.me.username if view.me else None) or (room.me.username if room.me else None)
-                        if me_name3 and room.last_defeat_version != room.match_version and room.last_win_version != room.match_version:
-                            # determine alive/left/_pt team
-                            has_left3 = True
-                            is_alive3 = False
-                            fallback3 = (view.me.is_alive if view.me and view.me.username == me_name3 else (room.me.is_alive if room.me and room.me.username == me_name3 else True))
-                            for pl in room.players.values():
-                                if pl.username == me_name3:
-                                    has_left3 = False
-                                    is_alive3 = pl.is_alive
-                                    break
-                            if has_left3:
-                                is_alive3 = fallback3
-                            is_team_stg = room.game_mode.value.lower() in ("wwzw", "ww", "wwzw", "zw_lg") and bool(room.teams)
-                            if has_left3 and is_alive3:
-                                log_engine("stG", session_id[:8], action="end neutral — left early still alive", stG=3, gm=room.game_mode.value, room=room.room_id[:8], version=room.match_version)
-                                # neutral — just bump version after, don't set win/defeat
-                                room.match_version += 1
-                                room.zone_match_active = False  # reset zone bookend as well
-                                if len(room.recent_kills) > 20: room.recent_kills = room.recent_kills[-10:]
-                                room.recent_knocks = []
-                                log_engine("match", session_id[:8], action="new_version", version=room.match_version, room=room.room_id[:8], via="stG 3 neutral")
-                            elif not is_alive3:
-                                _oldv = room.match_version
-                                room.match_version += 1
-                                room.zone_match_active = False
-                                if len(room.recent_kills) > 20: room.recent_kills = room.recent_kills[-10:]
-                                room.recent_knocks = []
-                                log_engine("match", session_id[:8], action="new_version", version=room.match_version, room=room.room_id[:8], via="stG 3 defeat")
-                                if room.last_defeat_version != room.match_version:
-                                    room.last_defeat_version = room.match_version
-                                    log_engine("defeat", session_id[:8], gm=room.game_mode.value, room=room.room_id[:8], via="stG 3 — eliminated", version=room.match_version)
-                                    room.recent_kills.append(KillInfo(instigator="system", instigated=me_name3, event_type="defeat"))
-                            else:
-                                _oldv2 = room.match_version
-                                room.match_version += 1
-                                room.zone_match_active = False
-                                if len(room.recent_kills) > 20: room.recent_kills = room.recent_kills[-10:]
-                                room.recent_knocks = []
-                                log_engine("match", session_id[:8], action="new_version", version=room.match_version, room=room.room_id[:8], via="stG 3 win")
-                                if room.last_win_version == _oldv2:
-                                    log_engine("stG", session_id[:8], action="end already won via last alive", stG=3, room=room.room_id[:8], version=_oldv2)
-                                else:
-                                    winner3 = me_name3
-                                    if is_team_stg and room.teams:
-                                        myt = room.get_team(me_name3)
-                                        if myt:
-                                            alive_in = sum(1 for m in myt.members if any(p.username==m and p.is_alive for p in room.players.values()))
-                                            if alive_in > 0:
-                                                winner3 = myt.team_id
-                                    room.winner = winner3
-                                    if room.last_win_version != room.match_version:
-                                        room.last_win_version = room.match_version
-                                        log_engine("win", session_id[:8], gm=room.game_mode.value, room=room.room_id[:8], via="stG 3 — still alive", winner=winner3, version=room.match_version)
-                                        room.recent_kills.append(KillInfo(instigator="system", instigated=me_name3, event_type="win"))
+                # per user: only capture wins/defeats when stG==3, check not eliminated / not alv false -> win, else defeat for wwzw/zw_lg
+                if stg == 3 and room.last_stg != 3 and room.game_mode and room.game_mode.value in ("zw_lg", "wwzw"):
+                    me_name = (view.me.username if view.me else None) or (room.me.username if room.me else None)
+                    if me_name and room.state == State.MATCH:
+                        # not eliminated: not alv false and not in eliminated list
+                        is_eliminated = False
+                        me_pl = None
+                        for p in room.players.values():
+                            if _names_equal(p.username, me_name):
+                                me_pl = p
+                                break
+                        if me_pl and not me_pl.is_alive:
+                            is_eliminated = True
+                        if room.last_defeat_version == room.match_version:
+                            is_eliminated = True
+                        # also check recent defeat already recorded for this match
+                        if not is_eliminated:
+                            if room.last_win_version != room.match_version:
+                                room.last_win_version = room.match_version
+                                winner = me_name
+                                if room.teams:
+                                    myt = room.get_team(me_name)
+                                    if myt:
+                                        winner = myt.team_id
+                                room.winner = winner
+                                log_engine("win", session_id[:8], gm=room.game_mode.value, room=room.room_id[:8], via="stG 3 not eliminated", winner=winner, version=room.match_version)
+                                room.recent_kills.append(KillInfo(instigator="system", instigated=me_name, event_type="win"))
+                        else:
+                            if room.last_defeat_version != room.match_version:
+                                room.last_defeat_version = room.match_version
+                                log_engine("defeat", session_id[:8], gm=room.game_mode.value, room=room.room_id[:8], via="stG 3 was eliminated", version=room.match_version)
+                                room.recent_kills.append(KillInfo(instigator="system", instigated=me_name, event_type="defeat"))
+                        # bump version for next match
+                        room.match_version += 1
+                        room.zone_match_active = False
+                        if len(room.recent_kills) > 20:
+                            room.recent_kills = room.recent_kills[-10:]
+                        room.recent_knocks = []
+                        log_engine("match", session_id[:8], action="new_version", version=room.match_version, room=room.room_id[:8], via="stG 3")
                 room.last_stg = stg
             except Exception:
-                pass
-            if room.game_mode and room.game_mode.value in ("zw_lg", "wwzw", "zw"):
-                pass
-            else:
                 pass
         # Zone timer — only from bz_* (not stG) for zw_lg/wwzw, hard 4:59
         # So packet.zone_time that came from stG should be ignored for zw_lg
@@ -609,123 +607,12 @@ class Engine:
             except Exception:
                 pass
 
-        # reset zone bookend on lobby
-        if is_lobby:
+        # zone bookend wins disabled per user — only stG==3 for wins/defeats
+        if room.state == State.LOBBY:
             room.zone_match_active = False
             room.last_zone_hex = None
 
-        # ---- ZONE BOOKEND (per user spec): first zone = match start, second zone = evaluate win/defeat ----
-        # Only for zone modes (zw_lg, wwzw, zw, etc). DF/BF are not zone.
-        ZONE_GMS = {"zw_lg", "wwzw", "zw", "ww", "wwzw", "WWZW"}
-        gm_low_zone = (room.game_mode.value.lower() if room.game_mode else "")
-        eff_is_zone = bool(is_zone_packet)
-        # also treat a pure zone_time packet as zone event for zone modes (user log zone_time:1)
-        if not eff_is_zone and packet.zone_time is not None and gm_low_zone in ZONE_GMS:
-            eff_is_zone = True
-        # wwzw spams 3-4 zone ticks per phase with huge timestamps (1497xxx) — ignore for bookend, only valid 0-600 counts
-        if eff_is_zone and packet.zone_time is not None:
-            if _valid_zone_time(packet.zone_time) is None:
-                eff_is_zone = False
-        if eff_is_zone and gm_low_zone in ZONE_GMS and room.state == State.MATCH:
-            # dedup retransmit
-            if packet.raw_hex and room.last_zone_hex and packet.raw_hex == room.last_zone_hex:
-                pass
-            else:
-                if packet.raw_hex:
-                    room.last_zone_hex = packet.raw_hex
-                if not room.zone_match_active:
-                    room.zone_match_active = True
-                    log_engine("zone_match", session_id[:8], action="started", gm=room.game_mode.value if room.game_mode else gm_low_zone, room=room.room_id[:8], version=room.match_version, zone_time=packet.zone_time, phase=packet.zone_phase)
-                else:
-                    # second zone -> evaluate
-                    me_name = (view.me.username if view.me else None) or (room.me.username if room.me else None)
-                    if not me_name:
-                        room.zone_match_active = False
-                        room.match_version += 1
-                        log_engine("zone_match", session_id[:8], action="reset no identity", room=room.room_id[:8], version=room.match_version)
-                    elif room.last_defeat_version == room.match_version:
-                        # already defeated via alv/kill this match — just close bookend
-                        log_engine("zone_match", session_id[:8], action="ended already defeated", gm=gm_low_zone, room=room.room_id[:8], version=room.match_version)
-                        room.zone_match_active = False
-                        room.match_version += 1
-                        if len(room.recent_kills) > 20:
-                            room.recent_kills = room.recent_kills[-10:]
-                        room.recent_knocks = []
-                        log_engine("match", session_id[:8], action="new_version", version=room.match_version, room=room.room_id[:8], via="zone bookend defeated")
-                    else:
-                        # determine alive/left
-                        has_left = True
-                        is_me_alive = False
-                        # default alive from view if not in room
-                        fallback_alive = (view.me.is_alive if view.me and view.me.username == me_name else (room.me.is_alive if room.me and room.me.username == me_name else True))
-                        for p in room.players.values():
-                            if p.username == me_name:
-                                has_left = False
-                                is_me_alive = p.is_alive
-                                break
-                        if has_left:
-                            is_me_alive = fallback_alive
-                        # team-aware win check for duo zone modes (wwzw) — if teammate alive, team wins
-                        is_team_zone = gm_low_zone in ("wwzw", "ww", "wwzw")
-                        if has_left and is_me_alive:
-                            log_engine("zone_match", session_id[:8], action="ended neutral — left early still alive", gm=gm_low_zone, room=room.room_id[:8], version=room.match_version)
-                            room.zone_match_active = False
-                            room.match_version += 1
-                            if len(room.recent_kills) > 20:
-                                room.recent_kills = room.recent_kills[-10:]
-                            room.recent_knocks = []
-                            log_engine("match", session_id[:8], action="new_version", version=room.match_version, room=room.room_id[:8], via="zone neutral")
-                        elif not is_me_alive:
-                            # eliminated via alv/killfeed before second zone — bump then flag on new version so processor sees it
-                            room.zone_match_active = False
-                            room.match_version += 1
-                            if len(room.recent_kills) > 20:
-                                room.recent_kills = room.recent_kills[-10:]
-                            room.recent_knocks = []
-                            log_engine("match", session_id[:8], action="new_version", version=room.match_version, room=room.room_id[:8], via="zone defeat")
-                            if room.last_defeat_version != room.match_version:
-                                room.last_defeat_version = room.match_version
-                                room.winner = None
-                                log_engine("defeat", session_id[:8], gm=gm_low_zone, room=room.room_id[:8], via="zone bookend — eliminated", version=room.match_version)
-                                room.recent_kills.append(KillInfo(instigator="system", instigated=me_name, event_type="defeat"))
-                        else:
-                            # still alive -> win (or team win) — bump version first so processor sees win on new version
-                            _old_ver = room.match_version
-                            room.zone_match_active = False
-                            room.match_version += 1
-                            if len(room.recent_kills) > 20:
-                                room.recent_kills = room.recent_kills[-10:]
-                            room.recent_knocks = []
-                            log_engine("match", session_id[:8], action="new_version", version=room.match_version, room=room.room_id[:8], via="zone win")
-                            # avoid double win if already won via last-alive on same match (old_ver)
-                            if room.last_win_version == _old_ver:
-                                log_engine("zone_match", session_id[:8], action="ended already won via last alive", gm=gm_low_zone, room=room.room_id[:8], version=_old_ver)
-                            else:
-                                did_win = False
-                                winner_name = me_name
-                                if is_team_zone and room.teams:
-                                    my_team = room.get_team(me_name)
-                                    if my_team:
-                                        alive_in_team = sum(1 for m in my_team.members if any(p.username == m and p.is_alive for p in room.players.values()))
-                                        if alive_in_team > 0:
-                                            did_win = True
-                                            winner_name = my_team.team_id
-                                            room.winner = winner_name
-                                        else:
-                                            did_win = True
-                                            room.winner = me_name
-                                    else:
-                                        did_win = True
-                                        room.winner = me_name
-                                else:
-                                    did_win = True
-                                    room.winner = me_name
-                                if did_win and room.last_win_version != room.match_version:
-                                    room.last_win_version = room.match_version
-                                    log_engine("win", session_id[:8], gm=gm_low_zone, room=room.room_id[:8], via="zone bookend — still alive", winner=winner_name, version=room.match_version)
-                                    room.recent_kills.append(KillInfo(instigator="system", instigated=me_name, event_type="win"))
-
-        # ---- JOIN (room-scoped, fill other players skin/pid/pfid) ---
+                # ---- JOIN (room-scoped, fill other players skin/pid/pfid) ---
         # Handle both Event Join (255) and Operation JoinRoom from other players joining existing room
         join_name = packet.player_name
         # Fallback: if packet has no name but gpb has playerProps 255, use that (covers JoinRoom from joiner)
@@ -733,13 +620,13 @@ class Engine:
             join_name = str(gpb["playerProps"]["255"])
         is_join_packet = packet.packet_type in (PacketType.JOIN, PacketType.JOIN_ROOM, PacketType.CREATE_ROOM)
         if is_join_packet and join_name:
-            # If this is not the self's first join (already handled), treat as other player joining existing room
-            is_self_join = join_name == (view.me.username if view.me else None) and is_first_join
+            # If this is not the self's first join (already handled), treat as other player joining existing room (normalized for dc: prefix)
+            is_self_join = _names_equal(join_name, view.me.username if view.me else None) and is_first_join
             if not is_self_join:
                 p_actor = actor_nr
                 existing_key = None
                 for k, p in room.players.items():
-                    if p.username == join_name:
+                    if _names_equal(p.username, join_name):
                         existing_key = k
                         break
                 if existing_key is not None:
@@ -794,7 +681,7 @@ class Engine:
         if packet.packet_type == PacketType.LEAVE and packet.player_name:
             to_del = None
             for k, p in room.players.items():
-                if p.username == packet.player_name or (actor_nr is not None and k == int(actor_nr)):
+                if _names_equal(p.username, packet.player_name) or (actor_nr is not None and k == int(actor_nr)):
                     to_del = k
                     break
             if to_del is not None:
@@ -836,20 +723,20 @@ class Engine:
                 target_key = int(actor_nr)
             elif alv_name:
                 for k, p in room.players.items():
-                    if p.username == alv_name:
+                    if _names_equal(p.username, alv_name):
                         target = p
                         target_key = k
                         break
                 # fallback to packet.player_name if alv_name differs
                 if not target and packet.player_name:
                     for k, p in room.players.items():
-                        if p.username == packet.player_name:
+                        if _names_equal(p.username, packet.player_name):
                             target = p
                             target_key = k
                             break
             if target is None and alv_name:
                 for k, p in room.players.items():
-                    if p.username == alv_name:
+                    if _names_equal(p.username, alv_name):
                         target = p
                         target_key = k
                         break
@@ -867,7 +754,7 @@ class Engine:
                         skin=str(skid) if skid else None,
                         pickaxe=str(pid) if pid else None,
                         is_alive=packet.is_alive,
-                        is_self=alv_name == (view.me.username if view.me else None),
+                        is_self=_names_equal(alv_name, view.me.username if view.me else None),
                         pt=pt,
                     )
                     if pt: _rebuild_teams(room)
@@ -906,92 +793,13 @@ class Engine:
                 elif target.is_alive and not was_alive:
                     room.players_count += 1
                     log_engine("alv", session_id[:8], name=target.username, alive=True, count=room.players_count, room=room.room_id[:8])
-                if target.is_self or (view.me and target.username == view.me.username):
+                if target.is_self or (view.me and _names_equal(target.username, view.me.username)):
                     if view.me:
                         view.me.is_alive = target.is_alive
                         if target.skin: view.me.skin = target.skin
-                    if room.me and target.username == room.me.username:
+                    if room.me and _names_equal(target.username, room.me.username):
                         room.me.is_alive = target.is_alive
                         if target.skin: room.me.skin = target.skin
-                # Immediate defeat for zw_lg/wwzw/BF2V2 when me (or me's team) dies during MATCH
-                if not target.is_alive and was_alive and room.state == State.MATCH:
-                    is_me = target.is_self or (view.me and target.username == view.me.username)
-                    is_teammate = False
-                    if not is_me and room.game_mode and room.game_mode.value in ("wwzw", "zw_lg", "BF2V2", "BF2V2") and target.username:
-                        # Check if eliminated player is teammate via _pt or Party team
-                        team = room.get_team(target.username)
-                        my_team = room.get_team(view.me.username) if view.me else None
-                        if team and my_team and team.team_id == my_team.team_id:
-                            is_teammate = True
-                    if is_me or is_teammate:
-                        # DF has no win/defeat — just K/D
-                        if room.game_mode and room.game_mode.value == "DF":
-                            pass
-                        elif room.game_mode and room.game_mode.value == "BF2V2":
-                            my_team = room.get_team(view.me.username) if view.me else None
-                            if my_team:
-                                alive_in_team = sum(1 for m in my_team.members if any(p.username==m and p.is_alive for p in room.players.values()))
-                                if alive_in_team > 0:
-                                    pass  # teammate still alive, not defeat yet
-                                elif room.last_defeat_version != room.match_version:
-                                    room.last_defeat_version = room.match_version
-                                    log_engine("defeat", session_id[:8], gm=room.game_mode.value, room=room.room_id[:8], via="team eliminated", version=room.match_version)
-                                    room.recent_kills.append(KillInfo(instigator="system", instigated=target.username, event_type="defeat"))
-                            elif is_me and room.last_defeat_version != room.match_version:
-                                room.last_defeat_version = room.match_version
-                                log_engine("defeat", session_id[:8], gm=room.game_mode.value, room=room.room_id[:8], via="alv", version=room.match_version)
-                        elif is_me and room.last_defeat_version != room.match_version:
-                            # Only for zone modes (zw_lg, wwzw) — DF excluded above
-                            if room.game_mode and room.game_mode.value in ("zw_lg", "wwzw", "zw", "WW", "WWZW"):
-                                room.last_defeat_version = room.match_version
-                                log_engine("defeat", session_id[:8], gm=room.game_mode.value if room.game_mode else "?", room=room.room_id[:8], via="alv", version=room.match_version)
-                                room.recent_kills.append(KillInfo(instigator="system", instigated=target.username, event_type="defeat"))
-
-        # ---- _pt TEAM via TargetActorNr (per user sample: _pt ties to TargetActorNr) — duos for private matches ----
-        # Sample: Properties {_pt:4} + TargetActorNr:8 + ActorNr:1 → actor 8 is team 4. Only private (party/short_code) really uses teams, but we track for all.
-        if gpb and gpb.get("properties") and ("_pt" in gpb["properties"] or "pt" in gpb["properties"]):
-            props_pt = gpb["properties"]
-            pt_raw = props_pt.get("_pt") if "_pt" in props_pt else props_pt.get("pt")
-            pt_str = str(pt_raw).strip() if pt_raw is not None else None
-            if pt_str:
-                # TargetActorNr is the actor being assigned to team
-                t_nr = None
-                try:
-                    pp = gpb.get("params", {})
-                    if isinstance(pp, dict) and "TargetActorNr" in pp:
-                        v = pp["TargetActorNr"]
-                        t_nr = int(v["value"]) if isinstance(v, dict) and "value" in v else int(v)
-                    elif gpb.get("raw", {}).get("ev", {}).get("params"):
-                        for _pp in gpb["raw"]["ev"]["params"]:
-                            if _pp.get("keyName") == "TargetActorNr":
-                                _v = _pp["value"]
-                                t_nr = int(_v["value"]) if isinstance(_v, dict) and "value" in _v else int(_v)
-                                break
-                except Exception:
-                    t_nr = None
-                # assign pt to that actor's player
-                if t_nr is not None:
-                    tgt_pt = None
-                    if t_nr in room.players:
-                        tgt_pt = room.players[t_nr]
-                    elif t_nr in room.actor_map:
-                        uname_pt = room.actor_map.get(t_nr)
-                        for _p in room.players.values():
-                            if _p.username == uname_pt:
-                                tgt_pt = _p
-                                break
-                    if tgt_pt:
-                        tgt_pt.pt = pt_str
-                        _rebuild_teams(room)
-                        log_engine("team_pt", session_id[:8], team=pt_str, target=t_nr, player=getattr(tgt_pt, "username", "?"), actorNr=actor_nr, room=room.room_id[:8])
-                    else:
-                        # pending: player not yet joined, store via actor_map pt pending?
-                        # keep in actor_pt map for future join (store on room)
-                        if not hasattr(room, "_pending_pt"):
-                            room._pending_pt = {}
-                        room._pending_pt[t_nr] = pt_str
-                        log_engine("team_pt", session_id[:8], team=pt_str, target=t_nr, status="pending no player yet", room=room.room_id[:8])
-
         # ---- SKIN / PICKAXE / GAME_ID / _pt via PropertiesChanged without alv (room-scoped) ----
         # Other players skins often arrive as type 4 code 253 with skid/pid but no alv — also _pt for duos via actorNr/TargetActorNr
         if gpb and gpb.get("properties") and packet.packet_type not in (PacketType.ALIVE, PacketType.ELIMINATED):
@@ -1054,7 +862,7 @@ class Engine:
                     # Late join via killfeed — only for valid deduped kills
                     for name, is_target in [(killer, False), (victim, True)]:
                         if name:
-                            existing = any(p.username == name for p in room.players.values())
+                            existing = any(_names_equal(p.username, name) for p in room.players.values())
                             if not existing:
                                 key = -1 if len(room.players) > 50 else hash(name) % 100000
                                 while key in room.players:
@@ -1063,7 +871,7 @@ class Engine:
                                     actor_nr=-1,
                                     username=name,
                                     is_alive=not is_target,
-                                    is_self=(view.me and name == view.me.username),
+                                    is_self=(view.me and _names_equal(name, view.me.username)),
                                 )
                                 log_engine("join", session_id[:8], name=name, source="killfeed", alive=not is_target, room=room.room_id[:8])
         elif packet.is_knock and packet.killer and packet.victim:
@@ -1074,9 +882,9 @@ class Engine:
         # When killfeed says victim == me during MATCH with >1 players, that's a loss even if alv never flips
         if packet.is_kill and packet.victim and room.state == State.MATCH and room.players_count > 1:
             is_me_victim = False
-            if view.me and packet.victim == view.me.username:
+            if view.me and _names_equal(packet.victim, view.me.username):
                 is_me_victim = True
-            elif room.me and packet.victim == room.me.username:
+            elif room.me and _names_equal(packet.victim, room.me.username):
                 is_me_victim = True
             # also team: if victim is teammate in BF2V2/wwzw and team now empty, engine already handles via alv team path — keep kill fallback only for solo
             gm_low_k = room.game_mode.value.lower() if room.game_mode else ""
@@ -1085,63 +893,25 @@ class Engine:
                 room.last_defeat_version = room.match_version
                 log_engine("defeat", session_id[:8], gm=room.game_mode.value if room.game_mode else "?", room=room.room_id[:8], via="kill victim", victim=packet.victim, version=room.match_version)
                 room.recent_kills.append(KillInfo(instigator=packet.killer or "system", instigated=packet.victim, event_type="defeat"))
-                # mark me dead for processor fallback consistency
-                if view.me and view.me.username == packet.victim:
+                # mark me dead for processor fallback consistency (normalized dc: prefix)
+                if view.me and _names_equal(view.me.username, packet.victim):
                     view.me.is_alive = False
-                if room.me and room.me.username == packet.victim:
+                if room.me and _names_equal(room.me.username, packet.victim):
                     room.me.is_alive = False
                 for p in room.players.values():
-                    if p.username == packet.victim:
+                    if _names_equal(p.username, packet.victim):
                         p.is_alive = False
                         break
                 if room.players_count > 0:
                     room.players_count = max(0, room.players_count - 1)
-        # Leave as defeat: me left during MATCH
+        # Leave as defeat: me left during MATCH (normalized for dc: prefix)
         if packet.packet_type == PacketType.LEAVE and packet.player_name and room.state == State.MATCH:
-            is_me_leave = (view.me and packet.player_name == view.me.username) or (room.me and packet.player_name == room.me.username)
+            is_me_leave = (view.me and _names_equal(packet.player_name, view.me.username)) or (room.me and _names_equal(packet.player_name, room.me.username))
             gm_low_l = room.game_mode.value.lower() if room.game_mode else ""
             if is_me_leave and gm_low_l != "df" and room.last_defeat_version != room.match_version:
                 room.last_defeat_version = room.match_version
                 log_engine("defeat", session_id[:8], gm=room.game_mode.value if room.game_mode else "?", room=room.room_id[:8], via="leave", version=room.match_version)
                 room.recent_kills.append(KillInfo(instigator=packet.player_name, instigated="", event_type="defeat"))
-
-        # ---- SOLO WIN via last alive (zw_lg/wwzw solo) — set winner for any last alive
-        # Guard: avoid early win right after join when only 1 player ever seen and no kills yet
-        if room.game_mode and room.game_mode.value in ("zw_lg", "wwzw", "zw", "WW", "WWZW") and room.state == State.MATCH and room.players_count == 1:
-            # Early guard: need at least 2 players ever seen or at least one kill, else it's just lobby join
-            if len(room.players) <= 1 and len(room.recent_kills) == 0:
-                pass
-            else:
-                alive = [p for p in room.players.values() if p.is_alive]
-                if len(alive) == 1:
-                    winner = alive[0].username
-                    room.winner = winner
-                    # Win for me only if I am winner
-                    if winner == (room.me.username if room.me else None) and room.me and room.me.is_alive and room.last_win_version != room.match_version:
-                        room.last_win_version = room.match_version
-                        log_engine("win", session_id[:8], gm=room.game_mode.value, room=room.room_id[:8], via="last alive", winner=winner, version=room.match_version)
-                        room.recent_kills.append(KillInfo(instigator="system", instigated=winner, event_type="win"))
-                    elif winner != (room.me.username if room.me else None):
-                        log_engine("win", session_id[:8], gm=room.game_mode.value, room=room.room_id[:8], via="last alive", winner=winner, version=room.match_version)
-
-        # ---- WINNER determination (per room, not just me) ----
-        # For any MATCH, if only one player/team remains alive, set room.winner (used for bot)
-        if room.state == State.MATCH:
-            alive_players = [p for p in room.players.values() if p.is_alive]
-            if len(alive_players) == 1 and room.game_mode and room.game_mode.value in ("zw_lg", "DF"):
-                room.winner = alive_players[0].username
-            elif room.teams and room.game_mode and room.game_mode.value in ("wwzw", "BF2V2", "zw_lg"):
-                # Duo: one team remains
-                alive_teams = []
-                for tid, team in room.teams.items():
-                    if any(any(p.username==m and p.is_alive for p in room.players.values()) for m in team.members):
-                        alive_teams.append(team)
-                if len(alive_teams) == 1:
-                    room.winner = alive_teams[0].team_id
-                    # Also handle leave as elimination: if team left, it's not alive
-                    if room.game_mode.value == "BF2V2" and any(k.event_type=="left" and k.instigator in [m for t in room.teams.values() for m in t.members] for k in room.recent_kills[-5:]):
-                        # Leave counts as eliminated for BF2V2 win
-                        pass
 
         # ---- BF2V2 win via team elimination (killfeed + leave) ----
         if room.game_mode and room.game_mode.value == "BF2V2" and room.state == State.MATCH:
