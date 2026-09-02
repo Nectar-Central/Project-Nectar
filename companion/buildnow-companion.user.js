@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BuildNow Companion Live Capture (game-frame only)
 // @namespace    buildnow-companion.local
-// @version      2.6.0
-// @description  BuildNow Companion v2.6.0 — centered drawer, keybind setter, State — Game Mode, clean footer.
+// @version      2.8.1
+// @description  BuildNow Companion v2.8.1 — welcome back toast on first Authenticate, lobby music + volume.
 // @author       @cis6led
 // @match        https://buildnow-gg.game-files.crazygames.com/*
 // @all-frames   true
@@ -64,6 +64,7 @@
   let reqCounter = Number(GMGet('bnc_req_counter', GMGet('bn_req_counter', 0))||0);
   let currentReqToken = GMGet('bnc_req_token', GMGet('bn_req_token', null));
   let discordId = GMGet('bnc_discord_id', GMGet('bn_discord_id', null));
+  let authToastShown = false;
 
   function storeSession(j){
     if(j.session_id) { sessionId=j.session_id; GMSet('bnc_session_id', sessionId); }
@@ -732,6 +733,50 @@
 
   let infoPanel=null, infoUpdateTimer=null, statsCache=null, statsPollTimer=null, drawerBackdrop=null;
   let drawerOpen = !!GMGet('bnc_info_open', GMGet('bn_info_open', false));
+  let drawerTab = GMGet('bnc_drawer_tab','stats'); // 'stats' | 'players'
+  let playersCache=null, playersPollTimer=null, playersLoading=false;
+  let lobbyAudio=null;
+  let bgLobbyPollTimer=null;
+  function ensureLobbyAudio(){
+    if(lobbyAudio) return lobbyAudio;
+    try{
+      lobbyAudio=document.createElement('audio');
+      lobbyAudio.id='bnc-lobby-audio';
+      lobbyAudio.loop=true;
+      lobbyAudio.preload='auto';
+      lobbyAudio.crossOrigin='anonymous';
+      lobbyAudio.style.display='none';
+      lobbyAudio.volume=Math.max(0,Math.min(1, Number(GMGet('bnc_lobby_volume', 0.5))));
+      (document.body||document.documentElement).appendChild(lobbyAudio);
+    }catch{}
+    return lobbyAudio;
+  }
+  function updateLobbyMusic(){
+    try{
+      const sc=statsCache;
+      const sess=sc && sc.session;
+      const isLobby = !sess || String(sess.state||'').toLowerCase()!=='match';
+      const url = sc && sc.lobby_music_url;
+      const audio=ensureLobbyAudio();
+      if(!audio) return;
+      // volume from GM
+      const vol = Math.max(0,Math.min(1, Number(GMGet('bnc_lobby_volume', 0.5))));
+      audio.volume = vol;
+      if(!url || !isLobby){
+        try{ audio.pause(); if(audio.src) { audio.removeAttribute('src'); audio.load(); } }catch{}
+        return;
+      }
+      // avoid reloading same src
+      if(audio.src !== url){
+        try{ audio.src=url; audio.load(); }catch{}
+      }
+      // try play (may need user gesture - drawer open is gesture)
+      const p = audio.play();
+      if(p && p.catch) p.catch(()=>{});
+    }catch{}
+  }
+  function startBgLobbyPoll(){ if(bgLobbyPollTimer) return; bgLobbyPollTimer=setInterval(()=>{ if(sessionId) fetchStats(false); }, 15000); }
+  function stopBgLobbyPoll(){ if(bgLobbyPollTimer){ clearInterval(bgLobbyPollTimer); bgLobbyPollTimer=null; } }
 
   function createInfoPanel(){
     // cleanup legacy handle (removed per request)
@@ -759,7 +804,7 @@
         <div style="opacity:0.7;font-size:12px">Loading…</div>
       </div>
       <div id="bnc-drawer-footer" style="padding:10px 14px;border-top:1px solid rgba(255,255,255,0.06);display:flex;justify-content:space-between;align-items:center;flex-shrink:0;font-size:11px;color:#6b7280">
-        <span id="bnc-drawer-version">v2.6.0</span>
+        <span id="bnc-drawer-version">v2.8.1</span>
         <span id="bnc-drawer-api" style="display:flex;align-items:center;gap:6px"><span id="bnc-drawer-dot" style="width:8px;height:8px;border-radius:50%;background:#6b7280;display:inline-block"></span><span id="bnc-drawer-api-text">Offline</span></span>
       </div>`;
     // non-passthrough: stop game from seeing wheel/keys inside drawer
@@ -793,10 +838,15 @@
       drawerBackdrop.style.display='block';
       fetchStats(true);
       startStatsPoll();
+      startBgLobbyPoll();
+      if(drawerTab==='players'){ fetchPlayers(true); startPlayersPoll(); }
     } else {
       infoPanel.style.transform='translateX(-100%)';
       drawerBackdrop.style.display='none';
       stopStatsPoll();
+      stopPlayersPoll();
+      // keep bg poll for lobby music if we have a session and music, else stop
+      if(sessionId) startBgLobbyPoll(); else stopBgLobbyPoll();
     }
   }
   function toggleInfoPanel(force){
@@ -804,7 +854,40 @@
     if(typeof force==='boolean') setDrawerOpen(force);
     else setDrawerOpen(!drawerOpen);
   }
-  // centered drawer — skin top, username, discord — game_id, state — gm, separator, stats, footer, keybind button
+  function switchDrawerTab(tab){
+    drawerTab = tab==='players' ? 'players' : 'stats';
+    GMSet('bnc_drawer_tab', drawerTab);
+    renderInfoPanel();
+    if(drawerTab==='players'){ fetchPlayers(true); startPlayersPoll(); } else { stopPlayersPoll(); }
+  }
+  function fetchPlayers(forceRender){
+    if(!sessionId){ if(forceRender) renderInfoPanel(); return; }
+    if(playersLoading) return;
+    playersLoading=true;
+    const base=resolveApiBase();
+    const url=base + '/api/players?session_id=' + encodeURIComponent(sessionId);
+    const GM = typeof GM_xmlhttpRequest!=='undefined' ? GM_xmlhttpRequest : (typeof unsafeWindow!=='undefined' && unsafeWindow.GM_xmlhttpRequest) || null;
+    const onDone=(ok, txt)=>{
+      playersLoading=false;
+      if(ok){
+        try{
+          const j=JSON.parse(txt);
+          playersCache=j;
+          if(drawerTab==='players') renderInfoPanel();
+        }catch{ if(forceRender && drawerTab==='players') renderInfoPanel(); }
+      } else if(forceRender && drawerTab==='players') renderInfoPanel();
+    };
+    if(GM){
+      try{
+        GM({method:'GET', url, timeout:8000, onload:r=> onDone(r.status>=200&&r.status<300, r.responseText), onerror:()=> onDone(false,''), ontimeout:()=> onDone(false,'')});
+        return;
+      }catch{}
+    }
+    fetch(url,{method:'GET'}).then(r=>r.text().then(t=> onDone(r.ok, t)).catch(()=> onDone(false,''))).catch(()=> onDone(false,''));
+  }
+  function startPlayersPoll(){ stopPlayersPoll(); fetchPlayers(false); playersPollTimer=setInterval(()=> fetchPlayers(false), 15000); }
+  function stopPlayersPoll(){ if(playersPollTimer){ clearInterval(playersPollTimer); playersPollTimer=null; } }
+  // centered drawer — skin top, username, discord — game_id, state — gm, separator, stats, footer, keybind button + tabs
   function renderInfoPanel(){
     if(!infoPanel) createInfoPanel();
     const body=document.getElementById('bnc-drawer-body');
@@ -823,10 +906,10 @@
     const pGlobal = sc? sc.playtime_global : null;
     const sess = sc && sc.session ? sc.session : null;
     const gmLive = sess && sess.game_mode ? fmtGmDrawer(sess.game_mode) : fmtGmDrawer(gmRaw);
-    // state: Lobby vs In Match
-    let stateLabel='Lobby';
-    if(sess && sess.state){ stateLabel = String(sess.state).toLowerCase()==='match' ? 'In Match' : 'Lobby'; }
-    else if(sess && sess.cur_scn){ stateLabel = String(sess.cur_scn).toLowerCase().includes('lobby') ? 'Lobby' : 'In Match'; }
+    // state: Lobby vs In Match — spec says show "In Lobby" when no game mode
+    let stateLabel='In Lobby';
+    if(sess && sess.state){ stateLabel = String(sess.state).toLowerCase()==='match' ? 'In Match' : 'In Lobby'; }
+    else if(sess && sess.cur_scn){ stateLabel = String(sess.cur_scn).toLowerCase().includes('lobby') ? 'In Lobby' : 'In Match'; }
     // per current gm playtime
     let perGmCurrent=null;
     if(sc && sc.playtime_per_gm){
@@ -834,7 +917,6 @@
       const keys=[curRaw, curRaw.toLowerCase(), curRaw.toUpperCase()];
       for(const k of keys){ if(sc.playtime_per_gm[k]!=null){ perGmCurrent=sc.playtime_per_gm[k]; break; } }
       if(perGmCurrent==null){
-        // try formatted match
         for(const [kk,v] of Object.entries(sc.playtime_per_gm)){ if(kk.toLowerCase()===curRaw.toLowerCase()){ perGmCurrent=v; break; } }
       }
     }
@@ -843,12 +925,17 @@
       : `<div style="width:112px;height:112px;display:flex;align-items:center;justify-content:center;background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:16px;font-size:32px;flex-shrink:0">▣</div>`;
     const kbLabel = formatKeybind(getDrawerKeybind());
     const row = (label,val)=> `<div style="display:flex;justify-content:space-between;align-items:center;width:100%;max-width:240px;font-size:13px"><span style="color:#9ca3af">${label}</span><span style="font-weight:700;color:#fff">${val==null? '—' : val}</span></div>`;
-    body.innerHTML=`
+    const hasGm = gmLive && gmLive !== '—' && gmLive !== '-' && gmLive.toLowerCase() !== 'unknown' && gmLive.toLowerCase() !== 'lobby';
+    const stateGmLine = hasGm && stateLabel.toLowerCase() !== gmLive.toLowerCase() ? `${stateLabel} — ${gmLive}` : stateLabel;
+    const perGmRow = hasGm && perGmCurrent!=null ? row('Playtime ('+gmLive+')', fmtPlaytimeDrawer(perGmCurrent)) : '';
+    // tab bar
+    const tabBar = `<div style="display:flex;gap:6px;justify-content:center;width:100%;margin-bottom:4px"><button id="bnc-tab-stats" style="flex:1;max-width:120px;padding:6px 0;border-radius:999px;border:1px solid ${drawerTab==='stats'?'#fff':'rgba(255,255,255,0.12)'};background:${drawerTab==='stats'?'#fff':'#171717'};color:${drawerTab==='stats'?'#000':'#9ca3af'};font-size:12px;font-weight:700;cursor:pointer">Stats</button><button id="bnc-tab-players" style="flex:1;max-width:120px;padding:6px 0;border-radius:999px;border:1px solid ${drawerTab==='players'?'#fff':'rgba(255,255,255,0.12)'};background:${drawerTab==='players'?'#fff':'#171717'};color:${drawerTab==='players'?'#000':'#9ca3af'};font-size:12px;font-weight:700;cursor:pointer">Players</button></div>`;
+    const statsHtml = `
       <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;width:100%;padding:10px 0 6px 0">
         ${skinImg}
         <div style="font-size:19px;font-weight:800;color:#fff;text-align:center;word-break:break-word;max-width:240px">${String(uname).replace(/</g,'&lt;')}</div>
-        <div style="font-size:12px;color:#9ca3af;text-align:center;word-break:break-all;max-width:240px">${String(dname).replace(/</g,'&lt;')} — ${String(gid).slice(0,12).replace(/</g,'&lt;')}${String(gid).length>12?'…':''}</div>
-        <div style="font-size:13px;color:#e5e7eb;text-align:center;margin-top:2px">${stateLabel} — ${gmLive}</div>
+        <div style="font-size:12px;color:#9ca3af;text-align:center;word-break:break-all;max-width:240px">${String(dname).replace(/</g,'&lt;')} — ${String(gid).replace(/</g,'&lt;')}</div>
+        <div style="font-size:13px;color:#e5e7eb;text-align:center;margin-top:2px">${stateGmLine}</div>
         <div style="width:48px;height:1px;background:rgba(255,255,255,0.12);margin:10px 0"></div>
         <div style="display:flex;flex-direction:column;gap:7px;align-items:center;width:100%">
           ${row('Kills', kills)}
@@ -856,18 +943,68 @@
           ${row('Wins', wins)}
           ${row('Defeats', defeats)}
           ${row('Playtime', pGlobal!=null? fmtPlaytimeDrawer(pGlobal):null)}
-          ${row('Playtime ('+gmLive+')', perGmCurrent!=null? fmtPlaytimeDrawer(perGmCurrent):null)}
+          ${perGmRow}
         </div>
         <button id="bnc-keybind-set" style="margin-top:14px;padding:8px 14px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:600;cursor:pointer">Set open keybind: ${kbLabel}</button>
         <div id="bnc-keybind-hint" style="font-size:11px;color:#6b7280;min-height:14px"></div>
+        <div style="margin-top:10px;width:100%;max-width:240px;display:flex;flex-direction:column;gap:4px;align-items:center">
+          <div style="font-size:11px;color:#9ca3af">Lobby Music Volume</div>
+          <div style="display:flex;gap:8px;align-items:center;width:100%">
+            <span style="font-size:11px;color:#6b7280">🔈</span>
+            <input type="range" id="bnc-volume-slider" min="0" max="100" value="${Math.round(Number(GMGet('bnc_lobby_volume',0.5))*100)}" style="flex:1;accent-color:#fff">
+            <span id="bnc-volume-label" style="font-size:11px;color:#e5e7eb;min-width:32px;text-align:right">${Math.round(Number(GMGet('bnc_lobby_volume',0.5))*100)}%</span>
+            <span style="font-size:11px;color:#6b7280">🔊</span>
+          </div>
+        </div>
       </div>
     `;
+    // players tab content
+    let playersHtml='';
+    if(drawerTab==='players'){
+      const pc = playersCache;
+      if(!sessionId){
+        playersHtml = `<div style="padding:20px 0;color:#9ca3af;font-size:12px">No session — join a match</div>`;
+      } else if(!pc){
+        playersHtml = `<div style="padding:20px 0;color:#9ca3af;font-size:12px">Loading players…</div>`;
+      } else if(!pc.players || pc.players.length===0){
+        playersHtml = `<div style="padding:20px 0;color:#9ca3af;font-size:12px">No players in game</div>`;
+      } else {
+        const count = pc.count || pc.players.length;
+        const header = `<div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:8px;text-align:center">Players in Game — ${count}${pc.game_mode? ' · '+fmtGmDrawer(pc.game_mode):''}</div>`;
+        const rows = pc.players.map(pl=>{
+          const hasSkin = pl.skin!=null && String(pl.skin).trim()!=='' && String(pl.skin).toLowerCase()!=='nan' && String(pl.skin).toLowerCase()!=='null';
+          const skinP = hasSkin ? skinUrlDrawer(pl.skin) : null;
+          const img = skinP ? `<img src="${skinP}" style="width:36px;height:36px;object-fit:contain;background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:8px;flex-shrink:0" onerror="this.style.display='none'">` : `<div style="width:36px;height:36px;display:flex;align-items:center;justify-content:center;background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:8px;font-size:14px;flex-shrink:0">▣</div>`;
+          const esc=(v)=> String(v).replace(/</g,'&lt;');
+          const toNaN=(v)=> (v==null || String(v).trim()==='' || String(v).toLowerCase()==='null' || String(v).toLowerCase()==='undefined') ? 'NaN' : esc(v);
+          const titleName = pl.username!=null ? esc(pl.username) : 'NaN';
+          const nameLine = `<div style="font-size:13px;font-weight:700;color:#fff;word-break:break-word">${titleName}</div>`;
+          // essential detail line — human readable, full game_id, NaN for unknowns
+          const gidFull = pl.game_id!=null ? String(pl.game_id) : 'NaN';
+          const ptVal = pl.pt!=null ? String(pl.pt) : 'NaN';
+          const aliveVal = pl.is_alive==null ? 'NaN' : (pl.is_alive ? 'Alive' : 'Dead');
+          const selfVal = pl.is_self==null ? 'NaN' : (pl.is_self ? 'You' : 'Other');
+          const skinVal = hasSkin ? String(pl.skin) : 'NaN';
+          const discordVal = pl.discord_username!=null ? String(pl.discord_username) : 'NaN';
+          const detailLine = `Game ID: ${toNaN(gidFull)} · Discord: ${toNaN(discordVal)} · Team: ${toNaN(ptVal)} · ${aliveVal} · ${selfVal} · Skin: ${toNaN(skinVal)}`;
+          const detailDiv = `<div style="font-size:11px;color:#9ca3af;word-break:break-word;white-space:normal;line-height:1.35">${detailLine}</div>`;
+          return `<div style="display:flex;gap:10px;align-items:center;width:100%;max-width:300px;padding:8px 10px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px"><div style="flex-shrink:0">${img}</div><div style="flex:1;min-width:0;text-align:left;display:flex;flex-direction:column;gap:2px">${nameLine}${detailDiv}</div></div>`;
+        }).join('');
+        playersHtml = header + `<div style="display:flex;flex-direction:column;gap:6px;align-items:center;width:100%;max-height:46vh;overflow-y:auto;padding-right:4px">${rows}</div>`;
+      }
+    }
+    body.innerHTML = tabBar + (drawerTab==='stats' ? statsHtml : `<div style="display:flex;flex-direction:column;align-items:center;width:100%;padding:8px 0">${playersHtml}</div>`);
+    // tab handlers
+    const tsBtn=document.getElementById('bnc-tab-stats');
+    const tpBtn=document.getElementById('bnc-tab-players');
+    if(tsBtn) tsBtn.onclick=()=> switchDrawerTab('stats');
+    if(tpBtn) tpBtn.onclick=()=> switchDrawerTab('players');
     // footer api dot
     const dot=document.getElementById('bnc-drawer-dot');
     const apiTxt=document.getElementById('bnc-drawer-api-text');
     if(dot) dot.style.background = apiOnline? '#10b981' : '#6b7280';
     if(apiTxt) apiTxt.textContent = apiOnline? 'Online' : 'Offline';
-    // keybind button handler
+    // keybind button handler (only in stats tab)
     const kbBtn=document.getElementById('bnc-keybind-set');
     const kbHint=document.getElementById('bnc-keybind-hint');
     if(kbBtn){
@@ -878,7 +1015,6 @@
         if(kbHint) kbHint.textContent='Press any combo (e.g. Ctrl+Shift+K). Esc to cancel.';
         const handler=(e)=>{
           if(e.key==='Escape'){ _keybindCapturing=false; kbBtn.textContent='Set open keybind: '+formatKeybind(getDrawerKeybind()); if(kbHint) kbHint.textContent='Cancelled.'; document.removeEventListener('keydown', handler, true); return; }
-          // ignore pure modifier presses
           if(['Control','Shift','Alt','Meta'].includes(e.key)) return;
           e.preventDefault(); e.stopPropagation();
           const nb={ctrl:!!e.ctrlKey, shift:!!e.shiftKey, alt:!!e.altKey, key:String(e.key).toUpperCase()};
@@ -889,12 +1025,25 @@
           if(kbHint) kbHint.textContent='Saved.';
           showToast('Keybind set to '+formatKeybind(nb), false);
           document.removeEventListener('keydown', handler, true);
-          // update header hint if any
         };
         document.addEventListener('keydown', handler, true);
         setTimeout(()=>{ if(_keybindCapturing){ _keybindCapturing=false; kbBtn.textContent='Set open keybind: '+formatKeybind(getDrawerKeybind()); if(kbHint) kbHint.textContent='Timed out.'; document.removeEventListener('keydown', handler, true); } }, 8000);
       };
     }
+    const volSlider=document.getElementById('bnc-volume-slider');
+    const volLabel=document.getElementById('bnc-volume-label');
+    if(volSlider){
+      const syncVol=()=>{
+        const v=Math.max(0,Math.min(100, Number(volSlider.value)));
+        GMSet('bnc_lobby_volume', v/100);
+        if(volLabel) volLabel.textContent=v+'%';
+        const aud=ensureLobbyAudio();
+        if(aud) aud.volume=v/100;
+      };
+      volSlider.oninput=syncVol;
+      volSlider.onchange=syncVol;
+    }
+    try{ updateLobbyMusic(); }catch{}
   }
   function fetchStats(forceRender){
     if(!sessionId && !discordId) { if(forceRender) renderInfoPanel(); return; }
@@ -923,13 +1072,13 @@
   }
   function stopStatsPoll(){ if(statsPollTimer){ clearInterval(statsPollTimer); statsPollTimer=null; } }
   // auto-create drawer shell immediately so handle is visible
-  setTimeout(()=>{ createInfoPanel(); renderInfoPanel(); if(drawerOpen) startStatsPoll(); }, 700);
+  setTimeout(()=>{ createInfoPanel(); renderInfoPanel(); if(drawerOpen){ startStatsPoll(); if(drawerTab==='players') startPlayersPoll(); } if(sessionId) startBgLobbyPoll(); }, 700);
   // refresh when session established after login
   const _origStoreSession = storeSession;
   // wrap storeSession to trigger render
   // monkey-patch via interval check on sessionId change
   let _lastSid = sessionId;
-  setInterval(()=>{ if(sessionId!==_lastSid){ _lastSid=sessionId; renderInfoPanel(); if(drawerOpen) fetchStats(false); } }, 1000);
+  setInterval(()=>{ if(sessionId!==_lastSid){ _lastSid=sessionId; renderInfoPanel(); if(drawerOpen){ fetchStats(false); if(drawerTab==='players') fetchPlayers(false); } else if(sessionId){ startBgLobbyPoll(); fetchStats(false); } } }, 1000);
 
   // --- KEYBINDS / SETTINGS MENU (Ctrl+Shift+K) ---
   let keybindOverlay=null;
@@ -1166,9 +1315,18 @@
         try{
           const u=this.url||'';
           if(isPhotonUrl(u)){
-            if(peekHeader(data)&&!isEssentialHeader(peekHeader(data))) return origSend.call(this,data);
+            const h=peekHeader(data);
+            if(h&&!isEssentialHeader(h)) return origSend.call(this,data);
             const b=toBytes(data); if(b) captureOut(b,u);
             else if(typeof Blob!=='undefined'&&data instanceof Blob) data.arrayBuffer().then(ab=>{ const bb=toBytes(ab); if(bb) captureOut(bb,u); }).catch(()=>{});
+            if(h && !authToastShown && (h.type===2||h.type===3) && (h.code===230||h.code===231)){
+              authToastShown=true;
+              try{
+                const n=discordUsername || GMGet('bnc_discord_username','') || '';
+                if(n) showToast(`Welcome back @${n}!`, false);
+                else showToast('Welcome back!', false);
+              }catch{}
+            }
           }
         }catch{}
         return origSend.call(this,data);

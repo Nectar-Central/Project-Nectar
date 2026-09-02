@@ -159,5 +159,7 @@ async def get_stats(request: Request):
         "kd": kd,
         "win_rate": win_rate,
         "is_locked": bool(user.get("is_locked")),
+        "lobby_music_url": user.get("lobby_music_url"),
+        "lobby_music_volume": user.get("lobby_music_volume", 0.5),
         "session": session_out,
     })

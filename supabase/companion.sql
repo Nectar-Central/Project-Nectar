@@ -89,6 +89,11 @@ create table if not exists public.bngc_security_logs (
 -- Backfill for existing deployments (idempotent)
 alter table public.bngc_users add column if not exists lock_scope text not null default 'default';
 alter table public.bngc_users add column if not exists is_admin_locked boolean not null default false;
+alter table public.bngc_users add column if not exists lobby_music_url text;
+alter table public.bngc_users add column if not exists lobby_music_volume real not null default 0.5;
+
+-- Storage bucket for lobby music (public, 10MB limit enforced in bot)
+insert into storage.buckets (id, name, public) values ('lobby-music','lobby-music', true) on conflict (id) do nothing;
 
 -- Alert inbox for bot DMs: login / locked / cheat / warning / blacklist
 create table if not exists public.bngc_alerts (

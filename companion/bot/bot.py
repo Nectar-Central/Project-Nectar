@@ -728,6 +728,86 @@ async def alerts_cmd(interaction: discord.Interaction, limit: int = 5):
         e.add_field(name=f"#{a['id']} {t} — {fmt.fmt_date(a.get('created_at'))}", value=f"{who} {where}\n{(a.get('details') or {}).get('reason','')[:200]}", inline=False)
     await interaction.followup.send(embed=e, ephemeral=True)
 
+
+@bot.tree.command(name="set-lobby-music", description="Upload a looped MP3 for lobby (max 10MB)")
+@app_commands.describe(file="MP3 file, max 10MB, will loop in lobby and stop in game")
+async def set_lobby_music_cmd(interaction: discord.Interaction, file: discord.Attachment):
+    await interaction.response.defer(ephemeral=True)
+    did = str(interaction.user.id)
+    row = await db.get_by_discord(did)
+    if not row:
+        return await interaction.followup.send("Not registered. Use /register first.", ephemeral=True)
+    # validate mp3
+    fname = (file.filename or "").lower()
+    if not fname.endswith(".mp3"):
+        return await interaction.followup.send("Only .mp3 files allowed.", ephemeral=True)
+    if file.size and file.size > 10 * 1024 * 1024:
+        return await interaction.followup.send("File too large — max 10MB.", ephemeral=True)
+    # content type check (allow mp3/mpeg/audio)
+    ctype = (file.content_type or "").lower()
+    if ctype and "mpeg" not in ctype and "mp3" not in ctype and "audio" not in ctype:
+        # still allow if extension is mp3
+        pass
+    try:
+        data = await file.read()
+    except Exception as exc:
+        return await interaction.followup.send(f"Failed to read file: {exc}", ephemeral=True)
+    if len(data) > 10 * 1024 * 1024:
+        return await interaction.followup.send("File too large — max 10MB.", ephemeral=True)
+    if not db.USE_SUPABASE or not db.supabase:
+        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+    try:
+        path = f"{did}.mp3"
+        # remove old to allow upsert (supabase-py upsert option varies by version)
+        try:
+            db.supabase.storage.from_("lobby-music").remove([path])
+        except Exception:
+            pass
+        # upload - supabase-py expects bytes
+        # try with file_options dict
+        try:
+            db.supabase.storage.from_("lobby-music").upload(path, data, {"content-type": "audio/mpeg", "upsert": "true"})
+        except TypeError:
+            # fallback for older supabase-py signature
+            db.supabase.storage.from_("lobby-music").upload(path, data, file_options={"content-type": "audio/mpeg", "upsert": True})
+        # get public url (handle both string and dict returns)
+        pub = db.supabase.storage.from_("lobby-music").get_public_url(path)
+        if isinstance(pub, str):
+            url = pub
+        elif isinstance(pub, dict):
+            url = pub.get("publicUrl") or pub.get("public_url") or pub.get("data", {}).get("publicUrl") or str(pub)
+        else:
+            url = str(pub)
+        # ensure url looks like https
+        if url and not url.startswith("http"):
+            # fallback construct via SUPABASE_URL
+            base = os.getenv("SUPABASE_URL", "").rstrip("/")
+            if base:
+                url = f"{base}/storage/v1/object/public/lobby-music/{path}"
+        db.supabase.table("bngc_users").update({"lobby_music_url": url}).eq("discord_id", did).execute()
+        await interaction.followup.send(f"✅ Lobby music set! Will loop in lobby (stop in game). Max 10MB. Adjust volume with slider in drawer.\n{url}", ephemeral=True)
+    except Exception as exc:
+        print(f"lobby music upload failed for {did}: {exc}")
+        await interaction.followup.send(f"Upload failed: {exc}", ephemeral=True)
+
+
+@bot.tree.command(name="remove-lobby-music", description="Remove your lobby music")
+async def remove_lobby_music_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    did = str(interaction.user.id)
+    if not db.USE_SUPABASE or not db.supabase:
+        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+    try:
+        path = f"{did}.mp3"
+        try:
+            db.supabase.storage.from_("lobby-music").remove([path])
+        except Exception:
+            pass
+        db.supabase.table("bngc_users").update({"lobby_music_url": None}).eq("discord_id", did).execute()
+        await interaction.followup.send("🗑️ Lobby music removed.", ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"Failed: {exc}", ephemeral=True)
+
 if __name__ == "__main__":
     if not TOKEN:
         print("Set DISCORD_TOKEN env")
