@@ -40,6 +40,7 @@ class Player:
     is_ready: bool = False     # ready
     is_alive: bool = True      # alv
     is_self: bool = False      # true if this is the session's own player (me)
+    pt: str | None = None      # _pt / pt — team id for duos (wwzw/BF2V2/DF duo), maps to RoomView.teams
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -251,6 +252,9 @@ class RoomView:
     last_stg: int | None = None                      # last stG value for win/loss per GM (3→1)
     winner: str | None = None                        # last match winner (username or team_id)
     created_at: str | None = None
+    # zone bookend for zone modes (zw_lg/wwzw): first zone = start, second zone = win/defeat evaluation
+    zone_match_active: bool = False
+    last_zone_hex: str | None = None
 
     def get_team(self, username: str) -> Team | None:
         for t in self.teams.values():

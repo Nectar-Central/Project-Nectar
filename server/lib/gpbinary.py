@@ -101,6 +101,7 @@ USEFUL_PROPS = {
     "skid", "BPid", "pid", "Party", "ready", "stG",
     "bz_phase_start", "bz_zone", "bz_phase", "bz_enabled", "bz_pattern",
     "alv", "curScn", "gm", "gv",
+    "_pt", "pt",
 }
 CURSCN_WHITELIST = ["lobby", "game", "zonewars", "zw_lg", "wild", "wwzw", "boxfights", "ww"]
 

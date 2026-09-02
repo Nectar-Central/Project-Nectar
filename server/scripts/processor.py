@@ -276,22 +276,6 @@ async def process_batch(
                                 "match_version": pkt_match_ver,
                             },
                         }).execute()
-                        # Also as killfeed joined for replay visibility
-                        supabase.table("bngc_game_events").insert({
-                            "discord_id": discord_id,
-                            "session_id": session_id,
-                            "event_type": "killfeed",
-                            "event_data": {
-                                "gm": eff_gm,
-                                "instigator": joiner,
-                                "instigated": None,
-                                "kill_type": "joined",
-                                "room_id": pkt_room_id,
-                                "code": pkt_short,
-                                "short_code": pkt_short,
-                                "match_version": pkt_match_ver,
-                            },
-                        }).execute()
                         log_sys(f"PROCESSOR JOIN {joiner} session={session_id[:8]} gm={eff_gm} room={str(pkt_room_id or '')[:8]}")
                     except Exception as exc_j:
                         log_err(f"processor join write failed {joiner}: {exc_j}")
@@ -579,6 +563,36 @@ async def process_batch(
                     view.playtime.total_seconds = 0
             except Exception as exc2:
                 log_err(f"processor playtime failed {exc2}")
+
+            # --- Sync to bngc_player_stats (so SELECT * FROM bngc_player_stats is populated) ---
+            try:
+                supabase.table("bngc_player_stats").upsert({
+                    "discord_id": discord_id,
+                    "kills": int(user.get("kills") or 0),
+                    "deaths": int(user.get("deaths") or 0),
+                    "wins": int(user.get("wins") or 0),
+                    "defeats": int(user.get("defeats") or 0),
+                }, on_conflict="discord_id").execute()
+                log_sys(f"PROCESSOR sync player_stats {discord_id[:6]} kills={user.get('kills',0)} defeats={user.get('defeats',0)} wins={user.get('wins',0)}")
+            except Exception as exc_ps:
+                try:
+                    supabase.table("bngc_player_stats").insert({
+                        "discord_id": discord_id,
+                        "kills": int(user.get("kills") or 0),
+                        "deaths": int(user.get("deaths") or 0),
+                        "wins": int(user.get("wins") or 0),
+                        "defeats": int(user.get("defeats") or 0),
+                    }).execute()
+                except Exception:
+                    try:
+                        supabase.table("bngc_player_stats").update({
+                            "kills": int(user.get("kills") or 0),
+                            "deaths": int(user.get("deaths") or 0),
+                            "wins": int(user.get("wins") or 0),
+                            "defeats": int(user.get("defeats") or 0),
+                        }).eq("discord_id", discord_id).execute()
+                    except Exception as exc2b:
+                        log_err(f"processor player_stats sync failed {exc2b} {exc_ps}")
 
     except Exception as exc:
         log_err(f"processor win/defeat failed {exc}")

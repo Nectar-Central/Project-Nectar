@@ -61,6 +61,8 @@ from server.lib.logger import log_sys, log_err, log_ok, banner
 from server.routes.capture import router as capture_router
 from server.routes.validate_token import router as validate_router
 from server.routes.session_state import router as session_state_router
+from server.routes.stats import router as stats_router
+from server.routes.discovery import router as discovery_router
 
 # ---------------------------------------------------------------------------
 # Health check
@@ -87,6 +89,8 @@ async def health():
 app.include_router(capture_router)
 app.include_router(validate_router)
 app.include_router(session_state_router)
+app.include_router(stats_router)
+app.include_router(discovery_router)
 
 # TODO: Port remaining routes if needed (player_sync, event, playtime are now via capture + engine)
 # For now, GET /api/session/{id}/state is the poll endpoint for the photon-client SDK
