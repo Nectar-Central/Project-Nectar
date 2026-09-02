@@ -29,4 +29,4 @@ if __name__ == "__main__":
     import bot as bot_mod
     import discord
     # bot_mod.bot.run will block
-    bot_mod.bot.run(os.getenv("DISCORD_TOKEN") or os.getenv("BOT_TOKEN"))
+    bot_mod.bot.run(os.getenv("DISCORD_TOKEN") or os.getenv("DISCORD_BOT_TOKEN") or os.getenv("BOT_TOKEN"))
