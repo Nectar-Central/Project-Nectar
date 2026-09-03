@@ -626,8 +626,7 @@
         label: r.label,
         rawHex: r.rawHex
       }));
-      const hostMode = !!GMGet('bnc_host_mode', false);
-      apiPost('/api/capture', { sessionId: captureSessionId, records, hostMode }, (ok)=>{
+      apiPost('/api/capture', { sessionId: captureSessionId, records }, (ok)=>{
         if(ok) sent += batch.length;
         else logErr(`Replay batch failed at ${start}`);
         setTimeout(()=>sendBatch(start + batchSize), 50);
@@ -833,6 +832,12 @@
   // Drawer always starts closed on page load (first open) — never auto-open from storage.
   let drawerOpen = false;
   try { GMSet('bnc_info_open', false); } catch {}
+  // Ranked/host shelved: drop stale ranked session hint + force individualist.
+  try {
+    const _sg = GMGet('bnc_session_gm', null);
+    if(_sg && String(_sg).toLowerCase().indexOf('ranked') === 0) GMDel('bnc_session_gm');
+    GMSet('bnc_host_mode', false);
+  } catch {}
   let drawerTab = GMGet('bnc_drawer_tab','stats'); // 'stats' | 'players'
   let playersCache=null, playersPollTimer=null, playersLoading=false;
   let lobbyAudio=null;
@@ -1210,11 +1215,6 @@
              <span style="font-size:11px;color:#6b7280">🔊</span>
            </div>
          </div>
-         <label style="margin-top:8px;width:100%;max-width:240px;display:flex;gap:8px;align-items:center;justify-content:center;padding:6px 8px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:8px;cursor:pointer">
-           <input type="checkbox" id="bnc-host-toggle" ${GMGet('bnc_host_mode', false)?'checked':''} style="accent-color:#fff">
-           <span style="font-size:11px;color:#e5e7eb;font-weight:600">Host mode (server rooms · comp replay)</span>
-         </label>
-         <div style="font-size:10px;color:#6b7280;max-width:240px;text-align:center;line-height:1.3">Individualist by default. Host tracks all players for replays in server zw_lg/wwzw rooms (not BF2V2).</div>
        </div>
      `;
     // players tab content
@@ -1302,16 +1302,6 @@
       volSlider.oninput=syncVol;
       volSlider.onchange=syncVol;
     }
-    const hostToggle=document.getElementById('bnc-host-toggle');
-    if(hostToggle){
-      hostToggle.onchange=()=>{
-        const on=!!hostToggle.checked;
-        GMSet('bnc_host_mode', on);
-        logInfo(`[HOST] mode ${on?'ON':'OFF'}`);
-        try{ feedLog('info', {host_mode:on}); }catch{}
-        showToast(on?'Host mode ON — replays track all players':'Host mode OFF — individualist', false);
-      };
-    }
     try{ updateLobbyMusic(); }catch(e){ logErr(`[AUDIO] update after render err ${e.message}`); }
     try{ prefetchLobbyMusic(); }catch{}
   }
@@ -1378,29 +1368,8 @@
     if(e.ctrlKey && e.shiftKey && (e.key||'').toUpperCase()==='K'){ e.preventDefault(); e.stopPropagation(); toggleKeybinds(); }
   }, true);
 
-  // --- RANKED HUD (only when joining private room with short_code / pID) ---
-  let rankedHUD=null; let rankedShort=null;
-  function createRankedHUD(){
-    if(document.getElementById('bnc-ranked')) return;
-    rankedHUD=document.createElement('div');
-    rankedHUD.id='bnc-ranked';
-    Object.assign(rankedHUD.style,{position:'fixed', top:'52px', left:'50%', transform:'translateX(-50%)', zIndex:'2147483645', background:'linear-gradient(135deg,#7c3aed 0%,#4f46e5 100%)', color:'#fff', padding:'6px 14px', borderRadius:'999px', fontFamily:'Inter, system-ui, sans-serif', fontSize:'12px', fontWeight:'800', letterSpacing:'0.3px', display:'none', boxShadow:'0 4px 16px rgba(124,58,237,0.45)', border:'1px solid rgba(255,255,255,0.12)'});
-    rankedHUD.textContent='RANKED - private lobby';
-    (document.body||document.documentElement).appendChild(rankedHUD);
-  }
-  function showRankedHUD(code){
-    if(!rankedHUD) createRankedHUD();
-    rankedShort=code;
-    rankedHUD.textContent = `RANKED - ${code}`;
-    rankedHUD.style.display='block';
-    // also update info panel gm hint
-    if(code) GMSet('bnc_session_gm', 'ranked_'+code);
-    setTimeout(()=>{ /* keep visible */ }, 0);
-  }
-  function hideRankedHUD(){ if(rankedHUD) rankedHUD.style.display='none'; rankedShort=null; }
-  // expose for API capture response to trigger
-  window.__BNC_SHOW_RANKED__ = showRankedHUD;
-  window.__BNC_HIDE_RANKED__ = hideRankedHUD;
+  // Ranked UI removed — ranked is not ready. (Host mode toggle removed too;
+  // individualist tracking only for now.)
 
   function isPhotonUrl(url){ if(!url) return false; const u=String(url); if(u.includes(APP_ID)) return true; for(const h of PHOTON_HOSTS) if(u.toLowerCase().includes(h)) return true; if(u.includes('wss://')&&u.includes('exitgames')) return true; return false; }
   function shortUrl(url){ return String(url).replace(/^wss?:\/\//,'').replace(/\?libversion.*$/,'').slice(0,80); }
@@ -1587,8 +1556,7 @@
     flushTimer=null;
     const batch=queue.splice(0,BATCH_MAX);
     for(const r of batch) ensureHex(r);
-    const hostMode = !!GMGet('bnc_host_mode', false);
-    const payload={ sessionId: captureSessionId, records: batch, hostMode };
+    const payload={ sessionId: captureSessionId, records: batch };
     flushInFlight=true;
     feedLog('flush', {count:batch.length, queued:queue.length});
     apiPost('/api/capture', payload, (ok, txt)=>{
@@ -1637,17 +1605,7 @@
                   logGroup(`ZONE seq=${p.seq} time=${p.zone_time} phase=${p.zone_phase}`, ()=>{ console.log('packet', p); console.log('decrypted', dec); console.log('hex', p.rawHex); });
                 }catch{}
               }
-              // Ranked HUD: only show when joining private room with short_code (5-char code) - not every packet
-              if(p.short_code && /^[A-Z0-9]{5}$/i.test(String(p.short_code))){ showRankedHUD(String(p.short_code).toUpperCase()); }
-              else if(p.room_gm && String(p.room_gm).toLowerCase().includes('ranked') && p.short_code){ showRankedHUD(String(p.short_code).toUpperCase()); }
             }
-            // Also check session for private ranked room
-            try{
-              const sess = j.session;
-              if(sess && sess.rooms){
-                for(const rv of Object.values(sess.rooms)){ if(rv.short_code && /^[A-Z0-9]{5}$/i.test(rv.short_code)){ showRankedHUD(rv.short_code); break; } }
-              }
-            }catch{}
 
             // Apply server reconciliation from capture response (shared helper)
             if(_reconcileServerState(j.session)) {

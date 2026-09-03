@@ -3,6 +3,7 @@
 # Usage:
 #   1. Fill server/.env (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
 #      UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN). Never commit it.
+#      Add DISCORD_TOKEN there too to run the Discord bot in the same container.
 #   2. docker compose up --build -d
 #   3. Check GET http://localhost:8000/api/health
 #      (upstash_configured + reachable should be true)

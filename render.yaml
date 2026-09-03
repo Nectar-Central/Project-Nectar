@@ -1,0 +1,30 @@
+# Render Blueprint — BNGC API + Discord bot in one Docker container.
+# Deploy: dashboard → New → Blueprint → select this repo. Fill the secrets below.
+#
+# IMPORTANT: use a paid instance type (Starter or higher). Free web services
+# SLEEP after 15 min idle — that disconnects the Discord bot and wipes engine
+# memory (Upstash restores it on wake, but the bot will flap). The healthcheck
+# keeps paid instances honest.
+services:
+  - type: web
+    name: bngc-api
+    env: docker
+    dockerfilePath: ./server/Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    plan: starter
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: PHOTON_KEY
+        sync: false
+      # SERVER_URL intentionally unset — start.sh defaults it to this container.
+      # GUILD_ID intentionally unset — the bot code already defaults it.
