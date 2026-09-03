@@ -9,33 +9,43 @@ from datetime import datetime
 GAME_MODE_NAMES = {
     "zw_lg": "Late Game Zonewars",
     "zw": "Zone Wars",
-    "wwzw": "Wild West Zonewars",
-    "ww": "Wild West",
-    "WW": "Wild West",
+    "wwzw": "Duo Wild West",
+    "ww": "Solo Wild West",
+    "WW": "Solo Wild West",
     "bf": "Boxfights",
     "BF": "Boxfights",
     "bf2v2": "Boxfights 2v2",
     "bf_2v2": "Boxfights 2v2",
     "BF2V2": "Boxfights 2v2",
-    "df": "Free Build",
-    "DF": "Free Build",
+    "va": "V-Arena",
+    "VA": "V-Arena",
+    "tdm_bvr": "Red Vs Blue",
+    "RVB": "Red Vs Blue",
+    "r_1v1": "Realistic 1v1",
+    "R_1V1": "Realistic 1v1",
+    "df": "Free Mode",
+    "DF": "Free Mode",
     "lobby": "Lobby",
     "lobby_main": "Lobby",
     "mainlobby": "Lobby",
     "main_lobby": "Lobby",
 }
 
-def format_game_mode(raw: str | None) -> str:
+def format_game_mode(raw: str | None, duo: bool = False) -> str:
     if not raw:
         return "Unknown"
     key = str(raw).strip()
     if key in GAME_MODE_NAMES:
-        return GAME_MODE_NAMES[key]
-    low = key.lower()
-    if low in GAME_MODE_NAMES:
-        return GAME_MODE_NAMES[low]
-    # fallback: prettify raw (e.g. zw_warmup -> Zw Warmup)
-    return key.replace("_", " ").replace("-", " ").title()
+        label = GAME_MODE_NAMES[key]
+    elif key.lower() in GAME_MODE_NAMES:
+        label = GAME_MODE_NAMES[key.lower()]
+    else:
+        # fallback: prettify raw (e.g. zw_warmup -> Zw Warmup)
+        return key.replace("_", " ").replace("-", " ").title()
+    # (Duo) qualification for solo/duo variants (DF, ZW_LG)
+    if duo and key.lower() in ("df", "zw_lg") and not label.lower().startswith(("solo", "duo", "(duo)")):
+        return f"(Duo) {label}"
+    return label
 
 def format_game_mode_short(raw: str | None) -> str:
     """Short label for compact displays."""

@@ -9,6 +9,34 @@ Validation checks a sliding window (current ±10) to tolerate drift/burst.
 
 import hmac
 import hashlib
+from datetime import datetime, timezone
+
+
+# ---------------------------------------------------------------------------
+# Session expiry — sessions live 2 days, then must be refreshed (re-validate)
+# ---------------------------------------------------------------------------
+
+SESSION_TTL_DAYS = 2
+
+
+def is_session_expired(sess: dict | None) -> bool:
+    """True if a bngc_sessions row is older than SESSION_TTL_DAYS.
+
+    Missing created_at (legacy rows) counts as NOT expired — only explicit
+    timestamps expire, so old rows without dates keep working until re-linked.
+    """
+
+    if not sess:
+        return False
+    created = sess.get("created_at")
+    if not created:
+        return False
+    try:
+        ts = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+        age_days = (datetime.now(timezone.utc) - ts).total_seconds() / 86400
+        return age_days > SESSION_TTL_DAYS
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------

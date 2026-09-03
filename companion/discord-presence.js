@@ -45,17 +45,23 @@ const POLL_MS = 1500;
 
 const GM_NAMES = {
   DF: 'Free Mode',
-  zw_lg: 'Lategame Zone Wars',
+  zw_lg: 'Late Game Zonewars',
   zw: 'Zone Wars',
-  wwzw: 'Zone Wars — Duo Wild West',
+  wwzw: 'Duo Wild West',
   BF: 'Boxfights',
   BF2V2: 'Boxfights 2v2',
   bf: 'Boxfights',
   bf2v2: 'Boxfights 2v2',
-  WW: 'Wild West',
-  ww: 'Wild West',
-  wildwest: 'Wild West',
-  wild_west: 'Wild West',
+  VA: 'V-Arena',
+  va: 'V-Arena',
+  tdm_bvr: 'Red Vs Blue',
+  RVB: 'Red Vs Blue',
+  R_1V1: 'Realistic 1v1',
+  r_1v1: 'Realistic 1v1',
+  WW: 'Solo Wild West',
+  ww: 'Solo Wild West',
+  wildwest: 'Solo Wild West',
+  wild_west: 'Solo Wild West',
   br: 'Battle Royale',
   BR: 'Battle Royale',
   TDM: 'Team Deathmatch',
@@ -63,12 +69,13 @@ const GM_NAMES = {
   SND: 'Search & Destroy',
 };
 function gmLabel(gm, gv){
-  if (gv === 'duo' && gm) {
-    const base = GM_NAMES[gm] || GM_NAMES[gm.toLowerCase()] || gm;
-    return `Duo ${base}`;
-  }
   if(!gm) return 'BuildNow GG';
-  return GM_NAMES[gm] || GM_NAMES[gm.toLowerCase()] || gm;
+  const base = GM_NAMES[gm] || GM_NAMES[gm.toLowerCase()] || gm;
+  const isDuo = String(gv || '').toLowerCase().startsWith('duo');
+  if (isDuo && !/^(solo|duo|\(duo\))/i.test(base)) {
+    return `(Duo) ${base}`;
+  }
+  return base;
 }
 
 let rpc = new RPC.Client({ transport: 'ipc' });

@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse
 
 from ..lib.supabase_client import supabase, db
 from ..lib.redis_client import cache
-from ..lib.tokens import generate_request_token
+from ..lib.tokens import generate_request_token, is_session_expired
 from ..lib.logger import log_sys, log_ok, log_err
 from ..lib.alerts import create_alert
 
@@ -92,13 +92,14 @@ async def validate_token(request: Request):
 
     if login_token:
         # Already used? Check for idempotent reuse
+        session_expired_refresh = False
         if login_token.get("used"):
-            # If there's already an active session for this discord_id, return it
+            # If there's already an active, fresh session for this discord_id, return it
             # instead of locking — prevents userscript re-validate loops
             try:
                 existing = (
                     supabase.table("bngc_sessions")
-                    .select("session_id, current_token")
+                    .select("session_id, current_token, created_at")
                     .eq("discord_id", login_token["discord_id"])
                     .eq("is_active", True)
                     .order("created_at", desc=True)
@@ -106,7 +107,7 @@ async def validate_token(request: Request):
                     .single()
                     .execute()
                 )
-                if existing.data:
+                if existing.data and not is_session_expired(existing.data):
                     sess = existing.data
                     log_sys(
                         f"VALIDATE reuse but active session exists {str(sess['session_id'])[:8]} — returning existing"
@@ -130,36 +131,49 @@ async def validate_token(request: Request):
                         "initial_token": sess["current_token"],
                         "reused": True,
                     })
+                if existing.data:
+                    # Active session is older than 2 days — deactivate it and fall through
+                    # to fresh creation below (refresh, NOT a lock)
+                    try:
+                        supabase.table("bngc_sessions").update({"is_active": False}).eq("session_id", existing.data["session_id"]).execute()
+                    except Exception:
+                        pass
+                    log_sys(f"VALIDATE refresh expired session {str(existing.data['session_id'])[:8]} — issuing new")
+                    session_expired_refresh = True
             except Exception:
                 pass
 
-            # Otherwise, lock the account (real reuse) — friend-account enforcement (default lock, user can /unlock)
+            if session_expired_refresh:
+                pass  # fall through to fresh creation below (refresh, NOT a lock)
+            else:
+                # Otherwise, lock the account (real reuse) — friend-account enforcement (default lock, user can /unlock)
+                try:
+                    supabase.table("bngc_users").update({
+                        "is_locked": True,
+                        "lock_reason": "Login token reuse (friend account)",
+                        "lock_scope": "default",
+                        "is_admin_locked": False,
+                    }).eq("discord_id", login_token["discord_id"]).execute()
+                except Exception:
+                    pass
+
+                await cache.blacklist_token(token, 300)
+                create_alert(login_token["discord_id"], "locked", request, details={"reason": "token reuse — possible friend account sharing", "token_prefix": str(token)[:4], "ip": ip, "scope": "default"}, severity="critical")
+                create_alert(login_token["discord_id"], "blacklist", request, details={"reason": "token reuse", "scope": "default"}, severity="critical")
+
+                return JSONResponse(
+                    {"error": "Token already used - account locked. Use /unlock to unlock.", "lock_scope": "default", "is_admin_locked": False},
+                    status_code=403,
+                )
+
+        # Check expiry (skipped on session refresh — the 2-day session TTL governs, not the login token)
+        if not session_expired_refresh:
             try:
-                supabase.table("bngc_users").update({
-                    "is_locked": True,
-                    "lock_reason": "Login token reuse (friend account)",
-                    "lock_scope": "default",
-                    "is_admin_locked": False,
-                }).eq("discord_id", login_token["discord_id"]).execute()
+                expires = login_token.get("expires_at")
+                if expires and datetime.fromisoformat(expires.replace("Z", "+00:00")) < datetime.now(timezone.utc):
+                    return JSONResponse({"error": "Token expired"}, status_code=401)
             except Exception:
                 pass
-
-            await cache.blacklist_token(token, 300)
-            create_alert(login_token["discord_id"], "locked", request, details={"reason": "token reuse — possible friend account sharing", "token_prefix": str(token)[:4], "ip": ip, "scope": "default"}, severity="critical")
-            create_alert(login_token["discord_id"], "blacklist", request, details={"reason": "token reuse", "scope": "default"}, severity="critical")
-
-            return JSONResponse(
-                {"error": "Token already used - account locked. Use /unlock to unlock.", "lock_scope": "default", "is_admin_locked": False},
-                status_code=403,
-            )
-
-        # Check expiry
-        try:
-            expires = login_token.get("expires_at")
-            if expires and datetime.fromisoformat(expires.replace("Z", "+00:00")) < datetime.now(timezone.utc):
-                return JSONResponse({"error": "Token expired"}, status_code=401)
-        except Exception:
-            pass
 
         # Mark as used
         try:

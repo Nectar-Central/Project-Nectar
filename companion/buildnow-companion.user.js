@@ -752,8 +752,8 @@
   }, 800);
 
   // --- PLAYER DRAWER (left overlay, skin, discord, game_id, game_mode, stats polled /api/stats 15s) ---
-  const GM_NAMES_DRAWER = {zw_lg:'Late Game Zonewars', zw:'Zone Wars', wwzw:'Wild West Zonewars', ww:'Wild West', WW:'Wild West', bf:'Boxfights', BF:'Boxfights', bf2v2:'Boxfights 2v2', BF2V2:'Boxfights 2v2', df:'Free Build', DF:'Free Build', lobby:'Lobby'};
-  function fmtGmDrawer(raw){ if(!raw) return '-'; const k=String(raw).trim(); if(GM_NAMES_DRAWER[k]) return GM_NAMES_DRAWER[k]; const low=k.toLowerCase(); if(GM_NAMES_DRAWER[low]) return GM_NAMES_DRAWER[low]; return k.replace(/[_-]+/g,' ').replace(/\b\w/g,s=>s.toUpperCase()); }
+  const GM_NAMES_DRAWER = {zw_lg:'Late Game Zonewars', zw:'Zone Wars', wwzw:'Duo Wild West', ww:'Solo Wild West', WW:'Solo Wild West', bf:'Boxfights', BF:'Boxfights', bf2v2:'Boxfights 2v2', BF2V2:'Boxfights 2v2', va:'V-Arena', VA:'V-Arena', tdm_bvr:'Red Vs Blue', RVB:'Red Vs Blue', r_1v1:'Realistic 1v1', R_1V1:'Realistic 1v1', df:'Free Mode', DF:'Free Mode', lobby:'Lobby'};
+  function fmtGmDrawer(raw, duo){ if(!raw) return '-'; const k=String(raw).trim(); let label = GM_NAMES_DRAWER[k] || GM_NAMES_DRAWER[k.toLowerCase()] || k.replace(/[_-]+/g,' ').replace(/\b\w/g,s=>s.toUpperCase()); if(duo && (k.toLowerCase()==='df' || k.toLowerCase()==='zw_lg') && !/^(solo|duo|\(duo\))/i.test(label)) label = '(Duo) ' + label; return label; }
   function fmtPlaytimeDrawer(s){ if(s==null) return '-'; s=Math.max(0,Math.floor(Number(s)||0)); const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), sec=s%60; if(h) return `${h}h ${m}m`; if(m) return `${m}m ${sec}s`; return `${sec}s`; }
   function skinUrlDrawer(id){ if(!id || id==='-' ) return null; return `https://buildnow-api.netlify.app/skins/${encodeURIComponent(String(id).trim())}.png`; }
   // keybind for drawer - customizable via button in drawer
@@ -784,7 +784,9 @@
   let apiOnline=false;
 
   let infoPanel=null, infoUpdateTimer=null, statsCache=null, statsPollTimer=null, drawerBackdrop=null;
-  let drawerOpen = !!GMGet('bnc_info_open', GMGet('bn_info_open', false));
+  // Drawer always starts closed on page load (first open) — never auto-open from storage.
+  let drawerOpen = false;
+  try { GMSet('bnc_info_open', false); } catch {}
   let drawerTab = GMGet('bnc_drawer_tab','stats'); // 'stats' | 'players'
   let playersCache=null, playersPollTimer=null, playersLoading=false;
   let lobbyAudio=null;
@@ -1090,7 +1092,9 @@
     const defeats = sc? sc.defeats : null;
     const pGlobal = sc? sc.playtime_global : null;
     const sess = sc && sc.session ? sc.session : null;
-    const gmLive = sess && sess.game_mode ? fmtGmDrawer(sess.game_mode) : fmtGmDrawer(gmRaw);
+    const _curRoom = sess && sess.rooms ? sess.rooms[sess.current_room_id] : null;
+    const _isDuoRoom = !!(_curRoom && _curRoom.gv && String(_curRoom.gv).toLowerCase() !== 'solo');
+    const gmLive = sess && sess.game_mode ? fmtGmDrawer(sess.game_mode, _isDuoRoom) : fmtGmDrawer(gmRaw, _isDuoRoom);
     // state: Lobby vs In Match - spec says show "In Lobby" when no game mode
     let stateLabel='In Lobby';
     if(sess && sess.state){ stateLabel = String(sess.state).toLowerCase()==='match' ? 'In Match' : 'In Lobby'; }
@@ -1301,16 +1305,13 @@
     const ov=document.createElement('div');
     ov.id='bnc-keys';
     Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483646', background:'rgba(0,0,0,0.54)', display:'none', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif'});
-    ov.innerHTML = `<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:20px;min-width:360px;max-width:520px;color:#e5e7eb"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><b style="font-size:15px;color:#fff">BuildNow Companion - Shortcuts & Settings</b><button id="bnc-keys-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 8px;cursor:pointer">Close</button></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;line-height:1.6"><div><code>Ctrl+Shift+C</code> - Collect toggle<br><code>Ctrl+Shift+S</code> - Save collected<br><code>Ctrl+Shift+L</code> - Load file<br><code>Ctrl+Shift+R</code> - Replay</div><div><code>Ctrl+Shift+F</code> - Feed (dev only)<br><code>Ctrl+Shift+P</code> - Pause feed<br><code id="bnc-keys-drawer-label">Ctrl+Shift+I</code> - Player info<br><code>Ctrl+Shift+K</code> - This menu</div></div><div style="margin-top:14px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);font-size:11px;opacity:0.7">Settings: <label style="cursor:pointer"><input type="checkbox" id="bnc-dev-toggle"> Dev mode (feed)</label> · <label style="cursor:pointer"><input type="checkbox" id="bnc-info-auto"> Show player info on start</label></div></div>`;
+    ov.innerHTML = `<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:20px;min-width:360px;max-width:520px;color:#e5e7eb"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><b style="font-size:15px;color:#fff">BuildNow Companion - Shortcuts & Settings</b><button id="bnc-keys-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 8px;cursor:pointer">Close</button></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;line-height:1.6"><div><code>Ctrl+Shift+C</code> - Collect toggle<br><code>Ctrl+Shift+S</code> - Save collected<br><code>Ctrl+Shift+L</code> - Load file<br><code>Ctrl+Shift+R</code> - Replay</div><div><code>Ctrl+Shift+F</code> - Feed (dev only)<br><code>Ctrl+Shift+P</code> - Pause feed<br><code id="bnc-keys-drawer-label">Ctrl+Shift+I</code> - Player info<br><code>Ctrl+Shift+K</code> - This menu</div></div><div style="margin-top:14px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);font-size:11px;opacity:0.7">Settings: <label style="cursor:pointer"><input type="checkbox" id="bnc-dev-toggle"> Dev mode (feed)</label></div></div>`;
     (document.body||document.documentElement).appendChild(ov);
     ov.addEventListener('click', (e)=>{ if(e.target===ov) ov.style.display='none'; });
     ov.querySelector('#bnc-keys-close').onclick=()=> ov.style.display='none';
     const devT = ov.querySelector('#bnc-dev-toggle');
     devT.checked = !!GMGet('bnc_dev_mode', false);
     devT.onchange=()=>{ GMSet('bnc_dev_mode', devT.checked); showToast(devT.checked? 'Dev mode ON':'Dev mode OFF', false); if(devT.checked){ feedEnabled=true; feedWrap.style.display='block'; } else feedWrap.style.display='none'; };
-    const autoT = ov.querySelector('#bnc-info-auto');
-    autoT.checked = !!GMGet('bnc_info_open', false);
-    autoT.onchange=()=> GMSet('bnc_info_open', autoT.checked);
     try{ const dl=ov.querySelector('#bnc-keys-drawer-label'); if(dl) dl.textContent=formatKeybind(getDrawerKeybind()); }catch{}
     keybindOverlay=ov;
   }
@@ -1639,6 +1640,21 @@
         feedLog('err', {count:batch.length, ok:false, txt:String(txt).slice(0,120)});
         if(String(txt).includes('Invalid req_token') || String(txt).includes('expired')){
           queue=[]; feedLog('err', {msg:'token error - re-link'});
+          if(String(txt).toLowerCase().includes('session expired') && sessionId){
+            // 2-day session expiry: drop session (keep login token), re-validate for a
+            // fresh session; fall back to the token prompt when revalidation fails.
+            logInfo('[AUTH] session expired - refreshing');
+            sessionId=null; currentReqToken=null; reqCounter=0;
+            try{ GMDel('bnc_session_id'); GMDel('bn_session_id'); GMDel('bnc_req_token'); GMDel('bn_req_token'); GMDel('bnc_req_counter'); GMDel('bn_req_counter'); }catch{}
+            if(loginToken){
+              showToast('Session expired - refreshing...', false);
+              apiPost('/api/validate-token', {token: loginToken}, (ok2, txt2)=>{
+                if(!ok2){ cleanTokenStorage(); setTimeout(()=>{ showTokenPrompt(); showToast('Session expired - enter new token', true); }, 800); }
+              });
+            } else {
+              cleanTokenStorage(); setTimeout(()=>{ showTokenPrompt(); showToast('Session expired - enter new token', true); }, 800);
+            }
+          }
         } else {
           queue=batch.concat(queue).slice(0,BATCH_MAX*4);
         }

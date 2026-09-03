@@ -33,8 +33,8 @@ class GameMode(str, Enum):
 
     DF = "DF"               # Free Mode / MainWorld
     ZW = "zw"               # Zone Wars
-    ZW_LG = "zw_lg"          # Lategame Zone Wars
-    WW = "WW"               # Wild West
+    ZW_LG = "zw_lg"          # Late Game Zonewars
+    WW = "WW"               # Solo Wild West
     WWZW = "wwzw"            # Duo Wild West (zone wars)
     BF = "BF"               # Boxfights
     BF2V2 = "BF2V2"          # Boxfights 2v2
@@ -116,16 +116,23 @@ class GameMode(str, Enum):
         names = {
             GameMode.DF: "Free Mode",
             GameMode.ZW: "Zone Wars",
-            GameMode.ZW_LG: "Lategame Zone Wars",
-            GameMode.WW: "Wild West",
+            GameMode.ZW_LG: "Late Game Zonewars",
+            GameMode.WW: "Solo Wild West",
             GameMode.WWZW: "Duo Wild West",
             GameMode.BF: "Boxfights",
             GameMode.BF2V2: "Boxfights 2v2",
             GameMode.VA: "V-Arena",
-            GameMode.RVB: "Red vs Blue",
+            GameMode.RVB: "Red Vs Blue",
             GameMode.R1V1: "Realistic 1v1",
         }
         return names.get(self, self.value)
+
+    def display(self, duo: bool = False) -> str:
+        """Display label with (Duo) qualification for solo/duo variants (DF, ZW_LG)."""
+        base = self.human_name
+        if duo and self in (GameMode.DF, GameMode.ZW_LG) and not base.lower().startswith(("solo", "duo", "(duo)")):
+            return f"(Duo) {base}"
+        return base
 
 
 class PacketType(str, Enum):

@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 
 from ..lib.supabase_client import supabase, db
 from ..lib.redis_client import cache
-from ..lib.tokens import generate_request_token, validate_request_token
+from ..lib.tokens import generate_request_token, validate_request_token, is_session_expired
 from ..lib.logger import log_sys, log_err
 from ..lib.photon_engine import Engine
 from ..lib.alerts import create_alert
@@ -48,6 +48,13 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
         sess = res.get("data")
         if not sess:
             return JSONResponse({"error": "Invalid auth session"}, status_code=401)
+        if is_session_expired(sess):
+            try:
+                db.update_session_sync(auth_session_id, {"is_active": False})
+            except Exception:
+                pass
+            log_sys(f"CAPTURE expired session {auth_session_id[:8]} — client must re-link")
+            return JSONResponse({"error": "Session expired - please re-link"}, status_code=401)
         if sess.get("is_locked"):
             scope = str(sess.get("lock_scope") or ("admin" if sess.get("is_admin_locked") else "default")).lower()
             is_admin = scope == "admin" or bool(sess.get("is_admin_locked"))

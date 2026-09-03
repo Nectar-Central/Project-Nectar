@@ -75,12 +75,29 @@ async def get_active_session(discord_id: str):
 
 
 async def get_active_sessions(discord_id: str, limit: int = 5):
-    """Get multiple recent active sessions ordered by created_at desc."""
+    """Get multiple recent active sessions ordered by created_at desc.
+
+    Sessions older than 2 days are expired (see SESSION_TTL_DAYS) and skipped.
+    """
     if not db.USE_SUPABASE or not db.supabase:
         return []
     try:
-        r = db.supabase.table("bngc_sessions").select("session_id, created_at").eq("discord_id", discord_id).eq("is_active", True).order("created_at", desc=True).limit(limit).execute()
-        return [x.get("session_id") for x in (r.data or []) if x.get("session_id")]
+        r = db.supabase.table("bngc_sessions").select("session_id, created_at").eq("discord_id", discord_id).eq("is_active", True).order("created_at", desc=True).limit(limit * 2).execute()
+        out = []
+        for x in (r.data or []):
+            if not x.get("session_id"):
+                continue
+            try:
+                from datetime import datetime, timezone
+                ts = datetime.fromisoformat(str(x.get("created_at", "")).replace("Z", "+00:00"))
+                if (datetime.now(timezone.utc) - ts).total_seconds() > 2 * 86400:
+                    continue  # expired session — client must re-link
+            except Exception:
+                pass
+            out.append(x["session_id"])
+            if len(out) >= limit:
+                break
+        return out
     except Exception as e:
         print(f"[session] get actives failed: {e}")
         return []
@@ -472,14 +489,22 @@ async def _match_logic(interaction: discord.Interaction):
     sids = await get_active_sessions(did, limit=5)
     if not sids:
         return await interaction.followup.send("No active match found. Start a game first.")
-    state = None
-    sid = None
+    # Fetch states for all candidates, prefer the one actually in a match room
+    # (first-with-state could be a stale lobby while another session is live).
+    states: list[tuple[str, dict]] = []
     for cand in sids:
         st = await get_session_state(cand)
         if st:
-            state = st
-            sid = cand
+            states.append((cand, st))
+    state = None
+    sid = None
+    for cand, st in states:
+        rooms = st.get("rooms") or {}
+        if any(rid != "lobby" and (rv.get("state") == "match") for rid, rv in rooms.items()):
+            state, sid = st, cand
             break
+    if state is None and states:
+        sid, state = states[0]
     if not state:
         sid = sids[0]
         row = await db.get_by_discord(did)
@@ -578,7 +603,7 @@ async def _match_logic(interaction: discord.Interaction):
         e.add_field(name="Match ID", value=f"`{display_rid[:8]}`", inline=True)
     if party.get("is_party"): e.add_field(name="Party", value="In Party", inline=True)
     if skin: e.add_field(name="Skin", value=fmt.skin_display(skin), inline=True)
-    e.add_field(name="Players", value=kills_lines[:1024], inline=False)
+    e.add_field(name="Player List", value=kills_lines[:1024], inline=False)
     await interaction.followup.send(embed=e)
 
 
@@ -634,6 +659,60 @@ async def sessions_cmd(interaction: discord.Interaction):
     embed = views.sessions_overview_embed(sessions)
     view = views.SessionSelectView(sessions, did)
     await interaction.followup.send(embed=embed, view=view)
+
+
+@bot.tree.command(name="recentmatches", description="Show your recent individual matches across sessions")
+async def recentmatches_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    did = str(interaction.user.id)
+    sessions = await db.get_recent_matches(did, limit=5)
+    if not sessions:
+        return await interaction.followup.send("No matches yet. Play a match first.")
+    items: list[dict] = []
+    for s in sessions[:3]:
+        sid = s.get("session_id")
+        if not sid:
+            continue
+        try:
+            grouped = await db.get_match_events_grouped(sid, did)
+        except Exception:
+            continue
+        for key, evs in grouped.items():
+            if not evs:
+                continue
+            try:
+                ts = max((ev.get("created_at") or "" for ev in evs))
+            except Exception:
+                ts = s.get("last_played") or s.get("created_at")
+            gm = next(((ev.get("event_data") or {}).get("gm") for ev in evs if (ev.get("event_data") or {}).get("gm")), None)
+            # room short: composite room_version keys keep room part + version
+            room_short = key
+            try:
+                if "_" in key:
+                    rp, mv = key.rsplit("_", 1)
+                    room_short = rp[:8] + (f" v{mv}" if mv.isdigit() else "")
+                else:
+                    room_short = key[:8]
+            except Exception:
+                room_short = str(key)[:8]
+            items.append({
+                "session_id": sid,
+                "session_short": str(sid)[:8],
+                "room_short": room_short,
+                "ts": ts,
+                "gm": gm,
+                "kills": sum(1 for ev in evs if ev.get("event_type") == "kill"),
+                "deaths": sum(1 for ev in evs if ev.get("event_type") == "death"),
+                "win": any(ev.get("event_type") == "win" for ev in evs),
+                "defeat": any(ev.get("event_type") == "defeat" for ev in evs),
+            })
+    if not items:
+        return await interaction.followup.send("No matches yet. Play a match first.")
+    try:
+        items.sort(key=lambda m: m.get("ts") or "", reverse=True)
+    except Exception:
+        pass
+    await interaction.followup.send(embed=views.recent_matches_embed(items[:10]))
 
 
 @bot.tree.command(name="replay", description="Show replay for a match")

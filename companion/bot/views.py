@@ -78,6 +78,25 @@ def matches_in_session_embed(session_id: str, events: list[dict], session_meta: 
     e.set_footer(text=f"{len(groups)} matches in this session — pick one below")
     return e
 
+def recent_matches_embed(matches: list[dict]) -> discord.Embed:
+    """Flat list of recent individual matches (room + version) across sessions.
+
+    Each item: {session_short, room_short, ts, gm, kills, deaths, win, defeat}.
+    """
+    e = discord.Embed(title="Recent Matches", color=0x7C3AED)
+    if not matches:
+        e.description = "No matches yet. Play a match first."
+        return e
+    for i, m in enumerate(matches[:10], 1):
+        gm_label = fmt.format_game_mode(m.get("gm")) if m.get("gm") else "Match"
+        ts = fmt.fmt_date(m.get("ts"))
+        result = "Victory" if m.get("win") else ("Defeat" if m.get("defeat") else "—")
+        stats = f"K:{m.get('kills',0)} D:{m.get('deaths',0)} · {result}"
+        e.add_field(name=f"{i}. {ts} — {gm_label}", value=f"{stats} · `{m.get('room_short','?')}`", inline=False)
+    e.set_footer(text="Use /replay <session> or /killfeed <session> with the session id from /sessions")
+    return e
+
+
 def match_detail_embed(session_id: str, events: list[dict], room_id: str | None = None) -> discord.Embed:
     # Filter to room if provided (supports composite room_id_version)
     if room_id:
