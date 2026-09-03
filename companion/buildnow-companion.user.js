@@ -480,6 +480,45 @@
     return s;
   }
 
+  // Server-state reconciliation (enter/exit driver for audio + optimistic state).
+  // Derives server in-match from EITHER shape: capture POST (full rooms map) or
+  // stats GET (flat current-room fields). Flips optimistic state on disagreement
+  // once optimistic is stale (>10s — server trails live packets ~2-5s), which heals
+  // stuck flags even when idle (no capture batches flowing). Returns true on flip.
+  function _serverInMatch(sess) {
+    if(!sess) return null;
+    try {
+      const rooms = sess.rooms;
+      const curRoom = rooms ? rooms[sess.current_room_id] : null;
+      const serverCurScn = (curRoom && curRoom.cur_scn) || sess.cur_scn || null;
+      if(serverCurScn) return serverCurScn !== 'MainLobby';
+      if(sess.state) return String(sess.state).toLowerCase() === 'match';
+    } catch(e) {}
+    return null;
+  }
+  function _reconcileServerState(sess) {
+    try {
+      const serverInMatch = _serverInMatch(sess);
+      if(serverInMatch === null || serverInMatch === _optimisticState.inMatch) return false;
+      const optimisticFresh = (Date.now() - (_optimisticState.lastUpdateAt || 0)) < 10000;
+      if(optimisticFresh) {
+        logSys(`[OPTIMISTIC] server reconcile ignored (fresh optimistic inMatch=${_optimisticState.inMatch}, server=${serverInMatch})`);
+        return false;
+      }
+      logSys(`[OPTIMISTIC] server reconcile inMatch=${serverInMatch} (was ${_optimisticState.inMatch})`);
+      try {
+        const rooms = sess.rooms;
+        const curRoom = rooms ? rooms[sess.current_room_id] : null;
+        const serverCurScn = (curRoom && curRoom.cur_scn) || sess.cur_scn || null;
+        if(serverCurScn) _optimisticState.curScn = serverCurScn;
+      } catch(e) {}
+      _optimisticState.inMatch = serverInMatch;
+      _optimisticState.lastUpdateAt = Date.now();
+      try { updateLobbyMusic(); } catch {}  // enter-match pauses, exit-to-lobby resumes
+      return true;
+    } catch(e) { return false; }
+  }
+
   function _applyOptimisticKillfeed(killer, victim) {
     const myName = GMGet('bnc_game_username', '') || '';
     if (!myName) return;
@@ -1271,13 +1310,13 @@
       if(useGM && GM){
         try{
           GM({method:'GET', url, headers:{'Content-Type':'application/json'}, timeout:8000,
-            onload: r=>{ if(r.status>=200&&r.status<300){ try{ const j=JSON.parse(r.responseText); statsCache=j; logInfo(`[AUDIO] stats fetched lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } renderInfoPanel(); }catch(e){ logErr(`[AUDIO] stats parse err ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ const d=document.getElementById('bnc-drawer-dot'); const t=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background=apiOnline?'#10b981':'#6b7280'; if(t) t.textContent=apiOnline?'Online':'Offline'; }catch{} },
+            onload: r=>{ if(r.status>=200&&r.status<300){ try{ const j=JSON.parse(r.responseText); statsCache=j; logInfo(`[AUDIO] stats fetched lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } try{ _reconcileServerState(j.session); }catch{} renderInfoPanel(); }catch(e){ logErr(`[AUDIO] stats parse err ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ const d=document.getElementById('bnc-drawer-dot'); const t=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background=apiOnline?'#10b981':'#6b7280'; if(t) t.textContent=apiOnline?'Online':'Offline'; }catch{} },
             onerror: ()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const t=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(t) t.textContent='Offline'; }catch{} },
             ontimeout: ()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const t=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(t) t.textContent='Offline'; }catch{} }});
           return;
         }catch{}
       }
-      fetch(url, {method:'GET'}).then(r=>r.text().then(t=>{ if(r.ok){ try{ const j=JSON.parse(t); statsCache=j; logInfo(`[AUDIO] stats fetched (fetch) lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats-fetch', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } renderInfoPanel(); }catch(e){ logErr(`[AUDIO] stats parse err (fetch) ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background=apiOnline?'#10b981':'#6b7280'; if(tt) tt.textContent=apiOnline?'Online':'Offline'; }catch{} }).catch(()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(tt) tt.textContent='Offline'; }catch{} })).catch(()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(tt) tt.textContent='Offline'; }catch{} });
+      fetch(url, {method:'GET'}).then(r=>r.text().then(t=>{ if(r.ok){ try{ const j=JSON.parse(t); statsCache=j; logInfo(`[AUDIO] stats fetched (fetch) lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats-fetch', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} try{ _reconcileServerState(j.session); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } renderInfoPanel(); }catch(e){ logErr(`[AUDIO] stats parse err (fetch) ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background=apiOnline?'#10b981':'#6b7280'; if(tt) tt.textContent=apiOnline?'Online':'Offline'; }catch{} }).catch(()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(tt) tt.textContent='Offline'; }catch{} })).catch(()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(tt) tt.textContent='Offline'; }catch{} });
     };
     doFetch(true);
   }
@@ -1593,37 +1632,10 @@
               }
             }catch{}
 
-            // Apply optimistic corrections from server response
-            // Heals stuck optimistic state (e.g. left match with no MainLobby scene
-            // and no re-auth: optimistic stays in-match forever while server is lobby).
-            try {
-              const sess = j.session;
-              if(sess) {
-                const curRoom = sess.rooms?.[sess.current_room_id];
-                const serverCurScn = (curRoom && curRoom.cur_scn) || sess.cur_scn || null;
-                // Derive server in-match: prefer cur_scn, fall back to FSM state
-                // (cur_scn can be null when the server never saw a scene packet).
-                let serverInMatch = null;
-                if(serverCurScn) serverInMatch = serverCurScn !== 'MainLobby';
-                else if(sess.state) serverInMatch = String(sess.state).toLowerCase() === 'match';
-                if(serverInMatch !== null && serverInMatch !== _optimisticState.inMatch) {
-                  // Server trails live packets by ~2-5s (batch + POST), so trust a
-                  // fresh optimistic value; trust the server once optimistic is stale.
-                  const optimisticFresh = (Date.now() - (_optimisticState.lastUpdateAt || 0)) < 10000;
-                  if(optimisticFresh) {
-                    logSys(`[OPTIMISTIC] server correction ignored (fresh optimistic=${_optimisticState.curScn} inMatch=${_optimisticState.inMatch}, serverInMatch=${serverInMatch})`);
-                  } else {
-                    logSys(`[OPTIMISTIC] server correction inMatch=${serverInMatch} (was ${_optimisticState.inMatch}, serverCurScn=${serverCurScn})`);
-                    if(serverCurScn) _optimisticState.curScn = serverCurScn;
-                    _optimisticState.inMatch = serverInMatch;
-                    _optimisticState.lastUpdateAt = Date.now();
-                    // Re-sync audio + drawer
-                    try { updateLobbyMusic(); } catch {}
-                    try { renderInfoPanel(); } catch {}
-                  }
-                }
-              }
-            } catch(e) {}
+            // Apply server reconciliation from capture response (shared helper)
+            if(_reconcileServerState(j.session)) {
+              try { renderInfoPanel(); } catch {}
+            }
           }
         }catch(e){ feedLog('decrypted', {err:e.message}); }
         feedLog('sent', {count:batch.length, ok:true});
