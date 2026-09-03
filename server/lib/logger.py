@@ -97,8 +97,11 @@ TAG = {
     "JOIN": _bg(16, 185, 129, _color(0, 32, 24, " JOIN ")),
     "LEAVE": _bg(245, 158, 11, _color(32, 16, 0, " LEVE ")),
     "KILL": _bg(239, 68, 68, _color(255, 255, 255, " KILL ")),
+    "WIN": _bg(234, 179, 8, _color(32, 24, 0, " WIN  ")),
+    "DEFEAT": _bg(100, 116, 139, _color(255, 255, 255, " DEFEAT ")),
     "ALV": _bg(59, 130, 246, _color(255, 255, 255, " ALV  ")),
     "ZONE": _bg(168, 85, 247, _color(255, 255, 255, " ZONE ")),
+    "STG": _bg(249, 115, 22, _color(255, 255, 255, " STG  ")),
     "STATE": _bg(124, 58, 237, _color(255, 255, 255, " STATE")),
 }
 
@@ -208,8 +211,11 @@ _EVENT_TAG = {
     "join": TAG["JOIN"],
     "leave": TAG["LEAVE"],
     "killfeed": TAG["KILL"],
+    "win": TAG["WIN"],
+    "defeat": TAG["DEFEAT"],
     "alv": TAG["ALV"],
     "zone": TAG["ZONE"],
+    "stg": TAG["STG"],
     "state": TAG["STATE"],
     "name_change": TAG["SYS"],
 }

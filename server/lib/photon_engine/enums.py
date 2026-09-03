@@ -38,7 +38,38 @@ class GameMode(str, Enum):
     WWZW = "wwzw"            # Duo Wild West (zone wars)
     BF = "BF"               # Boxfights
     BF2V2 = "BF2V2"          # Boxfights 2v2
+    VA = "VA"               # V-Arena (1v1)
+    RVB = "tdm_bvr"         # Red vs Blue (TDM, 2 teams up to 8, first to 15 kills)
+    R1V1 = "R_1V1"          # Realistic 1v1
     UNKNOWN = "unknown"
+
+    @classmethod
+    def from_gm(cls, gm_str: str | None) -> "GameMode | None":
+        """
+        Map a raw `gm` string to GameMode.
+
+        Exact match first ("zw_lg"), then case-insensitive ("ZW_LG"), then
+        longest-prefix ("zw_lg_duo" -> ZW_LG, "df_duo" -> DF). Longest-first so
+        BF2V2 wins over BF. UNKNOWN is never prefix-matched.
+        Returns None when nothing matches (caller logs raw string for discovery).
+        """
+
+        if not gm_str:
+            return None
+        try:
+            return cls(gm_str)
+        except ValueError:
+            pass
+        low = str(gm_str).lower()
+        for m in cls:
+            if m is cls.UNKNOWN:
+                continue
+            if m.value.lower() == low:
+                return m
+        for m in sorted((m for m in cls if m is not cls.UNKNOWN), key=lambda m: -len(m.value)):
+            if low.startswith(m.value.lower()):
+                return m
+        return None
 
     @classmethod
     def from_curscn(cls, curscn: str | None) -> "GameMode | None":
@@ -90,6 +121,9 @@ class GameMode(str, Enum):
             GameMode.WWZW: "Duo Wild West",
             GameMode.BF: "Boxfights",
             GameMode.BF2V2: "Boxfights 2v2",
+            GameMode.VA: "V-Arena",
+            GameMode.RVB: "Red vs Blue",
+            GameMode.R1V1: "Realistic 1v1",
         }
         return names.get(self, self.value)
 

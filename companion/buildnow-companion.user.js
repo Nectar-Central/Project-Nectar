@@ -447,6 +447,57 @@
   const DROP_EVS_NOISY=new Set([200,201,202,204,206]);
   const BATCH_MAX=40, FLUSH_MS=250;
 
+  // ---- OPTIMISTIC STATE ----
+  let _optimisticState = {
+    curScn: null,        // current scene from last packet
+    inMatch: false,      // derived: true if curScn != MainLobby
+    lastUpdateAt: 0,     // timestamp of last optimistic update
+  };
+
+  function _applyOptimisticCurScn(curScn, opts) {
+    if (!curScn || curScn === _optimisticState.curScn) return;
+    const wasInMatch = _optimisticState.inMatch;
+    _optimisticState.curScn = curScn;
+    _optimisticState.inMatch = curScn !== 'MainLobby';
+    _optimisticState.lastUpdateAt = Date.now();
+    logSys(`[OPTIMISTIC] curScn=${curScn} inMatch=${_optimisticState.inMatch}`);
+    const silent = opts && opts.silent;
+    // Audio rule: pause ONLY on scene flip (lobby<->match). Same-side scene
+    // changes and silent sets never touch audio (prevents stop+restart cycles).
+    if (!silent && wasInMatch !== _optimisticState.inMatch) {
+      try { updateLobbyMusic(); } catch {}
+    }
+    // fast drawer update
+    if (wasInMatch !== _optimisticState.inMatch) {
+      try { renderInfoPanel(); } catch {}
+    }
+  }
+
+  function _normName(n) {
+    if (!n) return '';
+    let s = String(n).replace(/<[^>]*>/g, '').trim();
+    if (s.toLowerCase().startsWith('dc:')) s = s.slice(3).trim();
+    return s;
+  }
+
+  function _applyOptimisticKillfeed(killer, victim) {
+    const myName = GMGet('bnc_game_username', '') || '';
+    if (!myName) return;
+    const myNorm = _normName(myName);
+    const killerNorm = _normName(killer);
+    const victimNorm = _normName(victim);
+    if (!statsCache) return;
+    if (myNorm && killerNorm && myNorm === killerNorm) {
+      statsCache.kills = (statsCache.kills || 0) + 1;
+      logSys(`[OPTIMISTIC] KILL +1 → ${statsCache.kills} victim=${victim}`);
+      try { renderInfoPanel(); } catch {}
+    } else if (myNorm && victimNorm && myNorm === victimNorm) {
+      statsCache.deaths = (statsCache.deaths || 0) + 1;
+      logSys(`[OPTIMISTIC] DEATH +1 → ${statsCache.deaths} killer=${killer}`);
+      try { renderInfoPanel(); } catch {}
+    }
+  }
+
   // ---- COLLECT MODE ----
   let collectMode = false;
   let collectedPackets = [];
@@ -529,7 +580,8 @@
         label: r.label,
         rawHex: r.rawHex
       }));
-      apiPost('/api/capture', { sessionId: captureSessionId, records }, (ok)=>{
+      const hostMode = !!GMGet('bnc_host_mode', false);
+      apiPost('/api/capture', { sessionId: captureSessionId, records, hostMode }, (ok)=>{
         if(ok) sent += batch.length;
         else logErr(`Replay batch failed at ${start}`);
         setTimeout(()=>sendBatch(start + batchSize), 50);
@@ -737,6 +789,10 @@
   let playersCache=null, playersPollTimer=null, playersLoading=false;
   let lobbyAudio=null;
   let bgLobbyPollTimer=null;
+  let _audioPlaying=false;
+  let _audioPlayPending=false; // play() in flight (buffering) — blocks duplicate play() calls
+  let _authCount=0; // outgoing Authenticate packets seen (first = login, never touches audio)
+  let _lastPauseReason=null; // reason string of the last _audioPause() call (for STOPPED tracing)
   function ensureLobbyAudio(){
     if(lobbyAudio) return lobbyAudio;
     try{
@@ -757,7 +813,7 @@
       lobbyAudio.style.opacity='0';
       lobbyAudio.style.pointerEvents='none';
       lobbyAudio.volume=Math.max(0,Math.min(1, Number(GMGet('bnc_lobby_volume', 0.5))));
-      // detailed audio event logs
+      // detailed audio event logs + track _audioPlaying state
       try{
         ['loadstart','canplay','canplaythrough','playing','pause','ended','error','stalled','suspend','volumechange','emptied'].forEach(ev=>{
           lobbyAudio.addEventListener(ev, ()=>{
@@ -766,48 +822,117 @@
             else if(ev==='playing') logOk(`[AUDIO] event ${ev} ${st}`);
             else logInfo(`[AUDIO] event ${ev} ${st}`);
             try{ feedLog(ev==='error'?'err': ev==='playing'?'ok':'info', {audio:ev, src:String(lobbyAudio.src||''), vol:lobbyAudio.volume, paused:lobbyAudio.paused}); }catch{}
+            // Track _audioPlaying state: only flip to false on pause/ended/error/emptied events
+            if(ev==='pause' || ev==='ended' || ev==='error' || ev==='emptied'){
+              if(_audioPlaying) _audioPlaying=false; // only flip if currently true
+              _audioPlayPending=false; // play attempt settled
+            }
+            if(ev==='playing'){
+              _audioPlaying=true; // set true when playing starts (idempotent)
+              _audioPlayPending=false; // play attempt settled
+            }
+            // STOPPED tracing: log what stopped playback and the last known reason
+            if(ev==='pause' || ev==='ended' || ev==='error'){
+              logInfo(`[AUDIO] STOPPED event=${ev} reason=${_lastPauseReason||'external/unknown'} vol=${lobbyAudio.volume.toFixed(2)} src=${String(lobbyAudio.src||'').slice(-50)} inMatch=${_optimisticState.inMatch} readyState=${lobbyAudio.readyState}${lobbyAudio.error? ' errCode='+lobbyAudio.error.code : ''}`);
+              try{ feedLog('info', {audio:'stopped', event:ev, reason:_lastPauseReason||'external/unknown', vol:lobbyAudio.volume, inMatch:_optimisticState.inMatch}); }catch{}
+              _lastPauseReason=null; // consume (next stop needs a fresh reason)
+            }
           });
         });
       }catch{}
       (document.body||document.documentElement).appendChild(lobbyAudio);
       logInfo(`[AUDIO] appended hidden tag vol=${lobbyAudio.volume} loop=${lobbyAudio.loop} autoplay=${lobbyAudio.autoplay}`);
-      // try resume on user gesture (drawer open)
-      try{ const resume=()=>{ logInfo('[AUDIO] click resume try'); try{ if(lobbyAudio && lobbyAudio.paused && lobbyAudio.src) lobbyAudio.play().then(()=> logOk('[AUDIO] resume playing')).catch(e=> logErr(`[AUDIO] resume blocked ${e.message||e}`)); }catch(e){ logErr(`[AUDIO] resume err ${e.message}`);} }; document.addEventListener('click', resume, {once:true}); }catch{}
+      // try resume on user gesture (drawer open) — only if not already playing and not in match
+      try{ const resume=()=>{ logInfo('[AUDIO] click resume try'); try{ const rs = statsCache && statsCache.session; const rsLobby = !_optimisticState.inMatch && (!rs || String(rs.state||'').toLowerCase()!=='match'); if(lobbyAudio && !_audioPlaying && !_audioPlayPending && rsLobby && lobbyAudio.paused && lobbyAudio.src) { _audioPlayPending=true; lobbyAudio.play().then(()=> logOk('[AUDIO] resume playing')).catch(e=> { _audioPlayPending=false; logErr(`[AUDIO] resume blocked ${e.message||e}`); }); } }catch(e){ logErr(`[AUDIO] resume err ${e.message}`);} }; document.addEventListener('click', resume, {once:true}); }catch{}
     }catch(e){ logErr(`[AUDIO] ensure failed ${e.message}`); }
     return lobbyAudio;
+  }
+  // Single choke point for stopping lobby audio — records WHY for STOPPED tracing
+  function _audioPause(reason){
+    try{
+      const a = lobbyAudio;
+      if(!a){ logInfo(`[AUDIO] STOP request reason=${reason} (no audio tag)`); return; }
+      logInfo(`[AUDIO] STOP request reason=${reason} paused=${a.paused} playing=${_audioPlaying} pending=${_audioPlayPending} inMatch=${_optimisticState.inMatch} readyState=${a.readyState} vol=${a.volume.toFixed(2)}`);
+      _lastPauseReason = reason;
+      if(!a.paused) a.pause();
+    }catch(e){ logErr(`[AUDIO] pause err ${e.message}`); }
   }
   function updateLobbyMusic(){
     try{
       const sc=statsCache;
       const sess=sc && sc.session;
-      const isLobby = !sess || String(sess.state||'').toLowerCase()!=='match';
+      // Use optimistic state for immediate response, fall back to server state
+      const isLobby = !_optimisticState.inMatch && (!sess || String(sess.state||'').toLowerCase()!=='match');
       const rawUrl = sc && sc.lobby_music_url; const url = rawUrl ? (rawUrl.startsWith('http') ? rawUrl : 'https://mnpwvwjqawmuqmickteu.supabase.co/storage/v1/object/public/lobby-music/'+rawUrl.replace(/^music\//,'')).replace(/\?$/,'') : null;
       const audio=ensureLobbyAudio();
       if(!audio){ logErr('[AUDIO] update no audio'); return; }
       // volume from GM
       const vol = Math.max(0,Math.min(1, Number(GMGet('bnc_lobby_volume', 0.5))));
       audio.volume = vol;
-      logInfo(`[AUDIO] update isLobby=${isLobby} hasUrl=${!!url} url=${String(url||'')} src=${String(audio.src||'')} vol=${vol.toFixed(2)} paused=${audio.paused} readyState=${audio.readyState} networkState=${audio.networkState} state=${sess? sess.state:'no-sess'}`);
-      try{ feedLog('info', {audio:'update', isLobby, hasUrl:!!url, vol, paused:audio.paused, state:sess? sess.state:null}); }catch{}
-      if(!url || !isLobby){
-        logInfo(`[AUDIO] pause (no url or not lobby) url=${!!url} isLobby=${isLobby}`);
-        try{ audio.pause(); if(audio.src) { audio.removeAttribute('src'); audio.load(); logInfo('[AUDIO] paused and src cleared'); } }catch(e){ logErr(`[AUDIO] pause err ${e.message}`); }
+      logInfo(`[AUDIO] update isLobby=${isLobby} optimistic=${_optimisticState.inMatch} hasUrl=${!!url} url=${String(url||'')} src=${String(audio.src||'')} vol=${vol.toFixed(2)} paused=${audio.paused} readyState=${audio.readyState} networkState=${audio.networkState} state=${sess? sess.state:'no-sess'}`);
+      try{ feedLog('info', {audio:'update', isLobby, inMatch:_optimisticState.inMatch, curScn:_optimisticState.curScn, hasUrl:!!url, vol, paused:audio.paused, state:sess? sess.state:null}); }catch{}
+      // GUARD: pause ONLY on optimistic in-match. A MainLobby curScn (or anything
+      // else while lobby) must never pause the music.
+      if(_optimisticState.inMatch){
+        _audioPause('in-match');
         return;
       }
-      // force-reload when src changed, or browser dropped source (networkState=3 NO_SOURCE / error)
+      // Lobby (optimistic): never pause here — without a URL there is nothing to start.
+      if(!url){
+        logInfo('[AUDIO] no url, nothing to play (no pause)');
+        return;
+      }
+      // Server still thinks match (it trails live packets ~2-5s): hold, don't play yet.
+      if(!isLobby){
+        logInfo(`[AUDIO] hold (server still match, optimistic lobby) state=${sess? sess.state:'no-sess'}`);
+        return;
+      }
+      // Guard FIRST: skip when audio is actually producing sound (ground truth = paused flag).
+      // The _audioPlaying var can desync (e.g. src swapped without a pause event), so resync it here.
+      if(!audio.paused && audio.readyState >= 2){
+        _audioPlaying = true; // resync (playing event may have been missed)
+        logInfo('[AUDIO] actually playing, skip everything (no restart)');
+        return;
+      }
+      // Guard: play() already in flight (buffering) — a second play() restarts the track
+      if(_audioPlayPending){
+        logInfo('[AUDIO] play already pending, skip duplicate play()');
+        return;
+      }
+      _audioPlaying = false; // resync (stale true with no sound -> allow play below)
+      // only reload when src changed or browser dropped source (only reached when NOT sounding)
       const needsReload = audio.src !== url || audio.networkState === 3 || (audio.error && audio.error.code);
       if(needsReload){
         logInfo(`[AUDIO] src reload src_changed=${audio.src!==url} networkState=${audio.networkState} errCode=${audio.error? audio.error.code:'none'} url=${String(url)}`);
         try{ audio.src=url; audio.load(); logInfo('[AUDIO] load called'); }catch(e){ logErr(`[AUDIO] load err ${e.message}`); }
       } else {
-        logInfo('[AUDIO] src same, skip load');
+        logInfo('[AUDIO] src cached, skip load');
       }
       // try play (may need user gesture - drawer open is gesture)
-      logInfo(`[AUDIO] play() try vol=${vol} loop=${audio.loop} autoplay=${audio.autoplay}`);
+      logInfo(`[AUDIO] play() try vol=${vol} loop=${audio.loop} autoplay=${audio.autoplay} paused=${audio.paused} readyState=${audio.readyState}`);
+      _audioPlayPending = true; // mark play in flight before calling
       const p = audio.play();
-      if(p && p.then) p.then(()=> logOk('[AUDIO] play() ok playing')).catch(e=> logErr(`[AUDIO] play() blocked ${e.message||e} — need user click on page/drawer`));
-      else if(p && p.catch) p.catch(e=> logErr(`[AUDIO] play() blocked ${e.message||e}`));
-      else logInfo('[AUDIO] play() no promise');
+      if(p && p.then) p.then(()=> logOk('[AUDIO] play() ok playing')).catch(e=> { _audioPlayPending=false; logErr(`[AUDIO] play() blocked ${e.message||e} — need user click on page/drawer`); });
+      else if(p && p.catch) p.catch(e=> { _audioPlayPending=false; logErr(`[AUDIO] play() blocked ${e.message||e}`); });
+      else { _audioPlayPending=false; logInfo('[AUDIO] play() no promise'); }
+    }catch{}
+  }
+  function prefetchLobbyMusic(){
+    try{
+      const sc=statsCache;
+      const rawUrl=sc && sc.lobby_music_url;
+      if(!rawUrl) return;
+      const url=rawUrl.startsWith('http') ? rawUrl : 'https://mnpwvwjqawmuqmickteu.supabase.co/storage/v1/object/public/lobby-music/'+rawUrl.replace(/^music\//,'');
+      if(!url) return;
+      // warm browser cache with fetch
+      fetch(url, {method:'HEAD'}).catch(()=>{});
+      // only preload if silent and not in match (avoid restart; ground truth = paused)
+      const audio=ensureLobbyAudio();
+      if(!audio || _optimisticState.inMatch || !audio.paused) return;
+      if(audio.src!==url){
+        logInfo(`[AUDIO] prefetch src=${url.slice(-40)}`);
+        try{ audio.src=url; audio.load(); }catch{}
+      }
     }catch{}
   }
   function startBgLobbyPoll(){ if(bgLobbyPollTimer) return; bgLobbyPollTimer=setInterval(()=>{ if(sessionId) fetchStats(false); }, 15000); }
@@ -878,11 +1003,19 @@
         const isLobby = !sess || String(sess.state||'').toLowerCase()!=='match';
         if(isLobby && sc && sc.lobby_music_url){
           const aud=ensureLobbyAudio();
-          if(aud){
+          // Drawer must NEVER restart lobby music: only act when audio is silent, no play
+          // in flight, and we're in lobby (optimistic AND server — server trails, so both).
+          // Ground truth = aud.paused.
+          const drawerIsLobby = !_optimisticState.inMatch && (!sess || String(sess.state||'').toLowerCase()!=='match');
+          if(aud && aud.paused && !_audioPlayPending && drawerIsLobby){
             const rawUrl=sc.lobby_music_url||''; const fullUrl=(rawUrl.startsWith('http')? rawUrl: 'https://mnpwvwjqawmuqmickteu.supabase.co/storage/v1/object/public/lobby-music/'+rawUrl.replace(/^music\//,'')).replace(/\?$/,'');
             if(aud.src !== fullUrl || aud.networkState===3 || (aud.error && aud.error.code)){ try{ aud.src=fullUrl; aud.load(); logInfo(`[AUDIO] drawer open src set ${fullUrl}`); }catch{} }
             aud.volume=Math.max(0,Math.min(1, Number(GMGet('bnc_lobby_volume',0.5))));
-            const p=aud.play(); if(p&&p.catch) p.catch(()=>{});
+            _audioPlaying = false; // resync before play
+            _audioPlayPending = true; // mark play in flight
+            const p=aud.play(); if(p&&p.catch) p.catch(()=>{ _audioPlayPending=false; });
+          } else if(aud){
+            logInfo(`[AUDIO] drawer open skip play inMatch=${_optimisticState.inMatch} paused=${aud.paused} pending=${_audioPlayPending}`);
           }
         } else {
           ensureLobbyAudio();
@@ -1012,17 +1145,22 @@
         </div>
         <button id="bnc-keybind-set" style="margin-top:14px;padding:8px 14px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:600;cursor:pointer">Set open keybind: ${kbLabel}</button>
         <div id="bnc-keybind-hint" style="font-size:11px;color:#6b7280;min-height:14px"></div>
-        <div style="margin-top:10px;width:100%;max-width:240px;display:flex;flex-direction:column;gap:4px;align-items:center">
-          <div style="font-size:11px;color:#9ca3af">Lobby Music Volume</div>
-          <div style="display:flex;gap:8px;align-items:center;width:100%">
-            <span style="font-size:11px;color:#6b7280">🔈</span>
-            <input type="range" id="bnc-volume-slider" min="0" max="100" value="${Math.round(Number(GMGet('bnc_lobby_volume',0.5))*100)}" style="flex:1;accent-color:#fff">
-            <span id="bnc-volume-label" style="font-size:11px;color:#e5e7eb;min-width:32px;text-align:right">${Math.round(Number(GMGet('bnc_lobby_volume',0.5))*100)}%</span>
-            <span style="font-size:11px;color:#6b7280">🔊</span>
-          </div>
-        </div>
-      </div>
-    `;
+          <div style="margin-top:10px;width:100%;max-width:240px;display:flex;flex-direction:column;gap:4px;align-items:center">
+           <div style="font-size:11px;color:#9ca3af">Lobby Music Volume</div>
+           <div style="display:flex;gap:8px;align-items:center;width:100%">
+             <span style="font-size:11px;color:#6b7280">🔈</span>
+             <input type="range" id="bnc-volume-slider" min="0" max="100" value="${Math.round(Number(GMGet('bnc_lobby_volume',0.5))*100)}" style="flex:1;accent-color:#fff">
+             <span id="bnc-volume-label" style="font-size:11px;color:#e5e7eb;min-width:32px;text-align:right">${Math.round(Number(GMGet('bnc_lobby_volume',0.5))*100)}%</span>
+             <span style="font-size:11px;color:#6b7280">🔊</span>
+           </div>
+         </div>
+         <label style="margin-top:8px;width:100%;max-width:240px;display:flex;gap:8px;align-items:center;justify-content:center;padding:6px 8px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:8px;cursor:pointer">
+           <input type="checkbox" id="bnc-host-toggle" ${GMGet('bnc_host_mode', false)?'checked':''} style="accent-color:#fff">
+           <span style="font-size:11px;color:#e5e7eb;font-weight:600">Host mode (server rooms · comp replay)</span>
+         </label>
+         <div style="font-size:10px;color:#6b7280;max-width:240px;text-align:center;line-height:1.3">Individualist by default. Host tracks all players for replays in server zw_lg/wwzw rooms (not BF2V2).</div>
+       </div>
+     `;
     // players tab content
     let playersHtml='';
     if(drawerTab==='players'){
@@ -1106,7 +1244,18 @@
       volSlider.oninput=syncVol;
       volSlider.onchange=syncVol;
     }
+    const hostToggle=document.getElementById('bnc-host-toggle');
+    if(hostToggle){
+      hostToggle.onchange=()=>{
+        const on=!!hostToggle.checked;
+        GMSet('bnc_host_mode', on);
+        logInfo(`[HOST] mode ${on?'ON':'OFF'}`);
+        try{ feedLog('info', {host_mode:on}); }catch{}
+        showToast(on?'Host mode ON — replays track all players':'Host mode OFF — individualist', false);
+      };
+    }
     try{ updateLobbyMusic(); }catch(e){ logErr(`[AUDIO] update after render err ${e.message}`); }
+    try{ prefetchLobbyMusic(); }catch{}
   }
   function fetchStats(forceRender){
     if(!sessionId && !discordId) { if(forceRender) renderInfoPanel(); return; }
@@ -1131,7 +1280,9 @@
   function startStatsPoll(){
     stopStatsPoll();
     fetchStats(false);
-    statsPollTimer=setInterval(()=> fetchStats(false), 15000);
+    // Poll every 30s when in-match (we have optimistic state), 15s in lobby
+    const interval = _optimisticState.inMatch ? 30000 : 15000;
+    statsPollTimer=setInterval(()=> fetchStats(false), interval);
   }
   function stopStatsPoll(){ if(statsPollTimer){ clearInterval(statsPollTimer); statsPollTimer=null; } }
   // auto-create drawer shell immediately so handle is visible + hidden audio tag that auto plays
@@ -1204,8 +1355,15 @@
     if(!bytes||bytes.length<3) return false;
     const type=bytes[1]; const code=bytes[2];
     if(type===6||type===7) return false;
+    // Operations: only Join/Create/JoinRandom/Authenticate (225-231)
     if(type===2||type===3) return ESSENTIAL_OPS.has(code);
-    if(type===4){ if(DROP_EVS_NOISY.has(code)) return false; return ESSENTIAL_EVS.has(code); }
+    // Events: only Join(255), Leave(254), PropertiesChanged(253)
+    if(type===4){
+      if(DROP_EVS_NOISY.has(code)) return false;
+      // PropertiesChanged (253): keep all - filter useful props later in enqueue
+      if(code===253) return true;
+      return ESSENTIAL_EVS.has(code);
+    }
     return type===1||type===5;
   }
 
@@ -1240,6 +1398,123 @@
       feedLog('filtered', {type, code, dir, label:rec.label, hex:rawHex.slice(0,12)+'..'});
       return;
     }
+
+    // PropertiesChanged (253) filtering: keep packets with keys the server needs
+    // (scene, alive, match marker, skins, teams, zone, party). Everything else is noise.
+    if(type===4 && code===253) {
+      const hx = rawHex.toLowerCase();
+      const KEEP_253 = [
+        '63757253636e', // curScn (scene changes)
+        '616c76',       // alv (alive/eliminated)
+        '737447',       // stG (match start/end marker)
+        '736b6964',     // skid (skin)
+        '706964',       // pid (pickaxe)
+        '70666964',     // pfid (game id)
+        '42506964',     // BPid
+        '5f7074',       // _pt (team)
+        '7074',         // pt (team fallback)
+        '5061727479',   // Party
+        '704944',       // pID (private room code)
+        '627a5f',       // bz_ (zone phase/time/pattern)
+        '7265616479',   // ready
+        '323535',       // "255" (player name key)
+      ];
+      if(!KEEP_253.some(k => hx.includes(k))) {
+        feedLog('filtered', {type, code, dir, reason:'no useful prop', hex:rawHex.slice(0,12)+'..'});
+        return;
+      }
+    }
+
+    // Optimistic parsing: detect curScn from raw bytes immediately
+    if(type===4 && code===253 && dir==='in') {
+      try {
+        const curScnMatch = rawHex.match(/63757253636e07([0-9a-f]{2})([0-9a-f]+)/);
+        if(curScnMatch) {
+          const len = parseInt(curScnMatch[1], 16) * 2;
+          const valHex = curScnMatch[2].slice(0, len);
+          let curScn = '';
+          for(let i = 0; i < valHex.length; i += 2) {
+            curScn += String.fromCharCode(parseInt(valHex.slice(i, i+2), 16));
+          }
+          if(curScn && curScn.length > 0) {
+            _applyOptimisticCurScn(curScn);
+          }
+        }
+      } catch(e) {}
+    }
+
+    // Optimistic: detect Authenticate (opCode 230 = 0xE6) outgoing → lobby.
+    // First auth = login: set lobby state silently (never touch audio — it's
+    // either already starting or will start via stats). Later auths = back to
+    // lobby → normal path, which unpauses if we flipped out of a match.
+    if(dir==='out' && type===2 && code===230) {
+      _authCount++;
+      if(_authCount === 1) {
+        _applyOptimisticCurScn('MainLobby', {silent:true});
+      } else {
+        _applyOptimisticCurScn('MainLobby');
+      }
+    }
+
+    // Optimistic: detect killfeed (type=4, code=101) → increment kills/deaths immediately
+    if(type===4 && code===101 && dir==='in') {
+      try {
+        const kfHex = rawHex.toLowerCase();
+        // GPB string extraction: find String type (07), parse length, extract UTF-8
+        function extractGpbStrings(hex) {
+          const strings = [];
+          let i = 0;
+          while(i < hex.length - 2) {
+            if(hex[i] === '07') { // String type
+              i++;
+              // parse variable-length count
+              let len = 0;
+              let shift = 0;
+              let b;
+              do {
+                if(i >= hex.length) break;
+                b = parseInt(hex.slice(i, i+2), 16);
+                i += 2;
+                len |= (b & 0x7f) << shift;
+                shift += 7;
+              } while(b & 0x80);
+              // extract string bytes
+              if(len > 0 && i + len*2 <= hex.length) {
+                let s = '';
+                for(let j = 0; j < len; j++) {
+                  const c = parseInt(hex.slice(i + j*2, i + j*2 + 2), 16);
+                  if(c >= 32 && c < 127) s += String.fromCharCode(c);
+                }
+                strings.push(s);
+                i += len * 2;
+              }
+            } else {
+              i += 2;
+            }
+          }
+          return strings;
+        }
+        const strings = extractGpbStrings(kfHex);
+        // find killfeed string (contains "killed" or "knocked")
+        const kfStr = strings.find(s => s.includes('killed') || s.includes('knocked'));
+        if(kfStr) {
+          const isKill = kfStr.includes('killed');
+          const sep = isKill ? 'killed' : 'knocked';
+          const parts = kfStr.split(sep);
+          if(parts.length >= 2) {
+            // killer: text before separator, strip color tags
+            const killer = parts[0].replace(/<[^>]*>/g, '').trim();
+            // victim: text after separator, strip color tags
+            const victim = parts[1].replace(/<[^>]*>/g, '').trim();
+            if(killer && victim) {
+              logSys(`[OPTIMISTIC] killfeed detected killer=${killer} victim=${victim}`);
+              _applyOptimisticKillfeed(killer, victim);
+            }
+          }
+        }
+      } catch(e) {}
+    }
+
     delete rec._isEssential; delete rec._type; delete rec._code;
     queue.push(rec);
     feedLog('capture', {type, code, dir, label:rec.label, seq:rec.seq, hex:rawHex.slice(0,12)+'..', queued:queue.length});
@@ -1255,7 +1530,8 @@
     flushTimer=null;
     const batch=queue.splice(0,BATCH_MAX);
     for(const r of batch) ensureHex(r);
-    const payload={ sessionId: captureSessionId, records: batch };
+    const hostMode = !!GMGet('bnc_host_mode', false);
+    const payload={ sessionId: captureSessionId, records: batch, hostMode };
     flushInFlight=true;
     feedLog('flush', {count:batch.length, queued:queue.length});
     apiPost('/api/capture', payload, (ok, txt)=>{
@@ -1315,6 +1591,38 @@
                 for(const rv of Object.values(sess.rooms)){ if(rv.short_code && /^[A-Z0-9]{5}$/i.test(rv.short_code)){ showRankedHUD(rv.short_code); break; } }
               }
             }catch{}
+
+            // Apply optimistic corrections from server response
+            // Heals stuck optimistic state (e.g. left match with no MainLobby scene
+            // and no re-auth: optimistic stays in-match forever while server is lobby).
+            try {
+              const sess = j.session;
+              if(sess) {
+                const curRoom = sess.rooms?.[sess.current_room_id];
+                const serverCurScn = (curRoom && curRoom.cur_scn) || sess.cur_scn || null;
+                // Derive server in-match: prefer cur_scn, fall back to FSM state
+                // (cur_scn can be null when the server never saw a scene packet).
+                let serverInMatch = null;
+                if(serverCurScn) serverInMatch = serverCurScn !== 'MainLobby';
+                else if(sess.state) serverInMatch = String(sess.state).toLowerCase() === 'match';
+                if(serverInMatch !== null && serverInMatch !== _optimisticState.inMatch) {
+                  // Server trails live packets by ~2-5s (batch + POST), so trust a
+                  // fresh optimistic value; trust the server once optimistic is stale.
+                  const optimisticFresh = (Date.now() - (_optimisticState.lastUpdateAt || 0)) < 10000;
+                  if(optimisticFresh) {
+                    logSys(`[OPTIMISTIC] server correction ignored (fresh optimistic=${_optimisticState.curScn} inMatch=${_optimisticState.inMatch}, serverInMatch=${serverInMatch})`);
+                  } else {
+                    logSys(`[OPTIMISTIC] server correction inMatch=${serverInMatch} (was ${_optimisticState.inMatch}, serverCurScn=${serverCurScn})`);
+                    if(serverCurScn) _optimisticState.curScn = serverCurScn;
+                    _optimisticState.inMatch = serverInMatch;
+                    _optimisticState.lastUpdateAt = Date.now();
+                    // Re-sync audio + drawer
+                    try { updateLobbyMusic(); } catch {}
+                    try { renderInfoPanel(); } catch {}
+                  }
+                }
+              }
+            } catch(e) {}
           }
         }catch(e){ feedLog('decrypted', {err:e.message}); }
         feedLog('sent', {count:batch.length, ok:true});

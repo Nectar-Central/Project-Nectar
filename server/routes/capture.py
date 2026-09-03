@@ -32,6 +32,7 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
     req_token = body.get("req_token")
     discord_id = body.get("discord_id")
     token = body.get("token")
+    host_mode = bool(body.get("hostMode") or body.get("host_mode"))
     ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "-")
 
     if not isinstance(records, list):
@@ -76,6 +77,7 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
             log_sys(f"CAPTURE token ok auth={str(auth_session_id)[:8]} req={req_token} → new {new_token} counter {sess['token_counter']}->{new_counter}")
 
     # Feed engine per session — no DB writes, just abstract data
+    # Build one packet dict PER record (processor needs every packet, not just the last)
     packets = []
     for rec in records:
         hex_str = rec.get("rawHex") or ""
@@ -98,6 +100,15 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
         except Exception:
             pass
         packets.append(d)
+
+    # persist host_mode on SessionView (lifetime of session) — individualist vs host collab
+    if auth_session_id and host_mode:
+        try:
+            vw = engine.get_session(auth_session_id)
+            if vw:
+                vw.host_mode = True
+        except Exception:
+            pass
 
     # Get session view after batch
     view = engine.get_session(auth_session_id) if auth_session_id else None

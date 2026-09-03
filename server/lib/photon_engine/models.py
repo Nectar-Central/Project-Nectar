@@ -234,6 +234,13 @@ class RoomView:
     me: Player | None = None                         # per-room me (not session-wide)
     players: dict[int, Player] = field(default_factory=dict)
     actor_map: dict[int, str] = field(default_factory=dict)  # actorNr -> username, built from ActorList + Join 255 (for alv without 255)
+    pending_pt: dict[int, str] = field(default_factory=dict)  # actorNr -> team id stashed from _pt packets for late joiners
+    gv: str | None = None  # game variant from Create/Join GameProperties ("solo"/"duo"/...) — duo modes have gv != solo
+
+    @property
+    def is_duo(self) -> bool:
+        """Duo room iff gv is set and not solo (duo DF, duo zw_lg, wwzw-style teams)."""
+        return bool(self.gv) and self.gv.lower() != "solo"
     last_kill_hex: str | None = None  # dedup: last kill rawHex (retransmit guard, not same victim in new round)
     players_count: int = 0
     max_players: int | None = None
@@ -249,7 +256,10 @@ class RoomView:
     match_playtime: Playtime = field(default_factory=lambda: Playtime())  # per-room playtime (ticks per match_version)
     last_win_version: int = -1                       # dedup win per match_version
     last_defeat_version: int = -1                    # dedup defeat per match_version
+    had_self_death: bool = False                     # self death already counted this life (reset on match enter / revive)
+    had_self_defeat: bool = False                    # self defeat already recorded this life (reset on match enter / revive)
     last_stg: int | None = None                      # last stG value for win/loss per GM (3→1)
+    stg_is_phase_end: bool = False                 # True only when stG=3 arrived as phase end (from below), never timer ticks
     winner: str | None = None                        # last match winner (username or team_id)
     created_at: str | None = None
     # zone bookend for zone modes (zw_lg/wwzw): first zone = start, second zone = win/defeat evaluation
@@ -270,6 +280,8 @@ class RoomView:
             "me": self.me.to_dict() if self.me else None,
             "players": {str(k): v.to_dict() for k, v in self.players.items()},
             "actor_map": {str(k): v for k, v in self.actor_map.items()},
+            "pending_pt": {str(k): v for k, v in self.pending_pt.items()},
+            "gv": self.gv,
             "players_count": self.players_count,
             "max_players": self.max_players,
             "state": self.state.value,
@@ -282,8 +294,11 @@ class RoomView:
             "recent_knocks": [k.to_dict() for k in self.recent_knocks[-20:]],
             "match_version": self.match_version,
             "match_playtime": self.match_playtime.to_dict(),
+            "stg_is_phase_end": self.stg_is_phase_end,
             "last_win_version": self.last_win_version,
             "last_defeat_version": self.last_defeat_version,
+            "had_self_death": self.had_self_death,
+            "had_self_defeat": self.had_self_defeat,
             "winner": self.winner,
         }
 
@@ -316,6 +331,9 @@ class SessionView:
     current_room_id: str | None = None
     usernameChangeCount: int = 0
     playtime: Playtime = field(default_factory=Playtime)
+    host_mode: bool = False  # set from capture payload; true = server-room host (collaborative replay)
+    # philosophy: individualist by default (public/friendly private) -> only self stats;
+    # host_mode + short_code -> also track others for comp replay
 
     # Back-compat proxies — point to current room or empty defaults
     @property
@@ -423,6 +441,7 @@ class SessionView:
             "session_id": self.session_id,
             "me": self.me.to_dict() if self.me else None,
             "current_room_id": self.current_room_id,
+            "host_mode": self.host_mode,
             "rooms": {rid: rv.to_dict() for rid, rv in self.rooms.items()},
             "playtime": self.playtime.to_dict(),
             # back-compat top-level (current room)

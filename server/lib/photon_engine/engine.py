@@ -17,7 +17,66 @@ def _norm_name(n: str | None) -> str:
     return s
 def _names_equal(a, b) -> bool:
     na = _norm_name(a); nb = _norm_name(b)
-    return bool(na and nb and na == nb) or bool(na and nb and na.lower() == nb.lower())
+    return bool(na and nb and na == nb)
+
+def _resolve_actor(room, nr: int | None) -> str | None:
+    """Resolve actorNr -> player username via actor_map, room.players key, or player.actor_nr.
+    Actor 0 = room-level properties (curScn/stG/pID), never a player — returns "room"."""
+    if nr is None:
+        return None
+    try:
+        if int(nr) == 0:
+            return "room"
+    except Exception:
+        pass
+    try:
+        if nr in room.actor_map:
+            return str(room.actor_map[nr])
+        if nr in room.players:
+            return str(room.players[nr].username)
+        for p in room.players.values():
+            if p.actor_nr == nr:
+                return str(p.username)
+    except Exception:
+        pass
+    return None
+
+
+def _find_player(room, actor=None, target=None, name=None):
+    """Resolve (key, player): TargetActorNr subject first, then sender ActorNr, then name.
+    _pt/skin packets address the subject ONLY via TargetActorNr (actor is the room
+    master), so target must win. Actor 0 = room-level, never a player — skipped."""
+    for nr in (target, actor):
+        if nr is None:
+            continue
+        try:
+            nr = int(nr)
+        except Exception:
+            continue
+        if nr == 0:
+            continue
+        try:
+            if nr in room.players:
+                return nr, room.players[nr]
+        except Exception:
+            pass
+        nm = None
+        try:
+            nm = room.actor_map.get(nr)
+        except Exception:
+            pass
+        if nm:
+            for k, p in room.players.items():
+                if _names_equal(p.username, nm):
+                    return k, p
+        for k, p in room.players.items():
+            if p.actor_nr == nr:
+                return k, p
+    if name:
+        for k, p in room.players.items():
+            if _names_equal(p.username, name):
+                return k, p
+    return None, None
 
 def _is_valid_pid(v: str | None) -> str | None:
     """Validate 5-char private join code (e.g. PBS05) — rejects ghost 'n'."""
@@ -59,6 +118,8 @@ class EnginePacket:
     short_code: str | None = None
     match_version: int | None = None
     room_gm: str | None = None
+    actor_nr: int | None = None       # sender actor (params.ActorNr) — original value
+    target_actor_nr: int | None = None  # subject actor (params.TargetActorNr) — original value
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {
@@ -85,6 +146,8 @@ class EnginePacket:
             "short_code": self.short_code,
             "match_version": self.match_version,
             "room_gm": self.room_gm,
+            "actor_nr": self.actor_nr,
+            "target_actor_nr": self.target_actor_nr,
         }
         if self.is_kill or self.is_knock:
             d["kill"] = {
@@ -134,6 +197,12 @@ class Engine:
 
         packet = self._gpb_to_abstract(hex_string, gpb)
 
+        # Visibility: log packets that classified as UNKNOWN (nothing should be invisible)
+        if packet.packet_type == PacketType.UNKNOWN and gpb:
+            unk_props = list((gpb.get("properties") or {}).keys())[:8]
+            unk_pp = list((gpb.get("playerProps") or {}).keys())[:8]
+            log_engine("debug", session_id[:8], msg=f"unknown pkt ev={gpb.get('evName')}/{gpb.get('opName')} evCode={gpb.get('evCode')} op={gpb.get('op')} props={unk_props} playerProps={unk_pp} hex={hex_string[:32]}..")
+
         # Ensure we have a RoomView to scope to
         # If no current room, create a default lobby room
         from .models import RoomView
@@ -149,7 +218,17 @@ class Engine:
                     view.current_room_id = room_id
                     log_engine("room", session_id[:8], action="switched", room=room_id[:8])
                 return view.rooms[room_id]
-            # no room_id — use current or create default lobby
+            # no room_id — strict: route to current MATCH room if exists, else current, else lobby
+            # this stops killfeeds (no RoomName) from landing in a throwaway lobby room
+            # when user is in-game — fixes gm:null / room:lobby bug
+            cur = view.rooms.get(view.current_room_id) if view.current_room_id else None
+            if cur and cur.state == State.MATCH:
+                return cur
+            # prefer any MATCH room with a game_mode (in case current_room_id is stale lobby)
+            for rv in view.rooms.values():
+                if rv.state == State.MATCH and rv.game_mode:
+                    view.current_room_id = rv.room_id
+                    return rv
             if view.current_room_id and view.current_room_id in view.rooms:
                 return view.rooms[view.current_room_id]
             if "lobby" not in view.rooms:
@@ -228,16 +307,48 @@ class Engine:
         elif packet.cur_scn:
             cur_scn = packet.cur_scn
 
-        is_auth = gpb and gpb.get("opName") in ("Authenticate", "AuthenticateOnce")
-        is_lobby = cur_scn == "MainLobby"
+        # Extract TargetActorNr (may be wrapped {"value": N})
+        target_actor_nr = None
+        try:
+            _targ = (gpb.get("params", {}) or {}).get("TargetActorNr") if gpb else None
+            while isinstance(_targ, dict) and "value" in _targ:
+                _targ = _targ["value"]
+            if _targ is not None and str(_targ).strip().lstrip("-").isdigit():
+                target_actor_nr = int(_targ)
+        except Exception:
+            target_actor_nr = None
+        # Resolve actor numbers to player names (None when absent) for all logs below
+        actor_name = _resolve_actor(room, actor_nr)
+        target_name = _resolve_actor(room, target_actor_nr)
+        # Stamp ORIGINAL actor numbers on the packet for the processor (the locals
+        # may be reassigned below, e.g. alv TargetActorNr routing — processor re-resolves)
+        packet.actor_nr = actor_nr
+        packet.target_actor_nr = target_actor_nr
+        # Log actorNr + TargetActorNr for every packet with gpb (debug actor routing)
+        # Target shown only when present (Join has actor only — no target to misuse)
+        if gpb and (actor_nr is not None or target_actor_nr is not None):
+            tgt_part = f" targetActorNr={target_actor_nr} ({target_name})" if target_actor_nr is not None else ""
+            log_engine("actor", session_id[:8], msg=f"actorNr={actor_nr} ({actor_name}){tgt_part} ev={gpb.get('evName')}/{gpb.get('opName')} type={packet.packet_type.value} room={room.room_id[:8]}", room=room.room_id[:8], actor=actor_nr, actor_name=actor_name, target=target_actor_nr, target_name=target_name)
 
-        # Reset usernameChangeCount on Authenticate or MainLobby
-        if is_auth or is_lobby:
+        # Log PropertiesChanged packets (evCode 253) — key events for debugging
+        if gpb and gpb.get("evName") == "PropertiesChanged":
+            props = gpb.get("properties", {})
+            actor_str = f" actor={actor_nr} ({actor_name}) target={target_actor_nr} ({target_name})"
+            # Log important properties in detail (alv, curScn, stG, 255)
+            important = {}
+            for k in ("alv", "curScn", "stG", "255", "skid", "_pt", "pt"):
+                if k in props:
+                    important[k] = props[k]
+            if important:
+                log_engine("props", session_id[:8], msg=f"PropertiesChanged{actor_str} props={important} room={room.room_id[:8]}", room=room.room_id[:8])
+            else:
+                prop_keys = list(props.keys())[:6]
+                log_engine("props", session_id[:8], msg=f"PropertiesChanged{actor_str} keys={prop_keys} room={room.room_id[:8]}", room=room.room_id[:8])
+
+        is_auth = gpb and gpb.get("opName") in ("Authenticate", "AuthenticateOnce")
+        # usernameChangeCount reset is AUTH only; scene MainLobby will reset via FSM on_enter
+        if is_auth:
             view.usernameChangeCount = 0
-            if is_lobby:
-                room.state = State.LOBBY
-                room.cur_scn = cur_scn
-                view.playtime.last_state = State.LOBBY.value
 
         # Helper to extract other player's props (skid/pid/pfid/_pt) from gpb
         def _other_props():
@@ -386,6 +497,36 @@ class Engine:
         except Exception:
             pass
 
+        # gv — game variant (solo/duo/...) from Create/Join GameProperties.
+        # Duo modes (duo DF, duo zw_lg) have gv != "solo" — team logic flows via _pt teams.
+        # Unknown modes (v-arena, red-vs-blue, boxfight, realistic-1v1): play each once and
+        # read the discover line below (gm/gv/max/curScn) to wire up their IDs.
+        try:
+            gv_val = None
+            gp_keys: list = []
+            if gpb.get("params", {}).get("GameProperties"):
+                gp = gpb["params"]["GameProperties"]
+                from ..gpbinary import _unwrap as _uw_gv
+                gp_val = _uw_gv(gp) if isinstance(gp, dict) and "value" in gp else gp
+                if isinstance(gp_val, dict):
+                    gp_keys = sorted([str(k) for k in gp_val.keys()])[:12]
+                    for _gk, _gv in gp_val.items():
+                        if str(_gk).lower() == "gv" and _gv is not None:
+                            gv_val = str(_gv)
+                            break
+            if not gv_val and gpb.get("properties", {}).get("gv") is not None:
+                gv_val = str(gpb["properties"]["gv"])
+            if gv_val and not room.gv:
+                room.gv = gv_val
+                log_engine("room", session_id[:8], action="gv", gv=room.gv, duo=room.is_duo, room=room.room_id[:8])
+            if is_first_join and gpb.get("opName") in ("CreateRoom", "JoinRoom", "JoinRandomRoom"):
+                log_engine("room", session_id[:8], action="discover", op=gpb.get("opName"),
+                           gm=gpb.get("gm"), gv=room.gv or gv_val, max=room.max_players,
+                           curScn=cur_scn, room_name=(room_name or "")[:12], room=room.room_id[:8],
+                           gp_keys=gp_keys or None)
+        except Exception:
+            pass
+
         # Build actor_map from ActorList + PlayerProperties (for alv without 255) — contract: RoomView.actor_map
         try:
             # ActorList may be in params (unwrapped) or raw resp
@@ -406,7 +547,7 @@ class Engine:
                         actor_list = _uw_al2(p["value"])
                         break
             if actor_list:
-                # PlayerProperties dict keys are actorNr strings
+                # PlayerProperties dict keys may be ints or strings (after _unwrap)
                 pp = gpb.get("playerProps") or {}
                 # Also try GameProperties? no
                 # If raw, need to get from raw resp
@@ -416,25 +557,60 @@ class Engine:
                             from ..gpbinary import _unwrap as _uw_pp
                             pp = _uw_pp(p["value"])
                             break
+                # Flat single-player props (Join 255): {'255': name, ...} with scalar
+                # values — this is the JOINER's own props, not an actorNr->props map.
+                # Map this packet's actor directly instead of misreading it as a map.
+                if isinstance(pp, dict) and isinstance(pp.get("255"), str):
+                    if actor_nr is not None:
+                        try:
+                            room.actor_map[int(actor_nr)] = str(pp["255"])
+                            log_engine("debug", session_id[:8], msg=f"actor_map single actor={int(actor_nr)} name={pp['255']} map={sorted(list(room.actor_map.items()))[:8]}", room=room.room_id[:8])
+                        except Exception:
+                            pass
+                    pp_norm: dict | None = None  # flat props: skip the actorNr-map loop below
+                else:
+                    # Normalize pp keys to str -> props dict for int/str key mismatch
+                    pp_norm = {}
+                    if isinstance(pp, dict):
+                        for k, v in pp.items():
+                            try:
+                                pp_norm[str(int(k) if isinstance(k, str) and k.strip().lstrip("-").isdigit() else k)] = v
+                            except Exception:
+                                pp_norm[str(k)] = v
+                added: list = []
+                missing: list = []
+                if pp_norm is None:
+                    actor_list = []  # flat single-player props handled above — nothing to map
                 for a in actor_list:
                     try:
                         # actor_list items may be {"value":2} or int
                         av = a["value"] if isinstance(a, dict) and "value" in a else a
                         actor_nr = int(av)
-                        # Try to get username for this actor
+                        # Try to get username for this actor (both str and int keys)
                         uname = None
-                        if isinstance(pp, dict) and str(actor_nr) in pp:
-                            uname = pp[str(actor_nr)].get("255")
+                        entry = pp_norm.get(str(actor_nr))
+                        if isinstance(entry, dict):
+                            uname = entry.get("255")
+                            if isinstance(uname, dict) and "value" in uname:
+                                uname = uname["value"]
                         if uname:
-                            room.actor_map[actor_nr] = str(uname)
+                            uname = str(uname)
+                            room.actor_map[actor_nr] = uname
+                            added.append((actor_nr, uname))
                             # Also ensure player exists in room.players if not already
                             if actor_nr not in room.players:
                                 # Create placeholder, will be filled on Join
                                 pass
+                        else:
+                            missing.append(actor_nr)
                     except Exception:
                         continue
                 if actor_list:
-                    log_engine("debug", session_id[:8], msg=f"actor_map built {actor_list[:4]} -> {list(room.actor_map.items())[:3]}", room=room.room_id[:8])
+                    try:
+                        al_ints = [int(a["value"] if isinstance(a, dict) and "value" in a else a) for a in actor_list[:8]]
+                    except Exception:
+                        al_ints = actor_list[:8]
+                    log_engine("debug", session_id[:8], msg=f"actor_map built actors={al_ints} pp_keys={sorted(list(pp_norm.keys()))[:8]} added={added[:6]} missing={missing[:6]} map={sorted(list(room.actor_map.items()))[:8]}", room=room.room_id[:8])
         except Exception:
             pass
         # Also handle single Join event to fill actor_map incrementally
@@ -444,52 +620,23 @@ class Engine:
             except Exception:
                 pass
 
-        # Non-first joins: update GM if not set (room-scoped)
-        if packet.game_mode and not room.game_mode:
-            room.game_mode = packet.game_mode
+        # GM is locked by FSM on MATCH enter only — do not set here (prevents flicker)
+        # pending_gm plumbing still applies below for JoinRandomRoom without RoomName
 
-        # State from curScn + packets — per user spec with diff check
-        # Lobby->Match via curScn!=MainLobby / killfeed / stG 1 ; Match->Lobby via authenticate / leave
-        # Only switch if current state != target, else ignore
-        if cur_scn:
-            old_state = room.state
-            room.cur_scn = cur_scn
-            target_state = None
-            if cur_scn == "MainLobby":
-                target_state = State.LOBBY
-            elif cur_scn != "MainLobby":
-                target_state = State.MATCH
-            if target_state and room.state != target_state:
-                log_engine("state", session_id[:8], old=room.state.value, new=target_state.value, room=room.room_id[:8], curScn=cur_scn, via="curScn")
-                room.state = target_state
-                view.playtime.last_state = target_state.value
-                if target_state == State.LOBBY:
-                    room.zone_match_active = False
-            elif target_state and room.state == target_state:
-                pass  # same state packet, ignore per user
-
-        # Additional state transitions per user spec (diff check)
-        # Determine packet's target state
-        pkt_target_state = None
-        # Match -> Lobby via authenticate or leave (self)
-        is_auth_pkt = gpb and gpb.get("opName") in ("Authenticate", "AuthenticateOnce")
-        is_leave_self = packet.packet_type == PacketType.LEAVE and packet.player_name and _names_equal(packet.player_name, view.me.username if view.me else "")
-        # Lobby -> Match via killfeed, stG 1, curScn already handled above, but also stG1
-        is_killfeed_pkt = packet.is_kill or packet.is_knock
-        is_stg1_pkt = gpb and gpb.get("properties") and str(gpb["properties"].get("stG")) == "1"
-        if room.state == State.MATCH and (is_auth_pkt or is_leave_self):
-            pkt_target_state = State.LOBBY
-        elif room.state == State.LOBBY and (is_killfeed_pkt or is_stg1_pkt):
-            pkt_target_state = State.MATCH
-        # For curScn we already handled, but also check if curScn packet arrived and state diff already handled
-        if pkt_target_state and room.state != pkt_target_state:
-            log_engine("state", session_id[:8], old=room.state.value, new=pkt_target_state.value, room=room.room_id[:8], via="packet", pkt=packet.packet_type.value if packet.packet_type else "?")
-            room.state = pkt_target_state
-            view.playtime.last_state = pkt_target_state.value
-            if pkt_target_state == State.LOBBY:
-                room.zone_match_active = False
-        elif pkt_target_state and room.state == pkt_target_state:
-            pass  # ignore same state packet per user
+        # ---- Strict FSM: state/gm only via enter/exit ----
+        # LOBBY enter: authenticate / leave(self) ; LOBBY exit: scene(curScn!=MainLobby)
+        # MATCH enter: scene(curScn!=MainLobby)   ; MATCH exit: authenticate / leave(self)
+        # Everything else (killfeed, stG, zone, skin) is ignored for state.
+        try:
+            from .fsm import RoomFSM
+            did, _old, _new, _via = RoomFSM.transition(room, view, packet, gpb, cur_scn, session_id)
+            # keep room.cur_scn always up to date on scene packets (even when no transition)
+            if cur_scn is not None:
+                room.cur_scn = cur_scn
+                if cur_scn == "MainLobby":
+                    view.usernameChangeCount = 0
+        except Exception as e:
+            log_engine("debug", session_id[:8], msg=f"fsm error {e}", room=room.room_id[:8])
 
         # Zone (room-scoped) — hard 4:59 (299) for zw_lg/wwzw, stG is match marker not zone
         def _valid_zone_time(v):
@@ -498,50 +645,34 @@ class Engine:
                 return iv if 0 <= iv <= 600 else None
             except Exception:
                 return None
-        # stG handling — match start/end marker for zw_lg/wwzw (not zone timer) — must be before zone handling
+        # stG handling — match start/end marker (1=start, 3=end), NOT zone timer.
+        # Timer-flavored stG (e.g. 30s countdowns) also passes here: only a 3 arriving
+        # from below (None/0/1/2) counts as phase end. A 3 ticking down from above (4->3)
+        # is a timer and must not bump versions or arm wins. Must run before zone handling.
+        _STG_PHASE_MODES = (GameMode.ZW_LG, GameMode.WWZW, GameMode.BF2V2, GameMode.BF, GameMode.VA, GameMode.RVB, GameMode.R1V1)
         is_stg_packet = gpb and gpb.get("properties") and "stG" in gpb["properties"]
         if is_stg_packet:
             try:
                 stg = int(float(gpb["properties"]["stG"]))
-                # per user: only capture wins/defeats when stG==3, check not eliminated / not alv false -> win, else defeat for wwzw/zw_lg
-                if stg == 3 and room.last_stg != 3 and room.game_mode and room.game_mode.value in ("zw_lg", "wwzw"):
-                    me_name = (view.me.username if view.me else None) or (room.me.username if room.me else None)
-                    if me_name and room.state == State.MATCH:
-                        # not eliminated: not alv false and not in eliminated list
-                        is_eliminated = False
-                        me_pl = None
-                        for p in room.players.values():
-                            if _names_equal(p.username, me_name):
-                                me_pl = p
-                                break
-                        if me_pl and not me_pl.is_alive:
-                            is_eliminated = True
-                        if room.last_defeat_version == room.match_version:
-                            is_eliminated = True
-                        # also check recent defeat already recorded for this match
-                        if not is_eliminated:
-                            if room.last_win_version != room.match_version:
-                                room.last_win_version = room.match_version
-                                winner = me_name
-                                if room.teams:
-                                    myt = room.get_team(me_name)
-                                    if myt:
-                                        winner = myt.team_id
-                                room.winner = winner
-                                log_engine("win", session_id[:8], gm=room.game_mode.value, room=room.room_id[:8], via="stG 3 not eliminated", winner=winner, version=room.match_version)
-                                room.recent_kills.append(KillInfo(instigator="system", instigated=me_name, event_type="win"))
-                        else:
-                            if room.last_defeat_version != room.match_version:
-                                room.last_defeat_version = room.match_version
-                                log_engine("defeat", session_id[:8], gm=room.game_mode.value, room=room.room_id[:8], via="stG 3 was eliminated", version=room.match_version)
-                                room.recent_kills.append(KillInfo(instigator="system", instigated=me_name, event_type="defeat"))
-                        # bump version for next match
-                        room.match_version += 1
-                        room.zone_match_active = False
-                        if len(room.recent_kills) > 20:
-                            room.recent_kills = room.recent_kills[-10:]
-                        room.recent_knocks = []
-                        log_engine("match", session_id[:8], action="new_version", version=room.match_version, room=room.room_id[:8], via="stG 3")
+                # Log every stG change (match progress 1→2→3) like KILL lines
+                if stg != room.last_stg:
+                    log_engine("stg", session_id[:8], stg=stg, gm=room.game_mode.value if room.game_mode else None, room=room.room_id[:8])
+                # stG=3: match end marker — Processor handles win/defeat calculation
+                if stg == 3 and room.last_stg != 3 and room.game_mode and room.game_mode in _STG_PHASE_MODES:
+                    if room.last_stg is None or room.last_stg <= 2:
+                        room.stg_is_phase_end = True  # arm win path (repeats/timers leave it)
+                        me_name = (view.me.username if view.me else None) or (room.me.username if room.me else None)
+                        if me_name and room.state == State.MATCH:
+                            # bump version for next match — Processor checks stG==3 to calculate win/defeat
+                            room.match_version += 1
+                            room.zone_match_active = False
+                            if len(room.recent_kills) > 20:
+                                room.recent_kills = room.recent_kills[-10:]
+                            room.recent_knocks = []
+                            log_engine("match", session_id[:8], action="new_version", version=room.match_version, room=room.room_id[:8], via="stG 3")
+                    # else: timer ticking down through 3 — leave flag untouched
+                elif stg != 3:
+                    room.stg_is_phase_end = False  # new phase/round in progress — disarm stale end
                 room.last_stg = stg
             except Exception:
                 pass
@@ -630,14 +761,20 @@ class Engine:
                         existing_key = k
                         break
                 if existing_key is not None:
+                    was_dead = not room.players[existing_key].is_alive
                     room.players[existing_key].is_alive = True
+                    # re-join of a dead player (e.g. multi-round reset) = new life for self
+                    if was_dead and (room.players[existing_key].is_self or (view.me and _names_equal(join_name, view.me.username))):
+                        room.had_self_death = False
+                        room.had_self_defeat = False
+                        log_engine("debug", session_id[:8], msg=f"rejoin reset flags for {join_name}", room=room.room_id[:8])
                     skid, pid, pfid, pt = _other_props()
                     if skid: room.players[existing_key].skin = skid
                     if pid: room.players[existing_key].pickaxe = pid
                     if pfid: room.players[existing_key].game_id = pfid
                     if pt: room.players[existing_key].pt = pt
-                    elif hasattr(room, "_pending_pt") and existing_key in getattr(room, "_pending_pt", {}):
-                        pt = room._pending_pt.pop(existing_key)
+                    elif existing_key in room.pending_pt:
+                        pt = room.pending_pt.pop(existing_key)
                         room.players[existing_key].pt = pt
                         log_engine("team_pt", session_id[:8], team=pt, target=existing_key, player=join_name, via="pending apply on existing", room=room.room_id[:8])
                     if pt: _rebuild_teams(room)
@@ -649,8 +786,8 @@ class Engine:
                         key = (key + 1) % 100000
                     skid, pid, pfid, pt = _other_props()
                     # apply pending _pt from TargetActorNr (private duos) if no pt in join props
-                    if not pt and hasattr(room, "_pending_pt") and key in getattr(room, "_pending_pt", {}):
-                        pt = room._pending_pt.pop(key)
+                    if not pt and key in room.pending_pt:
+                        pt = room.pending_pt.pop(key)
                         log_engine("team_pt", session_id[:8], team=pt, target=key, player=join_name, via="pending apply on join", room=room.room_id[:8])
                     room.players[key] = Player(
                         actor_nr=key if p_actor is not None else -1,
@@ -768,7 +905,7 @@ class Engine:
                     target_key = key
                     if packet.packet_type == PacketType.ALIVE:
                         room.players_count += 1
-                        log_engine("alv", session_id[:8], name=alv_name, alive=True, count=room.players_count, room=room.room_id[:8])
+                        log_engine("alv", session_id[:8], name=alv_name, alive=True, count=room.players_count, room=room.room_id[:8], actor=actor_nr, target=target_actor_nr)
             if target:
                 was_alive = target.is_alive
                 target.is_alive = packet.is_alive
@@ -789,10 +926,15 @@ class Engine:
                 if not target.is_alive and was_alive:
                     if room.players_count > 0:
                         room.players_count = max(0, room.players_count - 1)
-                    log_engine("alv", session_id[:8], name=target.username, alive=False, count=room.players_count, room=room.room_id[:8])
+                    log_engine("alv", session_id[:8], name=target.username, alive=False, count=room.players_count, room=room.room_id[:8], actor=actor_nr, target=target_actor_nr)
                 elif target.is_alive and not was_alive:
                     room.players_count += 1
-                    log_engine("alv", session_id[:8], name=target.username, alive=True, count=room.players_count, room=room.room_id[:8])
+                    log_engine("alv", session_id[:8], name=target.username, alive=True, count=room.players_count, room=room.room_id[:8], actor=actor_nr, target=target_actor_nr)
+                    # revive/respawn/round-reset for self = new life: reset per-life flags
+                    if target.is_self or (view.me and _names_equal(target.username, view.me.username)):
+                        room.had_self_death = False
+                        room.had_self_defeat = False
+                        log_engine("debug", session_id[:8], msg=f"revive reset flags for {target.username}", room=room.room_id[:8])
                 if target.is_self or (view.me and _names_equal(target.username, view.me.username)):
                     if view.me:
                         view.me.is_alive = target.is_alive
@@ -805,41 +947,33 @@ class Engine:
         if gpb and gpb.get("properties") and packet.packet_type not in (PacketType.ALIVE, PacketType.ELIMINATED):
             props = gpb["properties"]
             if any(k in props for k in ("skid", "pid", "pfid", "BPid", "_pt", "pt")):
-                # Find target by actor_nr or 255 — _pt ties to actorNr/TargetActorNr per user note (fallback if above dedicated block missed)
+                # Subject resolution: TargetActorNr first (subject), then ActorNr (sender),
+                # then 255/name. _pt packets carry the subject ONLY in TargetActorNr.
                 tname = props.get("255") or packet.player_name
-                # also try _pt path: if packet missing 255 but has _pt, resolve via actorNr
-                if not tname and ("_pt" in props or "pt" in props) and actor_nr is not None and int(actor_nr) in room.players:
-                    tgt = room.players[int(actor_nr)]
-                    skid, pid, pfid, pt = _other_props()
-                    if pt: tgt.pt = pt; _rebuild_teams(room)
-                    if skid and not tgt.skin: tgt.skin = skid
-                    if pid and not tgt.pickaxe: tgt.pickaxe = pid
-                    if pfid and not tgt.game_id: tgt.game_id = pfid
-                    if "ready" in props: tgt.is_ready = bool(props["ready"])
-                    # skip the 255 path
-                    tname = None
-                if tname:
-                    tgt = None
-                    if actor_nr is not None and int(actor_nr) in room.players:
-                        tgt = room.players[int(actor_nr)]
-                    else:
-                        for k, p in room.players.items():
-                            if p.username == tname:
-                                tgt = p
-                                break
-                    if tgt:
-                        skid, pid, pfid, pt = _other_props()
-                        if skid and not tgt.skin:
-                            tgt.skin = skid
-                            log_engine("skin", session_id[:8], name=tname, skin=skid, room=room.room_id[:8])
-                            feed_hint = f"skin filled for {tname} via PropertiesChanged"
-                        if pid and not tgt.pickaxe:
-                            tgt.pickaxe = pid
-                        if pfid and not tgt.game_id:
-                            tgt.game_id = pfid
-                        if pt: tgt.pt = pt; _rebuild_teams(room)
-                        if "ready" in props:
-                            tgt.is_ready = bool(props["ready"])
+                _tk, tgt = _find_player(room, actor=actor_nr, target=target_actor_nr, name=tname)
+                skid, pid, pfid, pt = _other_props()
+                if tgt is not None:
+                    if pt and tgt.pt != pt:
+                        tgt.pt = pt
+                        _rebuild_teams(room)
+                        log_engine("team_pt", session_id[:8], team=pt, target=_tk, player=tgt.username, via="props", room=room.room_id[:8])
+                    if skid and not tgt.skin:
+                        tgt.skin = skid
+                        log_engine("skin", session_id[:8], name=tgt.username, skin=skid, room=room.room_id[:8])
+                        feed_hint = f"skin filled for {tgt.username} via PropertiesChanged"
+                    if pid and not tgt.pickaxe:
+                        tgt.pickaxe = pid
+                    if pfid and not tgt.game_id:
+                        tgt.game_id = pfid
+                    if "ready" in props:
+                        tgt.is_ready = bool(props["ready"])
+                elif pt and target_actor_nr:
+                    # Subject not in room yet (late joiner): stash _pt for JOIN to apply
+                    try:
+                        room.pending_pt[int(target_actor_nr)] = pt
+                        log_engine("team_pt", session_id[:8], team=pt, target=int(target_actor_nr), via="pending stash", room=room.room_id[:8])
+                    except Exception:
+                        pass
 
         # ---- KILLFEED (room-scoped) — validated, dedup only on retransmit (same rawHex)
         if packet.is_kill and packet.killer and packet.victim:
@@ -878,77 +1012,19 @@ class Engine:
             room.recent_knocks.append(KillInfo(instigator=packet.killer, instigated=packet.victim, event_type="knocked"))
             if len(room.recent_knocks) > 100:
                 room.recent_knocks = room.recent_knocks[-100:]
-        # ---- DEFEAT via kill victim (pcount>1, no stG/alv) — covers missing alv=false
-        # When killfeed says victim == me during MATCH with >1 players, that's a loss even if alv never flips
-        if packet.is_kill and packet.victim and room.state == State.MATCH and room.players_count > 1:
-            is_me_victim = False
-            if view.me and _names_equal(packet.victim, view.me.username):
-                is_me_victim = True
-            elif room.me and _names_equal(packet.victim, room.me.username):
-                is_me_victim = True
-            # also team: if victim is teammate in BF2V2/wwzw and team now empty, engine already handles via alv team path — keep kill fallback only for solo
-            gm_low_k = room.game_mode.value.lower() if room.game_mode else ""
-            if is_me_victim and gm_low_k != "df" and room.last_defeat_version != room.match_version:
-                # only if we haven't already defeated via alv
-                room.last_defeat_version = room.match_version
-                log_engine("defeat", session_id[:8], gm=room.game_mode.value if room.game_mode else "?", room=room.room_id[:8], via="kill victim", victim=packet.victim, version=room.match_version)
-                room.recent_kills.append(KillInfo(instigator=packet.killer or "system", instigated=packet.victim, event_type="defeat"))
-                # mark me dead for processor fallback consistency (normalized dc: prefix)
-                if view.me and _names_equal(view.me.username, packet.victim):
-                    view.me.is_alive = False
-                if room.me and _names_equal(room.me.username, packet.victim):
-                    room.me.is_alive = False
-                for p in room.players.values():
-                    if _names_equal(p.username, packet.victim):
-                        p.is_alive = False
-                        break
-                if room.players_count > 0:
-                    room.players_count = max(0, room.players_count - 1)
-        # Leave as defeat: me left during MATCH (normalized for dc: prefix)
-        if packet.packet_type == PacketType.LEAVE and packet.player_name and room.state == State.MATCH:
-            is_me_leave = (view.me and _names_equal(packet.player_name, view.me.username)) or (room.me and _names_equal(packet.player_name, room.me.username))
-            gm_low_l = room.game_mode.value.lower() if room.game_mode else ""
-            if is_me_leave and gm_low_l != "df" and room.last_defeat_version != room.match_version:
-                room.last_defeat_version = room.match_version
-                log_engine("defeat", session_id[:8], gm=room.game_mode.value if room.game_mode else "?", room=room.room_id[:8], via="leave", version=room.match_version)
-                room.recent_kills.append(KillInfo(instigator=packet.player_name, instigated="", event_type="defeat"))
-
-        # ---- BF2V2 win via team elimination (killfeed + leave) ----
-        if room.game_mode and room.game_mode.value == "BF2V2" and room.state == State.MATCH:
-            if room.teams:
-                my_team = room.get_team(view.me.username) if view.me else None
-                if my_team:
-                    self_team_alive = any(any(p.username==m and p.is_alive for p in room.players.values()) for m in my_team.members)
-                    for tid, team in room.teams.items():
-                        if tid == my_team.team_id:
-                            continue
-                        alive_in_enemy = sum(1 for m in team.members if any(p.username==m and p.is_alive for p in room.players.values()))
-                        # Count leave as dead for BF2V2
-                        left_in_enemy = sum(1 for m in team.members if any(k.event_type=="left" and k.instigator==m for k in room.recent_kills[-10:]))
-                        alive_in_enemy = max(0, alive_in_enemy - left_in_enemy)
-                        if alive_in_enemy == 0 and len(team.members) >= 2:
-                            if self_team_alive and room.last_win_version != room.match_version:
-                                room.last_win_version = room.match_version
-                                log_engine("win", session_id[:8], gm=room.game_mode.value, room=room.room_id[:8], via="team elimination", version=room.match_version)
-                                room.recent_kills.append(KillInfo(instigator="system", instigated="enemy team", event_type="win"))
-                                room.winner = my_team.team_id
-                        elif alive_in_enemy > 0 and not self_team_alive and room.last_defeat_version != room.match_version:
-                            room.last_defeat_version = room.match_version
-                            log_engine("defeat", session_id[:8], gm=room.game_mode.value, room=room.room_id[:8], via="team eliminated", version=room.match_version)
-                # Also handle case where my_team is None (solo in duo?) — check generic solo win already handled above
-            # Fallback for wwzw duo win via stG + last alive team
-            elif room.game_mode and room.game_mode.value == "wwzw" and room.last_win_version != room.match_version:
-                alive_players = [p for p in room.players.values() if p.is_alive]
-                if len(alive_players) == 2 and any(p.username==view.me.username for p in alive_players) if view.me else False:
-                    # Check if teammate is Player 49900 and both alive
-                    my_team = room.get_team(view.me.username) if view.me else None
-                    if my_team and all(any(p.username==m and p.is_alive for p in room.players.values()) for m in my_team.members):
-                        # Check other teams dead
-                        other_alive = any(p.is_alive and p.username not in my_team.members for p in room.players.values())
-                        if not other_alive:
-                            room.last_win_version = room.match_version
-                            log_engine("win", session_id[:8], gm=room.game_mode.value, room=room.room_id[:8], via="duo last team", version=room.match_version)
-                            room.winner = my_team.team_id
+        # ---- Kill victim: mark player dead — Processor handles defeat calculation ----
+        if packet.is_kill and packet.victim and room.state == State.MATCH:
+            # Mark victim as dead in room state
+            for p in room.players.values():
+                if _names_equal(p.username, packet.victim):
+                    p.is_alive = False
+                    break
+            if view.me and _names_equal(view.me.username, packet.victim):
+                view.me.is_alive = False
+            if room.me and _names_equal(room.me.username, packet.victim):
+                room.me.is_alive = False
+            if room.players_count > 0:
+                room.players_count = max(0, room.players_count - 1)
 
         # ---- TEAMS (duo modes: WWZW, BF2V2) ----
         if room.game_mode in (GameMode.WWZW, GameMode.BF2V2) or (room.game_mode and "2v2" in room.game_mode.value):
@@ -1025,17 +1101,10 @@ class Engine:
         if not gpb:
             return pkt
 
-        # game_mode from gm
+        # game_mode from gm (exact, case-insensitive, longest-prefix for variants)
         gm_str = gpb.get("gm")
         if gm_str:
-            try:
-                pkt.game_mode = GameMode(gm_str)
-            except ValueError:
-                low = str(gm_str).lower()
-                for m in GameMode:
-                    if m.value.lower() == low:
-                        pkt.game_mode = m
-                        break
+            pkt.game_mode = GameMode.from_gm(str(gm_str))
 
         # curScn
         cur = gpb.get("curScn") or gpb.get("properties", {}).get("curScn")
