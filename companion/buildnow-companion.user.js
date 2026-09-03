@@ -17,6 +17,7 @@
 // @connect      exitgames.com
 // @connect      cdn.jsdelivr.net
 // @connect      api-compbng.vercel.app
+// @connect      project-nectar.onrender.com
 // @connect      vercel.app
 // @connect      *.vercel.app
 // @connect      supabase.co
@@ -38,9 +39,9 @@
     return;
   }
 
-  // api-compbng.vercel.app is primary. Local dev override: GMSet('bnc_api_base','http://127.0.0.1:8000') or 'https://api-compbng.vercel.app'
+  // project-nectar.onrender.com is primary. Local dev override: GMSet('bnc_api_base','http://127.0.0.1:8000')
   const VERCEL_API = GMGet('bnc_api_base', GMGet('bn_api_base', null)) || null;
-  const SERVER_API = 'https://api-compbng.vercel.app';
+  const SERVER_API = 'https://project-nectar.onrender.com';
   const LOCAL_API  = 'http://127.0.0.1:8000';
   function resolveApiBase(){
     if (VERCEL_API && String(VERCEL_API).startsWith('http')) return String(VERCEL_API).replace(/\/$/,'');
@@ -1789,6 +1790,6 @@
     // legacy alias
     window.__PHOTON_SNIFFER__=api;
     if(typeof unsafeWindow!=='undefined'&&unsafeWindow!==window){ unsafeWindow.__BUILDNOW_COMPANION__=api; unsafeWindow.__BNC__=api; unsafeWindow.__PHOTON_SNIFFER__=api; }
-    logSys('ready - BuildNow Companion active (api-compbng.vercel.app) · COLLECT Ctrl+Shift+C/S/L/R');
+    logSys('ready - BuildNow Companion active (project-nectar.onrender.com) · COLLECT Ctrl+Shift+C/S/L/R');
   }catch{}
 })();

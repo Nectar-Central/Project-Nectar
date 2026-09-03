@@ -1,8 +1,9 @@
 """
-discovery.py — GET /api/search and GET /api/leaderboard
+discovery.py — GET /api/search, GET /api/leaderboard, GET /api/user
 
 Search: ?q=xxx → users matching discord_username / game_username / game_id
 Leaderboard: ?sort=kills|wins|kd|win_rate|playtime&limit=20&offset=0 -> ordered bngc_users + computed fields
+User: ?discord_id=xxx | ?game_username=xxx | ?game_id=xxx -> public player profile (no secrets)
 """
 
 from fastapi import APIRouter, Request
@@ -143,5 +144,68 @@ async def leaderboard(request: Request):
             for i, r in enumerate(sliced):
                 r["rank"] = offset + i + 1
             return JSONResponse({"sort": sort, "order": order, "limit": limit, "offset": offset, "count": len(sliced), "results": sliced})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/user?discord_id=... | ?game_username=... | ?game_id=...
+# ---------------------------------------------------------------------------
+@router.get("/api/user")
+async def get_user(request: Request):
+    """Public player profile for website embeds — stats only, never secrets."""
+    qp = request.query_params
+    discord_id = (qp.get("discord_id") or "").strip()
+    game_username = (qp.get("game_username") or "").strip()
+    game_id = (qp.get("game_id") or "").strip()
+    if not discord_id and not game_username and not game_id:
+        return JSONResponse({"error": "discord_id, game_username or game_id required"}, status_code=400)
+
+    if not supabase:
+        return JSONResponse({"error": "Server not configured"}, status_code=500)
+
+    try:
+        cols = "discord_id,discord_username,game_username,game_id,skin,pickaxe,kills,deaths,wins,defeats,playtime_global,playtime_per_gm"
+        row = None
+        for col, val in (("discord_id", discord_id), ("game_username", game_username), ("game_id", game_id)):
+            if not val:
+                continue
+            try:
+                res = supabase.table("bngc_users").select(cols).eq(col, val).limit(1).execute()
+                if res.data:
+                    row = res.data[0]
+                    break
+            except Exception:
+                continue
+        if not row:
+            return JSONResponse({"error": "user not found"}, status_code=404)
+
+        kills = int(row.get("kills") or 0)
+        deaths = int(row.get("deaths") or 0)
+        wins = int(row.get("wins") or 0)
+        defeats = int(row.get("defeats") or 0)
+        per_gm = row.get("playtime_per_gm")
+        if isinstance(per_gm, str):
+            try:
+                import json as _j
+                per_gm = _j.loads(per_gm)
+            except Exception:
+                per_gm = {}
+        return JSONResponse({
+            "discord_id": row.get("discord_id"),
+            "discord_username": row.get("discord_username"),
+            "game_username": row.get("game_username"),
+            "game_id": row.get("game_id"),
+            "skin": row.get("skin"),
+            "pickaxe": row.get("pickaxe"),
+            "kills": kills,
+            "deaths": deaths,
+            "wins": wins,
+            "defeats": defeats,
+            "kd": round(kills / deaths, 2) if deaths else float(kills),
+            "win_rate": round(wins / (wins + defeats), 3) if (wins + defeats) else 0,
+            "playtime_global": int(row.get("playtime_global") or 0),
+            "playtime_per_gm": per_gm or {},
+        })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
