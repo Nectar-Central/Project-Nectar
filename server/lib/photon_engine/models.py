@@ -41,6 +41,7 @@ class Player:
     is_alive: bool = True      # alv
     is_self: bool = False      # true if this is the session's own player (me)
     pt: str | None = None      # _pt / pt — team id for duos (wwzw/BF2V2/DF duo), maps to RoomView.teams
+    late_join: bool = False    # joined while room.state == MATCH (mid-match join, not pre-match lobby)
 
     def to_dict(self) -> dict:
         return asdict(self)

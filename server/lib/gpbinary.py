@@ -707,6 +707,15 @@ def parse_killfeed_text(raw: str) -> dict:
         result["type"] = "kill"
         result["killer"] = killer
         result["victim"] = victim
+    elif " eliminated " in clean:
+        # DF elimination variant ("X eliminated Y") — same as a kill
+        killer, victim = clean.split(" eliminated ", 1)
+        killer, victim = killer.strip(), victim.strip()
+        if not killer or not victim or "<" in killer or "<" in victim or ">" in killer or ">" in victim:
+            return {"raw": raw, "text": clean, "type": "other", "killer": None, "victim": None}
+        result["type"] = "kill"
+        result["killer"] = killer
+        result["victim"] = victim
     elif " knocked " in clean:
         killer, victim = clean.split(" knocked ", 1)
         killer, victim = killer.strip(), victim.strip()

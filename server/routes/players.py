@@ -4,7 +4,7 @@ players.py — GET /api/players?session_id=xxx
 Returns live players in current room, enriched with DB info if present.
 Per spec: show discord username + gameid + skin image if in DB, else just name.
 
-Response: { count, players: [ { username, game_id, skin, discord_username, discord_id, is_self, is_alive, pt, in_db } ] }
+Response: { count, players: [ { username, game_id, skin, discord_username, discord_id, is_self, is_alive, pt, late_join, in_db } ] }
 """
 
 from fastapi import APIRouter, Request
@@ -56,7 +56,7 @@ async def get_players(request: Request):
         return JSONResponse({"count": 0, "players": []})
 
     players_dict = cur.get("players") or {}
-    # players_dict is {actorNr: {username, game_id, skin, is_alive, is_self, pt ...}}
+    # players_dict is {actorNr: {username, game_id, skin, is_alive, is_self, pt, late_join ...}}
     raw_players = []
     for _k, p in players_dict.items():
         raw_players.append({
@@ -67,6 +67,7 @@ async def get_players(request: Request):
             "is_self": bool(p.get("is_self")),
             "pt": p.get("pt"),
             "actor_nr": p.get("actor_nr"),
+            "late_join": bool(p.get("late_join")),
         })
 
     # Enrich with DB info where game_id or username matches bngc_users
@@ -111,6 +112,7 @@ async def get_players(request: Request):
                     "is_self": p["is_self"],
                     "is_alive": p["is_alive"],
                     "pt": p["pt"],
+                    "late_join": p["late_join"],
                     "in_db": True,
                 })
             else:
@@ -123,6 +125,7 @@ async def get_players(request: Request):
                     "is_self": p["is_self"],
                     "is_alive": p["is_alive"],
                     "pt": p["pt"],
+                    "late_join": p["late_join"],
                     "in_db": False,
                 })
     else:

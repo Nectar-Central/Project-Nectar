@@ -291,6 +291,7 @@ function parseKillfeedText(raw) {
   const clean = stripColorTags(raw);
   const out = { raw, text: clean, type: null, killer: null, victim: null };
   if (clean.includes(' killed ')) { const p = clean.split(' killed '); out.type = 'kill'; out.killer = p[0].trim(); out.victim = p[1].trim(); }
+  else if (clean.includes(' eliminated ')) { const p = clean.split(' eliminated '); out.type = 'kill'; out.killer = p[0].trim(); out.victim = p[1].trim(); }
   else if (clean.includes(' knocked ')) { const p = clean.split(' knocked '); out.type = 'knock'; out.killer = p[0].trim(); out.victim = p[1].trim(); }
   else if (clean.includes(' Left Match')) { out.type = 'leave'; out.killer = clean.replace(' Left Match', '').trim(); }
   else if (clean.includes(' joined')) { out.type = 'join'; out.killer = clean.replace(' joined', '').trim(); }

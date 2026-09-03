@@ -535,8 +535,10 @@ async def process_batch(
                             try:
                                 if not _is_kd_only(eff_gm) and not (death_room is not None and death_room.had_self_defeat):
                                     _tstat = _team_alive_for_me(death_room, view, me_name)
-                                    if _tstat is True:  # duo + teammate alive → no defeat yet
-                                        log_sys(f"PROCESSOR defeat deferred duo teammate alive gm={eff_gm}")
+                                    if _tstat is True:  # duo + teammate alive → hold marker for drain
+                                        if death_room is not None and death_room.last_defeat_version != death_room.match_version:
+                                            death_room.last_defeat_version = death_room.match_version
+                                        log_sys(f"PROCESSOR defeat deferred duo teammate alive gm={eff_gm} (held for drain)")
                                     else:  # solo, no team data, or whole team dead
                                         _write_defeat(discord_id, session_id, user, eff_gm, pkt_room_id, pkt_short, pkt_match_ver, death_room)
                             except Exception as e:
@@ -616,8 +618,10 @@ async def process_batch(
                                 try:
                                     if not _is_kd_only(eff_gm) and not room_alv.had_self_defeat:
                                         _tstat_alv = _team_alive_for_me(room_alv, view, me_name)
-                                        if _tstat_alv is True:  # duo + teammate alive → no defeat yet
-                                            log_sys(f"PROCESSOR defeat deferred duo teammate alive gm={eff_gm} via=alv")
+                                        if _tstat_alv is True:  # duo + teammate alive → hold marker for drain
+                                            if room_alv.last_defeat_version != room_alv.match_version:
+                                                room_alv.last_defeat_version = room_alv.match_version
+                                            log_sys(f"PROCESSOR defeat deferred duo teammate alive gm={eff_gm} via=alv (held for drain)")
                                         else:
                                             _write_defeat(discord_id, session_id, user, eff_gm, pkt_room_id, pkt_short, pkt_match_ver, room_alv)
                                 except Exception as e_def:
@@ -671,22 +675,20 @@ async def process_batch(
                         pass            # Silently ignore leave event write errors
                     log_sys(f"PROCESSOR LEAVE {leaver} gm={eff_gm}")
 
-                    # Defeat via leave: I left/kicked during MATCH with pcount>0
-                    # Blocked when a defeat was already recorded this life, when a win
-                    # stands for this version, or in K/D-only modes (death path wins)
+                    # Defeat via leave: quitting mid-match is a personal defeat immediately
+                    # (abandon = loss, teammate status irrelevant). Blocked when already
+                    # recorded this life, when a win stands, or in K/D-only modes.
                     try:
                         if _names_equal(leaver, me_name):  # I am the leaver
                             gm_low_lv = str(eff_gm or "").lower()  # Lowercase game mode
                             if gm_low_lv and not _is_kd_only(eff_gm):  # K/D-only has no defeat
                                 room2 = _get_room(pkt_room_id, view)  # Resolve room
-                                # Room must be in MATCH state with >0 players
-                                if room2 and room2.state.value == "match" and room2.players_count > 0:
-                                    # Mark defeat — the per-room loop drains it (blocked if already recorded)
-                                    if (room2.last_defeat_version != room2.match_version
-                                            and not room2.had_self_defeat
+                                # Room must be in MATCH state (pcount unused: I just left it)
+                                if room2 and room2.state.value == "match":
+                                    if (not room2.had_self_defeat
                                             and room2.last_win_version != room2.match_version):
-                                        room2.last_defeat_version = room2.match_version  # Mark for drain
-                                        log_sys(f"PROCESSOR marked defeat via leave gm={eff_gm}")
+                                        _write_defeat(discord_id, session_id, user, eff_gm, pkt_room_id, pkt_short, pkt_match_ver, room2)
+                                        log_sys(f"PROCESSOR DEFEAT via leave gm={eff_gm}")
                                     else:
                                         log_sys(f"PROCESSOR defeat-via-leave skip already recorded this life gm={eff_gm}")
                     except Exception as e:
@@ -921,9 +923,11 @@ async def process_batch(
                         user["deaths"] = new_def_death
                         room2.had_self_death = True
 
-            # Drain: single DB write point for defeats (kill/leave/alv/stG markers set above)
-            # One defeat per life — a stale marker for an already-recorded defeat is discarded.
-            # A recorded win suppresses any defeat for the same version (win stands).
+            # Drain: single DB write point for defeats (kill/alv/stG markers set above;
+            # leave writes immediately). One defeat per life — a stale marker for an
+            # already-recorded defeat is discarded. A recorded win suppresses any defeat
+            # for the same version (win stands). A marker held while a duo teammate
+            # lives is kept (silent) until the team dies, then written.
             if room2.last_defeat_version == room2.match_version and room2.last_defeat_version != -1:
                 if room2.had_self_defeat:
                     log_sys(f"PROCESSOR DEFEAT skip already recorded this life gm={gm2}")
@@ -931,6 +935,8 @@ async def process_batch(
                 elif room2.last_win_version == room2.match_version:
                     log_sys(f"PROCESSOR DEFEAT skip win already recorded gm={gm2}")
                     room2.last_defeat_version = -1  # Discard stale marker
+                elif _team_alive_for_me(room2, view, me_name_local2) is True:
+                    pass  # hold marker silently — teammate still alive, re-evaluated next batch
                 else:
                     new_def = (user.get("defeats") or 0) + 1
                     supabase.table("bngc_users").update({"defeats": new_def}).eq("discord_id", discord_id).execute()

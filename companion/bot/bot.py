@@ -203,10 +203,10 @@ async def register_cmd(interaction: discord.Interaction, game_handle: app_comman
             print(f"Player profile save failed for {interaction.user.id}: {exc}")
 
     try:
-        await interaction.user.send(f"Your BuildNow login token is **{token}**\nEnter it in the userscript prompt (once, 5 min expiry). Keep it secret!")
+        await interaction.user.send(f"Your BuildNow login token is **{token}**\nEnter it in the userscript prompt (once, 5 min expiry). Keep it secret!\nPlay a match to get your stats saved.")
     except discord.Forbidden:
         pass
-    message = f"Token sent to your DMs: **{token}**\nEnter it in the game iframe prompt on first run. One-time use."
+    message = f"Token sent to your DMs: **{token}**\nEnter it in the game iframe prompt on first run. One-time use.\nPlay a match to get your stats saved."
     if game_handle and profile_error is None:
         message += f"\nDashboard profile saved for **{game_handle}**."
     elif game_handle:
@@ -604,6 +604,50 @@ async def _match_logic(interaction: discord.Interaction):
     if party.get("is_party"): e.add_field(name="Party", value="In Party", inline=True)
     if skin: e.add_field(name="Skin", value=fmt.skin_display(skin), inline=True)
     e.add_field(name="Player List", value=kills_lines[:1024], inline=False)
+    await interaction.followup.send(embed=e)
+
+
+@bot.tree.command(name="status", description="Show your status: in lobby or in match + game mode")
+async def status_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    did = str(interaction.user.id)
+    sids = await get_active_sessions(did, limit=5)
+    if not sids:
+        return await interaction.followup.send("No linked session — use **/register**, then play a match to get your stats saved.")
+    # Prefer the session with a live match room, else first with state
+    best = None
+    for cand in sids:
+        st = await get_session_state(cand)
+        if not st:
+            continue
+        rooms = st.get("rooms") or {}
+        if any(rid != "lobby" and rv.get("state") == "match" for rid, rv in rooms.items()):
+            best = (cand, st)
+            break
+        if best is None:
+            best = (cand, st)
+    if best is None:
+        return await interaction.followup.send("Linked, but offline — start the game.")
+    sid, state = best
+    rooms = state.get("rooms") or {}
+    match_rid, match_room = None, None
+    for rid, rv in rooms.items():
+        if rid != "lobby" and rv.get("state") == "match":
+            match_rid, match_room = rid, rv
+            break
+    cur_id = state.get("current_room_id")
+    if match_room is None and cur_id and cur_id in rooms:
+        match_rid, match_room = cur_id, rooms[cur_id]
+    in_match = bool(match_room and match_room.get("state") == "match")
+    gm_raw = (match_room.get("game_mode") if match_room else None) or state.get("game_mode")
+    gm = fmt.format_game_mode(gm_raw) if gm_raw else "—"
+    e = discord.Embed(title="Status", color=0x10b981 if in_match else 0x2b2d31)
+    e.add_field(name="Status", value="In Match" if in_match else "In Lobby", inline=True)
+    e.add_field(name="Game mode", value=gm, inline=True)
+    if in_match and match_room:
+        e.add_field(name="Players", value=f"{match_room.get('players_count', '?')}/{match_room.get('max_players') or '?'}", inline=True)
+        if match_rid and match_rid != "lobby":
+            e.add_field(name="Match ID", value=f"`{match_rid[:8]}`", inline=True)
     await interaction.followup.send(embed=e)
 
 

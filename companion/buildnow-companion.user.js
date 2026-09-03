@@ -442,7 +442,7 @@
   // --- Packet sender only ---
   const APP_ID='30773790-f9fe-487c-92c2-19517c5c39ad';
   const PHOTON_HOSTS=['exitgames.com','photon'];
-  const ESSENTIAL_OPS=new Set([225,226,227,230,231]);
+  const ESSENTIAL_OPS=new Set([225,226,227,228,230,231]); // 228 = LeaveRoom/queue-cancel candidate (semantics unconfirmed — watch op#228 lines in server logs before wiring removal)
   const ESSENTIAL_EVS=new Set([101,253,254,255]);
   const DROP_EVS_NOISY=new Set([200,201,202,204,206]);
   const BATCH_MAX=40, FLUSH_MS=250;
@@ -488,11 +488,14 @@
   function _serverInMatch(sess) {
     if(!sess) return null;
     try {
+      // FSM state wins over scene: leaving via leave/auth clears state to lobby while
+      // cur_scn stays stale on the last match scene (no MainLobby packet ever comes).
+      // Trusting stale cur_scn here stuck audio paused forever in the lobby.
+      if(sess.state) return String(sess.state).toLowerCase() === 'match';
       const rooms = sess.rooms;
       const curRoom = rooms ? rooms[sess.current_room_id] : null;
       const serverCurScn = (curRoom && curRoom.cur_scn) || sess.cur_scn || null;
       if(serverCurScn) return serverCurScn !== 'MainLobby';
-      if(sess.state) return String(sess.state).toLowerCase() === 'match';
     } catch(e) {}
     return null;
   }
@@ -1216,7 +1219,8 @@
         playersHtml = `<div style="padding:20px 0;color:#9ca3af;font-size:12px">No players in game</div>`;
       } else {
         const count = pc.count || pc.players.length;
-        const header = `<div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:8px;text-align:center">Players in Game - ${count}${pc.game_mode? ' · '+fmtGmDrawer(pc.game_mode):''}</div>`;
+        const lateCount = pc.players.filter(p=>p && p.late_join).length;
+        const header = `<div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:8px;text-align:center">Players in Game - ${count}${pc.game_mode? ' · '+fmtGmDrawer(pc.game_mode):''}${lateCount? ` · <span style="color:#f59e0b">${lateCount} late join${lateCount>1?'s':''}</span>`:''}</div>`;
         const rows = pc.players.map(pl=>{
           const skinId = (pl.skin!=null && String(pl.skin).trim()!=='' && String(pl.skin).toLowerCase()!=='nan' && String(pl.skin).toLowerCase()!=='null') ? pl.skin : 'cct_0_default';
           const skinP = skinUrlDrawer(skinId);
@@ -1225,7 +1229,8 @@
           const esc=(v)=> String(v).replace(/</g,'&lt;');
           const toNaN=(v)=> (v==null || String(v).trim()==='' || String(v).toLowerCase()==='null' || String(v).toLowerCase()==='undefined') ? 'NaN' : esc(v);
           const titleName = pl.username!=null ? esc(pl.username) : 'NaN';
-          const nameLine = `<div style="font-size:13px;font-weight:700;color:#fff;word-break:break-word">${titleName}</div>`;
+          const lateBadge = pl.late_join ? ` <span style="font-size:9px;font-weight:800;color:#000;background:#f59e0b;border-radius:4px;padding:1px 5px;vertical-align:middle;white-space:nowrap">LATE JOIN</span>` : '';
+          const nameLine = `<div style="font-size:13px;font-weight:700;color:#fff;word-break:break-word">${titleName}${lateBadge}</div>`;
           const gidFull = pl.game_id!=null ? String(pl.game_id) : 'NaN';
           const discordVal = pl.discord_username!=null ? String(pl.discord_username) : 'NaN';
           const detailLine = `Discord: ${toNaN(discordVal)} · Game ID: ${toNaN(gidFull)}`;
@@ -1535,11 +1540,13 @@
           return strings;
         }
         const strings = extractGpbStrings(kfHex);
-        // find killfeed string (contains "killed" or "knocked")
-        const kfStr = strings.find(s => s.includes('killed') || s.includes('knocked'));
+        // visibility: log every string in 101 packets so unknown verbs/formats show in feed
+        try{ feedLog('killfeed', {strings: strings.slice(0,4)}); }catch{}
+        // find killfeed string (contains "killed", "eliminated" or "knocked")
+        const kfStr = strings.find(s => s.includes('killed') || s.includes('eliminated') || s.includes('knocked'));
         if(kfStr) {
-          const isKill = kfStr.includes('killed');
-          const sep = isKill ? 'killed' : 'knocked';
+          const isKill = kfStr.includes('killed') || kfStr.includes('eliminated');
+          const sep = kfStr.includes('killed') ? 'killed' : (kfStr.includes('eliminated') ? 'eliminated' : 'knocked');
           const parts = kfStr.split(sep);
           if(parts.length >= 2) {
             // killer: text before separator, strip color tags
