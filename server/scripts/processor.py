@@ -24,6 +24,10 @@ from server.lib.logger import log_sys, log_err, log_engine
 # Strip color tags from player names (e.g. "<color=red>Player</color>" → "Player")
 from server.lib.gpbinary import _strip_color_tags
 
+# Retransmit window shared with the engine (killfeed can arrive twice with
+# different Photon framing: client RaiseEvent echo + server broadcast).
+from server.lib.photon_engine.engine import _KILL_DUP_WINDOW_MS
+
 # TYPE_CHECKING is False at runtime — only imports below when type-checking (mypy/pyright)
 from typing import TYPE_CHECKING
 
@@ -192,6 +196,77 @@ def _is_kd_only(gm) -> bool:
     Wins/defeats in RvB come only from the team-15 race or stG=3 team result.
     """
     return str(gm or "").lower() in ("df", "tdm_bvr")
+
+
+def _kill_count_dup(room, killer, victim, kind, pkt_t) -> bool:
+    """Retransmit guard for kill counting: same killer->victim kind already
+    counted within the window. State lives on the room (survives batches via
+    Upstash) and is stamped ONLY here — engine appends use recent_kills, so the
+    two paths can never suppress each other. Genuine same-pair re-kills need a
+    respawn cycle, far outside the window."""
+    try:
+        if not killer or not victim or room is None:
+            return False
+        try:
+            now_ms = float(pkt_t) if pkt_t is not None else None
+        except Exception:
+            now_ms = None
+        if now_ms is None:
+            try:
+                import time as _pt
+                now_ms = _pt.time() * 1000.0
+            except Exception:
+                return False
+        key = f"{_norm_name(killer)}\x00{_norm_name(victim)}\x00{kind}"
+        seen = getattr(room, "proc_kill_seen", None)
+        if not isinstance(seen, dict):
+            return False
+        # prune stale + overgrown entries opportunistically
+        try:
+            if len(seen) > 500:
+                for k in [k for k, ts in seen.items() if now_ms - float(ts) > _KILL_DUP_WINDOW_MS]:
+                    seen.pop(k, None)
+                while len(seen) > 500:
+                    seen.pop(next(iter(seen)))
+        except Exception:
+            pass
+        try:
+            last = seen.get(key)
+            if last is not None and abs(now_ms - float(last)) <= _KILL_DUP_WINDOW_MS:
+                return True
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return False
+
+
+def _kill_count_stamp(room, killer, victim, kind, pkt_t) -> None:
+    """Record a counted kill for the retransmit guard above."""
+    try:
+        if not killer or not victim or room is None:
+            return
+        try:
+            now_ms = float(pkt_t) if pkt_t is not None else None
+        except Exception:
+            now_ms = None
+        if now_ms is None:
+            try:
+                import time as _pt
+                now_ms = _pt.time() * 1000.0
+            except Exception:
+                return
+        key = f"{_norm_name(killer)}\x00{_norm_name(victim)}\x00{kind}"
+        seen = getattr(room, "proc_kill_seen", None)
+        if not isinstance(seen, dict):
+            try:
+                room.proc_kill_seen = {}
+                seen = room.proc_kill_seen
+            except Exception:
+                return
+        seen[key] = now_ms
+    except Exception:
+        pass
 
 
 def _extract_actors(pkt):
@@ -471,25 +546,45 @@ async def process_batch(
             if is_kf and instigator and instigated:  # Valid killfeed needs both killer and victim
                 # Determine if it's a kill or knock
                 kf_type = "killed" if (is_kill or pkt_type in ("kill", "KILL", "Kill")) else "knocked"
+                # Outbound RaiseEvent echo: our client sends the killfeed text and the
+                # server rebroadcasts it ~0.5s later. Only the broadcast counts — the
+                # echo would double every kill (and every knock).
+                pkt_is_echo = pkt.get("is_echo", False) if isinstance(pkt, dict) else bool(getattr(pkt, "is_echo", False))
+                # Retransmit guard: same content within the window (Photon can deliver
+                # the same event twice with different framing).
+                _kf_room = _get_room(pkt_room_id, view)
+                _kf_t = pkt.get("t") if isinstance(pkt, dict) else getattr(pkt, "t", None)
+                if pkt_is_echo:
+                    skip_kf = True
+                    log_sys(f"PROCESSOR killfeed echo ignored {instigator}->{instigated} ({kf_type})")
+                elif _kill_count_dup(_kf_room, instigator, instigated, kf_type, _kf_t):
+                    skip_kf = True
+                    log_sys(f"PROCESSOR killfeed dup ignored {instigator}->{instigated} ({kf_type}, retransmit window)")
+                else:
+                    skip_kf = False
                 # Insert killfeed event (records ALL kills/knocks in the lobby)
-                supabase.table("bngc_game_events").insert({
-                    "discord_id": discord_id,       # Which Discord user owns this session
-                    "session_id": session_id,       # Which session
-                    "event_type": "killfeed",       # Event type for querying
-                    "event_data": {                 # Kill details
-                        "gm": eff_gm,              # Game mode
-                        "instigator": instigator,   # Killer name
-                        "instigated": instigated,   # Victim name
-                        "kill_type": kf_type,       # "killed" or "knocked"
-                        "room_id": pkt_room_id,     # Room where it happened
-                        "code": pkt_short,          # Room short code
-                        "short_code": pkt_short,    # Duplicate for querying
-                        "match_version": pkt_match_ver,  # Match version
-                    },
-                }).execute()
+                if not skip_kf:
+                    supabase.table("bngc_game_events").insert({
+                        "discord_id": discord_id,       # Which Discord user owns this session
+                        "session_id": session_id,       # Which session
+                        "event_type": "killfeed",       # Event type for querying
+                        "event_data": {                 # Kill details
+                            "gm": eff_gm,              # Game mode
+                            "instigator": instigator,   # Killer name
+                            "instigated": instigated,   # Victim name
+                            "kill_type": kf_type,       # "killed" or "knocked"
+                            "room_id": pkt_room_id,     # Room where it happened
+                            "code": pkt_short,          # Room short code
+                            "short_code": pkt_short,    # Duplicate for querying
+                            "match_version": pkt_match_ver,  # Match version
+                        },
+                    }).execute()
+                    _kill_count_stamp(_kf_room, instigator, instigated, kf_type, _kf_t)
 
-                # Self-specific kill: increment kills + write kill event
-                if me_name and _names_equal(instigator, me_name):  # I am the killer
+                # Self-specific kill: increment kills + write kill event.
+                # Kills only (kf_type == killed): a knock is not an elimination —
+                # counting it doubled every knock-then-finish.
+                if not skip_kf and kf_type == "killed" and me_name and _names_equal(instigator, me_name):  # I am the killer
                     new_kills = (user.get("kills") or 0) + 1  # Increment kill count
                     supabase.table("bngc_users").update({"kills": new_kills}).eq("discord_id", discord_id).execute()
                     # Write kill event (separate from killfeed for stat tracking)
@@ -503,8 +598,10 @@ async def process_batch(
                     log_sys(f"PROCESSOR KILL victim={instigated} kills {user.get('kills',0)}->{new_kills}")
                     user["kills"] = new_kills       # Update local cache
 
-                # Self-specific death: increment deaths + write death event (one per life)
-                elif me_name and _names_equal(instigated, me_name):  # I am the victim
+                # Self-specific death: increment deaths + write death event (one per life).
+                # Kills only: being knocked is not death (revive possible) — the
+                # finishing "killed" feed or alv=false counts it.
+                elif not skip_kf and kf_type == "killed" and me_name and _names_equal(instigated, me_name):  # I am the victim
                     # Dedup key: prevent double-counting from killfeed + alv
                     dedup_key = (discord_id, pkt_match_ver if pkt_match_ver is not None else pkt_room_id)
                     if dedup_key not in death_counted_for_match:  # Not yet counted
@@ -798,8 +895,10 @@ async def process_batch(
                 continue  # Already recorded
 
             # Check if stG=3 just happened as a real phase end (not a zone-timer tick
-            # through 3): engine bumps match_version and arms stg_is_phase_end only then
-            if room.last_stg == 3 and room.stg_is_phase_end and room.match_version > 0:
+            # through 3): engine bumps match_version and arms stg_is_phase_end only then.
+            # Edge-triggered: the arm survives stG moving to 2/1 afterwards, so a batch
+            # containing [3,2] still drains. Consumed on write; cleared on MATCH enter.
+            if room.stg_is_phase_end and room.match_version > 0:
                 # Match just ended — check who's alive to determine winner
                 me_name_local = (view.me.username if view.me else None) or user.get("game_username")
                 if me_name_local and room.state.value == "match":
@@ -824,6 +923,7 @@ async def process_batch(
                             if my_team:
                                 winner = my_team.team_id
                         _write_win(discord_id, session_id, user, gm, room_id, room.short_code, room.match_version, winner, room)
+                        room.stg_is_phase_end = False  # consume arm (version bump re-arms)
 
                     # Note: defeat is handled by alv/kill/leave logic below
 
@@ -886,12 +986,14 @@ async def process_batch(
             if gm2 and gm2.lower() == "df":  # DF has no defeat
                 continue
 
-            # End-of-match sweep: stG=3 and I'm dead in room state (covers zone deaths
-            # with no killfeed/alv packets) — mark for drain below. Skipped when a
-            # defeat was already recorded this life (no double defeat at match end).
+            # End-of-match sweep: phase just ended and I'm dead in room state (covers
+            # zone deaths with no killfeed/alv packets) — mark for drain below. Skipped
+            # when a defeat was already recorded this life (no double defeat at match
+            # end). Edge-triggered via stg_is_phase_end (a batch ending on stG=2 must
+            # still sweep).
             me_name_local2 = (view.me.username if view.me else None) or user.get("game_username")
             if (room2.last_defeat_version != room2.match_version and not room2.had_self_defeat
-                    and room2.last_stg == 3
+                    and room2.stg_is_phase_end
                     and me_name_local2 and room2.state.value == "match" and room2.players_count > 1):
                 # Check if I'm dead (solo rule)
                 is_dead = False
@@ -952,6 +1054,7 @@ async def process_batch(
                     user["defeats"] = new_def
                     room2.had_self_defeat = True  # One defeat per life
                     room2.last_defeat_version = -1  # Drain (prevent re-processing)
+                    room2.stg_is_phase_end = False  # consume phase-end arm for this version
 
         # --- Competitive sealing (host collab only) ---
         # Only when host_mode is enabled and room is server-created (short_code)

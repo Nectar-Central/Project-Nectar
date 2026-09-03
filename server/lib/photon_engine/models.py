@@ -228,6 +228,8 @@ class KillInfo:
     instigator: str        # killer name
     instigated: str        # victim name
     event_type: str        # "killed" / "knocked" / "left"
+    t: float | None = None   # server ms when recorded (retransmit window dedup)
+    hx: str | None = None    # raw hex of the packet that created this entry
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -242,7 +244,12 @@ class KillInfo:
             ed = str(d.get("instigated") or "")
             if not ig and not ed:
                 return None
-            return cls(instigator=ig, instigated=ed, event_type=str(d.get("event_type") or "killed"))
+            try:
+                t = float(d["t"]) if d.get("t") is not None else None
+            except Exception:
+                t = None
+            hx = str(d["hx"]) if d.get("hx") else None
+            return cls(instigator=ig, instigated=ed, event_type=str(d.get("event_type") or "killed"), t=t, hx=hx)
         except Exception:
             return None
 
@@ -339,6 +346,7 @@ class RoomView:
     teams: dict[str, Team] = field(default_factory=dict)  # team_id -> Team (duo)
     recent_kills: list[KillInfo] = field(default_factory=list)
     recent_knocks: list[KillInfo] = field(default_factory=list)
+    proc_kill_seen: dict[str, float] = field(default_factory=dict)  # processor kill-count dedup: content key -> server ms (retransmit window, survives batches)
     match_version: int = 0                           # increments on stG 3→1 for private zw_lg multi-match per room
     match_playtime: Playtime = field(default_factory=lambda: Playtime())  # per-room playtime (ticks per match_version)
     last_win_version: int = -1                       # dedup win per match_version
@@ -358,6 +366,36 @@ class RoomView:
             if username in t.members:
                 return t
         return None
+
+    def adopt_game_mode(self, mode) -> bool:
+        """Adopt a game mode, treating DF/UNKNOWN/None as placeholders.
+
+        Rules (curScn is ground truth of where the player is):
+        - blank (None/UNKNOWN) accepts anything (incl. DF, needed for DF matches)
+        - DF placeholder upgrades to any concrete mode (join packets default gm=DF)
+        - concrete mode accepts a DIFFERENT concrete non-DF mode (scene correction,
+          e.g. room stuck on matchmaking gm while curScn says ZoneWars_LateGame)
+        - DF never clobbers a concrete mode (MainWorld sightings mid-match)
+        Returns True when room.game_mode changed. Callers log the change.
+        """
+        if mode is None:
+            return False
+        cur = self.game_mode
+        if cur is None or cur == GameMode.UNKNOWN:
+            if cur != mode:
+                self.game_mode = mode
+                return True
+            return False
+        if cur == GameMode.DF:
+            if mode != GameMode.DF:
+                self.game_mode = mode
+                return True
+            return False
+        # concrete mode: only a different concrete non-DF mode corrects it
+        if mode != cur and mode != GameMode.DF and mode != GameMode.UNKNOWN:
+            self.game_mode = mode
+            return True
+        return False
 
     def to_dict(self) -> dict:
         return {
@@ -379,6 +417,7 @@ class RoomView:
             "teams": {tid: t.to_dict() for tid, t in self.teams.items()},
             "recent_kills": [k.to_dict() for k in self.recent_kills[-100:]],
             "recent_knocks": [k.to_dict() for k in self.recent_knocks[-100:]],
+            "proc_kill_seen": {str(k): float(v) for k, v in list(self.proc_kill_seen.items())[-500:]},
             "match_version": self.match_version,
             "match_playtime": self.match_playtime.to_dict(),
             "stg_is_phase_end": self.stg_is_phase_end,
@@ -454,6 +493,11 @@ class RoomView:
                 k = KillInfo.from_dict(kd)
                 if k is not None:
                     r.recent_knocks.append(k)
+            try:
+                for k, v in (d.get("proc_kill_seen") or {}).items():
+                    r.proc_kill_seen[str(k)] = float(v)
+            except Exception:
+                pass
             try:
                 r.match_version = int(d.get("match_version") or 0)
             except Exception:

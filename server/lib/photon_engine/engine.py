@@ -1,11 +1,58 @@
 from dataclasses import dataclass
 from typing import Any
+import time
 
 from ..gpbinary import parse_gpbinary, parse_killfeed_text, _strip_color_tags
 from ..logger import log_engine
 
 from .enums import GameMode, PacketType, State
 from .models import KillInfo, Player, SessionView
+
+
+# Retransmit window for killfeed content dedup (ms). The same kill event can
+# arrive twice with different Photon framing (client RaiseEvent echo +
+# server broadcast, reliable repackaging) ~0.5-1s apart. Genuine same-pair
+# re-kills need a respawn cycle, far outside this window.
+_KILL_DUP_WINDOW_MS = 5000.0
+
+
+def _kill_content_dup(entries, killer: str | None, victim: str | None, kind: str, now_ms: float) -> bool:
+    """True if the same killer->victim kill/knock was already recorded within
+    the window. Entries without timestamps (old caches) never match."""
+    try:
+        if not killer or not victim:
+            return False
+        for k in reversed(entries[-50:]):
+            try:
+                if k.event_type != kind:
+                    continue
+                if not _names_equal(k.instigator, killer) or not _names_equal(k.instigated, victim):
+                    continue
+                if k.t is None:
+                    continue
+                if abs(now_ms - float(k.t)) <= _KILL_DUP_WINDOW_MS:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+def _op_has_alv(gpb) -> bool:
+    """True when an OUTBOUND SetProperties request carries the alive flag.
+
+    Operation requests put props under params.Properties (typed values), unlike
+    inbound broadcasts (top-level properties). Only our own client sends these.
+    """
+    try:
+        if not isinstance(gpb, dict) or gpb.get("opName") != "SetProperties":
+            return False
+        pp = (gpb.get("params") or {}).get("Properties")
+        ppv = pp.get("value") if isinstance(pp, dict) and set(pp.keys()) <= {"type", "value"} else pp
+        return isinstance(ppv, dict) and "alv" in ppv
+    except Exception:
+        return False
 
 
 def _norm_name(n: str | None) -> str:
@@ -108,6 +155,8 @@ class EnginePacket:
     party: str | None = None
     is_kill: bool = False
     is_knock: bool = False
+    is_echo: bool = False  # killfeed parsed from OUTBOUND RaiseEvent (client echo of what
+                           # the server rebroadcasts) — never counted, broadcast is authoritative
     is_join: bool = False
     is_leave: bool = False
     is_eliminated: bool = False
@@ -135,6 +184,7 @@ class EnginePacket:
             "party": self.party,
             "is_kill": self.is_kill,
             "is_knock": self.is_knock,
+            "is_echo": self.is_echo,
             "is_join": self.is_join,
             "is_leave": self.is_leave,
             "is_alive": self.is_alive,
@@ -450,7 +500,9 @@ class Engine:
             room.players[me_key] = view.me
             room.me = view.me  # per-room me
             log_engine("join", session_id[:8], name=new_name, skin=view.me.skin, gm=packet.game_mode.value if packet.game_mode else "?", max=room.max_players, count=room.players_count, room=room.room_id[:8])
-            if packet.game_mode and not room.game_mode:
+            # Fill blank gm only (None/UNKNOWN) — DF is the client default placeholder
+            # and must not lock the room; scene packets repair it via adopt_game_mode.
+            if packet.game_mode and room.game_mode in (None, GameMode.UNKNOWN):
                 room.game_mode = packet.game_mode
             # Party
             party_val = gpb.get("Party") if gpb.get("Party") is not None else gpb.get("properties", {}).get("Party")
@@ -493,7 +545,7 @@ class Engine:
             if packet.game_mode and not room_name:
                 self._pending_gm[session_id] = packet.game_mode
                 log_engine("debug", session_id[:8], msg=f"pending gm {packet.game_mode.value} for next room", room=room.room_id[:8])
-            elif room_name and not room.game_mode and session_id in self._pending_gm:
+            elif room_name and room.game_mode in (None, GameMode.UNKNOWN) and session_id in self._pending_gm:
                 pending_gm = self._pending_gm.pop(session_id, None)
                 if pending_gm:
                     room.game_mode = pending_gm
@@ -638,6 +690,18 @@ class Engine:
             # keep room.cur_scn always up to date on scene packets (even when no transition)
             if cur_scn is not None:
                 room.cur_scn = cur_scn
+                # curScn is ground truth of where the player is: repair placeholder or
+                # wrong room gm. Join/matchmaking packets default gm=DF, and a stale
+                # matchmaking gm can mismatch the actual scene (e.g. room says wwzw
+                # while curScn is ZoneWars_LateGame). adopt_game_mode only upgrades
+                # blanks/DF placeholders or corrects concrete-vs-concrete (never
+                # clobbers with DF), so lobby scenes are safe.
+                try:
+                    _cm = GameMode.from_curscn(cur_scn)
+                    if _cm is not None and room.adopt_game_mode(_cm):
+                        log_engine("room", session_id[:8], action="gm", gm=_cm.value, room=room.room_id[:8], note="scene repair")
+                except Exception:
+                    pass
                 if cur_scn == "MainLobby":
                     view.usernameChangeCount = 0
         except Exception as e:
@@ -654,6 +718,10 @@ class Engine:
         # Timer-flavored stG (e.g. 30s countdowns) also passes here: only a 3 arriving
         # from below (None/0/1/2) counts as phase end. A 3 ticking down from above (4->3)
         # is a timer and must not bump versions or arm wins. Must run before zone handling.
+        # Edge-triggered: once armed, the flag stays until the processor drain consumes
+        # it (win/defeat written) or a new match begins. It is NOT cleared when stG
+        # moves to 2/1 — a batch containing [3,2] must still drain the phase end,
+        # otherwise wins/defeats are silently missed.
         _STG_PHASE_MODES = (GameMode.ZW_LG, GameMode.WWZW, GameMode.BF2V2, GameMode.BF, GameMode.VA, GameMode.RVB, GameMode.R1V1)
         is_stg_packet = gpb and gpb.get("properties") and "stG" in gpb["properties"]
         if is_stg_packet:
@@ -676,8 +744,6 @@ class Engine:
                             room.recent_knocks = []
                             log_engine("match", session_id[:8], action="new_version", version=room.match_version, room=room.room_id[:8], via="stG 3")
                     # else: timer ticking down through 3 — leave flag untouched
-                elif stg != 3:
-                    room.stg_is_phase_end = False  # new phase/round in progress — disarm stale end
                 room.last_stg = stg
             except Exception:
                 pass
@@ -849,6 +915,22 @@ class Engine:
 
         # ---- ALIVE / ELIMINATED (room-scoped, also fill skin) ----
         # Contract: RoomView.actor_map[actorNr] resolves alv without 255 (bare alv packets)
+        # Outbound self-report fallback: our client sets its OWN alive flag via
+        # SetProperties with no TargetActorNr and no 255 (Photon targets self by
+        # default). Broadcasts always carry TargetActorNr, so this can never steal
+        # another player's alv. Needed when the actor map has no entry (fresh rooms,
+        # serverless gaps) — revive resets depend on resolving to me.
+        try:
+            if (not packet.player_name
+                    and packet.packet_type in (PacketType.ALIVE, PacketType.ELIMINATED)
+                    and gpb and gpb.get("opName") == "SetProperties"
+                    and not (gpb.get("params") or {}).get("TargetActorNr")):
+                _me_self = room.me or view.me
+                if _me_self is not None and getattr(_me_self, "username", None):
+                    packet.player_name = _me_self.username
+                    log_engine("alv", session_id[:8], name=_me_self.username, alive=bool(packet.is_alive), room=room.room_id[:8], via="self-report")
+        except Exception:
+            pass
         if packet.packet_type in (PacketType.ALIVE, PacketType.ELIMINATED) and (packet.player_name or actor_nr is not None or (gpb and gpb.get("params", {}).get("TargetActorNr") is not None)):
             # Resolve name via actor_map if packet has no 255
             alv_name = packet.player_name
@@ -991,22 +1073,29 @@ class Engine:
                     except Exception:
                         pass
 
-        # ---- KILLFEED (room-scoped) — validated, dedup only on retransmit (same rawHex)
+        # ---- KILLFEED (room-scoped) — dedup on content+time, echo never appends ----
+        # Same kill can arrive twice with different Photon framing (client RaiseEvent
+        # echo + server broadcast ~0.5s apart, or reliable repackaging). Byte compare
+        # misses those, so dedup on (killer, victim, kind) within a short window.
+        # Genuine same-pair re-kills need a respawn cycle, far outside the window.
         if packet.is_kill and packet.killer and packet.victim:
             from ..gpbinary import _strip_color_tags as _strip
             killer = _strip(str(packet.killer)).strip()
             victim = _strip(str(packet.victim)).strip()
             if not killer or not victim or "<" in killer or "<" in victim:
                 log_engine("debug", session_id[:8], msg=f"kill dropped empty killer={killer!r} victim={victim!r}", room=room.room_id[:8])
+            elif packet.is_echo:
+                log_engine("debug", session_id[:8], msg=f"kill echo ignored {killer}->{victim} (broadcast counts)", room=room.room_id[:8])
             else:
-                # Dedup: only if same rawHex as last kill (Photon retransmit), not same victim in new round (DF 2 kills)
-                is_dup = packet.raw_hex and packet.raw_hex == room.last_kill_hex
-                if is_dup:
-                    log_engine("debug", session_id[:8], msg=f"kill dup ignored {killer}->{victim} same hex", room=room.room_id[:8])
+                try:
+                    _now = time.time() * 1000.0
+                except Exception:
+                    _now = 0.0
+                if _kill_content_dup(room.recent_kills, killer, victim, "killed", _now):
+                    log_engine("debug", session_id[:8], msg=f"kill dup ignored {killer}->{victim} (retransmit window)", room=room.room_id[:8])
                 else:
                     log_engine("killfeed", session_id[:8], killer=killer, victim=victim, room=room.room_id[:8])
-                    room.recent_kills.append(KillInfo(instigator=killer, instigated=victim, event_type="killed"))
-                    room.last_kill_hex = packet.raw_hex
+                    room.recent_kills.append(KillInfo(instigator=killer, instigated=victim, event_type="killed", t=_now, hx=packet.raw_hex))
                     if len(room.recent_kills) > 100:
                         room.recent_kills = room.recent_kills[-100:]
                     # Late join via killfeed — only for valid deduped kills
@@ -1026,9 +1115,19 @@ class Engine:
                                 )
                                 log_engine("join", session_id[:8], name=name, source="killfeed", alive=not is_target, room=room.room_id[:8])
         elif packet.is_knock and packet.killer and packet.victim:
-            room.recent_knocks.append(KillInfo(instigator=packet.killer, instigated=packet.victim, event_type="knocked"))
-            if len(room.recent_knocks) > 100:
-                room.recent_knocks = room.recent_knocks[-100:]
+            if packet.is_echo:
+                log_engine("debug", session_id[:8], msg="knock echo ignored (broadcast counts)", room=room.room_id[:8])
+            else:
+                try:
+                    _now2 = time.time() * 1000.0
+                except Exception:
+                    _now2 = 0.0
+                if _kill_content_dup(room.recent_knocks, str(packet.killer), str(packet.victim), "knocked", _now2):
+                    log_engine("debug", session_id[:8], msg="knock dup ignored (retransmit window)", room=room.room_id[:8])
+                else:
+                    room.recent_knocks.append(KillInfo(instigator=str(packet.killer), instigated=str(packet.victim), event_type="knocked", t=_now2, hx=packet.raw_hex))
+                    if len(room.recent_knocks) > 100:
+                        room.recent_knocks = room.recent_knocks[-100:]
         # ---- Kill victim: mark player dead — Processor handles defeat calculation ----
         if packet.is_kill and packet.victim and room.state == State.MATCH:
             # Mark victim as dead in room state
@@ -1181,6 +1280,14 @@ class Engine:
                 pkt.is_knock = True
                 pkt.killer = parsed["killer"]
                 pkt.victim = parsed["victim"]
+            # Outbound RaiseEvent carrying killfeed text is the client's own echo
+            # of the kill (server rebroadcasts it as EventData 101 ~0.5s later).
+            # Only the broadcast counts — echoes would double every kill.
+            try:
+                if (pkt.is_kill or pkt.is_knock) and gpb.get("opName") == "RaiseEvent":
+                    pkt.is_echo = True
+            except Exception:
+                pass
             return pkt
 
         # join / leave / alv
@@ -1190,8 +1297,17 @@ class Engine:
         elif gpb.get("evName") == "Leave":
             pkt.packet_type = PacketType.LEAVE
             pkt.is_leave = True
-        elif "alv" in props:
-            if props["alv"]:
+        elif "alv" in props or _op_has_alv(gpb):
+            _alv_val = props.get("alv")
+            if _alv_val is None:
+                try:
+                    _pp = (gpb.get("params") or {}).get("Properties")
+                    _ppv = _pp.get("value") if isinstance(_pp, dict) and set(_pp.keys()) <= {"type", "value"} else _pp
+                    _raw = _ppv.get("alv") if isinstance(_ppv, dict) else None
+                    _alv_val = _raw.get("value") if isinstance(_raw, dict) and "value" in _raw else _raw
+                except Exception:
+                    _alv_val = None
+            if _alv_val:
                 pkt.packet_type = PacketType.ALIVE
                 pkt.is_alive = True
             else:

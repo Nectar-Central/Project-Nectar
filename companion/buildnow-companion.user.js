@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Nectar Buildnow Companion
 // @namespace    https://github.com/Nectar-Central
-// @version      2.8.8
-// @description  Nectar Buildnow Companion v2.8.8 — audio logs, off-screen hidden audio fix.
+// @version      2.11.0
+// @description  Nectar Buildnow Companion v2.11.0 — audio logs, potato graphics, loading-screen branding.
 // @author       Nectar Labs
 // @match        https://buildnow-gg.game-files.crazygames.com/*
 // @all-frames   true
@@ -26,6 +26,7 @@
 
 (function () {
   'use strict';
+  const BNC_VERSION = '2.11.0';
   const HREF = (() => { try { return location.href; } catch { return ''; } })();
   const IS_GAME_FRAME = HREF.includes('buildnow-gg.game-files.crazygames.com');
   if (!IS_GAME_FRAME) return;
@@ -658,13 +659,15 @@
   }
 
   // Hotkeys: Ctrl+Shift+C = toggle collect, etc - disable when modal/input focused
+  // Mac support: Cmd (metaKey) counts as Ctrl, so Cmd+Shift+<key> works like Ctrl+Shift+<key>
+  function modKey(e){ return !!(e.ctrlKey||e.metaKey); }
   function isModalOrInputFocused(){
     const ae = document.activeElement;
     return !!(ae && (ae.id === 'bnc-token-field' || ae.closest && ae.closest('#bnc-login-wrap')) || document.getElementById('bnc-login-wrap')?.contains(ae));
   }
   document.addEventListener('keydown', (e)=>{
     if (isModalOrInputFocused()) return;
-    if(e.ctrlKey && e.shiftKey){
+    if(modKey(e) && e.shiftKey){
       const k=(e.key||'').toUpperCase();
       if(k==='C'){ e.preventDefault(); e.stopPropagation(); toggleCollectMode(); }
       else if(k==='S'){ e.preventDefault(); e.stopPropagation(); downloadCollected(); }
@@ -715,7 +718,7 @@
     display: 'flex', gap: '6px', padding: '2px 6px', background: 'rgba(0,0,0,0.92)', borderTop: '1px solid rgba(255,255,255,0.12)',
     fontFamily: 'monospace', fontSize: '10px', pointerEvents: 'auto'
   });
-  feedBar.innerHTML = `<span style="opacity:0.5">BNC feed - zone/stG/alv full</span><button id="bnc-feed-pause" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:0 6px;cursor:pointer">${feedPaused?'▶ Resume':'⏸ Pause'}</button><button id="bnc-feed-expand" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:0 6px;cursor:pointer">⤢ Expand</button><span style="opacity:0.5">Ctrl+Shift+F toggle · Ctrl+Shift+P pause · hover to scroll · drag top edge to resize</span>`;
+  feedBar.innerHTML = `<span style="opacity:0.5">BNC feed - zone/stG/alv full</span><button id="bnc-feed-pause" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:0 6px;cursor:pointer">${feedPaused?'▶ Resume':'⏸ Pause'}</button><button id="bnc-feed-expand" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:0 6px;cursor:pointer">⤢ Expand</button><span style="opacity:0.5">Ctrl/Cmd+Shift+F toggle · Ctrl/Cmd+Shift+P pause · hover to scroll · drag top edge to resize</span>`;
   const feedEl = document.createElement('div');
   feedEl.id = 'bnc-log-feed';
   Object.assign(feedEl.style, {
@@ -763,13 +766,13 @@
   document.addEventListener('keydown', (e)=>{
     if (isModalOrInputFocused()) return;
     const k=(e.key||'').toUpperCase();
-    if(e.ctrlKey && e.shiftKey && k==='F'){
+    if(modKey(e) && e.shiftKey && k==='F'){
       e.preventDefault(); e.stopPropagation();
       feedEnabled = !feedEnabled;
       GMSet('bnc_feed_enabled', feedEnabled);
       feedWrap.style.display = feedEnabled ? 'block' : 'none';
       showToast(feedEnabled ? 'Feed ON' : 'Feed OFF', false);
-    } else if(e.ctrlKey && e.shiftKey && k==='P'){
+    } else if(modKey(e) && e.shiftKey && k==='P'){
       e.preventDefault(); e.stopPropagation();
       feedPaused = !feedPaused;
       GMSet('bnc_feed_paused', feedPaused);
@@ -809,22 +812,22 @@
       if(raw && typeof raw==='object' && raw.key) return raw;
       if(typeof raw==='string' && raw){
         try{ const j=JSON.parse(raw); if(j && j.key) return j; }catch{}
-        // legacy string like "Ctrl+Shift+I"
+        // legacy string like "Ctrl+Shift+I" (or "Cmd+Shift+I" on Mac)
         const parts=String(raw).split('+');
-        const kb={ctrl:false,shift:false,alt:false,key:'I'};
-        for(const p of parts){ const l=p.trim().toLowerCase(); if(l==='ctrl'||l==='control') kb.ctrl=true; else if(l==='shift') kb.shift=true; else if(l==='alt') kb.alt=true; else if(p.trim()) kb.key=p.trim().toUpperCase(); }
+        const kb={ctrl:false,shift:false,alt:false,meta:false,key:'I'};
+        for(const p of parts){ const l=p.trim().toLowerCase(); if(l==='ctrl'||l==='control') kb.ctrl=true; else if(l==='cmd'||l==='meta'||l==='command') kb.meta=true; else if(l==='shift') kb.shift=true; else if(l==='alt') kb.alt=true; else if(p.trim()) kb.key=p.trim().toUpperCase(); }
         return kb;
       }
     }catch{}
     return {ctrl:true, shift:true, alt:false, key:'I'};
   }
-  function formatKeybind(kb){ const a=[]; if(kb.ctrl) a.push('Ctrl'); if(kb.shift) a.push('Shift'); if(kb.alt) a.push('Alt'); a.push(String(kb.key||'').toUpperCase()); return a.join('+'); }
+  function formatKeybind(kb){ const a=[]; if(kb.meta) a.push('Cmd'); if(kb.ctrl) a.push('Ctrl'); if(kb.shift) a.push('Shift'); if(kb.alt) a.push('Alt'); a.push(String(kb.key||'').toUpperCase()); return a.join('+'); }
   function isDrawerKeybind(e){
     const kb=getDrawerKeybind();
     const k=(e.key||'').toUpperCase();
     // normalize: for letter keys compare uppercase, for others compare as is
     const want=k===String(kb.key).toUpperCase();
-    return want && !!e.ctrlKey===!!kb.ctrl && !!e.shiftKey===!!kb.shift && !!e.altKey===!!kb.alt;
+    return want && modKey(e)===!!(kb.ctrl||kb.meta) && !!e.shiftKey===!!kb.shift && !!e.altKey===!!kb.alt;
   }
   let _keybindCapturing=false;
   let apiOnline=false;
@@ -839,7 +842,8 @@
     if(_sg && String(_sg).toLowerCase().indexOf('ranked') === 0) GMDel('bnc_session_gm');
     GMSet('bnc_host_mode', false);
   } catch {}
-  let drawerTab = GMGet('bnc_drawer_tab','stats'); // 'stats' | 'players'
+  let drawerTab = GMGet('bnc_drawer_tab','stats'); // 'stats' | 'players' | 'potato'
+  if(drawerTab!=='stats'&&drawerTab!=='players'&&drawerTab!=='potato') drawerTab='stats';
   let playersCache=null, playersPollTimer=null, playersLoading=false;
   let lobbyAudio=null;
   let bgLobbyPollTimer=null;
@@ -1018,7 +1022,7 @@
         <div style="opacity:0.7;font-size:12px">Loading…</div>
       </div>
       <div id="bnc-drawer-footer" style="padding:10px 14px;border-top:1px solid rgba(255,255,255,0.06);display:flex;justify-content:space-between;align-items:center;flex-shrink:0;font-size:11px;color:#6b7280">
-        <span id="bnc-drawer-version">v2.8.8</span>
+        <span id="bnc-drawer-version">v${BNC_VERSION}</span>
         <span id="bnc-drawer-api" style="display:flex;align-items:center;gap:6px"><span id="bnc-drawer-dot" style="width:8px;height:8px;border-radius:50%;background:#6b7280;display:inline-block"></span><span id="bnc-drawer-api-text">Offline</span></span>
       </div>`;
     // non-passthrough: stop game from seeing wheel/keys inside drawer
@@ -1094,7 +1098,7 @@
     else setDrawerOpen(!drawerOpen);
   }
   function switchDrawerTab(tab){
-    drawerTab = tab==='players' ? 'players' : 'stats';
+    drawerTab = tab==='players' ? 'players' : tab==='potato' ? 'potato' : 'stats';
     GMSet('bnc_drawer_tab', drawerTab);
     renderInfoPanel();
     if(drawerTab==='players'){ fetchPlayers(true); startPlayersPoll(); } else { stopPlayersPoll(); }
@@ -1191,10 +1195,11 @@
         stopPlayersPoll();
       }
     }
-    // tab bar - hide Players when in lobby per request
+    // tab bar - hide Players when in lobby per request (Potato graphics tab always visible)
+    const tabBtn=(id,label,active)=>`<button id="${id}" style="flex:1;max-width:100px;padding:6px 0;border-radius:999px;border:1px solid ${active?'#fff':'rgba(255,255,255,0.12)'};background:${active?'#fff':'#171717'};color:${active?'#000':'#9ca3af'};font-size:12px;font-weight:700;cursor:pointer">${label}</button>`;
     const tabBar = isLobbyTab
-      ? `<div style="display:flex;gap:6px;justify-content:center;width:100%;margin-bottom:4px"><button id="bnc-tab-stats" style="flex:1;max-width:120px;padding:6px 0;border-radius:999px;border:1px solid #fff;background:#fff;color:#000;font-size:12px;font-weight:700;cursor:pointer">Stats</button></div>`
-      : `<div style="display:flex;gap:6px;justify-content:center;width:100%;margin-bottom:4px"><button id="bnc-tab-stats" style="flex:1;max-width:120px;padding:6px 0;border-radius:999px;border:1px solid ${drawerTab==='stats'?'#fff':'rgba(255,255,255,0.12)'};background:${drawerTab==='stats'?'#fff':'#171717'};color:${drawerTab==='stats'?'#000':'#9ca3af'};font-size:12px;font-weight:700;cursor:pointer">Stats</button><button id="bnc-tab-players" style="flex:1;max-width:120px;padding:6px 0;border-radius:999px;border:1px solid ${drawerTab==='players'?'#fff':'rgba(255,255,255,0.12)'};background:${drawerTab==='players'?'#fff':'#171717'};color:${drawerTab==='players'?'#000':'#9ca3af'};font-size:12px;font-weight:700;cursor:pointer">Players</button></div>`;
+      ? `<div style="display:flex;gap:6px;justify-content:center;width:100%;margin-bottom:4px">${tabBtn('bnc-tab-stats','Stats',drawerTab==='stats')}${tabBtn('bnc-tab-potato','🥔 Potato',drawerTab==='potato')}</div>`
+      : `<div style="display:flex;gap:6px;justify-content:center;width:100%;margin-bottom:4px">${tabBtn('bnc-tab-stats','Stats',drawerTab==='stats')}${tabBtn('bnc-tab-players','Players',drawerTab==='players')}${tabBtn('bnc-tab-potato','🥔 Potato',drawerTab==='potato')}</div>`;
     const statsHtml = `
       <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;width:100%;padding:10px 0 6px 0">
         ${skinImg}
@@ -1251,12 +1256,26 @@
         playersHtml = header + `<div style="display:flex;flex-direction:column;gap:6px;align-items:center;width:100%;max-height:46vh;overflow-y:auto;padding-right:4px">${rows}</div>`;
       }
     }
-    body.innerHTML = tabBar + (drawerTab==='stats' ? statsHtml : `<div style="display:flex;flex-direction:column;align-items:center;width:100%;padding:8px 0">${playersHtml}</div>`);
+    // potato tab content (PotatoBuilds system — simple on/off)
+    const potOn = potIsEnabled();
+    const potatoHtml = `
+      <div style="display:flex;flex-direction:column;align-items:center;width:100%;padding:8px 0;gap:10px">
+        <div style="font-size:14px;font-weight:800;color:#fff">🥔 Potato Graphics <span style="font-size:10px;font-weight:600;color:#6b7280">v${POT_VERSION}</span></div>
+        <div id="bnc-pot-status" style="font-size:11px;color:#9ca3af;text-align:center;max-width:260px">${potStatusText().replace(/</g,'&lt;')}</div>
+        <label style="display:flex;align-items:center;gap:8px;font-size:12px;font-weight:700;color:#fff;cursor:pointer;background:#171717;border:1px solid rgba(255,255,255,0.12);border-radius:10px;padding:8px 12px;width:100%;max-width:280px;box-sizing:border-box"><input type="checkbox" id="bnc-potato-enabled"${potOn?' checked':''} style="accent-color:#F5C542;width:15px;height:15px"> Enable potato graphics</label>
+        <div style="font-size:11px;color:#F5C542;background:rgba(245,197,66,0.08);border:1px solid rgba(245,197,66,0.35);border-radius:10px;padding:8px 12px;max-width:280px;text-align:center">Reload the page yourself to apply changes.</div>
+        <div style="font-size:10px;font-weight:800;color:#9ca3af;letter-spacing:0.08em">LOADING SCREEN</div>
+        <label style="display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;color:#e5e7eb;cursor:pointer;background:#171717;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:8px 12px;width:100%;max-width:280px;box-sizing:border-box"><input type="checkbox" id="bnc-rebrand-enabled"${bncRebrandOn()?' checked':''} style="accent-color:#F5C542;width:15px;height:15px"> Nectar loading branding</label>
+      </div>
+    `;
+    body.innerHTML = tabBar + (drawerTab==='stats' ? statsHtml : drawerTab==='players' ? `<div style="display:flex;flex-direction:column;align-items:center;width:100%;padding:8px 0">${playersHtml}</div>` : potatoHtml);
     // tab handlers
     const tsBtn=document.getElementById('bnc-tab-stats');
     const tpBtn=document.getElementById('bnc-tab-players');
+    const ptBtn=document.getElementById('bnc-tab-potato');
     if(tsBtn) tsBtn.onclick=()=> switchDrawerTab('stats');
     if(tpBtn) tpBtn.onclick=()=> switchDrawerTab('players');
+    if(ptBtn) ptBtn.onclick=()=> switchDrawerTab('potato');
     // footer api dot
     const dot=document.getElementById('bnc-drawer-dot');
     const apiTxt=document.getElementById('bnc-drawer-api-text');
@@ -1270,12 +1289,12 @@
         if(_keybindCapturing) return;
         _keybindCapturing=true;
         kbBtn.textContent='Press new keybind…';
-        if(kbHint) kbHint.textContent='Press any combo (e.g. Ctrl+Shift+K). Esc to cancel.';
+        if(kbHint) kbHint.textContent='Press any combo (e.g. Ctrl+Shift+K, or Cmd+Shift+K on Mac). Esc to cancel.';
         const handler=(e)=>{
           if(e.key==='Escape'){ _keybindCapturing=false; kbBtn.textContent='Set open keybind: '+formatKeybind(getDrawerKeybind()); if(kbHint) kbHint.textContent='Cancelled.'; document.removeEventListener('keydown', handler, true); return; }
           if(['Control','Shift','Alt','Meta'].includes(e.key)) return;
           e.preventDefault(); e.stopPropagation();
-          const nb={ctrl:!!e.ctrlKey, shift:!!e.shiftKey, alt:!!e.altKey, key:String(e.key).toUpperCase()};
+          const nb={ctrl:!!e.ctrlKey, meta:!!e.metaKey, shift:!!e.shiftKey, alt:!!e.altKey, key:String(e.key).toUpperCase()};
           if(!nb.key) return;
           try{ GMSet('bnc_drawer_keybind', JSON.stringify(nb)); }catch{ GMSet('bnc_drawer_keybind', nb); }
           _keybindCapturing=false;
@@ -1302,6 +1321,27 @@
       };
       volSlider.oninput=syncVol;
       volSlider.onchange=syncVol;
+    }
+    // potato tab handlers (only present in potato tab)
+    const potRefreshStatus=()=>{ const st=document.getElementById('bnc-pot-status'); if(st) st.textContent=potStatusText(); };
+    const potEnabledEl=document.getElementById('bnc-potato-enabled');
+    if(potEnabledEl){
+      potEnabledEl.onchange=()=>{
+        GMSet('bnc_potato_enabled', !!potEnabledEl.checked);
+        logInfo(`[POTATO] enabled=${!!potEnabledEl.checked} — reload the page yourself to apply`);
+        showToast(potEnabledEl.checked?'Potato ON — reload the page yourself to apply':'Potato OFF — reload the page yourself', false);
+        potRefreshStatus();
+      };
+    }
+    const bncRebrandEl=document.getElementById('bnc-rebrand-enabled');
+    if(bncRebrandEl){
+      bncRebrandEl.onchange=()=>{
+        GMSet('bnc_loading_rebrand', !!bncRebrandEl.checked);
+        logInfo(`[REBRAND] loading branding ${bncRebrandEl.checked?'on — applying now':'off'}`);
+        showToast(bncRebrandEl.checked?'Nectar loading branding on':'Nectar loading branding off', false);
+        if(bncRebrandEl.checked){ try{ bncRebrandBoot(); bncRebrandOnce(); }catch{} renderInfoPanel(); }
+        else{ try{ bncRebrandStop(); }catch{} }
+      };
     }
     try{ updateLobbyMusic(); }catch(e){ logErr(`[AUDIO] update after render err ${e.message}`); }
     try{ prefetchLobbyMusic(); }catch{}
@@ -1334,6 +1374,171 @@
     statsPollTimer=setInterval(()=> fetchStats(false), interval);
   }
   function stopStatsPoll(){ if(statsPollTimer){ clearInterval(statsPollTimer); statsPollTimer=null; } }
+  // ==== Potato graphics (PotatoBuilds system) ====
+  // Gated by bnc_potato_enabled. Enable in the drawer Potato tab, then reload
+  // the page yourself — nothing auto-reloads.
+  const POT_VERSION='1.0.0';
+  const POT_TEXTURE_LIMIT=14;
+  function potIsEnabled(){ try{ return !!GMGet('bnc_potato_enabled', false); }catch{ return false; } }
+  function potPage(){ try{ return (typeof unsafeWindow!=='undefined'&&unsafeWindow)?unsafeWindow:window; }catch{ return window; } }
+  let potCtx=null, potBooted=false, potStartedAt=Date.now(), potLooping=false;
+  function potConnect(){
+    if(potCtx) return true;
+    let runtime=null;
+    try{ runtime=potPage()?.UnityWebModkit?.Runtime; }catch{}
+    if(!runtime||typeof runtime.createPlugin!=='function') return false;
+    try{
+      potCtx=runtime.createPlugin({ name:'PotatoBuilds', version:POT_VERSION,
+        referencedAssemblies:['ACTk.Runtime.dll','GameAssembly.dll','System.Runtime.InteropServices.dll','mscorlib.dll','PhotonRealtime.dll','PhotonUnityNetworking.dll','PhotonUnityNetworking.Utilities.dll','Assembly-CSharp.dll','UnityEngine.CoreModule.dll','UnityEngine.PhysicsModule.dll','UnityEngine.IMGUIModule.dll','UnityEngine.AnimationModule.dll'] });
+      try{ potPage().ctx=potCtx; }catch{}
+      logInfo('[POTATO] PotatoBuilds plugin connected');
+      return true;
+    }catch(e){ logInfo(`[POTATO] PotatoBuilds bridge failed: ${e.message}`); return false; }
+  }
+  function potClearUnityCache(){
+    try{
+      const idb=(potPage()&&potPage().indexedDB)||window.indexedDB;
+      if(!idb||typeof idb.deleteDatabase!=='function') return;
+      const del=idb.deleteDatabase('UnityCache');
+      del.onsuccess=()=>{ try{ logInfo('[POTATO] UnityCache deleted'); }catch{} };
+      del.onerror=()=>{ try{ logInfo('[POTATO] UnityCache delete failed'); }catch{} };
+      del.onblocked=()=>{ try{ logInfo('[POTATO] UnityCache delete blocked — close other tabs'); }catch{} };
+    }catch{}
+  }
+  class QualitySettings {
+    constructor(ptr){ this.ptr=ptr; this.ptrRef=v=>v?.ptr??v; }
+    static set anisotropicFiltering(v){ try{ potCtx.call('UnityEngine.QualitySettings','set_anisotropicFiltering',[v]); }catch{} }
+    static set globalTextureMipmapLimit(v){ try{ potCtx.call('UnityEngine.QualitySettings','set_globalTextureMipmapLimit',[v]); }catch{} }
+    static set lodBias(v){ try{ potCtx.call('UnityEngine.QualitySettings','set_lodBias',[v]); }catch{} }
+    static set maximumLODLevel(v){ try{ potCtx.call('UnityEngine.QualitySettings','set_maximumLODLevel',[v]); }catch{} }
+    static set pixelLightCount(v){ try{ potCtx.call('UnityEngine.QualitySettings','set_pixelLightCount',[v]); }catch{} }
+    static set realtimeReflectionProbes(v){ try{ potCtx.call('UnityEngine.QualitySettings','set_realtimeReflectionProbes',[v]); }catch{} }
+    static set shadowCascades(v){ try{ potCtx.call('UnityEngine.QualitySettings','set_shadowCascades',[v]); }catch{} }
+    static set shadowDistance(v){ try{ potCtx.call('UnityEngine.QualitySettings','set_shadowDistance',[v]); }catch{} }
+    static set shadowResolution(v){ try{ potCtx.call('UnityEngine.QualitySettings','set_shadowResolution',[v]); }catch{} }
+    static set shadows(v){ try{ potCtx.call('UnityEngine.QualitySettings','set_shadows',[v]); }catch{} }
+    static set softParticles(v){ try{ potCtx.call('UnityEngine.QualitySettings','set_softParticles',[v]); }catch{} }
+    static set vSyncCount(v){ try{ potCtx.call('UnityEngine.QualitySettings','set_vSyncCount',[v]); }catch{} }
+    static set enableLODCrossFade(v){ try{ potCtx.call('UnityEngine.QualitySettings','set_enableLODCrossFade',[v]); }catch{} }
+  }
+  function potLoop(){
+    if(potLooping) return;
+    potLooping=true;
+    let raf=null;
+    try{ raf=(potPage().requestAnimationFrame||window.requestAnimationFrame||function(f){ return setTimeout(f,16); }).bind(potPage()); }catch{ raf=function(f){ return setTimeout(f,16); }; }
+    const step=()=>{
+      try{
+        if(potIsEnabled()&&potCtx){
+          try{ const pg=potPage(); if(pg.unityGameInstance) pg.unityInstance=pg.unityGameInstance; }catch{}
+          QualitySettings.globalTextureMipmapLimit=POT_TEXTURE_LIMIT;
+        }
+      }catch{}
+      try{ raf(step); }catch{}
+    };
+    try{ raf(step); }catch{}
+  }
+  function potStatusText(){
+    if(!potIsEnabled()) return 'Disabled — tick the box, then reload the page yourself.';
+    return `Active · PotatoBuilds v${POT_VERSION} · texture limit ${POT_TEXTURE_LIMIT} · bridge ${potCtx?'connected':'waiting for Unity…'}`;
+  }
+  function potBoot(){
+    if(potBooted||!potIsEnabled()) return;
+    potBooted=true;
+    logInfo(`[POTATO] PotatoBuilds v${POT_VERSION} enabled — clearing UnityCache, waiting for Unity runtime`);
+    try{ potClearUnityCache(); }catch{}
+    const poll=setInterval(()=>{
+      try{
+        if(potCtx){ clearInterval(poll); return; }
+        if(Date.now()-potStartedAt>60000){ clearInterval(poll); logInfo('[POTATO] Unity runtime not detected — potato idle'); return; }
+        if(!potConnect()) return;
+        clearInterval(poll);
+        logInfo('[POTATO] PotatoBuilds active — texture limit applied every frame');
+        potLoop();
+      }catch(e){ try{ clearInterval(poll); }catch{} }
+    },500);
+  }
+  try{ potBoot(); }catch(e){}
+  // ==== Loading-screen branding (Nectar rebrand of the CrazyGames loading shell) ====
+  // Replaces the stock loading headline/cover with Nectar text + banner. Polls briefly
+  // because the CrazyGames shell renders after document-start. Emotion hashes
+  // (.css-*) can change on CrazyGames rebuilds, so cover matching falls back to src.
+  const BNC_REBRAND_BANNER = 'https://mnpwvwjqawmuqmickteu.supabase.co/storage/v1/object/public/lobby-music/nectar_banner.png';
+  const BNC_REBRAND_TITLE = 'Nectar - Buildnow Enhanced';
+  function bncRebrandOn(){ try{ return GMGet('bnc_loading_rebrand', true) !== false; }catch{ return true; } }
+  function bncRebrandSetText(el,txt){
+    if(!el) return false;
+    try{
+      const cur=el.textContent;
+      if(cur===txt) return true;
+      el.textContent=txt;
+      try{ if(el.innerText!==undefined&&el.innerText!==txt) el.innerText=txt; }catch{}
+      return true;
+    }catch{ return false; }
+  }
+  function bncRebrandOnce(){
+    if(!bncRebrandOn()) return 'disabled';
+    let found=false, changed=false;
+    const launching=`Launching With Nectar v${BNC_VERSION}`;
+    // headline title (stable id on the CrazyGames loading shell)
+    try{
+      const title=document.getElementById('overlayThumbnailTitle');
+      if(title){ found=true; const before=title.textContent; if(bncRebrandSetText(title,BNC_REBRAND_TITLE)&&before!==BNC_REBRAND_TITLE) changed=true; }
+    }catch{}
+    // rotating loading messages — CrazyGames cycles msg0..msgN, so enforce every tick
+    try{
+      const msgs=document.querySelectorAll('._messages_fbnci_122 div')||[];
+      for(const m of msgs){ found=true; const before=m.textContent; if(bncRebrandSetText(m,launching)&&before!==launching) changed=true; }
+    }catch{}
+    // legacy unlocker selectors (other CrazyGames shell builds)
+    try{
+      const head1=document.querySelector('.css-vuljoq');
+      const t1=head1&&(head1.children&&head1.children[0]);
+      if(t1){ found=true; const before=t1.textContent; if(bncRebrandSetText(t1,launching)&&before!==launching) changed=true; }
+    }catch{}
+    try{
+      const head2=document.querySelector('.css-inwm4l');
+      const t2=head2&&(head2.children&&head2.children[0]);
+      if(t2){ found=true; const before=t2.textContent; if(bncRebrandSetText(t2,BNC_REBRAND_TITLE)&&before!==BNC_REBRAND_TITLE) changed=true; }
+    }catch{}
+    // cover art (background + thumbnail): swap every matching img, drop srcset
+    try{
+      const imgs=[...(document.querySelectorAll('img')||[])];
+      for(const im of imgs){
+        let isCover=false;
+        try{
+          const s=(im.currentSrc||im.src||'')+'';
+          const c=(im.className&&im.className.baseVal!==undefined?im.className.baseVal:im.className||'')+'';
+          const ss=(im.getAttribute&&im.getAttribute('srcset'))||im.srcset||'';
+          isCover=s.includes('buildnow-gg_16x9-cover')||String(ss).includes('buildnow-gg_16x9-cover')||String(c).includes('_root_gg1yh_');
+        }catch{}
+        if(!isCover) continue;
+        found=true;
+        try{ if(im.src!==BNC_REBRAND_BANNER){ im.src=BNC_REBRAND_BANNER; changed=true; } }catch{}
+        try{ if(im.srcset){ im.removeAttribute('srcset'); changed=true; } }catch{}
+        try{ if(im.getAttribute&&im.getAttribute('srcset')){ im.removeAttribute('srcset'); changed=true; } }catch{}
+      }
+    }catch{}
+    return !found?'waiting':(changed?'applied':'enforced');
+  }
+  let bncRebrandTimer=null, bncRebrandLogged=false;
+  function bncRebrandBoot(){
+    if(bncRebrandTimer) return;
+    if(!bncRebrandOn()) return;
+    logInfo('[REBRAND] loading-screen branding on');
+    // persistent: the shell rotates loading messages on its own timer, so
+    // re-enforce while the loading screen is present (writes are idempotent)
+    bncRebrandTimer=setInterval(()=>{
+      let st='waiting';
+      try{ st=bncRebrandOnce(); }catch{}
+      if(st!=='waiting'&&!bncRebrandLogged){ bncRebrandLogged=true; logInfo('[REBRAND] loading screen branded'); }
+      if(st==='waiting') bncRebrandLogged=false;
+    },800);
+  }
+  function bncRebrandStop(){
+    try{ if(bncRebrandTimer){ clearInterval(bncRebrandTimer); } }catch{}
+    bncRebrandTimer=null; bncRebrandLogged=false;
+  }
+  try{ bncRebrandBoot(); }catch(e){}
   // auto-create drawer shell immediately so handle is visible + hidden audio tag that auto plays
   setTimeout(()=>{ ensureLobbyAudio(); createInfoPanel(); renderInfoPanel(); if(drawerOpen){ startStatsPoll(); if(drawerTab==='players') startPlayersPoll(); } if(sessionId) startBgLobbyPoll(); }, 700);
   // refresh when session established after login
@@ -1350,7 +1555,7 @@
     const ov=document.createElement('div');
     ov.id='bnc-keys';
     Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483646', background:'rgba(0,0,0,0.54)', display:'none', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif'});
-    ov.innerHTML = `<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:20px;min-width:360px;max-width:520px;color:#e5e7eb"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><b style="font-size:15px;color:#fff">BuildNow Companion - Shortcuts & Settings</b><button id="bnc-keys-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 8px;cursor:pointer">Close</button></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;line-height:1.6"><div><code>Ctrl+Shift+C</code> - Collect toggle<br><code>Ctrl+Shift+S</code> - Save collected<br><code>Ctrl+Shift+L</code> - Load file<br><code>Ctrl+Shift+R</code> - Replay</div><div><code>Ctrl+Shift+F</code> - Feed (dev only)<br><code>Ctrl+Shift+P</code> - Pause feed<br><code id="bnc-keys-drawer-label">Ctrl+Shift+I</code> - Player info<br><code>Ctrl+Shift+K</code> - This menu</div></div><div style="margin-top:14px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);font-size:11px;opacity:0.7">Settings: <label style="cursor:pointer"><input type="checkbox" id="bnc-dev-toggle"> Dev mode (feed)</label></div></div>`;
+    ov.innerHTML = `<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:20px;min-width:360px;max-width:520px;color:#e5e7eb"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><b style="font-size:15px;color:#fff">BuildNow Companion - Shortcuts & Settings</b><button id="bnc-keys-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 8px;cursor:pointer">Close</button></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;line-height:1.6"><div><code>Ctrl+Shift+C</code> - Collect toggle<br><code>Ctrl+Shift+S</code> - Save collected<br><code>Ctrl+Shift+L</code> - Load file<br><code>Ctrl+Shift+R</code> - Replay</div><div><code>Ctrl+Shift+F</code> - Feed (dev only)<br><code>Ctrl+Shift+P</code> - Pause feed<br><code id="bnc-keys-drawer-label">Ctrl+Shift+I</code> - Player info<br><code>Ctrl+Shift+K</code> - This menu</div></div><div style="margin-top:10px;font-size:11px;opacity:0.7">Mac tip: use ⌘ instead of Ctrl — Cmd+Shift+&lt;key&gt; works the same.</div><div style="margin-top:14px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);font-size:11px;opacity:0.7">Settings: <label style="cursor:pointer"><input type="checkbox" id="bnc-dev-toggle"> Dev mode (feed)</label></div></div>`;
     (document.body||document.documentElement).appendChild(ov);
     ov.addEventListener('click', (e)=>{ if(e.target===ov) ov.style.display='none'; });
     ov.querySelector('#bnc-keys-close').onclick=()=> ov.style.display='none';
@@ -1366,7 +1571,7 @@
     if(_keybindCapturing) return;
     if (isModalOrInputFocused()) return;
     if(isDrawerKeybind(e)){ e.preventDefault(); e.stopPropagation(); toggleInfoPanel(); return; }
-    if(e.ctrlKey && e.shiftKey && (e.key||'').toUpperCase()==='K'){ e.preventDefault(); e.stopPropagation(); toggleKeybinds(); }
+    if(modKey(e) && e.shiftKey && (e.key||'').toUpperCase()==='K'){ e.preventDefault(); e.stopPropagation(); toggleKeybinds(); }
   }, true);
 
   // Ranked UI removed — ranked is not ready. (Host mode toggle removed too;

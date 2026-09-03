@@ -15,9 +15,11 @@ Philosophy (from user spec):
 Invariants enforced here:
   - No other packet type may flip state (killfeed, stG, skin, etc are ignored).
   - No state flicker: if target == current, suppress and log at debug.
-  - GM (game_mode) is set ONLY on MATCH enter via SCENE's gm/curScn inference and
-    is locked for the lifetime of the MATCH.  It is cleared only on MATCH exit
-    (LOBBY enter).  Mid-match GM updates are dropped — prevents flicker.
+- GM (game_mode) is set on MATCH enter via SCENE's gm/curScn inference and
+  may be corrected by curScn afterwards (curScn is ground truth: join packets
+  default gm=DF). DF/UNKNOWN never clobber a concrete mode, and mid-match
+  concrete-vs-concrete mismatches are still dropped as flicker. Cleared only
+  on MATCH exit (LOBBY enter).
   - on_enter / on_exit hooks are the ONLY place that mutates state/gm/zone
     and playtime last_state.  Callers must not write room.state directly.
 """
@@ -173,20 +175,28 @@ class RoomFSM:
     def _on_enter(room, view, old: State, new: State, via, session_id, packet, gpb, cur_scn):
         # LOBBY -> MATCH : lock GM exactly once
         if old == State.LOBBY and new == State.MATCH:
-            # Prefer packet.game_mode (from gm param) else infer from curScn.  Only set if unset.
+            # Prefer packet.game_mode (from gm param) else infer from curScn.
+            # curScn is ground truth: join/matchmaking packets default gm=DF, so a
+            # DF/blank room adopts the scene mode (ZoneWars_LateGame -> zw_lg).
+            # adopt_game_mode never clobbers with DF and only corrects
+            # concrete-vs-concrete, so lobby scenes stay safe.
             gm = packet.game_mode if packet and packet.game_mode else None
-            if not gm and cur_scn:
+            if (not gm or gm == GameMode.DF or gm == GameMode.UNKNOWN) and cur_scn:
                 try:
-                    gm = GameMode.from_curscn(cur_scn)
+                    scene_gm = GameMode.from_curscn(cur_scn)
+                    if scene_gm is not None:
+                        gm = scene_gm
                 except Exception:
-                    gm = None
-            if gm and not room.game_mode:
-                room.game_mode = gm
-                log_engine("room", session_id[:8], action="gm", gm=gm.value, room=room.room_id[:8], via=f"fsm:{via}")
-            elif gm and room.game_mode and gm != room.game_mode:
-                # flicker guard: mid-match gm mismatch -> drop, keep original
-                log_engine("debug", session_id[:8],
-                           msg=f"gm flicker suppressed {room.game_mode.value} != {gm.value}", room=room.room_id[:8])
+                    pass
+            if gm:
+                try:
+                    if room.adopt_game_mode(gm):
+                        log_engine("room", session_id[:8], action="gm", gm=room.game_mode.value, room=room.room_id[:8], via=f"fsm:{via}")
+                    elif gm != room.game_mode:
+                        log_engine("debug", session_id[:8],
+                                   msg=f"gm flicker suppressed {room.game_mode.value} != {gm.value}", room=room.room_id[:8])
+                except Exception:
+                    pass
             # if still no gm, keep pending_gm plumbing in engine.py to fill later on pending pop
             room.cur_scn = cur_scn
             # new match = new life: reset per-life death/defeat flags + drain markers
@@ -194,6 +204,9 @@ class RoomFSM:
             room.had_self_defeat = False
             room.last_win_version = -1
             room.last_defeat_version = -1
+            # clear any unconsumed phase-end arm from the previous match (drain is
+            # edge-triggered now: a batch ending on stG=2 must not leak its arm here)
+            room.stg_is_phase_end = False
             # fresh routing + history: drop previous match's actor names, kills, knocks
             # (rebuilt from Join/alv/killfeed packets; players/teams/counts are live-managed)
             try:
