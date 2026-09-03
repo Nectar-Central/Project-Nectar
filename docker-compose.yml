@@ -1,0 +1,41 @@
+# BNGC self-hosted API.
+#
+# Usage:
+#   1. Fill server/.env (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+#      UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN). Never commit it.
+#   2. docker compose up --build -d
+#   3. Check GET http://localhost:8000/api/health
+#      (upstash_configured + reachable should be true)
+#   4. Point the userscript at it:
+#        same machine → open the game with ?api=local in the URL, or
+#        any machine  → Tampermonkey dashboard → script Settings →
+#                       userscript GM value bnc_api_base = http://<server-ip>:8000
+#
+# Notes:
+#   - Single replica on purpose: engine sessions live in process memory.
+#     (Multi-replica works via Upstash hydration but can last-write-wins races.)
+#   - Supabase stays hosted (no local postgres needed).
+#   - Upstash stays cloud (free tier is plenty) — the API only needs its REST URL/token.
+#   - Behind HTTPS pages, plain http:// works via GM_xmlhttpRequest (privileged
+#     context, no mixed-content block). For friends over the internet, put this
+#     behind TLS (Caddy/traefik landlords do it in ~5 lines) and use https:// URL.
+services:
+  api:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: bngc-api:latest
+    container_name: bngc-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - server/.env
+    deploy:
+      replicas: 1
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=5)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

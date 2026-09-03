@@ -1,0 +1,16 @@
+# Never bake secrets or junk into the image
+**/.env
+**/__pycache__/
+**/*.pyc
+.git/
+.gitignore
+.venv/
+venv/
+node_modules/
+logs/
+server/logs/
+companion/captures/
+dist/
+build/
+.vercel/
+*.md
