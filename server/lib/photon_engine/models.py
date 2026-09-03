@@ -46,6 +46,27 @@ class Player:
     def to_dict(self) -> dict:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "Player | None":
+        """Rebuild from to_dict() — tolerant of missing keys (old caches)."""
+        if not isinstance(d, dict):
+            return None
+        try:
+            return cls(
+                actor_nr=int(d.get("actor_nr", -1)),
+                username=str(d.get("username") or ""),
+                game_id=d.get("game_id"),
+                skin=d.get("skin"),
+                pickaxe=d.get("pickaxe"),
+                is_ready=bool(d.get("is_ready", False)),
+                is_alive=bool(d.get("is_alive", True)),
+                is_self=bool(d.get("is_self", False)),
+                pt=d.get("pt"),
+                late_join=bool(d.get("late_join", False)),
+            )
+        except Exception:
+            return None
+
 
 @dataclass
 class Room:
@@ -81,6 +102,16 @@ class Party:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "Party":
+        """Rebuild from to_dict() — tolerant of missing keys (old caches)."""
+        if not isinstance(d, dict):
+            return cls()
+        try:
+            return cls(is_party=bool(d.get("is_party", False)), code=d.get("code"))
+        except Exception:
+            return cls()
 
 
 @dataclass
@@ -155,6 +186,32 @@ class Zone:
             pass
         return d
 
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "Zone":
+        """Rebuild from to_dict() — ignores computed keys, tolerant of missing."""
+        if not isinstance(d, dict):
+            return cls()
+        try:
+            z = cls()
+            if d.get("time") is not None:
+                try:
+                    z.time = int(d["time"])
+                except Exception:
+                    pass
+            z.phase = d.get("phase")
+            z.pattern = d.get("pattern")
+            try:
+                z.started_at = float(d["started_at"]) if d.get("started_at") is not None else None
+            except Exception:
+                z.started_at = None
+            try:
+                z.initial_time = int(d["initial_time"]) if d.get("initial_time") is not None else None
+            except Exception:
+                z.initial_time = None
+            return z
+        except Exception:
+            return cls()
+
 
 @dataclass
 class KillInfo:
@@ -174,6 +231,20 @@ class KillInfo:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "KillInfo | None":
+        """Rebuild from to_dict() — skips entries with no names."""
+        if not isinstance(d, dict):
+            return None
+        try:
+            ig = str(d.get("instigator") or "")
+            ed = str(d.get("instigated") or "")
+            if not ig and not ed:
+                return None
+            return cls(instigator=ig, instigated=ed, event_type=str(d.get("event_type") or "killed"))
+        except Exception:
+            return None
 
 
 @dataclass
@@ -219,6 +290,21 @@ class Team:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "Team | None":
+        """Rebuild from to_dict() — needs a team_id."""
+        if not isinstance(d, dict) or not d.get("team_id"):
+            return None
+        try:
+            members = d.get("members") or []
+            return cls(
+                team_id=str(d["team_id"]),
+                members=[str(m) for m in members if m is not None],
+                is_self_team=bool(d.get("is_self_team", False)),
+            )
+        except Exception:
+            return None
 
 
 @dataclass
@@ -291,8 +377,8 @@ class RoomView:
             "zone": self.zone.to_dict(),
             "party": self.party.to_dict(),
             "teams": {tid: t.to_dict() for tid, t in self.teams.items()},
-            "recent_kills": [k.to_dict() for k in self.recent_kills[-20:]],
-            "recent_knocks": [k.to_dict() for k in self.recent_knocks[-20:]],
+            "recent_kills": [k.to_dict() for k in self.recent_kills[-100:]],
+            "recent_knocks": [k.to_dict() for k in self.recent_knocks[-100:]],
             "match_version": self.match_version,
             "match_playtime": self.match_playtime.to_dict(),
             "stg_is_phase_end": self.stg_is_phase_end,
@@ -300,8 +386,100 @@ class RoomView:
             "last_defeat_version": self.last_defeat_version,
             "had_self_death": self.had_self_death,
             "had_self_defeat": self.had_self_defeat,
+            "last_stg": self.last_stg,
             "winner": self.winner,
+            "created_at": self.created_at,
         }
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "RoomView | None":
+        """Rebuild from to_dict() — tolerant of missing keys (old caches).
+
+        Used to restore engine state on serverless workers (Upstash cache).
+        Int-keyed maps (players/actor_map/pending_pt) are restored to ints.
+        """
+        if not isinstance(d, dict) or not d.get("room_id"):
+            return None
+        try:
+            r = cls(room_id=str(d["room_id"]), code=d.get("code"))
+            r.short_code = d.get("short_code")
+            me = Player.from_dict(d.get("me"))
+            r.me = me
+            players = d.get("players") or {}
+            for k, pd in players.items():
+                try:
+                    ik = int(k)
+                except Exception:
+                    continue
+                p = Player.from_dict(pd)
+                if p is not None:
+                    r.players[ik] = p
+            for k, v in (d.get("actor_map") or {}).items():
+                try:
+                    r.actor_map[int(k)] = str(v)
+                except Exception:
+                    continue
+            for k, v in (d.get("pending_pt") or {}).items():
+                try:
+                    r.pending_pt[int(k)] = str(v)
+                except Exception:
+                    continue
+            r.gv = d.get("gv")
+            try:
+                r.players_count = int(d.get("players_count") or 0)
+            except Exception:
+                pass
+            if d.get("max_players") is not None:
+                try:
+                    r.max_players = int(d["max_players"])
+                except Exception:
+                    pass
+            try:
+                r.state = State(d["state"]) if d.get("state") else State.LOBBY
+            except Exception:
+                r.state = State.LOBBY
+            r.game_mode = GameMode.from_gm(d.get("game_mode"))
+            r.cur_scn = d.get("cur_scn")
+            r.zone = Zone.from_dict(d.get("zone"))
+            r.party = Party.from_dict(d.get("party"))
+            for tid, td in (d.get("teams") or {}).items():
+                t = Team.from_dict(td)
+                if t is not None:
+                    r.teams[str(tid)] = t
+            for kd in (d.get("recent_kills") or [])[-100:]:
+                k = KillInfo.from_dict(kd)
+                if k is not None:
+                    r.recent_kills.append(k)
+            for kd in (d.get("recent_knocks") or [])[-100:]:
+                k = KillInfo.from_dict(kd)
+                if k is not None:
+                    r.recent_knocks.append(k)
+            try:
+                r.match_version = int(d.get("match_version") or 0)
+            except Exception:
+                pass
+            r.match_playtime = Playtime.from_dict(d.get("match_playtime"))
+            r.stg_is_phase_end = bool(d.get("stg_is_phase_end", False))
+            try:
+                r.last_win_version = int(d.get("last_win_version", -1))
+            except Exception:
+                pass
+            try:
+                r.last_defeat_version = int(d.get("last_defeat_version", -1))
+            except Exception:
+                pass
+            r.had_self_death = bool(d.get("had_self_death", False))
+            r.had_self_defeat = bool(d.get("had_self_defeat", False))
+            if d.get("last_stg") is not None:
+                try:
+                    r.last_stg = int(d["last_stg"])
+                except Exception:
+                    pass
+            r.winner = d.get("winner")
+            r.created_at = d.get("created_at")
+            return r
+        except Exception:
+            return None
 
 
 @dataclass
@@ -316,6 +494,28 @@ class Playtime:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "Playtime":
+        """Rebuild from to_dict() — tolerant of missing keys (old caches)."""
+        if not isinstance(d, dict):
+            return cls()
+        try:
+            per_gm = d.get("per_gm") or {}
+            last_at = None
+            try:
+                last_at = float(d["last_state_at"]) if d.get("last_state_at") is not None else None
+            except Exception:
+                last_at = None
+            return cls(
+                total_seconds=int(d.get("total_seconds") or 0),
+                per_gm={str(k): int(v) for k, v in per_gm.items()},
+                lobby_seconds=int(d.get("lobby_seconds") or 0),
+                last_state=d.get("last_state"),
+                last_state_at=last_at,
+            )
+        except Exception:
+            return cls()
 
 
 @dataclass
@@ -456,6 +656,33 @@ class SessionView:
             "room": self.room.to_dict(),
             "party": self.party.to_dict() if cur else Party().to_dict(),
             "teams": {tid: t.to_dict() for tid, t in cur.teams.items()} if cur else {},
-            "recent_kills": [k.to_dict() for k in self.recent_kills[-20:]],
-            "recent_knocks": [k.to_dict() for k in self.recent_knocks[-20:]],
+            "recent_kills": [k.to_dict() for k in self.recent_kills[-100:]],
+            "recent_knocks": [k.to_dict() for k in self.recent_knocks[-100:]],
         }
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "SessionView | None":
+        """Rebuild from to_dict() — tolerant of missing keys (old caches).
+
+        Used to restore engine state on serverless workers (Upstash cache).
+        Proxy-only top-level keys (players/state/...) are derived, not restored.
+        """
+        if not isinstance(d, dict) or not d.get("session_id"):
+            return None
+        try:
+            v = cls(session_id=str(d["session_id"]))
+            v.me = Player.from_dict(d.get("me"))
+            for rid, rd in (d.get("rooms") or {}).items():
+                r = RoomView.from_dict(rd)
+                if r is not None:
+                    v.rooms[str(rid)] = r
+            v.current_room_id = d.get("current_room_id")
+            try:
+                v.usernameChangeCount = int(d.get("usernameChangeCount") or 0)
+            except Exception:
+                pass
+            v.playtime = Playtime.from_dict(d.get("playtime"))
+            v.host_mode = bool(d.get("host_mode", False))
+            return v
+        except Exception:
+            return None

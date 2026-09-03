@@ -1088,6 +1088,10 @@ class Engine:
         """Get SessionView for a session_id (read-only)."""
         return self._sessions.get(session_id)
 
+    def put_session(self, session_id: str, view: "SessionView") -> None:
+        """Store a hydrated SessionView (serverless restore from Upstash cache)."""
+        self._sessions[session_id] = view
+
     # -------------------------------------------------------------------
     # Helpers
     # -------------------------------------------------------------------

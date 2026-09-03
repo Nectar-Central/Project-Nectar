@@ -83,6 +83,21 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
             db.update_session_sync(auth_session_id, {"current_token": new_token, "token_counter": new_counter})
             log_sys(f"CAPTURE token ok auth={str(auth_session_id)[:8]} req={req_token} → new {new_token} counter {sess['token_counter']}->{new_counter}")
 
+    # Serverless: restore engine state from Upstash when this worker has none.
+    # Without this, every fresh lambda starts from a blank session (rooms/players/
+    # FSM rebuilt per batch in isolation) — the states bug seen on Vercel.
+    if auth_session_id and engine.get_session(auth_session_id) is None:
+        try:
+            cached = await cache.get_session_state(auth_session_id)
+            if cached:
+                from ..lib.photon_engine.models import SessionView
+                restored = SessionView.from_dict(cached)
+                if restored is not None:
+                    engine.put_session(auth_session_id, restored)
+                    log_sys(f"CAPTURE restored engine state for {auth_session_id[:8]} rooms={len(restored.rooms)}")
+        except Exception as e:
+            log_err(f"CAPTURE restore failed {auth_session_id[:8]} {e}")
+
     # Feed engine per session — no DB writes, just abstract data
     # Build one packet dict PER record (processor needs every packet, not just the last)
     packets = []
@@ -128,18 +143,18 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
         except Exception:
             pass
 
-    # Schedule your DB writes in background — token already rotated inline, so POST stays fast
-    # Your script (server/scripts/processor.py) will use `packets` + `session` to decide kills/wins
+    # Run DB writes inline (awaited) — BackgroundTasks are unreliable on serverless
+    # (frozen after response) and this keeps local + Vercel behavior identical.
+    # Never let DB failures break the 200 response (token already rotated inline).
+    # Your script (server/scripts/processor.py) uses `packets` + `session` for kills/wins.
     if auth_session_id and packets and session_dict:
         try:
             from server.scripts.processor import process_batch
-            async def _run_processor():
-                try:
-                    await process_batch(auth_session_id, packets, view)
-                except Exception as e:
-                    log_err(f"PROCESSOR FAILED session={auth_session_id[:8]} {type(e).__name__}: {e}")
-            background_tasks.add_task(_run_processor)
-            log_sys(f"CAPTURE scheduled processor for {auth_session_id[:8]} {len(packets)} packets session players={view.players_count if view else '?'}")
+            try:
+                await process_batch(auth_session_id, packets, view)
+                log_sys(f"CAPTURE processed {auth_session_id[:8]} {len(packets)} packets session players={view.players_count if view else '?'}")
+            except Exception as e:
+                log_err(f"PROCESSOR FAILED session={auth_session_id[:8]} {type(e).__name__}: {e}")
         except Exception as e:
             log_err(f"CAPTURE processor import failed {e} — packets still returned, DB write skipped")
 
