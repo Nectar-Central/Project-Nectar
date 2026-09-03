@@ -803,7 +803,7 @@ async def alerts_cmd(interaction: discord.Interaction, limit: int = 5):
     for a in rows[:limit]:
         t = a.get("alert_type", "?")
         who = f"<@{a.get('discord_id')}>"
-        where = f"{a.get('country') or '?'} {a.get('ip_address') or ''}".strip()
+        where = f"{a.get('country') or '?'}"  # country only — never show IPs
         e.add_field(name=f"#{a['id']} {t} — {fmt.fmt_date(a.get('created_at'))}", value=f"{who} {where}\n{(a.get('details') or {}).get('reason','')[:200]}", inline=False)
     await interaction.followup.send(embed=e, ephemeral=True)
 

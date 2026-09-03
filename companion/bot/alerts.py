@@ -28,6 +28,10 @@ async def mark_notified(alert_id: int):
     except Exception:
         pass
 
+# Detail keys that may carry an IP — never rendered to users (DB keeps them).
+_IP_DETAIL_KEYS = {"ip", "ip_address", "ipaddress", "used_ip", "locked_ip", "client_ip", "remote_ip"}
+
+
 def build_embed(a: dict) -> discord.Embed:
     t = (a.get("alert_type") or "login").lower()
     cfg = TYPE_CFG.get(t, TYPE_CFG["login"])
@@ -43,15 +47,14 @@ def build_embed(a: dict) -> discord.Embed:
         e.add_field(name="Game ID", value=str(a["game_id"])[:32], inline=True)
     if a.get("country"):
         e.add_field(name="Country", value=str(a["country"]), inline=True)
-    if a.get("ip_address"):
-        e.add_field(name="IP", value=str(a["ip_address"])[:45], inline=True)
+    # NEVER show IPs to users — country only. IP stays in DB for enforcement.
     details = a.get("details") or {}
     if isinstance(details, dict) and details:
         # show reason if present
         if details.get("reason"):
             e.add_field(name="Reason", value=str(details["reason"])[:500], inline=False)
-        # keep other details truncated
-        rest = {k:v for k,v in details.items() if k not in ("reason",)}
+        # keep other details truncated, scrubbing any IP-ish keys
+        rest = {k:v for k,v in details.items() if k not in ("reason",) and k.lower() not in _IP_DETAIL_KEYS}
         if rest:
             e.add_field(name="Details", value=str(rest)[:900], inline=False)
     e.timestamp = discord.utils.parse_time(a.get("created_at")) if a.get("created_at") else None
