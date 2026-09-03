@@ -197,11 +197,14 @@ class Engine:
 
         packet = self._gpb_to_abstract(hex_string, gpb)
 
-        # Visibility: log packets that classified as UNKNOWN (nothing should be invisible)
+        # Visibility: log packets that classified as UNKNOWN (nothing should be invisible).
+        # For evCode 101, include the raw killfeed text so unrecognized verbs/formats
+        # are diagnosable from logs alone (no capture file needed).
         if packet.packet_type == PacketType.UNKNOWN and gpb:
             unk_props = list((gpb.get("properties") or {}).keys())[:8]
             unk_pp = list((gpb.get("playerProps") or {}).keys())[:8]
-            log_engine("debug", session_id[:8], msg=f"unknown pkt ev={gpb.get('evName')}/{gpb.get('opName')} evCode={gpb.get('evCode')} op={gpb.get('op')} props={unk_props} playerProps={unk_pp} hex={hex_string[:32]}..")
+            unk_kf = f" killfeed={gpb.get('killfeed')!r}" if gpb.get("evCode") == 101 and gpb.get("killfeed") else ""
+            log_engine("debug", session_id[:8], msg=f"unknown pkt ev={gpb.get('evName')}/{gpb.get('opName')} evCode={gpb.get('evCode')} op={gpb.get('op')} props={unk_props} playerProps={unk_pp}{unk_kf} hex={hex_string[:32]}..")
 
         # Ensure we have a RoomView to scope to
         # If no current room, create a default lobby room
@@ -407,6 +410,7 @@ class Engine:
                     is_alive=True,
                     is_self=True,
                     pt=str(gpb["playerProps"].get("_pt") or gpb["playerProps"].get("pt") or "") or None,
+                    late_join=(room.state == State.MATCH),
                 )
             else:
                 view.me.username = str(new_name)
@@ -563,8 +567,9 @@ class Engine:
                 if isinstance(pp, dict) and isinstance(pp.get("255"), str):
                     if actor_nr is not None:
                         try:
-                            room.actor_map[int(actor_nr)] = str(pp["255"])
-                            log_engine("debug", session_id[:8], msg=f"actor_map single actor={int(actor_nr)} name={pp['255']} map={sorted(list(room.actor_map.items()))[:8]}", room=room.room_id[:8])
+                            # Strip color tags so map names match _names_equal comparisons
+                            room.actor_map[int(actor_nr)] = _strip_color_tags(str(pp["255"])).strip()
+                            log_engine("debug", session_id[:8], msg=f"actor_map single actor={int(actor_nr)} name={room.actor_map[int(actor_nr)]} map={sorted(list(room.actor_map.items()))[:8]}", room=room.room_id[:8])
                         except Exception:
                             pass
                     pp_norm: dict | None = None  # flat props: skip the actorNr-map loop below
@@ -594,7 +599,7 @@ class Engine:
                             if isinstance(uname, dict) and "value" in uname:
                                 uname = uname["value"]
                         if uname:
-                            uname = str(uname)
+                            uname = _strip_color_tags(str(uname)).strip()
                             room.actor_map[actor_nr] = uname
                             added.append((actor_nr, uname))
                             # Also ensure player exists in room.players if not already
@@ -798,6 +803,7 @@ class Engine:
                         is_alive=True,
                         is_self=False,
                         pt=pt,
+                        late_join=(room.state == State.MATCH),
                     )
                     if pt: _rebuild_teams(room)
                     # Increment count for private rooms (CreateRoom) — for random rooms count is seeded from max, don't increment
@@ -815,12 +821,21 @@ class Engine:
             log_engine("debug", session_id[:8], msg=f"JOIN no name gpb={gpb.get('evName')}/{gpb.get('opName')} playerProps={pp_keys} props={props_keys} gpb_keys={gpb_keys}", room=room.room_id[:8])
 
         # ---- LEAVE (room-scoped, log explicitly) ----
+        # Removes the player from players AND actor_map so rosters never accumulate
+        # ghosts (queue leavers, mid-match quits). Name and actor both pruned.
         if packet.packet_type == PacketType.LEAVE and packet.player_name:
             to_del = None
             for k, p in room.players.items():
                 if _names_equal(p.username, packet.player_name) or (actor_nr is not None and k == int(actor_nr)):
                     to_del = k
                     break
+            if actor_nr is not None:
+                try:
+                    room.actor_map.pop(int(actor_nr), None)  # prune by actor number
+                except Exception:
+                    pass
+            for _ak in [ak for ak, an in room.actor_map.items() if _names_equal(an, packet.player_name)]:
+                room.actor_map.pop(_ak, None)  # prune by name (covers queue leaves)
             if to_del is not None:
                 room.players.pop(to_del, None)
                 if room.players_count > 0:
@@ -893,6 +908,7 @@ class Engine:
                         is_alive=packet.is_alive,
                         is_self=_names_equal(alv_name, view.me.username if view.me else None),
                         pt=pt,
+                        late_join=(room.state == State.MATCH),
                     )
                     if pt: _rebuild_teams(room)
                     room.players[key] = target
@@ -1006,6 +1022,7 @@ class Engine:
                                     username=name,
                                     is_alive=not is_target,
                                     is_self=(view.me and _names_equal(name, view.me.username)),
+                                    late_join=(room.state == State.MATCH),
                                 )
                                 log_engine("join", session_id[:8], name=name, source="killfeed", alive=not is_target, room=room.room_id[:8])
         elif packet.is_knock and packet.killer and packet.victim:
