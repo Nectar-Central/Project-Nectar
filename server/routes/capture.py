@@ -23,6 +23,9 @@ router = APIRouter()
 # Global engine — one per FastAPI worker, many sessions inside
 engine = Engine()
 
+# Once-per-worker flag for the missing-Upstash warning (else it spams every batch)
+_logged_no_upstash = False
+
 @router.post("/api/capture")
 async def capture_handler(request: Request, background_tasks: BackgroundTasks):
     body = await request.json()
@@ -87,6 +90,11 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
     # Without this, every fresh lambda starts from a blank session (rooms/players/
     # FSM rebuilt per batch in isolation) — the states bug seen on Vercel.
     if auth_session_id and engine.get_session(auth_session_id) is None:
+        if not cache.is_configured():
+            global _logged_no_upstash
+            if not _logged_no_upstash:
+                _logged_no_upstash = True
+                log_err("CAPTURE Upstash NOT configured — engine state cannot survive across serverless instances (set UPSTASH_REDIS_REST_URL/TOKEN)")
         try:
             cached = await cache.get_session_state(auth_session_id)
             if cached:
@@ -139,7 +147,9 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
     # Persist Engine state to Upstash so any lambda can serve currentmatch (Vercel serverless)
     if auth_session_id and session_dict:
         try:
-            await cache.set_session_state(auth_session_id, session_dict, ttl=3600)
+            _persist_ok = await cache.set_session_state(auth_session_id, session_dict, ttl=3600)
+            if not _persist_ok:
+                log_err(f"CAPTURE persist FAILED for {auth_session_id[:8]} — next lambda starts blank")
         except Exception:
             pass
 
@@ -157,6 +167,17 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
                 log_err(f"PROCESSOR FAILED session={auth_session_id[:8]} {type(e).__name__}: {e}")
         except Exception as e:
             log_err(f"CAPTURE processor import failed {e} — packets still returned, DB write skipped")
+
+    # Re-persist AFTER the processor: it mutates flags/markers/counters/winner that the
+    # pre-processor persist above does not include. Without this the next lambda restores
+    # stale markers and re-records defeats/wins (doubles on Vercel).
+    if auth_session_id and view is not None:
+        try:
+            _final_ok = await cache.set_session_state(auth_session_id, view.to_dict(), ttl=3600)
+            if not _final_ok:
+                log_err(f"CAPTURE final persist FAILED for {auth_session_id[:8]}")
+        except Exception:
+            pass
 
     # Also handle username/game_id change via engine's view.me
     # If view.me changed, include in response so userscript can update GM storage

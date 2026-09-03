@@ -67,19 +67,41 @@ async def _upstash_set(key: str, value: str, ttl: int = 3600) -> bool:
     url, token = _upstash_cfg()
     if not url:
         return False
+    # Session payloads are 10-60KB — must go in the POST body, never the URL
+    # (GET-style /set/<key>/<value> fails past ~8KB with URI Too Long).
+    # Upstash REST accepts a JSON command array: ["SET", key, value, "EX", ttl].
     try:
-        # Upstash REST: /set/<key>/<value>?EX=<ttl>
-        enc_val = urllib.parse.quote(value, safe="")
-        # value may be large JSON (10KB) — use POST to avoid URL length limit via /set
-        # Fallback to GET style for simplicity; Upstash supports both
-        req_url = f"{url}/set/{urllib.parse.quote(key, safe='')}/{enc_val}"
-        if ttl:
-            req_url += f"?EX={ttl}"
-        req = urllib.request.Request(req_url, headers={"Authorization": f"Bearer {token}"})
-        with urllib.request.urlopen(req, timeout=3) as r:
+        body = _json.dumps(["SET", key, value] + (["EX", int(ttl)] if ttl else [])).encode()
+        req = urllib.request.Request(url, data=body, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            if r.status != 200:
+                return False
+            try:
+                return _json.loads(r.read().decode()).get("result") == "OK"
+            except Exception:
+                return True
+    except Exception:
+        return False
+
+
+async def _upstash_ping(timeout: int = 3) -> bool:
+    """Cheap reachability check (GET /ping) — False when unconfigured or unreachable."""
+    import urllib.request, urllib.error
+    url, token = _upstash_cfg()
+    if not url:
+        return False
+    try:
+        req = urllib.request.Request(f"{url}/ping", headers={"Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status == 200
     except Exception:
         return False
+
+
+def is_cache_configured() -> bool:
+    """True when Upstash env vars are present (no network call)."""
+    url, token = _upstash_cfg()
+    return bool(url and token)
 
 
 class Cache:
@@ -193,18 +215,21 @@ class Cache:
 
     # --- Engine SessionView persistence (Vercel) ---
     @staticmethod
-    async def set_session_state(session_id: str, state: dict, ttl: int = 3600) -> None:
-        """Persist SessionView.to_dict() to Upstash + memory (survives lambda cold start)."""
+    async def set_session_state(session_id: str, state: dict, ttl: int = 3600) -> bool:
+        """Persist SessionView.to_dict() to Upstash + memory (survives lambda cold start).
+
+        Returns True when Upstash accepted it (False = memory-only, lost across lambdas).
+        """
         if not session_id or not state:
-            return
+            return False
         try:
             payload = _json.dumps(state, separators=(",", ":"))
         except Exception:
-            return
+            return False
         # memory
         _memory_state[session_id] = (payload, time.time() + ttl)
         # upstash
-        await _upstash_set(f"bnc:state:{session_id}", payload, ttl=ttl)
+        return await _upstash_set(f"bnc:state:{session_id}", payload, ttl=ttl)
 
     @staticmethod
     async def get_session_state(session_id: str) -> dict | None:
@@ -233,6 +258,17 @@ class Cache:
             except Exception:
                 return None
         return None
+
+
+    @staticmethod
+    def is_configured() -> bool:
+        """True when Upstash env vars are present (no network call)."""
+        return is_cache_configured()
+
+    @staticmethod
+    async def ping(timeout: int = 3) -> bool:
+        """True when Upstash is reachable."""
+        return await _upstash_ping(timeout=timeout)
 
 
 # Singleton
