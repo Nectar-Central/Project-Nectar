@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         BuildNow Companion Live Capture (game-frame only)
-// @namespace    buildnow-companion.local
+// @name         Nectar Buildnow Companion
+// @namespace    https://github.com/Nectar-Central
 // @version      2.8.8
-// @description  BuildNow Companion v2.8.8 — audio logs, off-screen hidden audio fix.
-// @author       @cis6led
+// @description  Nectar Buildnow Companion v2.8.8 — audio logs, off-screen hidden audio fix.
+// @author       Nectar Labs
 // @match        https://buildnow-gg.game-files.crazygames.com/*
 // @all-frames   true
 // @run-at       document-start
