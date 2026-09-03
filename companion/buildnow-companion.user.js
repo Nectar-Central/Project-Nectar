@@ -229,6 +229,13 @@
       setTimeout(()=>{ if(!toastReady){ toastReady=true; toastLoading=false; doShow(); } },2000);
     }catch{ toastReady=true; toastLoading=false; doShow(); }
   }
+  // The game frame is sandboxed without allow-top-navigation, so the script can
+  // never reload anything itself (not even its own frame reliably). Instead tell
+  // the user to reload with Ctrl+R.
+  function promptReload(msg){
+    try{ showToast(msg || 'Press Ctrl+R to reload the page', false); }catch{}
+    try{ logInfo('[UI] prompt reload: ' + (msg || 'Press Ctrl+R')); }catch{}
+  }
   function showLockedPanel(reason, scope){
     if(document.getElementById('bnc-locked')) return;
     const isAdmin = String(scope||'').toLowerCase()==='admin';
@@ -253,13 +260,12 @@
     document.getElementById('bnc-locked-disable').onclick=()=>{
       GMSet('bnc_disabled', true);
       try{ GMDel('bnc_session_id'); GMDel('bnc_req_token'); }catch{}
-      showToast('BNC disabled - reload to play normally', false);
-      setTimeout(()=>{ try{ window.top.location.reload(); }catch{ location.reload(); } }, 600);
+      promptReload('BNC disabled - press Ctrl+R to reload and play normally');
     };
     document.getElementById('bnc-locked-retry').onclick=()=>{
       wrap.remove();
       ['keydown','keyup','keypress'].forEach(ev=> window.removeEventListener(ev, blocker, true));
-      location.reload();
+      promptReload('Press Ctrl+R to reload the page');
     };
   }
   function showTokenPrompt(){
@@ -405,16 +411,14 @@
         }
         document.removeEventListener('keydown', escHandler, true);
         closeModal();
-        showToast('Linked! Reloading…',false);
-        setTimeout(()=>{ try{ window.top.location.reload(); }catch{ location.reload(); } }, 400);
+        promptReload('Linked! Press Ctrl+R to reload the page');
       });
     };
 
     disableBtn.onclick=()=>{
       GMSet('bnc_disabled', true);
       document.removeEventListener('keydown', escHandler, true); closeModal();
-      showToast('BNC disabled - reload to play normally', false);
-      setTimeout(()=>{ try{ window.top.location.reload(); }catch{ location.reload(); } }, 500);
+      promptReload('BNC disabled - press Ctrl+R to reload and play normally');
     };
     submitBtn.onclick=doSubmit;
     // Enter submits, Backspace/Delete must work - handled by guard not blocking default
@@ -1160,6 +1164,17 @@
     const stateGmLine = hasGm && stateLabel.toLowerCase() !== gmLive.toLowerCase() ? `${stateLabel} - ${gmLive}` : stateLabel;
     const smallRow = (label,val)=> `<div style="display:flex;justify-content:space-between;align-items:center;width:100%;max-width:240px;font-size:11px"><span style="color:#9ca3af">${label}</span><span style="font-weight:600;color:#fff">${val==null? '-' : val}</span></div>`;
     const perGmRow = hasGm && perGmCurrent!=null ? smallRow('Playtime ('+gmLive+')', fmtPlaytimeDrawer(perGmCurrent)) : '';
+    // Empty account (no game username and no stats yet): placeholder instead of blank rows
+    const _gmUname = GMGet('bnc_game_username', null);
+    const noStats = (kills==null) && (!_gmUname || _gmUname==='-');
+    const emptyStatsHtml = `<div style="display:flex;flex-direction:column;gap:8px;align-items:center;width:100%;max-width:240px;padding:18px 14px;background:#171717;border:1px dashed rgba(255,255,255,0.16);border-radius:12px;text-align:center"><div style="font-size:26px">📊</div><div style="font-size:14px;font-weight:800;color:#fff">No stats yet</div><div style="font-size:12px;color:#9ca3af;line-height:1.5">Play 1-2 matches to get your account ready.<br>Kills, deaths, wins and skins will show up here.</div></div>`;
+    const statsRowsHtml = noStats ? emptyStatsHtml : `
+          ${row('Kills', kills)}
+          ${row('Deaths', deaths)}
+          ${row('Wins', wins)}
+          ${row('Defeats', defeats)}
+          ${row('Playtime', pGlobal!=null? fmtPlaytimeDrawer(pGlobal):null)}
+          ${perGmRow}`;
     const isLobbyTab = stateLabel === 'In Lobby';
     if(isLobbyTab){
       // clean up stale player list when back in lobby (fixes not refreshing)
@@ -1182,12 +1197,7 @@
         <div style="font-size:13px;color:#e5e7eb;text-align:center;margin-top:2px">${stateGmLine}</div>
         <div style="width:48px;height:1px;background:rgba(255,255,255,0.12);margin:10px 0"></div>
         <div style="display:flex;flex-direction:column;gap:7px;align-items:center;width:100%">
-          ${row('Kills', kills)}
-          ${row('Deaths', deaths)}
-          ${row('Wins', wins)}
-          ${row('Defeats', defeats)}
-          ${row('Playtime', pGlobal!=null? fmtPlaytimeDrawer(pGlobal):null)}
-          ${perGmRow}
+          ${statsRowsHtml}
         </div>
         <button id="bnc-keybind-set" style="margin-top:14px;padding:8px 14px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:600;cursor:pointer">Set open keybind: ${kbLabel}</button>
         <div id="bnc-keybind-hint" style="font-size:11px;color:#6b7280;min-height:14px"></div>
