@@ -63,7 +63,7 @@
         
         <div class="search-container">
             <input type="text" id="playerSearch" placeholder="Enter your Nectar player name.....">
-            <button class="search-btn" type="button">
+            <button class="search-btn" id="searchBtn" type="button">
                  <img src="assets/icons/green-ok-sign.png" alt="" width="20">
                 search</button>
         </div>
@@ -87,6 +87,114 @@
                     <h3>Update: New Maps Added to The Game</h3>
                     <p>read more</p>
                 </div>
+            </div>
+        </div>
+    </div>
+
+</section>
+
+<!-- PLAYER PROFILE PAGE -->
+<section id="profile" class="page">
+    
+    <!-- Profile Banner & Main Info Header -->
+    <div class="profile-header">
+        <div class="profile-banner"></div>
+        <div class="profile-identity">
+            <img id="profile-pfp" src="assets/images/default-avatar.png" alt="Profile Picture" class="profile-avatar">
+            <h1 id="profile-username" class="profile-username">Player Name</h1>
+        </div>
+    </div>
+
+    <!-- Navigation Tabs -->
+    <div class="profile-tabs">
+        <button class="profile-tab-btn active" data-tab="overview">Overview</button>
+        <button class="profile-tab-btn" data-tab="events">Events</button>
+        <button class="profile-tab-btn" data-tab="matches">Matches</button>
+    </div>
+
+    <!-- TAB 1: OVERVIEW PANEL -->
+    <div id="tab-overview" class="profile-tab-content active">
+        <div class="overview-panel">
+            <div class="stats-grid main-stats">
+                <div class="stat-card">
+                    <span class="stat-label">Win %</span>
+                    <span class="stat-value" id="stat-winrate">0.0%</span>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-label">Wins</span>
+                    <span class="stat-value" id="stat-wins">0</span>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-label">K/D</span>
+                    <span class="stat-value" id="stat-kd">0.00</span>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-label">Kills</span>
+                    <span class="stat-value" id="stat-kills">0</span>
+                </div>
+            </div>
+
+            <div class="recent-stats-grid">
+                <div class="recent-stat-card">
+                    <h3>Last 7 Days</h3>
+                    <div class="recent-details">
+                        <div><span>Win %</span> <strong id="last7-winrate">--</strong></div>
+                        <div><span>Wins</span> <strong id="last7-wins">--</strong></div>
+                        <div><span>K/D</span> <strong id="last7-kd">--</strong></div>
+                        <div><span>Kills</span> <strong id="last7-kills">--</strong></div>
+                    </div>
+                </div>
+
+                <div class="recent-stat-card">
+                    <h3>Last 30 Days</h3>
+                    <div class="recent-details">
+                        <div><span>Win %</span> <strong id="last30-winrate">--</strong></div>
+                        <div><span>Wins</span> <strong id="last30-wins">--</strong></div>
+                        <div><span>K/D</span> <strong id="last30-kd">--</strong></div>
+                        <div><span>Kills</span> <strong id="last30-kills">--</strong></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 2: EVENTS PANEL -->
+    <div id="tab-events" class="profile-tab-content">
+        <div class="events-panel">
+            <h3 class="panel-title">EVENT RESULTS</h3>
+            <div class="table-container">
+                <table class="events-table">
+                    <thead>
+                        <tr>
+                            <th>Event</th>
+                            <th>Place</th>
+                            <th>PR Points</th>
+                            <th>Earnings</th>
+                            <th>Roster</th>
+                            <th>Matches</th>
+                            <th>Wins</th>
+                            <th>Elims</th>
+                            <th>K/D</th>
+                        </tr>
+                    </thead>
+                    <tbody id="events-list">
+                        <!-- Bot Endpoints will populate rows here -->
+                        <tr>
+                            <td colspan="9" class="no-data">Loading event statistics...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 3: MATCHES PANEL -->
+    <div id="tab-matches" class="profile-tab-content">
+        <div class="matches-panel">
+            <h3 class="panel-title">MATCH HISTORY</h3>
+            <div id="matches-list" class="matches-list">
+                <!-- Bot Endpoints / API will populate match cards here -->
+                <div class="no-data">Loading match history...</div>
             </div>
         </div>
     </div>
