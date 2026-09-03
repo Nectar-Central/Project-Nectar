@@ -70,6 +70,16 @@ from server.routes.health import router as health_router
 # Health check
 # ---------------------------------------------------------------------------
 
+@app.get("/")
+async def index():
+    """Landing page — keeps root probes (Render, browsers) out of the 404 logs."""
+    return {
+        "service": "photon-server (python)",
+        "health": "/api/health",
+        "docs": "/docs",
+    }
+
+
 @app.get("/health")
 @app.get("/status")
 async def health():
