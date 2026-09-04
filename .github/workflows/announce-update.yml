@@ -1,0 +1,73 @@
+# Announce userscript releases to players via DM.
+#
+# Trigger: the userscript file changed on main AND its @version header was
+# bumped (so routine edits without a version bump never spam anyone).
+# Manual runs: workflow_dispatch with explicit version + notes.
+#
+# Required repo secrets: DISCORD_TOKEN (bot token),
+# SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY.
+name: Announce userscript update
+
+on:
+  push:
+    branches: [main]
+    paths: ["companion/buildnow-companion.user.js"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to announce (e.g. 2.14.3)"
+        required: true
+      notes:
+        description: "Patch notes for the DM"
+        required: true
+
+concurrency:
+  group: announce-update
+  cancel-in-progress: false
+
+jobs:
+  announce:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Decide whether this push is a release
+        id: release
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "do_release=true" >> "$GITHUB_OUTPUT"
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CUR=$(grep -m1 '@version' companion/buildnow-companion.user.js | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
+          PREV=$(git show HEAD~1:companion/buildnow-companion.user.js 2>/dev/null | grep -m1 '@version' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
+          echo "current=$CUR previous=$PREV"
+          if [ -n "$CUR" ] && [ "$CUR" != "$PREV" ]; then
+            echo "do_release=true" >> "$GITHUB_OUTPUT"
+            echo "version=$CUR" >> "$GITHUB_OUTPUT"
+          else
+            echo "do_release=false" >> "$GITHUB_OUTPUT"
+            echo "version=$CUR" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: steps.release.outputs.do_release == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        if: steps.release.outputs.do_release == 'true'
+        run: pip install "discord.py>=2.4" supabase
+
+      - name: Send update DMs
+        if: steps.release.outputs.do_release == 'true'
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          VERSION: ${{ steps.release.outputs.version != '' && steps.release.outputs.version || inputs.version }}
+          NOTES: ${{ github.event_name == 'workflow_dispatch' && inputs.notes || join(github.event.commits.*.message, '\n') }}
+        run: python scripts/announce_update.py
