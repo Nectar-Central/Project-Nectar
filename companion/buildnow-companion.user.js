@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Nectar Buildnow Companion
 // @namespace    https://github.com/Nectar-Central
-// @version      2.13.0
-// @description  Nectar Buildnow Companion v2.13.0 — tracker plus loading-screen branding (all CrazyGames frames).
+// @version      2.14.0
+// @description  Nectar Buildnow Companion v2.14.0 — tracker plus loading-screen branding (all CrazyGames frames).
 // @author       Nectar Labs
 // @match        https://buildnow-gg.game-files.crazygames.com/*
 // @match        https://*.crazygames.com/*
@@ -27,7 +27,7 @@
 
 (function () {
   'use strict';
-  const BNC_VERSION = '2.13.0';
+  const BNC_VERSION = '2.14.0';
   const HREF = (() => { try { return location.href; } catch { return ''; } })();
   const IS_GAME_FRAME = HREF.includes('buildnow-gg.game-files.crazygames.com');
   // Loading shell lives inside an intermediate iframe (games.crazygames.com),
@@ -333,6 +333,67 @@
     try{ showToast(msg || 'Press Ctrl+R to reload the page', false); }catch{}
     try{ logInfo('[UI] prompt reload: ' + (msg || 'Press Ctrl+R')); }catch{}
   }
+  // ---- PARTY helpers ----
+  // sess shape: /api/stats session {party:{is_party,code}, short_code, ...}
+  function getPartyInfo(sess){
+    if(!sess) return {isParty:false, code:null};
+    const p = sess.party || null;
+    const isParty = !!(p && p.is_party);
+    const code = sess.short_code || (p && p.code) || null;
+    return {isParty, code};
+  }
+  function fmtPartyCode(code){
+    if(!code) return '-';
+    const s=String(code);
+    // party.code can be a full RoomName UUID — show short form; short_code (5-char) shows full
+    return s.length>8 ? s.slice(0,8) : s;
+  }
+  // ---- Party join/leave slide toast (left edge, slides left→right) ----
+  let _partyToastStyle=false;
+  function ensurePartyToastStyle(){
+    if(_partyToastStyle || !document.documentElement) return;
+    _partyToastStyle=true;
+    const st=document.createElement('style');
+    st.id='bnc-party-toast-style';
+    st.textContent=`@keyframes bnc-slide-in-left{from{transform:translateX(-110%);opacity:0}to{transform:translateX(0);opacity:1}}@keyframes bnc-slide-out-left{from{transform:translateX(0);opacity:1}to{transform:translateX(-110%);opacity:0}}.bnc-party-toast{animation:bnc-slide-in-left 280ms cubic-bezier(0.22,1,0.36,1)}.bnc-party-toast.bnc-hide{animation:bnc-slide-out-left 220ms ease-in forwards}`;
+    document.documentElement.appendChild(st);
+  }
+  function showPartyToast(name, isJoin){
+    try{
+      ensurePartyToastStyle();
+      let wrap=document.getElementById('bnc-party-toasts');
+      if(!wrap){
+        wrap=document.createElement('div');
+        wrap.id='bnc-party-toasts';
+        Object.assign(wrap.style,{position:'fixed',left:'12px',top:'64px',zIndex:'2147483646',display:'flex',flexDirection:'column',gap:'8px',pointerEvents:'none',fontFamily:'Inter, system-ui, sans-serif'});
+        (document.body||document.documentElement).appendChild(wrap);
+      }
+      const el=document.createElement('div');
+      el.className='bnc-party-toast';
+      const accent=isJoin?'#10b981':'#f59e0b';
+      const icon=isJoin?'🟢':'🔴';
+      const verb=isJoin?'joined':'left';
+      Object.assign(el.style,{display:'flex',alignItems:'center',gap:'8px',background:'#0f0f0f',color:'#fff',border:'1px solid rgba(255,255,255,0.12)',borderLeft:`4px solid ${accent}`,borderRadius:'10px',padding:'10px 14px',fontSize:'13px',fontWeight:'600',boxShadow:'0 4px 16px rgba(0,0,0,0.4)',maxWidth:'320px',wordBreak:'break-word'});
+      el.textContent=`${icon} ${String(name||'?').slice(0,32)} ${verb}`;
+      wrap.appendChild(el);
+      while(wrap.children.length>4) wrap.firstChild.remove();
+      setTimeout(()=>{ try{ el.classList.add('bnc-hide'); setTimeout(()=>{ try{ el.remove(); }catch{} },240); }catch{} },3000);
+    }catch{}
+  }
+  // diff player lists -> join/leave toasts. Silent on first snapshot or full reset.
+  let _prevPartyNames=null;
+  function detectPartyJoins(pc){
+    try{
+      const cur=((pc&&pc.players)||[]).map(p=>p&&p.username?String(p.username):'').filter(Boolean);
+      const curSet=new Set(cur);
+      if(_prevPartyNames===null){ _prevPartyNames=curSet; return; }
+      const prev=_prevPartyNames;
+      for(const n of curSet){ if(!prev.has(n)){ showPartyToast(n, true); try{ logInfo(`[PARTY] join ${n}`); }catch{} } }
+      for(const n of prev){ if(!curSet.has(n)){ showPartyToast(n, false); try{ logInfo(`[PARTY] leave ${n}`); }catch{} } }
+      _prevPartyNames=curSet;
+    }catch{}
+  }
+  function resetPartyJoins(){ _prevPartyNames=null; }
   function showLockedPanel(reason, scope){
     if(document.getElementById('bnc-locked')) return;
     const isAdmin = String(scope||'').toLowerCase()==='admin';
@@ -1178,6 +1239,7 @@
       startStatsPoll();
       startBgLobbyPoll();
       if(drawerTab==='players'){ fetchPlayers(true); startPlayersPoll(); }
+      else { try{ const _pio=getPartyInfo(statsCache&&statsCache.session); if(_pio.isParty&&_pio.code){ fetchPlayers(true); startPlayersPoll(); } }catch{} }
     } else {
       infoPanel.style.transform='translateX(-100%)';
       drawerBackdrop.style.display='none';
@@ -1211,7 +1273,9 @@
         try{
           const j=JSON.parse(txt);
           playersCache=j;
+          try{ detectPartyJoins(j); }catch{}
           if(drawerTab==='players') renderInfoPanel();
+          else { try{ const _pi=getPartyInfo(statsCache&&statsCache.session); if(_pi.isParty) renderInfoPanel(); }catch{} }
         }catch{ if(forceRender && drawerTab==='players') renderInfoPanel(); }
       } else if(forceRender && drawerTab==='players') renderInfoPanel();
     };
@@ -1266,7 +1330,14 @@
     const kbLabel = formatKeybind(getDrawerKeybind());
     const row = (label,val)=> `<div style="display:flex;justify-content:space-between;align-items:center;width:100%;max-width:240px;font-size:13px"><span style="color:#9ca3af">${label}</span><span style="font-weight:700;color:#fff">${val==null? '-' : val}</span></div>`;
     const hasGm = gmLive && gmLive !== '-' && gmLive !== '-' && gmLive.toLowerCase() !== 'unknown' && gmLive.toLowerCase() !== 'lobby';
-    const stateGmLine = hasGm && stateLabel.toLowerCase() !== gmLive.toLowerCase() ? `${stateLabel} - ${gmLive}` : stateLabel;
+    // party: "In Party - X - GM" when the player is in a party (X = short_code, fallback party code)
+    const _partyInfo = getPartyInfo(sess);
+    const isInParty = !!(_partyInfo.isParty && _partyInfo.code);
+    const partyCodeShort = isInParty ? fmtPartyCode(_partyInfo.code) : null;
+    let stateGmLine = hasGm && stateLabel.toLowerCase() !== gmLive.toLowerCase() ? `${stateLabel} - ${gmLive}` : stateLabel;
+    if(isInParty){
+      stateGmLine = hasGm ? `In Party - ${partyCodeShort} - ${gmLive}` : `In Party - ${partyCodeShort}`;
+    }
     const smallRow = (label,val)=> `<div style="display:flex;justify-content:space-between;align-items:center;width:100%;max-width:240px;font-size:11px"><span style="color:#9ca3af">${label}</span><span style="font-weight:600;color:#fff">${val==null? '-' : val}</span></div>`;
     const perGmRow = hasGm && perGmCurrent!=null ? smallRow('Playtime ('+gmLive+')', fmtPlaytimeDrawer(perGmCurrent)) : '';
     // Empty account (no game username and no stats yet): placeholder instead of blank rows
@@ -1280,21 +1351,42 @@
           ${row('Defeats', defeats)}
           ${row('Playtime', pGlobal!=null? fmtPlaytimeDrawer(pGlobal):null)}
           ${perGmRow}`;
+    // party roster inside the stats tab (visible whenever in a party)
+    let partyRosterHtml='';
+    if(isInParty){
+      const pc = playersCache;
+      const rosterRows = (pc && pc.players && pc.players.length)
+        ? pc.players.map(pl=>{
+            const nm = pl.username!=null ? String(pl.username).replace(/</g,'&lt;') : 'NaN';
+            const dot = pl.is_self ? '#10b981' : (pl.is_alive===false ? '#4b5563' : '#3b82f6');
+            const you = pl.is_self ? ' <span style="font-size:9px;font-weight:800;color:#000;background:#10b981;border-radius:4px;padding:1px 5px;vertical-align:middle">YOU</span>' : '';
+            return `<div style="display:flex;align-items:center;gap:8px;width:100%;font-size:12px"><span style="width:8px;height:8px;border-radius:50%;background:${dot};flex-shrink:0;display:inline-block"></span><span style="color:#fff;font-weight:600;word-break:break-word;text-align:left;flex:1">${nm}${you}</span></div>`;
+          }).join('')
+        : `<div style="font-size:11px;color:#6b7280">Loading party…</div>`;
+      const pcount = (pc && (pc.count || (pc.players&&pc.players.length))) || '';
+      partyRosterHtml = `<div style="width:100%;max-width:240px;display:flex;flex-direction:column;gap:6px;align-items:stretch;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:10px 12px;margin-top:4px"><div style="font-size:11px;font-weight:800;color:#fff;text-align:left">Party - ${String(partyCodeShort).replace(/</g,'&lt;')}${pcount? ' · '+pcount : ''}</div><div style="display:flex;flex-direction:column;gap:5px;max-height:180px;overflow-y:auto">${rosterRows}</div></div>`;
+    }
     const isLobbyTab = stateLabel === 'In Lobby';
-    if(isLobbyTab){
+    // keep roster visible while in a party (party lobby still reports In Lobby)
+    const showPlayersTab = !isLobbyTab || isInParty;
+    if(isLobbyTab && !isInParty){
       // clean up stale player list when back in lobby (fixes not refreshing)
       if(playersCache){ playersCache=null; }
+      try{ resetPartyJoins(); }catch{}
       if(drawerTab==='players'){
         drawerTab='stats';
         try{ GMSet('bnc_drawer_tab', drawerTab); }catch{}
         stopPlayersPoll();
       }
+    } else if(isInParty && !playersCache && !playersLoading){
+      // party roster for the drawer stats tab (diff also drives join/leave toasts)
+      try{ fetchPlayers(false); }catch{}
     }
-    // tab bar - hide Players when in lobby per request
+    // tab bar - hide Players when in lobby per request (but keep it when in a party)
     const tabBtn=(id,label,active)=>`<button id="${id}" style="flex:1;max-width:120px;padding:6px 0;border-radius:999px;border:1px solid ${active?'#fff':'rgba(255,255,255,0.12)'};background:${active?'#fff':'#171717'};color:${active?'#000':'#9ca3af'};font-size:12px;font-weight:700;cursor:pointer">${label}</button>`;
-    const tabBar = isLobbyTab
-      ? `<div style="display:flex;gap:6px;justify-content:center;width:100%;margin-bottom:4px">${tabBtn('bnc-tab-stats','Stats',drawerTab==='stats')}</div>`
-      : `<div style="display:flex;gap:6px;justify-content:center;width:100%;margin-bottom:4px">${tabBtn('bnc-tab-stats','Stats',drawerTab==='stats')}${tabBtn('bnc-tab-players','Players',drawerTab==='players')}</div>`;
+    const tabBar = showPlayersTab
+      ? `<div style="display:flex;gap:6px;justify-content:center;width:100%;margin-bottom:4px">${tabBtn('bnc-tab-stats','Stats',drawerTab==='stats')}${tabBtn('bnc-tab-players','Players',drawerTab==='players')}</div>`
+      : `<div style="display:flex;gap:6px;justify-content:center;width:100%;margin-bottom:4px">${tabBtn('bnc-tab-stats','Stats',drawerTab==='stats')}</div>`;
     const statsHtml = `
       <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;width:100%;padding:10px 0 6px 0">
         ${skinImg}
@@ -1305,6 +1397,7 @@
         <div style="display:flex;flex-direction:column;gap:7px;align-items:center;width:100%">
           ${statsRowsHtml}
         </div>
+        ${partyRosterHtml}
         <button id="bnc-keybind-set" style="margin-top:14px;padding:8px 14px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:600;cursor:pointer">Set open keybind: ${kbLabel}</button>
         <div id="bnc-keybind-hint" style="font-size:11px;color:#6b7280;min-height:14px"></div>
           <div style="margin-top:10px;width:100%;max-width:240px;display:flex;flex-direction:column;gap:4px;align-items:center">
@@ -1428,13 +1521,13 @@
       if(useGM && GM){
         try{
           GM({method:'GET', url, headers:{'Content-Type':'application/json'}, timeout:8000,
-            onload: r=>{ if(r.status>=200&&r.status<300){ try{ const j=JSON.parse(r.responseText); statsCache=j; logInfo(`[AUDIO] stats fetched lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } try{ _reconcileServerState(j.session); }catch{} renderInfoPanel(); }catch(e){ logErr(`[AUDIO] stats parse err ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ const d=document.getElementById('bnc-drawer-dot'); const t=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background=apiOnline?'#10b981':'#6b7280'; if(t) t.textContent=apiOnline?'Online':'Offline'; }catch{} },
+            onload: r=>{ if(r.status>=200&&r.status<300){ try{ const j=JSON.parse(r.responseText); statsCache=j; logInfo(`[AUDIO] stats fetched lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } try{ _reconcileServerState(j.session); }catch{} renderInfoPanel(); try{ const _pi=getPartyInfo(j.session); const _inMatch=j.session&&String(j.session.state||'').toLowerCase()==='match'; if((_pi.isParty&&_pi.code)||_inMatch) fetchPlayers(false); }catch{} }catch(e){ logErr(`[AUDIO] stats parse err ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ const d=document.getElementById('bnc-drawer-dot'); const t=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background=apiOnline?'#10b981':'#6b7280'; if(t) t.textContent=apiOnline?'Online':'Offline'; }catch{} },
             onerror: ()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const t=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(t) t.textContent='Offline'; }catch{} },
             ontimeout: ()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const t=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(t) t.textContent='Offline'; }catch{} }});
           return;
         }catch{}
       }
-      fetch(url, {method:'GET'}).then(r=>r.text().then(t=>{ if(r.ok){ try{ const j=JSON.parse(t); statsCache=j; logInfo(`[AUDIO] stats fetched (fetch) lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats-fetch', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} try{ _reconcileServerState(j.session); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } renderInfoPanel(); }catch(e){ logErr(`[AUDIO] stats parse err (fetch) ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background=apiOnline?'#10b981':'#6b7280'; if(tt) tt.textContent=apiOnline?'Online':'Offline'; }catch{} }).catch(()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(tt) tt.textContent='Offline'; }catch{} })).catch(()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(tt) tt.textContent='Offline'; }catch{} });
+      fetch(url, {method:'GET'}).then(r=>r.text().then(t=>{ if(r.ok){ try{ const j=JSON.parse(t); statsCache=j; logInfo(`[AUDIO] stats fetched (fetch) lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats-fetch', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} try{ _reconcileServerState(j.session); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } renderInfoPanel(); try{ const _pi2=getPartyInfo(j.session); const _inMatch2=j.session&&String(j.session.state||'').toLowerCase()==='match'; if((_pi2.isParty&&_pi2.code)||_inMatch2) fetchPlayers(false); }catch{} }catch(e){ logErr(`[AUDIO] stats parse err (fetch) ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background=apiOnline?'#10b981':'#6b7280'; if(tt) tt.textContent=apiOnline?'Online':'Offline'; }catch{} }).catch(()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(tt) tt.textContent='Offline'; }catch{} })).catch(()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(tt) tt.textContent='Offline'; }catch{} });
     };
     doFetch(true);
   }

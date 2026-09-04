@@ -681,7 +681,12 @@ def is_useful(gpb: dict | None) -> bool:
 
 
 def _strip_color_tags(text: str) -> str:
-    """Remove <color> tags from killfeed text — handles truncated </col and <#hex>."""
+    """Remove <color> tags from killfeed text — handles truncated </col and <#hex>.
+
+    Usernames may legitimately contain '<' (e.g. 'jesus loves u <3'), so the
+    fallback only removes known formatting tags and truncated tail fragments —
+    never a generic <...>, which would eat username content like '<3</b>'.
+    """
     import re
     # Exact tags
     text = re.sub(r"<color[^>]*>", "", text, flags=re.IGNORECASE)
@@ -689,8 +694,19 @@ def _strip_color_tags(text: str) -> str:
     # Truncated </col, </color without >, and hex colors like <color=#FC2> or <#000520>
     text = re.sub(r"</?color[^>]*>?", "", text, flags=re.IGNORECASE)
     text = re.sub(r"<#?[0-9a-fA-F]{3,6}>", "", text)
-    text = re.sub(r"<[^>]*>", "", text)  # fallback any leftover <...>
+    # Other known formatting tags (<b>, <i>, <size=..>) — NOT a generic <...> fallback
+    text = re.sub(r"</?(?:b|i|u|s|size|align)[^>]*>?", "", text, flags=re.IGNORECASE)
+    # Truncated tail fragment at end of string (packet cut mid-tag, e.g. 'Bob</col')
+    text = re.sub(r"</?[a-zA-Z#][^<>]*$", "", text)
+    text = re.sub(r"<$", "", text)
     return text.strip()
+
+
+def _has_tag_fragment(s: str) -> bool:
+    """True if s still contains something tag-like (truncated packet), False for
+    innocent content like the '<3' in 'jesus loves u <3' ('<' + digit, no tag shape)."""
+    import re
+    return bool(re.search(r"<\/?[a-zA-Z#]", s) or s.endswith("<"))
 
 
 def parse_killfeed_text(raw: str) -> dict:
@@ -701,8 +717,9 @@ def parse_killfeed_text(raw: str) -> dict:
     if " killed " in clean:
         killer, victim = clean.split(" killed ", 1)
         killer, victim = killer.strip(), victim.strip()
-        # Drop empty victims (e.g. "jew6led killed <empty>" or truncated)
-        if not killer or not victim or "<" in killer or "<" in victim or ">" in killer or ">" in victim:
+        # Drop truncated-tag leftovers (e.g. "jew6led killed <empty>"), but keep
+        # innocent '<' in usernames (e.g. 'jesus loves u <3')
+        if not killer or not victim or _has_tag_fragment(killer) or _has_tag_fragment(victim):
             return {"raw": raw, "text": clean, "type": "other", "killer": None, "victim": None}
         result["type"] = "kill"
         result["killer"] = killer
@@ -711,7 +728,7 @@ def parse_killfeed_text(raw: str) -> dict:
         # DF elimination variant ("X eliminated Y") — same as a kill
         killer, victim = clean.split(" eliminated ", 1)
         killer, victim = killer.strip(), victim.strip()
-        if not killer or not victim or "<" in killer or "<" in victim or ">" in killer or ">" in victim:
+        if not killer or not victim or _has_tag_fragment(killer) or _has_tag_fragment(victim):
             return {"raw": raw, "text": clean, "type": "other", "killer": None, "victim": None}
         result["type"] = "kill"
         result["killer"] = killer
@@ -719,20 +736,20 @@ def parse_killfeed_text(raw: str) -> dict:
     elif " knocked " in clean:
         killer, victim = clean.split(" knocked ", 1)
         killer, victim = killer.strip(), victim.strip()
-        if not killer or not victim or "<" in killer or "<" in victim:
+        if not killer or not victim or _has_tag_fragment(killer) or _has_tag_fragment(victim):
             return {"raw": raw, "text": clean, "type": "other", "killer": None, "victim": None}
         result["type"] = "knock"
         result["killer"] = killer
         result["victim"] = victim
     elif " Left Match" in clean:
         killer = clean.replace(" Left Match", "").strip()
-        if not killer or "<" in killer:
+        if not killer or _has_tag_fragment(killer):
             return {"raw": raw, "text": clean, "type": "other", "killer": None, "victim": None}
         result["type"] = "leave"
         result["killer"] = killer
     elif " joined" in clean:
         killer = clean.replace(" joined", "").strip()
-        if not killer or "<" in killer:
+        if not killer or _has_tag_fragment(killer):
             return {"raw": raw, "text": clean, "type": "other", "killer": None, "victim": None}
         result["type"] = "join"
         result["killer"] = killer
