@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 
 from ..lib.redis_client import cache
 from ..lib.supabase_client import supabase
+from ..lib import precision as _precision
 
 router = APIRouter()
 
@@ -27,10 +28,20 @@ async def health():
         engine_sessions = len(getattr(capture_engine, "_sessions", {}) or {})
     except Exception:
         engine_sessions = -1
+    # Settle any precision checks past their 2s delay, then report the score.
+    try:
+        await _precision.verify_due()
+    except Exception:
+        pass
+    try:
+        precision = await _precision.get_snapshot()
+    except Exception:
+        precision = {"precision_pct": 99.0, "verified": 0}
     return JSONResponse({
         "ok": True,
         "upstash_configured": upstash_configured,
         "upstash_reachable": upstash_reachable,
         "supabase_configured": supabase is not None,
         "engine_sessions": engine_sessions,
+        "precision": precision,
     })

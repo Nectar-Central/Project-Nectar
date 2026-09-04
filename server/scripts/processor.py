@@ -28,6 +28,9 @@ from server.lib.gpbinary import _strip_color_tags
 # different Photon framing: client RaiseEvent echo + server broadcast).
 from server.lib.photon_engine.engine import _KILL_DUP_WINDOW_MS
 
+# Precision tracking: each counted write is re-checked ~2s later (see precision.py)
+from server.lib import precision as _precision
+
 # TYPE_CHECKING is False at runtime — only imports below when type-checking (mypy/pyright)
 from typing import TYPE_CHECKING
 
@@ -324,6 +327,8 @@ def _write_win(discord_id, session_id, user, gm, room_id, short_code, match_ver,
     user["wins"] = new_wins             # Update local cache
     if room is not None:
         room.last_win_version = match_ver  # Mark recorded (version bump re-enables)
+    _precision.schedule("win", session_id=session_id, discord_id=discord_id,
+                        expected=new_wins, match_version=match_ver, room_id=room_id)
     return new_wins
 
 
@@ -353,6 +358,8 @@ def _write_defeat(discord_id, session_id, user, gm, room_id, short_code, match_v
     user["defeats"] = new_def           # Update local cache
     if room is not None:
         room.had_self_defeat = True     # Block later stG=3 / leave defeats this life
+    _precision.schedule("defeat", session_id=session_id, discord_id=discord_id,
+                        expected=new_def, match_version=match_ver, room_id=room_id)
     return new_def
 
 
@@ -492,6 +499,12 @@ async def process_batch(
     log_sys(f"PROCESSOR user={discord_id[:6]} kills={user.get('kills',0)} "
             f"deaths={user.get('deaths',0)} wins={user.get('wins',0)}")
 
+    # Settle precision checks due from earlier batches (writes are verified ~2s later)
+    try:
+        await _precision.verify_due()
+    except Exception:
+        pass
+
     # Track which match_versions already had a death counted (dedup alv + killfeed)
     # Prevents double-counting when both killfeed and alv report the same death
     death_counted_for_match = set()  # Set of (discord_id, match_version) tuples
@@ -597,6 +610,9 @@ async def process_batch(
                     }).execute()
                     log_sys(f"PROCESSOR KILL victim={instigated} kills {user.get('kills',0)}->{new_kills}")
                     user["kills"] = new_kills       # Update local cache
+                    _precision.schedule("kill", session_id=session_id, discord_id=discord_id,
+                                        expected=new_kills, match_version=pkt_match_ver,
+                                        room_id=pkt_room_id, extra={"victim": instigated})
 
                 # Self-specific death: increment deaths + write death event (one per life).
                 # Kills only: being knocked is not death (revive possible) — the
@@ -623,6 +639,9 @@ async def process_batch(
                             log_sys(f"PROCESSOR DEATH via killfeed killer={instigator} deaths {user.get('deaths',0)}->{new_deaths}")
                             user["deaths"] = new_deaths  # Update local cache
                             death_counted_for_match.add(dedup_key)  # Mark as counted
+                            _precision.schedule("death", session_id=session_id, discord_id=discord_id,
+                                                expected=new_deaths, match_version=pkt_match_ver,
+                                                room_id=pkt_room_id, extra={"via": "killfeed"})
                             if death_room is not None:
                                 death_room.had_self_death = True  # One death per life
                             # Defeat NOW: death before stG=3 counts immediately (K/D-only
@@ -710,6 +729,9 @@ async def process_batch(
                                 log_sys(f"PROCESSOR DEATH via alv deaths {user.get('deaths',0)}->{new_deaths_alv}")
                                 user["deaths"] = new_deaths_alv  # Update local cache
                                 death_counted_for_match.add(dedup_key_alv)  # Mark as counted
+                                _precision.schedule("death", session_id=session_id, discord_id=discord_id,
+                                                    expected=new_deaths_alv, match_version=pkt_match_ver,
+                                                    room_id=pkt_room_id, extra={"via": "alv"})
                                 room_alv.had_self_death = True  # One death per life
                                 # Defeat NOW (same rule as killfeed path, K/D-only excluded)
                                 try:
@@ -1024,6 +1046,9 @@ async def process_batch(
                         log_sys(f"PROCESSOR DEATH via stG reconcile deaths {user.get('deaths',0)}->{new_def_death}")
                         user["deaths"] = new_def_death
                         room2.had_self_death = True
+                        _precision.schedule("death", session_id=session_id, discord_id=discord_id,
+                                            expected=new_def_death, match_version=room2.match_version,
+                                            room_id=room_id2, extra={"via": "stG"})
 
             # Drain: single DB write point for defeats (kill/alv/stG markers set above;
             # leave writes immediately). One defeat per life — a stale marker for an
@@ -1055,6 +1080,9 @@ async def process_batch(
                     room2.had_self_defeat = True  # One defeat per life
                     room2.last_defeat_version = -1  # Drain (prevent re-processing)
                     room2.stg_is_phase_end = False  # consume phase-end arm for this version
+                    _precision.schedule("defeat", session_id=session_id, discord_id=discord_id,
+                                        expected=new_def, match_version=room2.match_version,
+                                        room_id=room_id2)
 
         # --- Competitive sealing (host collab only) ---
         # Only when host_mode is enabled and room is server-created (short_code)

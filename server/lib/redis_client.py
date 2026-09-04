@@ -261,6 +261,27 @@ class Cache:
 
 
     @staticmethod
+    async def get_raw(key: str) -> str | None:
+        """Generic small-value read (memory + Upstash). For gauges/snapshots."""
+        if not key:
+            return None
+        entry = _memory_state.get(key)
+        if entry:
+            payload, exp = entry
+            if time.time() < exp:
+                return payload
+            _memory_state.pop(key, None)
+        return await _upstash_get(key)
+
+    @staticmethod
+    async def set_raw(key: str, value: str, ttl: int = 3600) -> bool:
+        """Generic small-value write (memory + Upstash). For gauges/snapshots."""
+        if not key or value is None:
+            return False
+        _memory_state[key] = (value, time.time() + ttl)
+        return await _upstash_set(key, value, ttl=ttl)
+
+    @staticmethod
     def is_configured() -> bool:
         """True when Upstash env vars are present (no network call)."""
         return is_cache_configured()
