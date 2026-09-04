@@ -213,6 +213,15 @@ class RoomFSM:
                 room.actor_map = {}
                 room.recent_kills = []
                 room.recent_knocks = []
+                # ...except self: keep my actor routing so a nameless alv=false
+                # about me (e.g. a quiet zone elim with no killfeed) still
+                # resolves after the wipe. Actor numbers are stable per room
+                # and later Joins overwrite entries, so a stale seed can't shadow.
+                _self = room.me or view.me
+                _an = getattr(_self, "actor_nr", -1) if _self is not None else -1
+                _un = getattr(_self, "username", None) if _self is not None else None
+                if _un and isinstance(_an, int) and _an not in (None, -1, 0):
+                    room.actor_map[int(_an)] = _un
             except Exception:
                 pass
             log_engine("debug", session_id[:8], msg="room reset for new match (map/kills cleared)", room=room.room_id[:8])
