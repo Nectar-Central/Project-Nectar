@@ -13,6 +13,7 @@ Response:
     "kills": 12, "deaths": 5, "wins": 3, "defeats": 8,
     "playtime_global": 1234, "playtime_per_gm": {...},
     "kd": 2.4, "win_rate": 0.27,
+    "rank": {"by": "kills", "pct": 87, "rank": 5, "total": 120},
     "session": { "game_mode": "zw_lg", "cur_scn": "Game", "players_count": 4, "zone": {...} } | null
   }
 """
@@ -25,6 +26,21 @@ from ..lib.redis_client import cache
 from .capture import engine as capture_engine
 
 router = APIRouter()
+
+
+def better_than_pct(total: int, above: int) -> int:
+    """Percentile for the 'better than X% of players' drawer line.
+
+    rank = 1 + players strictly above you (ties share the best rank);
+    pct = % of the pool you beat. Returns 0 when the pool is meaningless.
+    """
+    try:
+        total, above = int(total or 0), int(above or 0)
+    except Exception:
+        return 0
+    if total < 2 or above < 0 or above >= total:
+        return 0
+    return round((total - 1 - above) / total * 100)
 
 
 @router.get("/api/stats")
@@ -145,6 +161,19 @@ async def get_stats(request: Request):
         except Exception:
             ppg = {}
 
+    # kills percentile for the drawer's "better than X% of players" line.
+    # Lightweight exact counts (no row data); hidden when unavailable.
+    rank = {"by": "kills", "pct": 0, "rank": 0, "total": 0}
+    try:
+        t = supabase.table("bngc_users").select("discord_id", count="exact").execute()
+        total = t.count or 0
+        a = supabase.table("bngc_users").select("discord_id", count="exact").gt("kills", kills).execute()
+        above = a.count or 0
+        rank = {"by": "kills", "pct": better_than_pct(total, above),
+                "rank": above + 1 if total else 0, "total": total or 0}
+    except Exception:
+        pass
+
     return JSONResponse({
         "discord_id": user.get("discord_id"),
         "discord_username": user.get("discord_username"),
@@ -160,6 +189,7 @@ async def get_stats(request: Request):
         "playtime_per_gm": ppg or {},
         "kd": kd,
         "win_rate": win_rate,
+        "rank": rank,
         "is_locked": bool(user.get("is_locked")),
         "lobby_music_url": user.get("lobby_music_url"),
         "lobby_music_volume": user.get("lobby_music_volume", 0.5),
