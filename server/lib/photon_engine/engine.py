@@ -406,7 +406,7 @@ class Engine:
         # Helper to extract other player's props (skid/pid/pfid/_pt) from gpb
         def _other_props():
             pp = gpb.get("playerProps") if gpb else None
-            props = gpb.get("properties") if gpb else {}
+            props = (gpb.get("properties") if gpb else None) or {}
             if not pp and not props:
                 return None, None, None, None
             skid = (pp.get("skid") if pp else None) or props.get("skid")
@@ -504,14 +504,21 @@ class Engine:
             # and must not lock the room; scene packets repair it via adopt_game_mode.
             if packet.game_mode and room.game_mode in (None, GameMode.UNKNOWN):
                 room.game_mode = packet.game_mode
-            # Party
-            party_val = gpb.get("Party") if gpb.get("Party") is not None else gpb.get("properties", {}).get("Party")
-            if party_val is not None:
-                room.party.is_party = bool(party_val)
-                if room_name:
-                    room.party.code = room_name
             # Debug: log gpb for first join to trace other player joins later
             log_engine("debug", session_id[:8], msg=f"first_join op={gpb.get('opName')} room={room_name} playerProps={list(gpb.get('playerProps', {}).keys())}", room=room.room_id[:8])
+
+        # Party — from ANY room join carrying Party info, not just the session's
+        # first join: a player joining a friend's party mid-session must still get
+        # the flag (drawer "In Party" depends on it). RoomName-gated so room-less
+        # matchmaking packets can never clear/set the current room's flag.
+        if is_first_join and room_name:
+            try:
+                party_val = gpb.get("Party") if gpb.get("Party") is not None else gpb.get("properties", {}).get("Party")
+                if party_val is not None:
+                    room.party.is_party = bool(party_val)
+                    room.party.code = room_name
+            except Exception:
+                pass
 
         # pID — 5-char code players type to join private room (validated len==5) — handles any packet, not just first join
         # e.g. JoinRandomRoom with pID DBSXH but no RoomName → pending, next JoinRoom with RoomName 004784f4 → assign
@@ -680,6 +687,26 @@ class Engine:
         # GM is locked by FSM on MATCH enter only — do not set here (prevents flicker)
         # pending_gm plumbing still applies below for JoinRandomRoom without RoomName
 
+        # ---- LEAVE attribution: ev 254 carries ActorNr, rarely 255 ----
+        # Resolve the leaver BEFORE the FSM so leave_self triggers (MATCH->LOBBY),
+        # the roster prunes, and leaving the current (party) room returns to lobby.
+        # Without this, nameless self-leaves are invisible: room stays MATCH with a
+        # stale party and the drawer is stuck on "In Party".
+        try:
+            if packet.packet_type == PacketType.LEAVE and not packet.player_name and actor_nr is not None:
+                _ln = room.actor_map.get(int(actor_nr))
+                if not _ln:
+                    for _cand in (room.me, view.me):
+                        if (_cand is not None and getattr(_cand, "actor_nr", -1) == int(actor_nr)
+                                and getattr(_cand, "username", None)):
+                            _ln = _cand.username
+                            break
+                if _ln:
+                    packet.player_name = _ln
+                    log_engine("leave", session_id[:8], name=_ln, room=room.room_id[:8], via="actor resolve")
+        except Exception:
+            pass
+
         # ---- Strict FSM: state/gm only via enter/exit ----
         # LOBBY enter: authenticate / leave(self) ; LOBBY exit: scene(curScn!=MainLobby)
         # MATCH enter: scene(curScn!=MainLobby)   ; MATCH exit: authenticate / leave(self)
@@ -739,6 +766,12 @@ class Engine:
                             # bump version for next match — Processor checks stG==3 to calculate win/defeat
                             room.match_version += 1
                             room.zone_match_active = False
+                            # new match = new life: party rooms stay MATCH across versions,
+                            # so without this deaths/defeats in later versions are wrongly
+                            # skipped as "already counted this life" (version markers are
+                            # owned by the processor drain, left untouched here)
+                            room.had_self_death = False
+                            room.had_self_defeat = False
                             if len(room.recent_kills) > 20:
                                 room.recent_kills = room.recent_kills[-10:]
                             room.recent_knocks = []
@@ -912,6 +945,19 @@ class Engine:
                 # still record leave for processor
                 room.recent_kills.append(KillInfo(instigator=packet.player_name, instigated="", event_type="left"))
                 log_engine("leave", session_id[:8], name=packet.player_name, count=room.players_count, room=room.room_id[:8], status="not_found")
+
+        # Self-leave of the current room -> back to lobby pseudo-room so stats,
+        # drawer and bot show In Lobby instead of the stale party/match room.
+        # (Party flag is kept: rejoining the same room restores the party view.)
+        try:
+            if packet.packet_type == PacketType.LEAVE and packet.player_name and room.room_id == (view.current_room_id or room.room_id):
+                _me_lv = (view.me.username if view.me and view.me.username else None) or (room.me.username if room.me and room.me.username else None)
+                if _me_lv and _names_equal(packet.player_name, _me_lv):
+                    if view.current_room_id != "lobby":
+                        _ensure_room("lobby")
+                        log_engine("room", session_id[:8], action="left-to-lobby", room=room.room_id[:8])
+        except Exception:
+            pass
 
         # ---- ALIVE / ELIMINATED (room-scoped, also fill skin) ----
         # Contract: RoomView.actor_map[actorNr] resolves alv without 255 (bare alv packets)
