@@ -66,6 +66,91 @@ def _names_equal(a, b) -> bool:
     na = _norm_name(a); nb = _norm_name(b)
     return bool(na and nb and na == nb)
 
+
+def _apply_roster_pt(room, actor_nr, uname, pt_raw) -> bool:
+    """Fill a missing team id from roster data (ActorList + PlayerProperties).
+
+    Late joiners receive the full roster including teams, while the targeted
+    _pt broadcasts from before capture began are missed forever — without this
+    their duo teams stay unknown and every death records immediately instead
+    of deferring to the surviving teammate. Actor key first, then username
+    match, else stash in pending_pt for a later JOIN. Never overwrites a live
+    value. Returns True when a player was updated (caller rebuilds teams).
+    """
+    try:
+        pt = pt_raw.get("value") if isinstance(pt_raw, dict) and "value" in pt_raw else pt_raw
+        if pt is None or str(pt).strip() == "":
+            return False
+        pts = str(pt).strip()
+        try:
+            anr = int(actor_nr)
+        except Exception:
+            anr = None
+        if anr is not None:
+            try:
+                ep = room.players.get(anr)
+            except Exception:
+                ep = None
+            if ep is not None:
+                if getattr(ep, "pt", None):
+                    return False
+                ep.pt = pts
+                return True
+        if uname:
+            for p in room.players.values():
+                if not getattr(p, "pt", None) and _names_equal(p.username, uname):
+                    p.pt = pts
+                    return True
+        if anr is not None:
+            try:
+                if room.pending_pt.get(anr) != pts:
+                    room.pending_pt[anr] = pts
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
+
+
+def _resolve_alv_subject(room, player_name, gpb, actor_nr):
+    """Return (name|None, actor|None) for a nameless alv packet.
+
+    TargetActorNr (the subject) wins over sender ActorNr (often the room
+    master, not the subject) — sender-first resolution misattributed
+    teammate deaths to whoever the sender mapped to. Falls back to the
+    sender map only when the target is unknown, preserving old behavior
+    (including keeping the sender actor) for that case.
+    """
+    name = player_name
+    sender_nr = actor_nr
+    if not name and isinstance(gpb, dict):
+        try:
+            targ = (gpb.get("params") or {}).get("TargetActorNr")
+            if isinstance(targ, dict) and "value" in targ:
+                targ = targ["value"]
+                if isinstance(targ, dict) and "value" in targ:
+                    targ = targ["value"]
+            if targ is not None:
+                try:
+                    tname = room.actor_map.get(int(targ))
+                except Exception:
+                    tname = None
+                if tname is not None:
+                    try:
+                        if isinstance(targ, int) or str(targ).isdigit():
+                            actor_nr = int(targ)
+                    except Exception:
+                        pass
+                    return tname, actor_nr
+        except Exception:
+            pass
+    if not name and sender_nr is not None:
+        try:
+            name = room.actor_map.get(int(sender_nr))
+        except Exception:
+            pass
+    return name, actor_nr
+
 def _resolve_actor(room, nr: int | None) -> str | None:
     """Resolve actorNr -> player username via actor_map, room.players key, or player.actor_nr.
     Actor 0 = room-level properties (curScn/stG/pID), never a player — returns "room"."""
@@ -661,6 +746,16 @@ class Engine:
                             uname = _strip_color_tags(str(uname)).strip()
                             room.actor_map[actor_nr] = uname
                             added.append((actor_nr, uname))
+                            # Harvest _pt for teams (late joiners get the full roster
+                            # incl. teams — targeted broadcasts from before capture
+                            # began are otherwise missed forever, see _apply_roster_pt)
+                            try:
+                                _pte = entry.get("_pt", entry.get("pt")) if isinstance(entry, dict) else None
+                                if _apply_roster_pt(room, actor_nr, uname, _pte):
+                                    _rebuild_teams(room)
+                                    log_engine("team_pt", session_id[:8], team=str(_pte)[:8], target=actor_nr, player=uname, via="roster harvest", room=room.room_id[:8])
+                            except Exception:
+                                pass
                             # Also ensure player exists in room.players if not already
                             if actor_nr not in room.players:
                                 # Create placeholder, will be filled on Join
@@ -978,24 +1073,9 @@ class Engine:
         except Exception:
             pass
         if packet.packet_type in (PacketType.ALIVE, PacketType.ELIMINATED) and (packet.player_name or actor_nr is not None or (gpb and gpb.get("params", {}).get("TargetActorNr") is not None)):
-            # Resolve name via actor_map if packet has no 255
-            alv_name = packet.player_name
-            if not alv_name and actor_nr is not None:
-                alv_name = room.actor_map.get(int(actor_nr))
-            # Also try TargetActorNr (253) for alv
-            if not alv_name and gpb:
-                try:
-                    targ = gpb.get("params", {}).get("TargetActorNr")
-                    if isinstance(targ, dict) and "value" in targ:
-                        targ = targ["value"]
-                        if isinstance(targ, dict) and "value" in targ:
-                            targ = targ["value"]
-                    if targ is not None:
-                        alv_name = room.actor_map.get(int(targ), alv_name)
-                        # also update actor_nr to target for lookup
-                        actor_nr = int(targ) if isinstance(targ, int) or str(targ).isdigit() else actor_nr
-                except Exception:
-                    pass
+            # Resolve name: TargetActorNr subject first, sender ActorNr only as
+            # fallback (sender is often the room master, not the subject).
+            alv_name, actor_nr = _resolve_alv_subject(room, packet.player_name, gpb, actor_nr)
             target = None
             target_key = None
             if actor_nr is not None and int(actor_nr) in room.players:

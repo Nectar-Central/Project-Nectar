@@ -217,10 +217,16 @@ class RoomFSM:
                 # about me (e.g. a quiet zone elim with no killfeed) still
                 # resolves after the wipe. Actor numbers are stable per room
                 # and later Joins overwrite entries, so a stale seed can't shadow.
+                # Only when I've actually joined THIS room (in players): a scene
+                # packet arriving before my join would otherwise seed a stale
+                # actor from a previous room and misattribute others to me.
                 _self = room.me or view.me
                 _an = getattr(_self, "actor_nr", -1) if _self is not None else -1
                 _un = getattr(_self, "username", None) if _self is not None else None
-                if _un and isinstance(_an, int) and _an not in (None, -1, 0):
+                _joined = bool(_un) and any(
+                    _names_equal(p.username, _un) for p in room.players.values()
+                )
+                if _joined and isinstance(_an, int) and _an not in (None, -1, 0):
                     room.actor_map[int(_an)] = _un
             except Exception:
                 pass
