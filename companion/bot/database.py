@@ -316,6 +316,42 @@ async def delete_user(discord_id):
 
 
 # ---------------------------------------------------------------------------
+# Leaderboard — /leaderboard
+# ---------------------------------------------------------------------------
+
+async def get_leaderboard(stat: str = "kills", limit: int = 10):
+    """Top players ordered by a stat (kills or wins).
+
+    Returns list of dicts with discord_id/discord_username/game_username/
+    kills/deaths/wins/defeats, highest first.
+    """
+    stat = stat if stat in ("kills", "wins") else "kills"
+    try:
+        limit = max(1, min(25, int(limit)))
+    except Exception:
+        limit = 10
+    cols = "discord_id,discord_username,game_username,kills,deaths,wins,defeats"
+    if USE_SUPABASE and supabase:
+        try:
+            r = supabase.table("bngc_users").select(cols).order(stat, desc=True).limit(limit).execute()
+            return r.data or []
+        except Exception as e:
+            print(f"[db] get_leaderboard failed: {e}")
+            return []
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                f"SELECT discord_id,discord_username,game_username,kills,deaths,wins,defeats FROM users ORDER BY {stat} DESC LIMIT ?",
+                (limit,),
+            ) as cur:
+                return [dict(row) for row in await cur.fetchall()]
+    except Exception as e:
+        print(f"[db] get_leaderboard sqlite failed: {e}")
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Match helpers — /matches, /replay, /killfeed
 # ---------------------------------------------------------------------------
 

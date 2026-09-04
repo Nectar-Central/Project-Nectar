@@ -29,6 +29,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 def gen_token(): return secrets.token_hex(8).upper()  # 16-char hex, e.g. A1B2C3D4E5F6A7B8 (one-time login)
 
 WARNINGS_FILE = Path(__file__).resolve().parent / "warnings.json"
+ANNOUNCED_FILE = Path(__file__).resolve().parent / "announced_updates.json"
+USERSCRIPT_URL = "https://raw.githubusercontent.com/Nectar-Central/Project-Nectar/main/companion/buildnow-companion.user.js"
 
 
 def load_warnings():
@@ -44,6 +46,22 @@ def save_warnings():
 
 
 warnings = load_warnings()
+
+
+def load_announced():
+    try:
+        with ANNOUNCED_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_announced(data: dict):
+    try:
+        ANNOUNCED_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[announce] save failed: {e}")
 
 
 def save_registered_player(discord_id: int, username: str, display_name: str, game_handle: str, avatar_url: str):
@@ -958,6 +976,150 @@ async def remove_lobby_music_cmd(interaction: discord.Interaction):
         await interaction.followup.send("🗑️ Lobby music removed.", ephemeral=True)
     except Exception as exc:
         await interaction.followup.send(f"Failed: {exc}", ephemeral=True)
+
+async def _fetch_health():
+    """Fetch GET /api/health from the API (same base as session state)."""
+    url = f"{SERVER_URL}/api/health"
+    try:
+        if aiohttp:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                    if r.status == 200:
+                        return await r.json()
+        else:
+            import urllib.request
+            with urllib.request.urlopen(url, timeout=8) as r:
+                return json.loads(r.read().decode())
+    except Exception as e:
+        print(f"[health] fetch failed: {e}")
+    return None
+
+@bot.tree.command(name="precision", description="Show server-side processing precision (kills/deaths/wins/defeats)")
+async def precision_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    data = await _fetch_health()
+    if not data or not isinstance(data.get("precision"), dict):
+        return await interaction.followup.send("Precision data unavailable — API unreachable.")
+    p = data["precision"]
+    pct = p.get("precision_pct", 0)
+    verified = p.get("verified", 0)
+    e = discord.Embed(title="Server Precision", color=0x10b981,
+                      description=f"**{pct}%** · {verified} verified")
+    for action in ("kill", "death", "win", "defeat"):
+        pa = (p.get("per_action") or {}).get(action) or {}
+        e.add_field(name=action.capitalize(),
+                    value=f"{pa.get('pct', 0)}% ({pa.get('ok', 0)} ok / {pa.get('fail', 0)} failed)",
+                    inline=True)
+    e.add_field(name="Pending", value=str(p.get("pending", 0)), inline=True)
+    e.add_field(name="Skipped", value=str(p.get("skipped", 0)), inline=True)
+    await interaction.followup.send(embed=e)
+
+
+@bot.tree.command(name="leaderboard", description="Top players by kills or wins")
+@app_commands.describe(stat="Stat to rank by", limit="How many players (1-25)")
+@app_commands.choices(stat=[
+    app_commands.Choice(name="Kills", value="kills"),
+    app_commands.Choice(name="Wins", value="wins"),
+])
+async def leaderboard_cmd(interaction: discord.Interaction, stat: str = "kills", limit: int = 10):
+    await interaction.response.defer(ephemeral=False)
+    rows = await db.get_leaderboard(stat if stat in ("kills", "wins") else "kills", limit)
+    if not rows:
+        return await interaction.followup.send("No players yet. Play a match first.")
+    title = f"Leaderboard — {'Kills' if stat == 'kills' else 'Wins'}"
+    e = discord.Embed(title=title, color=0x7c3aed)
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, r in enumerate(rows, 1):
+        name = r.get("discord_username") or r.get("game_username") or "?"
+        kills = r.get("kills") or 0
+        deaths = r.get("deaths") or 0
+        wins = r.get("wins") or 0
+        defeats = r.get("defeats") or 0
+        if stat == "wins":
+            total = wins + defeats
+            wr = f"{(wins / total * 100):.1f}% WR" if total else "—"
+            val = f"{wins} wins ({wr})"
+        else:
+            kd = f"{(kills / deaths):.2f} K/D" if deaths else (f"{kills} K/D" if kills else "—")
+            val = f"{kills} kills ({kd})"
+        prefix = medals[i - 1] if i <= 3 else f"{i}."
+        lines.append(f"{prefix} **{name}** — {val}")
+    e.description = "\n".join(lines)[:4000]
+    await interaction.followup.send(embed=e)
+
+
+async def _all_registered_discord_ids():
+    """Every registered discord_id (DM targets for update broadcasts)."""
+    if db.USE_SUPABASE and db.supabase:
+        try:
+            r = db.supabase.table("bngc_users").select("discord_id").limit(10000).execute()
+            return [str(x.get("discord_id")) for x in (r.data or []) if x.get("discord_id")]
+        except Exception as e:
+            print(f"[announce] supabase ids failed: {e}")
+            return []
+    try:
+        import aiosqlite
+        async with aiosqlite.connect(db.DB_PATH) as conn:
+            async with conn.execute("SELECT discord_id FROM users") as cur:
+                return [str(row[0]) for row in await cur.fetchall() if row[0]]
+    except Exception as e:
+        print(f"[announce] sqlite ids failed: {e}")
+        return []
+
+
+@bot.tree.command(name="announce-update", description="DM all registered players about a new update (admin)")
+@app_commands.describe(version="Update version, e.g. 2.14.3",
+                       notes="Patch notes (shown in the DM)",
+                       link="Userscript install link (default: current raw file)",
+                       force="Resend even if this version was already announced")
+@app_commands.default_permissions(administrator=True)
+async def announce_update_cmd(interaction: discord.Interaction,
+                              version: app_commands.Range[str, 1, 32],
+                              notes: app_commands.Range[str, 1, 1000],
+                              link: str | None = None,
+                              force: bool = False):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("Administrator only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    version = version.strip()
+    announced = load_announced()
+    if version in announced and not force:
+        prev = announced[version]
+        return await interaction.followup.send(
+            f"Version **{version}** was already announced ({prev.get('sent', 0)} sent). "
+            f"Use `force:True` to resend.", ephemeral=True)
+    url = (link or "").strip() or USERSCRIPT_URL
+    targets = await _all_registered_discord_ids()
+    if not targets:
+        return await interaction.followup.send("No registered players found.", ephemeral=True)
+    embed = discord.Embed(title=f"🚀 Nectar update {version} is out",
+                          description=notes[:1000], color=0x7c3aed)
+    embed.add_field(name="Reinstall", value=f"[Click here to reinstall]({url})", inline=False)
+    embed.set_footer(text="Open the link in Tampermonkey → Reinstall, then reload the game page.")
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label="Reinstall userscript", url=url))
+    sent, failed = 0, 0
+    for did in targets:
+        try:
+            user = await bot.fetch_user(int(did))
+            await user.send(embed=embed, view=view)
+            sent += 1
+        except discord.Forbidden:
+            failed += 1  # DMs closed — skip silently
+        except Exception as e:
+            print(f"[announce] DM failed for {did}: {e}")
+            failed += 1
+        try:
+            await asyncio.sleep(0.6)  # stay under DM rate limits
+        except: pass
+    announced[version] = {"at": datetime.now(timezone.utc).isoformat(),
+                          "by": str(interaction.user.id), "sent": sent, "failed": failed}
+    save_announced(announced)
+    await interaction.followup.send(
+        f"Update **{version}** announced: **{sent}** DMs sent, **{failed}** failed (DMs closed).",
+        ephemeral=True)
+
 
 if __name__ == "__main__":
     if not TOKEN:
