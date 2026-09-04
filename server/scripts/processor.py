@@ -194,6 +194,66 @@ def _team_alive_for_me(room, view, me_name):
         return None
 
 
+def _self_death_evidence(room, view, me_name) -> bool:
+    """Monotonic self-death evidence for one match: per-life flag, killed-me in
+    the killfeed, or self tracked dead. Deaths are loud (killfeed + alv always
+    broadcast), so NO evidence here means survived — this is what lets a phase
+    end resolve when the room has already emptied (no live players to judge)."""
+    try:
+        if room is not None and getattr(room, "had_self_death", False):
+            return True
+        if me_name:
+            for k in (getattr(room, "recent_kills", None) or []):
+                if k.event_type == "killed" and _names_equal(k.instigated, me_name):
+                    return True
+            for cand in (getattr(room, "me", None), getattr(view, "me", None)):
+                if cand is not None and _names_equal(cand.username, me_name) and not cand.is_alive:
+                    return True
+            for p in (getattr(room, "players", None) or {}).values():
+                if _names_equal(p.username, me_name) and not p.is_alive:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _phase_end_result(room, view, me_name) -> str | None:
+    """Decide a real phase end (stG=3): 'win', 'defeat', or None (undecidable).
+
+    Same generosity as the live paths (quiet teammates presumed alive), but
+    total: it resolves from killfeed/flag evidence when the room has emptied
+    and live players can't be judged. Mid-match deferral is untouched — this
+    runs only at phase end, when the team's fate is final and holding the
+    marker past it would freeze the arm forever.
+
+    Zero-info fallback is 'win': the arm existing means our client saw this
+    room's match end while connected, and deaths are loud (killfeed + alv
+    always broadcast) — no death evidence anywhere means survived.
+    """
+    try:
+        if not room or not me_name:
+            return None
+        alive = False
+        try:
+            for p in room.players.values():
+                if _names_equal(p.username, me_name) and p.is_alive:
+                    alive = True
+                    break
+        except Exception:
+            pass
+        team = _team_alive_for_me(room, view, me_name)
+        if alive or team is True:
+            return "win"
+        if _self_death_evidence(room, view, me_name):
+            return "defeat"
+        if team is False:
+            return "defeat"
+        return "win"
+    except Exception:
+        pass
+    return None
+
+
 def _is_kd_only(gm) -> bool:
     """Respawn modes: K/D tracked, no personal defeat (DF free mode, RvB TDM).
     Wins/defeats in RvB come only from the team-15 race or stG=3 team result.
@@ -890,10 +950,14 @@ async def process_batch(
     is_host = bool(getattr(view, "host_mode", False))  # Check if host mode is enabled
 
     def _should_skip_room(r) -> bool:
-        """Skip lobby rooms with no game mode and no pending win/defeat.
+        """Skip the lobby pseudo-room always (it can never produce a valid
+        win/defeat: its version never advances, so an arm there is undrainable),
+        plus lobby rooms with no game mode and no pending win/defeat.
         This prevents processing lobby-only batches that have no match data.
         """
-        return r.room_id == "lobby" and not r.game_mode and r.last_win_version != r.match_version and r.last_defeat_version != r.match_version
+        if r.room_id == "lobby":
+            return True
+        return not r.game_mode and r.last_win_version != r.match_version and r.last_defeat_version != r.match_version
 
     def _is_server_room(r) -> bool:
         """Server-created rooms carry a 5-char short_code.
@@ -921,23 +985,13 @@ async def process_batch(
             # Edge-triggered: the arm survives stG moving to 2/1 afterwards, so a batch
             # containing [3,2] still drains. Consumed on write; cleared on MATCH enter.
             if room.stg_is_phase_end and room.match_version > 0:
-                # Match just ended — check who's alive to determine winner
+                # Match just ended — check who's alive to determine winner.
+                # _phase_end_result matches the live rules (tracked alive, else
+                # duo-team incl. presumed-alive quiet members) and falls back to
+                # killfeed/flag evidence when the room already emptied.
                 me_name_local = (view.me.username if view.me else None) or user.get("game_username")
                 if me_name_local and room.state.value == "match":
-                    # Check if I'm still alive
-                    is_alive = False
-                    for p in room.players.values():
-                        if _names_equal(p.username, me_name_local) and p.is_alive:
-                            is_alive = True
-                            break
-
-                    # Duo: whole team alive (incl. presumed-alive quiet members) counts as alive,
-                    # so a dead member of the surviving team still gets the win
-                    _ta_win = _team_alive_for_me(room, view, me_name_local)
-                    if _ta_win is not None:
-                        is_alive = _ta_win
-
-                    if is_alive:
+                    if _phase_end_result(room, view, me_name_local) == "win":
                         # I'm alive → WIN (helper marks version so it records once)
                         winner = me_name_local
                         if room.teams:
@@ -1016,39 +1070,42 @@ async def process_batch(
             me_name_local2 = (view.me.username if view.me else None) or user.get("game_username")
             if (room2.last_defeat_version != room2.match_version and not room2.had_self_defeat
                     and room2.stg_is_phase_end
-                    and me_name_local2 and room2.state.value == "match" and room2.players_count > 1):
-                # Check if I'm dead (solo rule)
-                is_dead = False
-                for p in room2.players.values():
-                    if _names_equal(p.username, me_name_local2) and not p.is_alive:
-                        is_dead = True
-                        break
+                    and me_name_local2 and room2.state.value == "match"):
+                # Phase-end verdict from live + evidence rules (resolves emptied rooms)
+                end_res = _phase_end_result(room2, view, me_name_local2)
+                if room2.players_count > 1 or end_res == "defeat":
+                    # Check if I'm dead (solo rule)
+                    is_dead = False
+                    for p in room2.players.values():
+                        if _names_equal(p.username, me_name_local2) and not p.is_alive:
+                            is_dead = True
+                            break
 
-                # Duo: defeat only if whole team dead (quiet members presumed alive)
-                _ta2 = _team_alive_for_me(room2, view, me_name_local2)
-                if _ta2 is not None:
-                    is_dead = not _ta2
+                    # Duo: defeat only if whole team dead (quiet members presumed alive)
+                    _ta2 = _team_alive_for_me(room2, view, me_name_local2)
+                    if _ta2 is not None:
+                        is_dead = not _ta2
 
-                if is_dead:
-                    room2.last_defeat_version = room2.match_version  # Mark for drain
-                    log_sys(f"PROCESSOR marked defeat via stG room={room_id2[:8]} gm={gm2}")
-                    # Reconcile a death the live paths missed (keeps deaths == defeats)
-                    if not room2.had_self_death:
-                        new_def_death = (user.get("deaths") or 0) + 1
-                        supabase.table("bngc_users").update({"deaths": new_def_death}).eq("discord_id", discord_id).execute()
-                        supabase.table("bngc_game_events").insert({
-                            "discord_id": discord_id,
-                            "session_id": session_id,
-                            "event_type": "death",
-                            "event_data": {"gm": gm2, "killer": None, "via": "stG",
-                                           "room_id": room_id2, "code": room2.short_code, "match_version": room2.match_version},
-                        }).execute()
-                        log_sys(f"PROCESSOR DEATH via stG reconcile deaths {user.get('deaths',0)}->{new_def_death}")
-                        user["deaths"] = new_def_death
-                        room2.had_self_death = True
-                        _precision.schedule("death", session_id=session_id, discord_id=discord_id,
-                                            expected=new_def_death, match_version=room2.match_version,
-                                            room_id=room_id2, extra={"via": "stG"})
+                    if is_dead or end_res == "defeat":
+                        room2.last_defeat_version = room2.match_version  # Mark for drain
+                        log_sys(f"PROCESSOR marked defeat via stG room={room_id2[:8]} gm={gm2}")
+                        # Reconcile a death the live paths missed (keeps deaths == defeats)
+                        if not room2.had_self_death:
+                            new_def_death = (user.get("deaths") or 0) + 1
+                            supabase.table("bngc_users").update({"deaths": new_def_death}).eq("discord_id", discord_id).execute()
+                            supabase.table("bngc_game_events").insert({
+                                "discord_id": discord_id,
+                                "session_id": session_id,
+                                "event_type": "death",
+                                "event_data": {"gm": gm2, "killer": None, "via": "stG",
+                                               "room_id": room_id2, "code": room2.short_code, "match_version": room2.match_version},
+                            }).execute()
+                            log_sys(f"PROCESSOR DEATH via stG reconcile deaths {user.get('deaths',0)}->{new_def_death}")
+                            user["deaths"] = new_def_death
+                            room2.had_self_death = True
+                            _precision.schedule("death", session_id=session_id, discord_id=discord_id,
+                                                expected=new_def_death, match_version=room2.match_version,
+                                                room_id=room_id2, extra={"via": "stG"})
 
             # Drain: single DB write point for defeats (kill/alv/stG markers set above;
             # leave writes immediately). One defeat per life — a stale marker for an
