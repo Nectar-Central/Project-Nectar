@@ -121,6 +121,7 @@ async def get_stats(request: Request):
                     "zone": cur_room.get("zone"),
                     "room_id": cur_room.get("room_id"),
                     "short_code": cur_room.get("short_code"),
+                    "party": cur_room.get("party"),
                     "state": cur_room.get("state"),
                 }
             else:
@@ -129,6 +130,7 @@ async def get_stats(request: Request):
                     "cur_scn": live_session.get("cur_scn"),
                     "players_count": live_session.get("players_count"),
                     "zone": live_session.get("zone"),
+                    "party": live_session.get("party"),
                     "state": live_session.get("state"),
                 }
         except Exception:

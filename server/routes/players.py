@@ -135,4 +135,4 @@ async def get_players(request: Request):
     # Sort: self first, then alive first, then name
     enriched.sort(key=lambda x: (not x.get("is_self"), not x.get("is_alive"), (x.get("username") or "").lower()))
 
-    return JSONResponse({"count": len(enriched), "room_id": cur.get("room_id"), "game_mode": cur.get("game_mode"), "state": cur.get("state"), "players": enriched})
+    return JSONResponse({"count": len(enriched), "room_id": cur.get("room_id"), "game_mode": cur.get("game_mode"), "state": cur.get("state"), "short_code": cur.get("short_code"), "party": cur.get("party"), "players": enriched})
