@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Nectar Buildnow Companion
 // @namespace    https://github.com/Nectar-Central
-// @version      2.14.0
-// @description  Nectar Buildnow Companion v2.14.0 — tracker plus loading-screen branding (all CrazyGames frames).
+// @version      2.14.3
+// @description  Nectar Buildnow Companion v2.14.3 — tracker plus loading-screen branding (all CrazyGames frames).
 // @author       Nectar Labs
 // @match        https://buildnow-gg.game-files.crazygames.com/*
 // @match        https://*.crazygames.com/*
@@ -23,11 +23,13 @@
 // @connect      *.vercel.app
 // @connect      supabase.co
 // @connect      *.supabase.co
+// @updateURL    https://raw.githubusercontent.com/Nectar-Central/Project-Nectar/main/companion/buildnow-companion.user.js
+// @downloadURL  https://raw.githubusercontent.com/Nectar-Central/Project-Nectar/main/companion/buildnow-companion.user.js
 // ==/UserScript==
 
 (function () {
   'use strict';
-  const BNC_VERSION = '2.14.0';
+  const BNC_VERSION = '2.14.3';
   const HREF = (() => { try { return location.href; } catch { return ''; } })();
   const IS_GAME_FRAME = HREF.includes('buildnow-gg.game-files.crazygames.com');
   // Loading shell lives inside an intermediate iframe (games.crazygames.com),
@@ -348,14 +350,19 @@
     // party.code can be a full RoomName UUID — show short form; short_code (5-char) shows full
     return s.length>8 ? s.slice(0,8) : s;
   }
-  // ---- Party join/leave slide toast (left edge, slides left→right) ----
+  // ---- Party join/leave toast: big Scandinavian card, slides in from the left ----
+  // Dark-canvas ladder (near-black surface, white ink rungs, 12% borders),
+  // Inter, sentence case, left-aligned. Joined vs left is carried by shape
+  // (filled vs hollow dot) plus words — never by emoji or hue alone.
   let _partyToastStyle=false;
   function ensurePartyToastStyle(){
     if(_partyToastStyle || !document.documentElement) return;
     _partyToastStyle=true;
     const st=document.createElement('style');
     st.id='bnc-party-toast-style';
-    st.textContent=`@keyframes bnc-slide-in-left{from{transform:translateX(-110%);opacity:0}to{transform:translateX(0);opacity:1}}@keyframes bnc-slide-out-left{from{transform:translateX(0);opacity:1}to{transform:translateX(-110%);opacity:0}}.bnc-party-toast{animation:bnc-slide-in-left 280ms cubic-bezier(0.22,1,0.36,1)}.bnc-party-toast.bnc-hide{animation:bnc-slide-out-left 220ms ease-in forwards}`;
+    st.textContent=`@keyframes bnc-slide-in-left{from{transform:translateX(-110%);opacity:0}to{transform:translateX(0);opacity:1}}@keyframes bnc-slide-out-left{from{transform:translateX(0);opacity:1}to{transform:translateX(-110%);opacity:0}}.bnc-party-toast{animation:bnc-slide-in-left 260ms cubic-bezier(0.22,1,0.36,1)}`
+      + `.bnc-party-toast.bnc-hide{animation:bnc-slide-out-left 200ms ease-in forwards}`
+      + `@media (prefers-reduced-motion: reduce){.bnc-party-toast,.bnc-party-toast.bnc-hide{animation:none}}`;
     document.documentElement.appendChild(st);
   }
   function showPartyToast(name, isJoin){
@@ -365,20 +372,42 @@
       if(!wrap){
         wrap=document.createElement('div');
         wrap.id='bnc-party-toasts';
-        Object.assign(wrap.style,{position:'fixed',left:'12px',top:'64px',zIndex:'2147483646',display:'flex',flexDirection:'column',gap:'8px',pointerEvents:'none',fontFamily:'Inter, system-ui, sans-serif'});
+        Object.assign(wrap.style,{position:'fixed',left:'24px',top:'50%',transform:'translateY(-50%)',zIndex:'2147483646',display:'flex',flexDirection:'column',gap:'12px',pointerEvents:'none',fontFamily:'Inter, system-ui, sans-serif'});
         (document.body||document.documentElement).appendChild(wrap);
       }
       const el=document.createElement('div');
       el.className='bnc-party-toast';
-      const accent=isJoin?'#10b981':'#f59e0b';
-      const icon=isJoin?'🟢':'🔴';
-      const verb=isJoin?'joined':'left';
-      Object.assign(el.style,{display:'flex',alignItems:'center',gap:'8px',background:'#0f0f0f',color:'#fff',border:'1px solid rgba(255,255,255,0.12)',borderLeft:`4px solid ${accent}`,borderRadius:'10px',padding:'10px 14px',fontSize:'13px',fontWeight:'600',boxShadow:'0 4px 16px rgba(0,0,0,0.4)',maxWidth:'320px',wordBreak:'break-word'});
-      el.textContent=`${icon} ${String(name||'?').slice(0,32)} ${verb}`;
+      Object.assign(el.style,{display:'flex',alignItems:'center',gap:'16px',background:'#0A0A0A',border:'1px solid rgb(255 255 255 / 12%)',borderRadius:'12px',padding:'20px 24px',maxWidth:'400px'});
+      const dot=document.createElement('span');
+      if(isJoin){ Object.assign(dot.style,{width:'12px',height:'12px',borderRadius:'50%',background:'#fff',flexShrink:'0'}); }
+      else { Object.assign(dot.style,{width:'8px',height:'8px',borderRadius:'50%',border:'2px solid rgb(255 255 255 / 56%)',flexShrink:'0'}); }
+      const txt=document.createElement('div');
+      Object.assign(txt.style,{fontSize:'18px',lineHeight:'1.4',textAlign:'left',wordBreak:'break-word'});
+      const who=document.createElement('span');
+      who.textContent=String(name||'?').slice(0,28);
+      Object.assign(who.style,{color:'#fff',fontWeight:'600'});
+      const what=document.createElement('span');
+      what.textContent=isJoin?' joined the party':' left the party';
+      Object.assign(what.style,{color:'rgb(255 255 255 / 56%)',fontWeight:'400'});
+      txt.appendChild(who); txt.appendChild(what);
+      el.appendChild(dot); el.appendChild(txt);
       wrap.appendChild(el);
-      while(wrap.children.length>4) wrap.firstChild.remove();
-      setTimeout(()=>{ try{ el.classList.add('bnc-hide'); setTimeout(()=>{ try{ el.remove(); }catch{} },240); }catch{} },3000);
+      while(wrap.children.length>3) wrap.firstChild.remove();
+      setTimeout(()=>{ try{ el.classList.add('bnc-hide'); setTimeout(()=>{ try{ el.remove(); }catch{} },220); }catch{} },3500);
     }catch{}
+  }
+  // Toasts only in the party lobby (in party + in lobby). Mid-match movement
+  // stays quiet; the baseline still advances so no burst fires later.
+  function _partyToastAllowed(){
+    try{
+      if(typeof _optimisticState!=='undefined' && _optimisticState.inMatch) return false;
+      const sess=statsCache&&statsCache.session;
+      if(!sess) return false;
+      const pi=getPartyInfo(sess);
+      if(!pi.isParty||!pi.code) return false;
+      if(sess.state && String(sess.state).toLowerCase()==='match') return false;
+      return true;
+    }catch{ return false; }
   }
   // diff player lists -> join/leave toasts. Silent on first snapshot or full reset.
   let _prevPartyNames=null;
@@ -388,9 +417,10 @@
       const curSet=new Set(cur);
       if(_prevPartyNames===null){ _prevPartyNames=curSet; return; }
       const prev=_prevPartyNames;
+      _prevPartyNames=curSet;
+      if(!_partyToastAllowed()) return;
       for(const n of curSet){ if(!prev.has(n)){ showPartyToast(n, true); try{ logInfo(`[PARTY] join ${n}`); }catch{} } }
       for(const n of prev){ if(!curSet.has(n)){ showPartyToast(n, false); try{ logInfo(`[PARTY] leave ${n}`); }catch{} } }
-      _prevPartyNames=curSet;
     }catch{}
   }
   function resetPartyJoins(){ _prevPartyNames=null; }
@@ -1303,8 +1333,10 @@
     const sc = statsCache;
     const kills = sc? sc.kills : null;
     const deaths = sc? sc.deaths : null;
+    const kd = sc && sc.kd!=null ? sc.kd : null;
     const wins = sc? sc.wins : null;
     const defeats = sc? sc.defeats : null;
+    const rankPct = sc && sc.rank && sc.rank.total>=2 ? sc.rank.pct : null;
     const pGlobal = sc? sc.playtime_global : null;
     const sess = sc && sc.session ? sc.session : null;
     const _curRoom = sess && sess.rooms ? sess.rooms[sess.current_room_id] : null;
@@ -1347,29 +1379,16 @@
     const statsRowsHtml = noStats ? emptyStatsHtml : `
           ${row('Kills', kills)}
           ${row('Deaths', deaths)}
+          ${row('K/D', kd)}
           ${row('Wins', wins)}
           ${row('Defeats', defeats)}
           ${row('Playtime', pGlobal!=null? fmtPlaytimeDrawer(pGlobal):null)}
-          ${perGmRow}`;
-    // party roster inside the stats tab (visible whenever in a party)
-    let partyRosterHtml='';
-    if(isInParty){
-      const pc = playersCache;
-      const rosterRows = (pc && pc.players && pc.players.length)
-        ? pc.players.map(pl=>{
-            const nm = pl.username!=null ? String(pl.username).replace(/</g,'&lt;') : 'NaN';
-            const dot = pl.is_self ? '#10b981' : (pl.is_alive===false ? '#4b5563' : '#3b82f6');
-            const you = pl.is_self ? ' <span style="font-size:9px;font-weight:800;color:#000;background:#10b981;border-radius:4px;padding:1px 5px;vertical-align:middle">YOU</span>' : '';
-            return `<div style="display:flex;align-items:center;gap:8px;width:100%;font-size:12px"><span style="width:8px;height:8px;border-radius:50%;background:${dot};flex-shrink:0;display:inline-block"></span><span style="color:#fff;font-weight:600;word-break:break-word;text-align:left;flex:1">${nm}${you}</span></div>`;
-          }).join('')
-        : `<div style="font-size:11px;color:#6b7280">Loading party…</div>`;
-      const pcount = (pc && (pc.count || (pc.players&&pc.players.length))) || '';
-      partyRosterHtml = `<div style="width:100%;max-width:240px;display:flex;flex-direction:column;gap:6px;align-items:stretch;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:10px 12px;margin-top:4px"><div style="font-size:11px;font-weight:800;color:#fff;text-align:left">Party - ${String(partyCodeShort).replace(/</g,'&lt;')}${pcount? ' · '+pcount : ''}</div><div style="display:flex;flex-direction:column;gap:5px;max-height:180px;overflow-y:auto">${rosterRows}</div></div>`;
-    }
+          ${perGmRow}
+          ${rankPct!=null? `<div style="font-size:12px;color:#9ca3af;text-align:center;margin-top:2px">Better than <span style="color:#fff;font-weight:800">${rankPct}%</span> of players</div>`:''}`;
     const isLobbyTab = stateLabel === 'In Lobby';
-    // keep roster visible while in a party (party lobby still reports In Lobby)
-    const showPlayersTab = !isLobbyTab || isInParty;
-    if(isLobbyTab && !isInParty){
+    // No player list in party: Players tab only mid-match. In Party status
+    // still shows on the detail line above.
+    if(isLobbyTab){
       // clean up stale player list when back in lobby (fixes not refreshing)
       if(playersCache){ playersCache=null; }
       try{ resetPartyJoins(); }catch{}
@@ -1378,15 +1397,12 @@
         try{ GMSet('bnc_drawer_tab', drawerTab); }catch{}
         stopPlayersPoll();
       }
-    } else if(isInParty && !playersCache && !playersLoading){
-      // party roster for the drawer stats tab (diff also drives join/leave toasts)
-      try{ fetchPlayers(false); }catch{}
     }
-    // tab bar - hide Players when in lobby per request (but keep it when in a party)
+    // tab bar - Players only mid-match, never for party lobbies
     const tabBtn=(id,label,active)=>`<button id="${id}" style="flex:1;max-width:120px;padding:6px 0;border-radius:999px;border:1px solid ${active?'#fff':'rgba(255,255,255,0.12)'};background:${active?'#fff':'#171717'};color:${active?'#000':'#9ca3af'};font-size:12px;font-weight:700;cursor:pointer">${label}</button>`;
-    const tabBar = showPlayersTab
-      ? `<div style="display:flex;gap:6px;justify-content:center;width:100%;margin-bottom:4px">${tabBtn('bnc-tab-stats','Stats',drawerTab==='stats')}${tabBtn('bnc-tab-players','Players',drawerTab==='players')}</div>`
-      : `<div style="display:flex;gap:6px;justify-content:center;width:100%;margin-bottom:4px">${tabBtn('bnc-tab-stats','Stats',drawerTab==='stats')}</div>`;
+    const tabBar = isLobbyTab
+      ? `<div style="display:flex;gap:6px;justify-content:center;width:100%;margin-bottom:4px">${tabBtn('bnc-tab-stats','Stats',drawerTab==='stats')}</div>`
+      : `<div style="display:flex;gap:6px;justify-content:center;width:100%;margin-bottom:4px">${tabBtn('bnc-tab-stats','Stats',drawerTab==='stats')}${tabBtn('bnc-tab-players','Players',drawerTab==='players')}</div>`;
     const statsHtml = `
       <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;width:100%;padding:10px 0 6px 0">
         ${skinImg}
@@ -1397,7 +1413,6 @@
         <div style="display:flex;flex-direction:column;gap:7px;align-items:center;width:100%">
           ${statsRowsHtml}
         </div>
-        ${partyRosterHtml}
         <button id="bnc-keybind-set" style="margin-top:14px;padding:8px 14px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:600;cursor:pointer">Set open keybind: ${kbLabel}</button>
         <div id="bnc-keybind-hint" style="font-size:11px;color:#6b7280;min-height:14px"></div>
           <div style="margin-top:10px;width:100%;max-width:240px;display:flex;flex-direction:column;gap:4px;align-items:center">
