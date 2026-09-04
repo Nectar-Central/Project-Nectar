@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Nectar Buildnow Companion
 // @namespace    https://github.com/Nectar-Central
-// @version      2.14.3
-// @description  Nectar Buildnow Companion v2.14.3 — tracker plus loading-screen branding (all CrazyGames frames).
+// @version      2.14.4
+// @description  Nectar Buildnow Companion v2.14.4 — tracker plus loading-screen branding (all CrazyGames frames).
 // @author       Nectar Labs
 // @match        https://buildnow-gg.game-files.crazygames.com/*
 // @match        https://*.crazygames.com/*
@@ -29,7 +29,7 @@
 
 (function () {
   'use strict';
-  const BNC_VERSION = '2.14.3';
+  const BNC_VERSION = '2.14.4';
   const HREF = (() => { try { return location.href; } catch { return ''; } })();
   const IS_GAME_FRAME = HREF.includes('buildnow-gg.game-files.crazygames.com');
   // Loading shell lives inside an intermediate iframe (games.crazygames.com),
@@ -343,12 +343,6 @@
     const isParty = !!(p && p.is_party);
     const code = sess.short_code || (p && p.code) || null;
     return {isParty, code};
-  }
-  function fmtPartyCode(code){
-    if(!code) return '-';
-    const s=String(code);
-    // party.code can be a full RoomName UUID — show short form; short_code (5-char) shows full
-    return s.length>8 ? s.slice(0,8) : s;
   }
   // ---- Party join/leave toast: big Scandinavian card, slides in from the left ----
   // Dark-canvas ladder (near-black surface, white ink rungs, 12% borders),
@@ -991,6 +985,12 @@
   function fmtGmDrawer(raw, duo){ if(!raw) return '-'; const k=String(raw).trim(); let label = GM_NAMES_DRAWER[k] || GM_NAMES_DRAWER[k.toLowerCase()] || k.replace(/[_-]+/g,' ').replace(/\b\w/g,s=>s.toUpperCase()); if(duo && (k.toLowerCase()==='df' || k.toLowerCase()==='zw_lg') && !/^(solo|duo|\(duo\))/i.test(label)) label = '(Duo) ' + label; return label; }
   function fmtPlaytimeDrawer(s){ if(s==null) return '-'; s=Math.max(0,Math.floor(Number(s)||0)); const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), sec=s%60; if(h) return `${h}h ${m}m`; if(m) return `${m}m ${sec}s`; return `${sec}s`; }
   function skinUrlDrawer(id){ if(!id || id==='-' ) return null; return `https://buildnow-api.netlify.app/skins/${encodeURIComponent(String(id).trim())}.png`; }
+  // team number -> diamond color (1 red, 2 blue, 3 green, 4 orange, 5 purple, 6 yellow, 7 cyan, 8 pink)
+  function teamColorDrawer(pt){
+    const n=parseInt(String(pt==null?'':pt).trim(), 10);
+    const map={1:'#ef4444',2:'#3b82f6',3:'#22c55e',4:'#f97316',5:'#a855f7',6:'#eab308',7:'#06b6d4',8:'#ec4899'};
+    return map[n]||null;
+  }
   // keybind for drawer - customizable via button in drawer
   function getDrawerKeybind(){
     try{
@@ -1362,13 +1362,12 @@
     const kbLabel = formatKeybind(getDrawerKeybind());
     const row = (label,val)=> `<div style="display:flex;justify-content:space-between;align-items:center;width:100%;max-width:240px;font-size:13px"><span style="color:#9ca3af">${label}</span><span style="font-weight:700;color:#fff">${val==null? '-' : val}</span></div>`;
     const hasGm = gmLive && gmLive !== '-' && gmLive !== '-' && gmLive.toLowerCase() !== 'unknown' && gmLive.toLowerCase() !== 'lobby';
-    // party: "In Party - X - GM" when the player is in a party (X = short_code, fallback party code)
+    // party: "In Party - <state> - GM" when the player is in a party
     const _partyInfo = getPartyInfo(sess);
     const isInParty = !!(_partyInfo.isParty && _partyInfo.code);
-    const partyCodeShort = isInParty ? fmtPartyCode(_partyInfo.code) : null;
     let stateGmLine = hasGm && stateLabel.toLowerCase() !== gmLive.toLowerCase() ? `${stateLabel} - ${gmLive}` : stateLabel;
     if(isInParty){
-      stateGmLine = hasGm ? `In Party - ${partyCodeShort} - ${gmLive}` : `In Party - ${partyCodeShort}`;
+      stateGmLine = hasGm ? `In Party - ${stateLabel} - ${gmLive}` : `In Party - ${stateLabel}`;
     }
     const smallRow = (label,val)=> `<div style="display:flex;justify-content:space-between;align-items:center;width:100%;max-width:240px;font-size:11px"><span style="color:#9ca3af">${label}</span><span style="font-weight:600;color:#fff">${val==null? '-' : val}</span></div>`;
     const perGmRow = hasGm && perGmCurrent!=null ? smallRow('Playtime ('+gmLive+')', fmtPlaytimeDrawer(perGmCurrent)) : '';
@@ -1450,7 +1449,10 @@
           const toNaN=(v)=> (v==null || String(v).trim()==='' || String(v).toLowerCase()==='null' || String(v).toLowerCase()==='undefined') ? 'NaN' : esc(v);
           const titleName = pl.username!=null ? esc(pl.username) : 'NaN';
           const lateBadge = pl.late_join ? ` <span style="font-size:9px;font-weight:800;color:#000;background:#f59e0b;border-radius:4px;padding:1px 5px;vertical-align:middle;white-space:nowrap">LATE JOIN</span>` : '';
-          const nameLine = `<div style="font-size:13px;font-weight:700;color:#fff;word-break:break-word">${titleName}${lateBadge}</div>`;
+          const _ptColor = teamColorDrawer(pl.pt);
+          const _ptNum = parseInt(String(pl.pt==null?'':pl.pt).trim(), 10);
+          const teamDia = _ptColor ? `<span title="Team ${Number.isFinite(_ptNum)?_ptNum:esc(pl.pt)}" style="display:inline-block;width:9px;height:9px;background:${_ptColor};transform:rotate(45deg);margin-right:7px;flex-shrink:0;vertical-align:baseline"></span>` : '';
+          const nameLine = `<div style="font-size:13px;font-weight:700;color:#fff;word-break:break-word">${teamDia}${titleName}${lateBadge}</div>`;
           const gidFull = pl.game_id!=null ? String(pl.game_id) : 'NaN';
           const discordVal = pl.discord_username!=null ? String(pl.discord_username) : 'NaN';
           const detailLine = `Discord: ${toNaN(discordVal)} · Game ID: ${toNaN(gidFull)}`;
