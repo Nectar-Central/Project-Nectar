@@ -291,7 +291,8 @@ class SessionSelectView(discord.ui.View):
             groups.setdefault(rid, []).append(ev)
         if len(groups) <= 1:
             detail = match_detail_embed(sid, events)
-            view = MatchActionsView(sid, self.discord_id, events, room_id=None)
+            view = MatchActionsView(sid, self.discord_id, events, room_id=None,
+                                    room_ids=list(groups.keys()), index=0)
             await interaction.edit_original_response(embed=detail, view=view)
         else:
             view = MatchSelectView(sid, self.discord_id, events, list(groups.keys()))
@@ -303,6 +304,7 @@ class MatchSelectView(discord.ui.View):
         self.session_id = session_id
         self.discord_id = discord_id
         self.events = events
+        self.room_ids = list(room_ids)
         # Build options per room (room_ids are composite keys like room_id or room_id_version)
         options = []
         for idx, rid in enumerate(room_ids[:25], 1):
@@ -336,8 +338,13 @@ class MatchSelectView(discord.ui.View):
         await interaction.response.defer()
         # If room_id == session_id, treat as no room filter
         room_filter = None if rid == self.session_id else rid
+        try:
+            idx = self.room_ids.index(rid)
+        except ValueError:
+            idx = 0
         detail = match_detail_embed(self.session_id, self.events, room_filter)
-        view = MatchActionsView(self.session_id, self.discord_id, self.events, room_filter)
+        view = MatchActionsView(self.session_id, self.discord_id, self.events, room_filter,
+                                room_ids=self.room_ids, index=idx)
         await interaction.edit_original_response(embed=detail, view=view)
 
     async def on_back(self, interaction: discord.Interaction):
@@ -349,14 +356,21 @@ class MatchSelectView(discord.ui.View):
         await interaction.edit_original_response(embed=embed, view=view)
 
 class MatchActionsView(discord.ui.View):
-    def __init__(self, session_id: str, discord_id: str, events: list[dict], room_id: str | None, timeout: float = 180):
+    def __init__(self, session_id: str, discord_id: str, events: list[dict], room_id: str | None, timeout: float = 180,
+                 room_ids: list[str] | None = None, index: int = 0):
         super().__init__(timeout=timeout)
         self.session_id = session_id
         self.discord_id = discord_id
         self.events = events
         self.room_id = room_id
+        self.room_ids = list(room_ids) if room_ids else ([room_id] if room_id else [])
+        try:
+            self.index = max(0, min(int(index), len(self.room_ids) - 1)) if self.room_ids else 0
+        except Exception:
+            self.index = 0
         self.page = 0
         self.mode: str | None = None  # "killfeed" or "replay"
+        self._refresh_match_nav()
 
     @discord.ui.button(label="Killfeed", style=discord.ButtonStyle.danger, emoji="💀")
     async def killfeed_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -424,16 +438,43 @@ class MatchActionsView(discord.ui.View):
     @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, emoji="◀️")
     async def back_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        # Go back to match detail
-        detail = match_detail_embed(self.session_id, self.events, self.room_id)
+        # Back to the match picker (or sessions when this was the only match)
+        if self.room_ids and len(self.room_ids) > 1:
+            view = MatchSelectView(self.session_id, self.discord_id, self.events, self.room_ids)
+            embed = matches_in_session_embed(self.session_id, self.events, None)
+            return await interaction.edit_original_response(embed=embed, view=view)
+        sessions = await db.get_recent_matches(self.discord_id, limit=10)
+        embed = sessions_overview_embed(sessions)
+        view = SessionSelectView(sessions, self.discord_id)
+        await interaction.edit_original_response(embed=embed, view=view)
+
+    async def _step_match(self, interaction: discord.Interaction, delta: int):
+        """Step to the prev/next match in this session (detail mode)."""
+        await interaction.response.defer()
+        if not self.room_ids:
+            return
+        self.index = max(0, min(len(self.room_ids) - 1, self.index + delta))
+        self.room_id = self.room_ids[self.index]
         self.mode = None
         self.page = 0
+        detail = match_detail_embed(self.session_id, self.events, self.room_id)
+        self._refresh_match_nav()
         await interaction.edit_original_response(embed=detail, view=self)
+
+    def _refresh_match_nav(self):
+        """Row-1 Prev/Next step matches in detail mode (disabled at the ends)."""
+        multi = len(self.room_ids) > 1
+        for child in self.children:
+            if isinstance(child, discord.ui.Button) and child.label in ("◀ Prev", "Next ▶"):
+                if child.label == "◀ Prev":
+                    child.disabled = not multi or self.index <= 0
+                else:
+                    child.disabled = not multi or self.index >= len(self.room_ids) - 1
 
     @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary, row=1)
     async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.mode is None:
-            return await interaction.response.defer()
+            return await self._step_match(interaction, -1)
         await interaction.response.defer()
         self.page = max(0, self.page - 1)
         lines = killfeed_lines_for_events(self.events, self.room_id) if self.mode == "killfeed" else replay_lines_for_events(self.events, self.room_id)
@@ -446,7 +487,7 @@ class MatchActionsView(discord.ui.View):
     @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary, row=1)
     async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.mode is None:
-            return await interaction.response.defer()
+            return await self._step_match(interaction, +1)
         await interaction.response.defer()
         lines = killfeed_lines_for_events(self.events, self.room_id) if self.mode == "killfeed" else replay_lines_for_events(self.events, self.room_id)
         total_pages = max(1, (len(lines) + 12 - 1) // 12)
