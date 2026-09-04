@@ -1,9 +1,10 @@
 """
-discovery.py — GET /api/search, GET /api/leaderboard, GET /api/user
+discovery.py — GET /api/search, GET /api/leaderboard, GET /api/user, GET /api/matches
 
 Search: ?q=xxx → users matching discord_username / game_username / game_id
 Leaderboard: ?sort=kills|wins|kd|win_rate|playtime&limit=20&offset=0 -> ordered bngc_users + computed fields
 User: ?discord_id=xxx | ?game_username=xxx | ?game_id=xxx -> public player profile (no secrets)
+Matches: ?discord_id=xxx | ?game_username=xxx | ?game_id=xxx -> recent grouped matches (room+version)
 """
 
 from fastapi import APIRouter, Request
@@ -12,6 +13,74 @@ from fastapi.responses import JSONResponse
 from ..lib.supabase_client import supabase
 
 router = APIRouter()
+
+
+def _resolve_identity(discord_id: str = "", game_username: str = "", game_id: str = "") -> dict | None:
+    """Find a bngc_users row by whichever identifier is given. Pure lookup, no secrets."""
+    if not supabase:
+        return None
+    for col, val in (("discord_id", discord_id), ("game_username", game_username), ("game_id", game_id)):
+        if not val:
+            continue
+        try:
+            res = supabase.table("bngc_users").select("discord_id").eq(col, val).limit(1).execute()
+            if res.data:
+                return res.data[0]
+        except Exception:
+            continue
+    return None
+
+
+def _match_key(event_data: dict, session_id: str) -> str:
+    """Composite room+version key (same scheme as the bot: splits private
+    zw_lg multi-match on the same room_id)."""
+    gd = event_data or {}
+    rid = str(gd.get("room_id") or gd.get("room") or gd.get("code") or gd.get("short_code") or session_id)
+    mv = gd.get("match_version")
+    if mv is not None:
+        try:
+            return f"{rid}_{int(mv)}"
+        except Exception:
+            return f"{rid}_{mv}"
+    return rid
+
+
+def _group_match_events(events: list[dict], session_id: str = "") -> list[dict]:
+    """Collapse raw game events into per-match summaries (pure, unit-tested).
+
+    Returns newest-first: [{room, match_version, gm, kills, deaths, win,
+    defeat, created_at}] for groups that look like real matches.
+    """
+    groups: dict[str, list[dict]] = {}
+    for ev in events or []:
+        gd = ev.get("event_data") or {}
+        groups.setdefault(_match_key(gd, ev.get("session_id") or session_id), []).append(ev)
+    out = []
+    for key, evs in groups.items():
+        kinds = {e.get("event_type") for e in evs}
+        # skip lobby noise / sessions with no match-level signal
+        if not (kinds & {"kill", "death", "win", "defeat", "zone_change"}):
+            continue
+        try:
+            ts = max(str(e.get("created_at") or "") for e in evs)
+        except Exception:
+            ts = ""
+        gm = next(( (e.get("event_data") or {}).get("gm") for e in evs if (e.get("event_data") or {}).get("gm")), None)
+        first_gd = (evs[0].get("event_data") or {})
+        mv = first_gd.get("match_version")
+        room = str(first_gd.get("room_id") or first_gd.get("short_code") or "")[:8] or key[:8]
+        out.append({
+            "room": room,
+            "match_version": mv,
+            "gm": gm,
+            "kills": sum(1 for e in evs if e.get("event_type") == "kill"),
+            "deaths": sum(1 for e in evs if e.get("event_type") == "death"),
+            "win": any(e.get("event_type") == "win" for e in evs),
+            "defeat": any(e.get("event_type") == "defeat" for e in evs),
+            "created_at": ts,
+        })
+    out.sort(key=lambda m: m.get("created_at") or "", reverse=True)
+    return out
 
 # ---------------------------------------------------------------------------
 # GET /api/search?q=...
@@ -207,5 +276,32 @@ async def get_user(request: Request):
             "playtime_global": int(row.get("playtime_global") or 0),
             "playtime_per_gm": per_gm or {},
         })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/matches?discord_id=... | ?game_username=... | ?game_id=... [&limit=10]
+# ---------------------------------------------------------------------------
+@router.get("/api/matches")
+async def get_matches(request: Request):
+    """Recent grouped matches for the website profile tab (kills/deaths per
+    match + win/defeat outcome). No secrets."""
+    qp = request.query_params
+    ident = _resolve_identity(qp.get("discord_id") or "", qp.get("game_username") or "", qp.get("game_id") or "")
+    if not ident:
+        if not supabase:
+            return JSONResponse({"error": "Server not configured"}, status_code=500)
+        return JSONResponse({"error": "user not found"}, status_code=404)
+    try:
+        limit = max(1, min(int(qp.get("limit") or "10"), 25))
+    except Exception:
+        limit = 10
+    try:
+        res = supabase.table("bngc_game_events").select(
+            "session_id,event_type,event_data,created_at"
+        ).eq("discord_id", ident["discord_id"]).order("created_at", desc=True).limit(500).execute()
+        matches = _group_match_events(res.data or [])[:limit]
+        return JSONResponse({"count": len(matches), "matches": matches})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)

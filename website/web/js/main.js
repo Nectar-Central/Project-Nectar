@@ -311,23 +311,26 @@ async function loadLeaderboard() {
     console.log("[NECTAR] Fetching leaderboard from API...");
 
     try {
-        const response = await fetch(`${API_BASE_URL}/api/leaderboard`);
+        const response = await fetch(`${API_BASE_URL}/api/leaderboard?sort=kills&limit=20`);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
         let data = await response.json();
         if (typeof data === "string") data = JSON.parse(data);
+        // API returns {results:[...]} — accept a bare array too
+        const rows = Array.isArray(data) ? data : (data.results || []);
 
-        if (!Array.isArray(data) || data.length === 0) {
-            tbody.innerHTML = `<tr><td colspan="4" class="no-data">No leaderboard records found.</td></tr>`;
+        if (!Array.isArray(rows) || rows.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="5" class="no-data">No leaderboard records found.</td></tr>`;
             return;
         }
 
-        tbody.innerHTML = data.map((player, index) => {
+        tbody.innerHTML = rows.map((player, index) => {
             const rank = player.rank || index + 1;
-            const displayName = player.game_username || player.username || player.name || player.player || "Unknown";
+            const displayName = player.game_username || player.discord_username || player.username || player.name || "Unknown";
             const searchTag = player.game_username || player.discord_username || player.username || displayName;
-            const elo = player.elo ?? player.points ?? player.score ?? "--";
-            const division = player.division ?? player.tier ?? "Unranked";
+            const kills = player.kills ?? "--";
+            const wins = player.wins ?? "--";
+            const kd = player.kd ?? (player.deaths ? (player.kills / player.deaths).toFixed(2) : "--");
 
             return `
                 <tr>
@@ -337,15 +340,16 @@ async function loadLeaderboard() {
                             ${escapeHTML(displayName)}
                         </a>
                     </td>
-                    <td>${escapeHTML(elo)}</td>
-                    <td>${escapeHTML(division)}</td>
+                    <td>${escapeHTML(kills)}</td>
+                    <td>${escapeHTML(wins)}</td>
+                    <td>${escapeHTML(kd)}</td>
                 </tr>
             `;
         }).join("");
 
     } catch (error) {
         console.error("[NECTAR] Leaderboard fetch error:", error);
-        tbody.innerHTML = `<tr><td colspan="4" class="no-data">Failed to load leaderboard data.</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="5" class="no-data">Failed to load leaderboard data.</td></tr>`;
     }
 }
 
@@ -358,17 +362,67 @@ async function fetchAndShowPlayer(query) {
     if (usernameEl) usernameEl.textContent = `Loading stats for "${query}"...`;
 
     try {
-        const response = await fetch(`${API_BASE_URL}/api/player/${encodeURIComponent(query)}`);
-        if (!response.ok) throw new Error("Player not found");
-
-        let data = await response.json();
-        if (typeof data === "string") data = JSON.parse(data);
-
+        // Our API: /api/user?game_username= (fractional win_rate) with
+        // /api/search?q= fallback. Normalize to what renderProfileData reads.
+        let data = null;
+        const userResp = await fetch(`${API_BASE_URL}/api/user?game_username=${encodeURIComponent(query)}`);
+        if (userResp.ok) {
+            data = await userResp.json();
+            if (typeof data === "string") data = JSON.parse(data);
+        } else {
+            const searchResp = await fetch(`${API_BASE_URL}/api/search?q=${encodeURIComponent(query)}&limit=5`);
+            if (!searchResp.ok) throw new Error("Player not found");
+            let search = await searchResp.json();
+            if (typeof search === "string") search = JSON.parse(search);
+            const hits = Array.isArray(search) ? search : (search.results || []);
+            if (!hits.length) throw new Error("Player not found");
+            data = hits[0];
+        }
+        if (data && data.win_rate != null && data.winrate == null) {
+            data.winrate = (Number(data.win_rate) * 100).toFixed(1);
+        }
         renderProfileData(data, query);
+        loadProfileMatches(data.game_username || data.discord_username || query);
     } catch (error) {
         console.error("[NECTAR] Player fetch error:", error);
         if (usernameEl) usernameEl.textContent = `Player "${query}" Not Found`;
         resetProfileStats();
+    }
+}
+
+async function loadProfileMatches(query) {
+    const matchesList = document.getElementById("matches-list");
+    if (!matchesList || !query) return;
+    try {
+        const response = await fetch(`${API_BASE_URL}/api/matches?game_username=${encodeURIComponent(query)}&limit=10`);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        let data = await response.json();
+        if (typeof data === "string") data = JSON.parse(data);
+        const matches = data.matches || [];
+        if (!matches.length) {
+            matchesList.innerHTML = `<div class="no-data">No recent matches found.</div>`;
+            return;
+        }
+        matchesList.innerHTML = matches.map(m => {
+            const result = m.win ? "Win" : (m.defeat ? "Loss" : "—");
+            const when = m.created_at ? new Date(m.created_at).toLocaleString() : "Recently";
+            const kd = `${m.kills ?? 0}K / ${m.deaths ?? 0}D`;
+            return `
+                <div class="card" style="margin-bottom: 10px; display:flex; justify-content:space-between; align-items:center;">
+                    <div>
+                        <strong>${escapeHTML(m.gm || "Match")}</strong>
+                        <p style="margin:4px 0 0; font-size:14px; opacity:0.8;">${escapeHTML(when)}</p>
+                    </div>
+                    <div>
+                        <span>${escapeHTML(kd)}</span> |
+                        <span>Result: <strong>${escapeHTML(result)}</strong></span>
+                    </div>
+                </div>
+            `;
+        }).join("");
+    } catch (error) {
+        console.error("[NECTAR] Matches fetch error:", error);
+        matchesList.innerHTML = `<div class="no-data">No recent matches found.</div>`;
     }
 }
 
