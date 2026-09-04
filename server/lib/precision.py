@@ -93,15 +93,16 @@ def _record(ok: bool, action: str) -> None:
         pass
 
 
-def _verify_item(item: dict[str, Any]) -> bool | None:
+def _verify_item(item: dict[str, Any]) -> tuple[bool | None, str]:
     """Re-check one write against fresh DB state.
 
-    Returns True (precise), False (imprecise), or None (unknown — skip).
+    Returns (True/False/None, reason): True = precise, False = imprecise
+    (with reason "counter" and/or "event"), None = unknown, skip.
     """
     from .supabase_client import supabase
 
     if supabase is None:
-        return None
+        return None, "no-supabase"
     try:
         action = item["action"]
         field = _COUNTER_FIELD[action]
@@ -110,14 +111,16 @@ def _verify_item(item: dict[str, Any]) -> bool | None:
             "discord_id", item["discord_id"]).single().execute()
         user = ures.data if isinstance(ures, object) else None
         if not isinstance(user, dict):
-            return None
+            return None, "no-user-row"
         try:
             counter_ok = int(user.get(field) or 0) >= int(item["expected"])
         except Exception:
-            return None
+            return None, "bad-expected"
+        # Newest-first: high-volume sessions (100+ DF kills in one version)
+        # push the write out of an unordered limit-50 window (false fails).
         eres = supabase.table("bngc_game_events").select("event_data").eq(
             "session_id", item["session_id"]).eq(
-            "event_type", action).limit(50).execute()
+            "event_type", action).order("created_at", desc=True).limit(50).execute()
         rows = eres.data if isinstance(getattr(eres, "data", None), list) else []
         event_ok = False
         want_mv = item.get("match_version")
@@ -134,10 +137,12 @@ def _verify_item(item: dict[str, Any]) -> bool | None:
                     continue
             event_ok = True
             break
-        return bool(counter_ok and event_ok)
+        if counter_ok and event_ok:
+            return True, ""
+        return False, "+".join([s for s, ok in (("counter", counter_ok), ("event", event_ok)) if not ok])
     except Exception as exc:
         log_err(f"precision verify failed ({item.get('action')}) {exc}")
-        return None
+        return None, "exception"
 
 
 async def verify_due(max_items: int = 10) -> int:
@@ -150,11 +155,15 @@ async def verify_due(max_items: int = 10) -> int:
             due.append(_pending.popleft())
         # Drop overdue-but-uncapped backlog silently? No — keep for next call.
         for item in due:
-            res = _verify_item(item)
+            res, reason = _verify_item(item)
             if res is None:
                 _skipped += 1
             else:
                 _record(res, item["action"])
+                if not res:
+                    log_sys(f"PRECISION imprecise action={item.get('action')} "
+                            f"session={str(item.get('session_id') or '')[:8]} "
+                            f"expected={item.get('expected')} reason={reason}")
         if due:
             log_sys(f"PRECISION verified {len(due)} pending={len(_pending)} "
                     f"score={current_score_pct()}%")

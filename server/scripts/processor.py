@@ -365,10 +365,37 @@ def _eff_gm(pkt, pkt_room_gm, gm_val):
     return pkt_gm or pkt_room_gm or gm_val  # Fallback chain: packet → room → session
 
 
+def _result_event_exists(session_id, event_type, room_id, match_ver) -> bool:
+    """Idempotency guard: was this match result already written?
+
+    Retried/requeued batches re-run the drain with restored (marker-less)
+    state and would otherwise double-record wins/defeats. Kills are excluded
+    on purpose: respawn modes legitimately repeat same-victim kills, and the
+    time-window retransmit guard already covers those. Fail-open (False) on
+    read errors so a blip never blocks a legitimate first write.
+    """
+    try:
+        res = supabase.table("bngc_game_events").select("event_data").eq(
+            "session_id", session_id).eq(
+            "event_type", event_type).order("created_at", desc=True).limit(20).execute()
+        for r in (res.data or []):
+            ed = (r or {}).get("event_data") or {}
+            if str(ed.get("room_id") or "") == str(room_id or "") and ed.get("match_version") == match_ver:
+                return True
+    except Exception as exc:
+        log_err(f"processor result-exists check failed {exc}")
+    return False
+
+
 def _write_win(discord_id, session_id, user, gm, room_id, short_code, match_ver, winner, room):
     """Write one win to DB (bngc_users + bngc_game_events) + log lines.
     Marks room.last_win_version (NOT drained — version bump re-enables next match).
     """
+    if _result_event_exists(session_id, "win", room_id, match_ver):
+        log_sys(f"PROCESSOR WIN skip already recorded gm={gm} room={str(room_id or '')[:8]} ver={match_ver}")
+        if room is not None:
+            room.last_win_version = match_ver  # heal marker so it isn't retried
+        return user.get("wins") or 0
     new_wins = (user.get("wins") or 0) + 1  # Increment win count
     supabase.table("bngc_users").update({"wins": new_wins}).eq("discord_id", discord_id).execute()
     supabase.table("bngc_game_events").insert({
@@ -399,6 +426,11 @@ def _write_defeat(discord_id, session_id, user, gm, room_id, short_code, match_v
     """
     if room is not None and room.last_win_version == match_ver:
         log_sys(f"PROCESSOR DEFEAT skip win already recorded gm={gm}")  # Win stands
+        return user.get("defeats") or 0
+    if _result_event_exists(session_id, "defeat", room_id, match_ver):
+        log_sys(f"PROCESSOR DEFEAT skip already recorded gm={gm} room={str(room_id or '')[:8]} ver={match_ver}")
+        if room is not None:
+            room.had_self_defeat = True  # heal marker so it isn't retried
         return user.get("defeats") or 0
     new_def = (user.get("defeats") or 0) + 1  # Increment defeat count
     supabase.table("bngc_users").update({"defeats": new_def}).eq("discord_id", discord_id).execute()
@@ -1121,6 +1153,11 @@ async def process_batch(
                     room2.last_defeat_version = -1  # Discard stale marker
                 elif _team_alive_for_me(room2, view, me_name_local2) is True:
                     pass  # hold marker silently — teammate still alive, re-evaluated next batch
+                elif _result_event_exists(session_id, "defeat", room_id2, room2.match_version):
+                    log_sys(f"PROCESSOR DEFEAT skip already recorded gm={gm2} room={room_id2[:8]} ver={room2.match_version}")
+                    room2.had_self_defeat = True  # heal marker so it isn't retried
+                    room2.last_defeat_version = -1  # Discard stale marker
+                    room2.stg_is_phase_end = False
                 else:
                     new_def = (user.get("defeats") or 0) + 1
                     supabase.table("bngc_users").update({"defeats": new_def}).eq("discord_id", discord_id).execute()
