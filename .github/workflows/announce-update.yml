@@ -20,6 +20,11 @@ on:
       notes:
         description: "Patch notes for the DM"
         required: true
+      dry_run:
+        description: "Check secrets + count players without sending DMs"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: announce-update
@@ -70,4 +75,5 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           VERSION: ${{ steps.release.outputs.version != '' && steps.release.outputs.version || inputs.version }}
           NOTES: ${{ github.event_name == 'workflow_dispatch' && inputs.notes || join(github.event.commits.*.message, '\n') }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: python scripts/announce_update.py

@@ -22,6 +22,7 @@ USERSCRIPT_URL = (
     os.environ.get("USERSCRIPT_URL")
     or "https://raw.githubusercontent.com/Nectar-Central/Project-Nectar/main/companion/buildnow-companion.user.js"
 )
+DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
 
 
 class Announcer(discord.Client):
@@ -42,6 +43,10 @@ class Announcer(discord.Client):
             await self.close()
             sys.exit(2)
         print(f"announcing v{self.version} to {len(targets)} players")
+        if DRY_RUN:
+            print(f"dry run: would DM {len(targets)} players, sending nothing")
+            await self.close()
+            return
         embed = discord.Embed(title=f"🚀 Nectar update {self.version} is out",
                               description=self.notes, color=0x7C3AED)
         embed.add_field(name="Reinstall",
