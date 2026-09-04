@@ -58,7 +58,7 @@
 
 <section id="home" class="page active">
     
-    <div class="search-hero">
+ <div class="search-hero" style="width: 100%; background: url('assets/images/Nectar logo.png') center/cover no-repeat;">
         <h1 class="center-title">Find YOUR BNGG STATS</h1>
         
         <div class="search-container">
@@ -91,12 +91,25 @@
         </div>
     </div>
 
+    <div class="container">
+        <div class="discord-card">
+            <div class="discord-left">
+                <img src="assets/icons/38481-discord.png" alt="Discord" class="discord-icon" width="40">
+                <div>
+                    <h3>Join our Discord community!</h3>
+                    <p>Chat, find teammates, get updates & more.</p>
+                </div>
+            </div>
+            <a href="https://discord.gg/fwUwPH6jpt" target="_blank" class="discord-btn">Join Discord &rarr;</a>
+        </div>
+    </div>
+
 </section>
 
-<!-- PLAYER PROFILE PAGE -->
+<!-- the player profile page -->
 <section id="profile" class="page">
     
-    <!-- Profile Banner & Main Info Header -->
+    <!-- profile banner, chris here make it so it works -->
     <div class="profile-header">
         <div class="profile-banner"></div>
         <div class="profile-identity">
@@ -105,14 +118,12 @@
         </div>
     </div>
 
-    <!-- Navigation Tabs -->
     <div class="profile-tabs">
         <button class="profile-tab-btn active" data-tab="overview">Overview</button>
         <button class="profile-tab-btn" data-tab="events">Events</button>
         <button class="profile-tab-btn" data-tab="matches">Matches</button>
     </div>
 
-    <!-- TAB 1: OVERVIEW PANEL -->
     <div id="tab-overview" class="profile-tab-content active">
         <div class="overview-panel">
             <div class="stats-grid main-stats">
@@ -188,7 +199,6 @@
         </div>
     </div>
 
-    <!-- TAB 3: MATCHES PANEL -->
     <div id="tab-matches" class="profile-tab-content">
         <div class="matches-panel">
             <h3 class="panel-title">MATCH HISTORY</h3>
@@ -258,12 +268,40 @@
 
 </main>
 
-<footer>
-    <p>
-        &copy; 2026 Nectar Labs.
-        Built for the competitive BuildNow.GG community.
-        Established By Nectar Labs
-    </p>
+<footer class="footer">
+    <div class="footer-container">
+        <div class="footer-brand">
+            <div class="brand-logo">Nectar Labs <span class="badge">.GG</span></div>
+            <p>Built for the competitive BNGG community.</p>
+        </div>
+        
+        <div class="footer-col">
+            <h4>LINKS</h4>
+            <a href="#">About Us</a>
+            <a href="#">Contact</a>
+            <a href="#">Terms of Service</a>
+            <a href="#">Privacy Policy</a>
+        </div>
+
+        <div class="footer-col">
+            <h4>COMMUNITY</h4>
+            <a href="https://discord.gg/fwUwPH6jpt" target="_blank">Discord</a>
+            <a href="#">Twitter</a>
+            <a href="#">YouTube</a>
+            <a href="#">Twitch</a>
+        </div>
+
+        <div class="footer-col">
+            <h4>SUPPORT</h4>
+            <a href="#">Help Center</a>
+            <a href="#">Bug Reports</a>
+            <a href="#">Feature Requests</a>
+        </div>
+    </div>
+    
+    <div style="text-align: center; margin-top: 50px; padding-top: 20px; border-top: 1px solid #18181b; color: #71717a; font-size: 0.85rem;">
+        <p>&copy; 2026 Nectar Labs. Built for the competitive BuildNow.GG community. Established By Nectar Labs</p>
+    </div>
 </footer>
 
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>

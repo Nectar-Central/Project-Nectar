@@ -1,3 +1,10 @@
+@import url('https://fonts.googleapis.com/css2?family=Luckiest+Guy&display=swap');
+
+* {
+    margin: 0;
+    padding: 0;
+}
+    /* ... rest of your css ... */
 * {
     margin: 0;
     padding: 0;
@@ -126,26 +133,30 @@ body {
     transform: translateY(2px); 
 }
 
+/* Updated Hero Section to stretch full width */
 .search-hero {
+    width: 100%;
     min-height: 40vh;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
     text-align: center;
-    padding: 3rem 1rem;
-    background: var(--primary-purple); 
+    padding: 4rem 1rem;
+    background-color: var(--primary-purple); 
     background-size: cover;
     background-position: center;
+    background-repeat: no-repeat;
 }
 
 .center-title {
-    font-size: 2.5rem;
+    font-family: 'Luckiest Guy', cursive;
+    font-size: 4rem;
     font-weight: 900;
-    color: #fff;
+    color: #000;
     text-transform: uppercase;
     margin-bottom: 1.5rem;
-    letter-spacing: -0.5px;
+    letter-spacing: 1px;
 }
 
 .search-container {
@@ -187,10 +198,15 @@ body {
     color: #000;
 }
 
+/* Utility layout classes */
+.container {
+    padding: 0 8%;
+}
+
 .news-wrapper {
     max-width: 1200px;
     margin: 0 auto;
-    padding: 3rem 1rem;
+    padding: 3rem 8%;
 }
 
 .news-wrapper h2 {
@@ -199,6 +215,9 @@ body {
     margin-bottom: 1.5rem;
     text-transform: uppercase;
     color: var(--text-main);
+    display: flex;
+    align-items: center;
+    gap: 8px;
 }
 
 .news-grid {
@@ -260,8 +279,57 @@ section {
     padding: 3rem 8%;
 }
 
+#home {
+    padding: 0;
+}
+
 #profile {
     padding: 0;
+}
+
+.discord-card {
+    background: #2b0e4a;
+    border: 1px solid #4c1d95;
+    border-radius: 12px;
+    padding: 20px 30px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin: 40px auto;
+    max-width: 1300px;
+}
+
+.discord-left {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    color: #fff;
+}
+
+.discord-left h3 {
+    margin: 0;
+    font-size: 1.1rem;
+}
+
+.discord-left p {
+    margin: 4px 0 0;
+    color: #a78bfa;
+    font-size: 0.9rem;
+}
+
+.discord-btn {
+    background: #4c1d95;
+    color: #fff;
+    padding: 10px 20px;
+    border-radius: 8px;
+    text-decoration: none;
+    font-weight: 600;
+    border: 1px solid #6d28d9;
+    transition: background 0.2s;
+}
+
+.discord-btn:hover {
+    background: #5b21b6;
 }
 
 .section-title {
@@ -644,11 +712,51 @@ section {
     color: var(--text-main);
 }
 
-footer {
-    text-align: center;
-    padding: 2rem;
-    color: var(--text-muted);
-    border-top: 1px solid var(--border-color);
-    background: var(--bg-dark);
+/* New Multi-Column Footer Layout */
+.footer {
+    background-color: #09090b;
+    border-top: 1px solid #18181b;
+    padding: 50px 8%;
+    color: #a1a1aa;
+}
+
+.footer-container {
+    max-width: 1200px;
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: 2fr 1fr 1fr 1fr;
+    gap: 40px;
+}
+
+.footer-brand .brand-logo {
+    font-size: 1.2rem;
+    font-weight: 800;
+    color: #fff;
+    margin-bottom: 8px;
+}
+
+.footer-brand .badge {
+    background: #facc15;
+    color: #000;
+    padding: 2px 6px;
+    border-radius: 4px;
+}
+
+.footer-col h4 {
+    color: #f4f4f5;
+    font-size: 0.85rem;
+    margin-bottom: 12px;
+    letter-spacing: 0.05em;
+}
+
+.footer-col a {
+    display: block;
+    color: #71717a;
+    text-decoration: none;
+    margin-bottom: 8px;
     font-size: 0.9rem;
+}
+
+.footer-col a:hover {
+    color: #a78bfa;
 }
