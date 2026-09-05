@@ -2140,10 +2140,8 @@
   // Bucket filenames: platinum is stored as platinium.png (typo upstream).
   const RANKED_ICON_SLUG=t=>t==='Platinum'?'platinium':t.toLowerCase();
   RANKED_TIERS.forEach(t=>{ t.icon=`${RANKED_ASSETS}/${RANKED_ICON_SLUG(t.name)}.png`; });
-  // Icon art normalization: Unranked + Platinum PNGs are tightly cropped while
-  // the other eight carry transparent padding, so equal boxes render unequal
-  // art. Compensate with per-tier render sizes for one visual size.
-  const RANKED_ICON_PX=t=>((t==='Unranked'||t==='Platinum')?44:72);
+  // Panel icons render at one uniform size.
+  const RANKED_ICON_PX=()=>56;
   let rankedPanel=null, rankedTab='milestones', rankedLbCache=null, _rankedFadeT=null;
   function ensureRankedStyle(){
     if(document.getElementById('bnc-ranked-style')) return;
