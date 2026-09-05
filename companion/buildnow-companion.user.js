@@ -23,6 +23,8 @@
 // @connect      *.vercel.app
 // @connect      supabase.co
 // @connect      *.supabase.co
+// @connect      devtunnels.ms
+// @connect      *.devtunnels.ms
 // @updateURL    https://raw.githubusercontent.com/Nectar-Central/Project-Nectar/main/companion/buildnow-companion.user.js
 // @downloadURL  https://raw.githubusercontent.com/Nectar-Central/Project-Nectar/main/companion/buildnow-companion.user.js
 // ==/UserScript==
@@ -1710,6 +1712,15 @@
         </div>
         <button id="bnc-keybind-set" style="margin-top:14px;padding:8px 14px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:600;cursor:pointer">Set open keybind: ${kbLabel}</button>
         <div id="bnc-keybind-hint" style="font-size:11px;color:#6b7280;min-height:14px"></div>
+        <div style="margin-top:8px;width:100%;max-width:240px;display:flex;flex-direction:column;gap:6px;align-items:center">
+          <div style="font-size:11px;color:#9ca3af">API base URL</div>
+          <div style="display:flex;gap:6px;width:100%">
+            <input id="bnc-api-base" type="text" spellcheck="false" value="${String(resolveApiBase()).replace(/"/g,'&quot;')}" placeholder="https://…" style="flex:1;min-width:0;background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:#e5e7eb;font-size:11px;padding:6px 8px">
+            <button id="bnc-api-save" style="padding:6px 10px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:11px;font-weight:600;cursor:pointer">Save</button>
+            <button id="bnc-api-reset" title="Back to default server" style="padding:6px 10px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#9ca3af;font-size:11px;cursor:pointer">Reset</button>
+          </div>
+          <div id="bnc-api-hint" style="font-size:11px;color:#6b7280;min-height:14px">Point at a dev tunnel to use someone else's server. Reloads after save.</div>
+        </div>
           <div style="margin-top:10px;width:100%;max-width:240px;display:flex;flex-direction:column;gap:4px;align-items:center">
            <div style="font-size:11px;color:#9ca3af">Lobby Music Volume</div>
            <div style="display:flex;gap:8px;align-items:center;width:100%">
@@ -1828,8 +1839,28 @@
         setTimeout(()=>{ if(_keybindCapturing){ _keybindCapturing=false; kbBtn.textContent='Set open keybind: '+formatKeybind(getDrawerKeybind()); if(kbHint) kbHint.textContent='Timed out.'; document.removeEventListener('keydown', handler, true); } }, 8000);
       };
     }
-    const volSlider=document.getElementById('bnc-volume-slider');
-    const volLabel=document.getElementById('bnc-volume-label');
+    // API base override (dev tunnels): saved to GM storage, takes effect on reload.
+    const apiInput=document.getElementById('bnc-api-base');
+    const apiHint=document.getElementById('bnc-api-hint');
+    const apiSave=document.getElementById('bnc-api-save');
+    const apiReset=document.getElementById('bnc-api-reset');
+    if(apiSave){
+      apiSave.onclick=()=>{
+        const v=String((apiInput&&apiInput.value)||'').trim().replace(/\/+$/,'');
+        if(!/^https?:\/\//.test(v)){ if(apiHint) apiHint.textContent='Must start with http(s)://'; return; }
+        try{ GMSet('bnc_api_base', v); }catch{}
+        if(apiHint) apiHint.textContent='Saved — reload the page to switch.';
+        showToast('API base saved — reload the page', false);
+      };
+    }
+    if(apiReset){
+      apiReset.onclick=()=>{
+        try{ GMDel('bnc_api_base'); GMDel('bn_api_base'); }catch{}
+        if(apiHint) apiHint.textContent='Reset — reload the page.';
+        showToast('API base reset — reload the page', false);
+      };
+    }
+    const volSlider=document.getElementById('bnc-volume-slider');    const volLabel=document.getElementById('bnc-volume-label');
     if(volSlider){
       const syncVol=()=>{
         const v=Math.max(0,Math.min(100, Number(volSlider.value)));
