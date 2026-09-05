@@ -125,7 +125,8 @@ async def _startup_loops():
 
         asyncio.create_task(ranked_mod.load_loop())
     except Exception as exc:
-        log_err(f"[ranked] failed to start loop: {exc}")
+        from server.lib.logger import log_ranked
+        log_ranked(f"[ranked] failed to start loop: {exc}")
 
 # ---------------------------------------------------------------------------
 # Request logging middleware (like logReq in Node)
@@ -153,7 +154,17 @@ async def log_requests(request: Request, call_next):
         # Warn level (amber) — we reuse log_err for visibility
         log_err(f"{request.method} {request.url.path} → {status} {duration}ms ip={ip}")
     else:
-        log_ok(f"{request.method} {request.url.path} → {status} {duration}ms ip={ip}")
+        # Poll spam off the console: stats/players/capture 2xx fire every
+        # few seconds per client (BNC_DEBUG=1 to see them).
+        _quiet = request.url.path in ("/api/stats", "/api/players", "/api/capture")
+        if _quiet:
+            try:
+                from server.lib.logger import log_dbg
+                log_dbg(f"{request.method} {request.url.path} → {status} {duration}ms ip={ip}")
+            except Exception:
+                pass
+        else:
+            log_ok(f"{request.method} {request.url.path} → {status} {duration}ms ip={ip}")
 
     return response
 

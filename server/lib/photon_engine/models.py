@@ -355,6 +355,7 @@ class RoomView:
     had_self_defeat: bool = False                    # self defeat already recorded this life (reset on match enter / revive)
     last_stg: int | None = None                      # last stG value for win/loss per GM (3→1)
     stg_is_phase_end: bool = False                 # True only when stG=3 arrived as phase end (from below), never timer ticks
+    stg3_armed: bool = True                        # one-shot arm for the stG=3 version bump (re-armed each stG=1 / match entry; kills 3->2->3 flaps double-bumping)
     winner: str | None = None                        # last match winner (username or team_id)
     created_at: str | None = None
     ranked_warnings: list = field(default_factory=list)  # non-roster usernames seen in a ranked room (exposed via /api/stats)

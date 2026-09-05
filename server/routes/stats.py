@@ -40,7 +40,7 @@ from fastapi.responses import JSONResponse
 
 from ..lib.supabase_client import supabase, db
 from ..lib.redis_client import cache
-from ..lib.logger import log_sys
+from ..lib.logger import log_sys, log_ranked, log_dbg
 from ..lib import ranked as ranked_mod
 from .capture import engine as capture_engine
 
@@ -191,6 +191,38 @@ async def get_stats(request: Request):
             elif rooms:
                 # take most recent
                 cur_room = next(reversed(list(rooms.values())), None)
+            # Lobby-blip rescue: a lone Authenticate (or self-leave echo) parks
+            # current on the lobby pseudo-room while the game keeps capturing
+            # in a real room — no join follows, the player never actually left.
+            # If current is the lobby pseudo-room but another room has FRESH
+            # packets, serve the fresh room. Freshness-gated (same window as
+            # _SESSION_STALE_S) so kicked/reloaded ghosts with no packets stay
+            # buried and keep serving lobby/null.
+            try:
+                if cur_room and cur_room.get("room_id") == "lobby":
+                    import time as _t2
+                    now2 = _t2.time()
+                    best = None
+                    best_ts = 0.0
+                    for r in (rooms or {}).values():
+                        try:
+                            if not isinstance(r, dict) or r.get("room_id") == "lobby":
+                                continue
+                            lp = float(r.get("last_packet_at") or 0)
+                            if lp > best_ts:
+                                best_ts = lp
+                                best = r
+                        except Exception:
+                            continue
+                    if best is not None and (now2 - best_ts) <= _SESSION_STALE_S:
+                        cur_room = best
+                        try:
+                            log_dbg(f"[stats] lobby-blip rescue -> room {(best.get('short_code') or best.get('room_id'))} "
+                                    f"fresh={now2 - best_ts:.0f}s")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             if cur_room:
                 session_out = {
                     "game_mode": (cur_room.get("game_mode") or live_session.get("game_mode")),
@@ -243,7 +275,10 @@ async def get_stats(request: Request):
     try:
         code = (session_out or {}).get("short_code")
         if code:
-            rdata = ranked_mod.get_ranked_room(code)
+            # read-through on miss: a room created seconds ago isn't in the
+            # 30s cache yet (by-code sees it via direct DB read; without this
+            # stats stays blind until the next refresh).
+            rdata = ranked_mod.get_ranked_room_fresh(code)
             if rdata and rdata.get("status") in ("lobby", "live"):
                 pts = ranked_mod.get_ranked_points(discord_id)
                 tier = ranked_mod.milestone_for(pts)
@@ -313,6 +348,14 @@ async def get_stats(request: Request):
                         }
                 except Exception:
                     last_result = None
+                # Sealed-match count for this room (lobby card "sealed/max" line
+                # + session-ended detection). A count query, not row data.
+                sealed = 0
+                try:
+                    scnt = supabase.table("ranked_results").select("match_version", count="exact").eq("room_id", rid).execute()
+                    sealed = int(getattr(scnt, "count", 0) or 0)
+                except Exception:
+                    sealed = 0
                 ranked_out = {
                     "active": True,
                     "rid": rid,
@@ -337,20 +380,108 @@ async def get_stats(request: Request):
                     "min_points": rdata.get("min_points") or 0,
                     "max_points": rdata.get("max_points"),
                     "fee": rdata.get("fee") or 0,
+                    "sealed": sealed,
+                    "max_matches": rdata.get("max_matches"),
                 }
     except Exception:
         ranked_out = None
+    # Fallback: when session is stale (no short_code), look up ranked room by
+    # discord_id directly. The user may still be in a ranked room even though
+    # the capture session stopped sending packets.
+    if ranked_out is None and discord_id:
+        try:
+            r = supabase.table("ranked_rooms").select("*").in_(
+                "status", ["lobby", "live"]).order("created_at", desc=True).limit(50).execute()
+            cands = r.data or []
+            found = None
+            for status in ("live", "lobby"):
+                for row in cands:
+                    if row.get("status") == status:
+                        roster_ids = [
+                            str(x.get("discord_id"))
+                            for x in (row.get("roster") or [])
+                            if x.get("discord_id")
+                        ]
+                        if str(discord_id) in roster_ids:
+                            found = row
+                            break
+                if found:
+                    break
+            if found:
+                try:
+                    log_ranked(f"[ranked] stats did={str(discord_id)[:6]} code=None state=None -> fallback by-roster rid={found.get('id')} status={found.get('status')}")
+                except Exception:
+                    pass
+                pts = ranked_mod.get_ranked_points(discord_id)
+                tier = ranked_mod.milestone_for(pts)
+                nxt, need, pct = ranked_mod.next_milestone(pts)
+                rid = str(found.get("id") or "")
+                code_fb = str(found.get("short_code") or "").strip().upper()
+                host_game_username = None
+                host_skin = None
+                host_playing = False
+                try:
+                    hid = str(found.get("host_discord_id") or "")
+                    if hid:
+                        hres = supabase.table("bngc_users").select(
+                            "game_username,skin"
+                        ).eq("discord_id", hid).limit(1).execute()
+                        hrows = hres.data or []
+                        if hrows:
+                            host_game_username = hrows[0].get("game_username")
+                            host_skin = hrows[0].get("skin")
+                except Exception:
+                    pass
+                sealed = 0
+                try:
+                    scnt = supabase.table("ranked_results").select(
+                        "match_version", count="exact"
+                    ).eq("room_id", rid).execute()
+                    sealed = int(getattr(scnt, "count", 0) or 0)
+                except Exception:
+                    sealed = 0
+                ranked_out = {
+                    "active": True,
+                    "rid": rid,
+                    "short_code": code_fb,
+                    "status": found.get("status"),
+                    "is_host": str(discord_id) == str(
+                        found.get("host_discord_id") or ""
+                    ),
+                    "points": pts,
+                    "milestone": tier.get("name"),
+                    "milestone_icon_url": tier.get("icon_url"),
+                    "milestone_color": tier.get("color"),
+                    "arena_icon_url": ranked_mod.ARENA_ICON_URL,
+                    "points_to_next": need,
+                    "next_milestone": (nxt.get("name") if nxt else None),
+                    "next_points_pct": pct,
+                    "warnings": [],
+                    "match_id": rid,
+                    "match_version": 0,
+                    "last_result": None,
+                    "host_game_username": host_game_username,
+                    "host_skin": host_skin,
+                    "host_playing": host_playing,
+                    "min_points": found.get("min_points") or 0,
+                    "max_points": found.get("max_points"),
+                    "fee": found.get("fee") or 0,
+                    "sealed": sealed,
+                    "max_matches": found.get("max_matches"),
+                }
+        except Exception:
+            pass
     try:
         _rk_state = (session_out or {}).get("state")
         _rk_code = (session_out or {}).get("short_code")
         if ranked_out:
-            log_sys(f"[ranked] stats did={str(discord_id)[:6]} code={_rk_code} "
+            log_ranked(f"[ranked] stats did={str(discord_id)[:6]} code={_rk_code} "
                     f"state={_rk_state} -> BLOCK rid={ranked_out.get('rid')} "
                     f"status={ranked_out.get('status')} host={ranked_out.get('is_host')} "
                     f"v={ranked_out.get('match_version')} pts={ranked_out.get('points')} "
                     f"tier={ranked_out.get('milestone')}")
         else:
-            log_sys(f"[ranked] stats did={str(discord_id)[:6]} code={_rk_code} "
+            log_ranked(f"[ranked] stats did={str(discord_id)[:6]} code={_rk_code} "
                     f"state={_rk_state} -> none")
     except Exception:
         pass
@@ -377,7 +508,7 @@ async def get_stats(request: Request):
     except Exception:
         arena = None
     try:
-        log_sys(f"[stats] did={str(discord_id)[:6]} arena={bool(arena)} "
+        log_dbg(f"[stats] did={str(discord_id)[:6]} arena={bool(arena)} "
                 f"pts={arena['points'] if arena else '-'} "
                 f"tier={arena['milestone'] if arena else '-'} "
                 f"session={session_out.get('state') if session_out else 'none'} "

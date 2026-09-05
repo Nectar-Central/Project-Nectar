@@ -91,6 +91,7 @@ COL = {
 # Background tags
 TAG = {
     "SYS": _bg(124, 58, 237, _color(255, 255, 255, " SYS ")),
+    "RANKED": _bg(234, 179, 8, _color(32, 24, 0, " RANK ")),
     "OK": _bg(16, 185, 129, _color(0, 32, 24, " OK  ")),
     "ERR": _bg(239, 68, 68, _color(255, 255, 255, " ERR ")),
     "EVT": _bg(109, 40, 217, _color(255, 255, 255, " EVT ")),
@@ -148,6 +149,61 @@ def log_human(message: str) -> None:
     if not message:
         return
     print(f"{_timestamp()} {TAG['OK']} {message}")
+
+
+def log_dbg(message: str) -> None:
+    """Per-batch/per-packet chatter: console only when BNC_DEBUG=1.
+
+    Keeps the normal console readable; hot-path call sites use this
+    instead of log_sys.
+    """
+    try:
+        if _os.getenv("BNC_DEBUG") != "1":
+            return
+    except Exception:
+        return
+    print(f"{_timestamp()} {TAG['SYS']} {COL['dim'](message)}")
+
+
+# ---------------------------------------------------------------------------
+# Ranked file log — logs/ranked.log (rotating, 10MB, 3 backups)
+# ---------------------------------------------------------------------------
+
+_ranked_logger = logging.getLogger("ranked.file")
+_ranked_logger.setLevel(logging.INFO)
+_ranked_logger.propagate = False
+
+try:
+    if _os.getenv("VERCEL"):
+        _ranked_dir = Path("/tmp/logs")
+    else:
+        _ranked_dir = Path(__file__).parent.parent.parent / "logs"
+    _ranked_dir.mkdir(parents=True, exist_ok=True)
+    _ranked_handler = RotatingFileHandler(
+        _ranked_dir / "ranked.log", maxBytes=10_000_000, backupCount=3, encoding="utf-8"
+    )
+    _ranked_handler.setFormatter(logging.Formatter("%(message)s"))
+    _ranked_logger.addHandler(_ranked_handler)
+except (OSError, PermissionError):
+    pass
+
+
+def log_ranked(message: str) -> None:
+    """Ranked stream: console line + append to logs/ranked.log.
+
+    All [ranked] call sites go through here so one file tells the whole
+    story of a session (seals, placements, awards, bumps, verdicts).
+    Never raises.
+    """
+    try:
+        line = f"{datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3]} {message}"
+        print(f"{_timestamp()} {TAG['RANKED']} {message}")
+        try:
+            _ranked_logger.info(line)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 def log_req(ip: str, method: str, url: str, status: int, duration_ms: int) -> None:

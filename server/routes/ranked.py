@@ -18,6 +18,7 @@ import json
 
 from ..lib.supabase_client import supabase as _supabase_global
 from ..lib import ranked as ranked_mod
+from ..lib.logger import log_ranked
 router = APIRouter()
 
 ALLOWED_GMS = ("zw_lg", "df", "wwzw")
@@ -674,7 +675,7 @@ async def ranked_by_code(code: str, request: Request):
             room = None
         if room is None:
             payload = {"room": None, "on_roster": False, "is_host": False}
-            try: log_sys(f"[ranked] by-code did={did[:6]} code={code} -> {json.dumps(payload)}")
+            try: log_ranked(f"[ranked] by-code did={did[:6]} code={code} -> {json.dumps(payload)}")
             except: pass
             return JSONResponse(payload)
         ids = _roster_ids(room)
@@ -685,7 +686,7 @@ async def ranked_by_code(code: str, request: Request):
             "on_roster": on_roster,
             "is_host": is_host,
         }
-        try: log_sys(f"[ranked] by-code did={did[:6]} code={code} -> {json.dumps(payload, default=str)}")
+        try: log_ranked(f"[ranked] by-code did={did[:6]} code={code} -> {json.dumps(payload, default=str)}")
         except: pass
         return JSONResponse(payload)
     except Exception as exc:
@@ -720,7 +721,7 @@ async def ranked_mine(request: Request):
             found = None
         if found is None:
             payload = {"room": None, "on_roster": False, "is_host": False}
-            try: log_sys(f"[ranked] mine did={did[:6]} -> {json.dumps(payload)}")
+            try: log_ranked(f"[ranked] mine did={did[:6]} -> {json.dumps(payload)}")
             except: pass
             return JSONResponse(payload)
         payload = {
@@ -728,7 +729,7 @@ async def ranked_mine(request: Request):
             "on_roster": True,
             "is_host": did == str(found.get("host_discord_id")),
         }
-        try: log_sys(f"[ranked] mine did={did[:6]} -> {json.dumps(payload, default=str)}")
+        try: log_ranked(f"[ranked] mine did={did[:6]} -> {json.dumps(payload, default=str)}")
         except: pass
         return JSONResponse(payload)
     except Exception as exc:

@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 from ..lib.supabase_client import supabase, db
 from ..lib.redis_client import cache
 from ..lib.tokens import generate_request_token, validate_request_token, is_session_expired
-from ..lib.logger import log_sys, log_err
+from ..lib.logger import log_sys, log_err, log_dbg
 from ..lib.photon_engine import Engine
 from ..lib.alerts import create_alert
 
@@ -56,7 +56,7 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
                 db.update_session_sync(auth_session_id, {"is_active": False})
             except Exception:
                 pass
-            log_sys(f"CAPTURE expired session {auth_session_id[:8]} — client must re-link")
+            log_sys(f"CAPTURE expired session {auth_session_id[:13]} — client must re-link")
             return JSONResponse({"error": "Session expired - please re-link"}, status_code=401)
         if sess.get("is_locked"):
             scope = str(sess.get("lock_scope") or ("admin" if sess.get("is_admin_locked") else "default")).lower()
@@ -102,9 +102,9 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
                 restored = SessionView.from_dict(cached)
                 if restored is not None:
                     engine.put_session(auth_session_id, restored)
-                    log_sys(f"CAPTURE restored engine state for {auth_session_id[:8]} rooms={len(restored.rooms)}")
+                    log_sys(f"CAPTURE restored engine state for {auth_session_id[:13]} rooms={len(restored.rooms)}")
         except Exception as e:
-            log_err(f"CAPTURE restore failed {auth_session_id[:8]} {e}")
+            log_err(f"CAPTURE restore failed {auth_session_id[:13]} {e}")
 
     # Feed engine per session — no DB writes, just abstract data
     # Build one packet dict PER record (processor needs every packet, not just the last)
@@ -155,7 +155,7 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
         try:
             _persist_ok = await cache.set_session_state(auth_session_id, session_dict, ttl=3600)
             if not _persist_ok:
-                log_err(f"CAPTURE persist FAILED for {auth_session_id[:8]} — next lambda starts blank")
+                log_err(f"CAPTURE persist FAILED for {auth_session_id[:13]} — next lambda starts blank")
         except Exception:
             pass
 
@@ -168,9 +168,9 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
             from server.scripts.processor import process_batch
             try:
                 await process_batch(auth_session_id, packets, view)
-                log_sys(f"CAPTURE processed {auth_session_id[:8]} {len(packets)} packets session players={view.players_count if view else '?'}")
+                log_dbg(f"CAPTURE processed {auth_session_id[:13]} {len(packets)} packets session players={view.players_count if view else '?'}")
             except Exception as e:
-                log_err(f"PROCESSOR FAILED session={auth_session_id[:8]} {type(e).__name__}: {e}")
+                log_err(f"PROCESSOR FAILED session={auth_session_id[:13]} {type(e).__name__}: {e}")
         except Exception as e:
             log_err(f"CAPTURE processor import failed {e} — packets still returned, DB write skipped")
 
@@ -184,7 +184,7 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
             _final["_cached_at"] = _t2.time()
             _final_ok = await cache.set_session_state(auth_session_id, _final, ttl=3600)
             if not _final_ok:
-                log_err(f"CAPTURE final persist FAILED for {auth_session_id[:8]}")
+                log_err(f"CAPTURE final persist FAILED for {auth_session_id[:13]}")
         except Exception:
             pass
 

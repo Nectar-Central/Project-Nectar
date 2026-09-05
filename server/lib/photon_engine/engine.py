@@ -3,7 +3,7 @@ from typing import Any
 import time
 
 from ..gpbinary import parse_gpbinary, parse_killfeed_text, _strip_color_tags
-from ..logger import log_engine
+from ..logger import log_engine, log_ranked
 
 from .enums import GameMode, PacketType, State
 from .models import KillInfo, Player, SessionView
@@ -144,6 +144,26 @@ def _stg_starts_new_life(stg, last_stg) -> bool:
     """
     try:
         return int(float(stg)) == 1 and (last_stg is None or int(float(last_stg)) != 1)
+    except Exception:
+        return False
+
+
+def _stg_bumps_version(stg, last_stg, armed) -> bool:
+    """True only on a fresh stG=3 enter with a live one-shot arm.
+
+    The arm is consumed by the bump and re-armed at each stG=1 (or match
+    entry), so a 3->2->3 flap can't bump twice — the second bump would seal
+    an empty version (missed toasts/awards). Timer ticks through 3
+    (last_stg == 3) never bump. Never raises.
+    """
+    try:
+        if int(float(stg)) != 3:
+            return False
+        if last_stg is not None:
+            last = int(float(last_stg))
+            if last == 3 or last > 2:
+                return False
+        return bool(armed)
     except Exception:
         return False
 
@@ -339,7 +359,7 @@ class Engine:
 
     def __init__(self):
         self._sessions: dict[str, SessionView] = {}
-        self._pending_pid: dict[str, str] = {}  # session_id -> pID from JoinRandomRoom without RoomName (private join)
+        self._pending_pid: dict[str, tuple] = {}  # session_id -> (pID, ts) from JoinRandomRoom without RoomName (private join)
         self._pending_gm: dict[str, GameMode] = {}  # session_id -> gm from JoinRandomRoom without RoomName
 
     def feed(self, session_id: str, hex_string: str) -> EnginePacket:
@@ -355,14 +375,14 @@ class Engine:
         if view is None:
             view = SessionView(session_id=session_id)
             self._sessions[session_id] = view
-            log_engine("join", session_id[:8], action="new_session")
+            log_engine("join", session_id[:13], action="new_session")
 
         # Parse
         gpb = None
         try:
             gpb = parse_gpbinary(hex_string)
         except Exception as e:
-            log_engine("parse_fail", session_id[:8], error=str(e))
+            log_engine("parse_fail", session_id[:13], error=str(e))
             gpb = None
 
         packet = self._gpb_to_abstract(hex_string, gpb)
@@ -374,7 +394,7 @@ class Engine:
             unk_props = list((gpb.get("properties") or {}).keys())[:8]
             unk_pp = list((gpb.get("playerProps") or {}).keys())[:8]
             unk_kf = f" killfeed={gpb.get('killfeed')!r}" if gpb.get("evCode") == 101 and gpb.get("killfeed") else ""
-            log_engine("debug", session_id[:8], msg=f"unknown pkt ev={gpb.get('evName')}/{gpb.get('opName')} evCode={gpb.get('evCode')} op={gpb.get('op')} props={unk_props} playerProps={unk_pp}{unk_kf} hex={hex_string[:32]}..")
+            log_engine("debug", session_id[:13], msg=f"unknown pkt ev={gpb.get('evName')}/{gpb.get('opName')} evCode={gpb.get('evCode')} op={gpb.get('op')} props={unk_props} playerProps={unk_pp}{unk_kf} hex={hex_string[:32]}..")
 
         # Ensure we have a RoomView to scope to
         # If no current room, create a default lobby room
@@ -386,10 +406,10 @@ class Engine:
                 if room_id not in view.rooms:
                     view.rooms[room_id] = RoomView(room_id=room_id, code=room_id, created_at=datetime.now(timezone.utc).isoformat())
                     view.current_room_id = room_id
-                    log_engine("room", session_id[:8], action="created", room=room_id[:8])
+                    log_engine("room", session_id[:13], action="created", room=room_id[:8])
                 elif view.current_room_id != room_id:
                     view.current_room_id = room_id
-                    log_engine("room", session_id[:8], action="switched", room=room_id[:8])
+                    log_engine("room", session_id[:13], action="switched", room=room_id[:8])
                 return view.rooms[room_id]
             # no room_id — strict: route to current MATCH room if exists, else current, else lobby
             # this stops killfeeds (no RoomName) from landing in a throwaway lobby room
@@ -505,7 +525,7 @@ class Engine:
         # Target shown only when present (Join has actor only — no target to misuse)
         if gpb and (actor_nr is not None or target_actor_nr is not None):
             tgt_part = f" targetActorNr={target_actor_nr} ({target_name})" if target_actor_nr is not None else ""
-            log_engine("actor", session_id[:8], msg=f"actorNr={actor_nr} ({actor_name}){tgt_part} ev={gpb.get('evName')}/{gpb.get('opName')} type={packet.packet_type.value} room={room.room_id[:8]}", room=room.room_id[:8], actor=actor_nr, actor_name=actor_name, target=target_actor_nr, target_name=target_name)
+            log_engine("actor", session_id[:13], msg=f"actorNr={actor_nr} ({actor_name}){tgt_part} ev={gpb.get('evName')}/{gpb.get('opName')} type={packet.packet_type.value} room={room.room_id[:8]}", room=room.room_id[:8], actor=actor_nr, actor_name=actor_name, target=target_actor_nr, target_name=target_name)
 
         # Log PropertiesChanged packets (evCode 253) — key events for debugging
         if gpb and gpb.get("evName") == "PropertiesChanged":
@@ -517,10 +537,10 @@ class Engine:
                 if k in props:
                     important[k] = props[k]
             if important:
-                log_engine("props", session_id[:8], msg=f"PropertiesChanged{actor_str} props={important} room={room.room_id[:8]}", room=room.room_id[:8])
+                log_engine("props", session_id[:13], msg=f"PropertiesChanged{actor_str} props={important} room={room.room_id[:8]}", room=room.room_id[:8])
             else:
                 prop_keys = list(props.keys())[:6]
-                log_engine("props", session_id[:8], msg=f"PropertiesChanged{actor_str} keys={prop_keys} room={room.room_id[:8]}", room=room.room_id[:8])
+                log_engine("props", session_id[:13], msg=f"PropertiesChanged{actor_str} keys={prop_keys} room={room.room_id[:8]}", room=room.room_id[:8])
 
         is_auth = gpb and gpb.get("opName") in ("Authenticate", "AuthenticateOnce")
         # usernameChangeCount reset is AUTH only; scene MainLobby will reset via FSM on_enter
@@ -560,7 +580,7 @@ class Engine:
                             is_self = True
                         _room.teams[pt_id] = Team(team_id=str(pt_id), members=list(members), is_self_team=is_self)
                 if grouped:
-                    log_engine("team", session_id[:8], room=_room.room_id[:8], teams={k: len(v) for k,v in grouped.items()})
+                    log_engine("team", session_id[:13], room=_room.room_id[:8], teams={k: len(v) for k,v in grouped.items()})
             except Exception:
                 pass
 
@@ -573,7 +593,7 @@ class Engine:
         # First join for this session — set up me (session-scoped)
         if is_first_join and new_name and (view.usernameChangeCount or 0) == 0:
             if view.me and str(new_name) != str(view.me.username):
-                log_engine("name_change", session_id[:8], old=view.me.username, new=new_name)
+                log_engine("name_change", session_id[:13], old=view.me.username, new=new_name)
             if view.me is None:
                 view.me = Player(
                     actor_nr=int(actor_nr) if actor_nr is not None else -1,
@@ -623,13 +643,13 @@ class Engine:
             me_key = view.me.actor_nr if view.me.actor_nr != -1 else hash(view.me.username) % 100000
             room.players[me_key] = view.me
             room.me = view.me  # per-room me
-            log_engine("join", session_id[:8], name=new_name, skin=view.me.skin, gm=packet.game_mode.value if packet.game_mode else "?", max=room.max_players, count=room.players_count, room=room.room_id[:8])
+            log_engine("join", session_id[:13], name=new_name, skin=view.me.skin, gm=packet.game_mode.value if packet.game_mode else "?", max=room.max_players, count=room.players_count, room=room.room_id[:8])
             # Fill blank gm only (None/UNKNOWN) — DF is the client default placeholder
             # and must not lock the room; scene packets repair it via adopt_game_mode.
             if packet.game_mode and room.game_mode in (None, GameMode.UNKNOWN):
                 room.game_mode = packet.game_mode
             # Debug: log gpb for first join to trace other player joins later
-            log_engine("debug", session_id[:8], msg=f"first_join op={gpb.get('opName')} room={room_name} playerProps={list(gpb.get('playerProps', {}).keys())}", room=room.room_id[:8])
+            log_engine("debug", session_id[:13], msg=f"first_join op={gpb.get('opName')} room={room_name} playerProps={list(gpb.get('playerProps', {}).keys())}", room=room.room_id[:8])
 
         # Party — from ANY room join carrying Party info, not just the session's
         # first join: a player joining a friend's party mid-session must still get
@@ -659,28 +679,39 @@ class Engine:
             if not pID_val2 and gpb.get("playerProps", {}).get("pID"):
                 pID_val2 = gpb["playerProps"]["pID"]
             valid2 = _is_valid_pid(pID_val2)
-            if valid2 and not room.short_code:
+            # never stamp the lobby pseudo-room: it isn't a real room, and a
+            # code on it would serve a ghost BLOCK (v=0, no warnings) while
+            # the player sits in MainLobby matchmaking.
+            if valid2 and not room.short_code and room.room_id != "lobby":
                 room.short_code = valid2
-                log_engine("room", session_id[:8], action="pID", code=room.short_code, room=room.room_id[:8])
+                log_engine("room", session_id[:13], action="pID", code=room.short_code, room=room.room_id[:8])
             elif pID_val2 and not valid2:
-                log_engine("debug", session_id[:8], msg=f"pID ghost ignored {pID_val2!r}", room=room.room_id[:8])
+                log_engine("debug", session_id[:13], msg=f"pID ghost ignored {pID_val2!r}", room=room.room_id[:8])
             if not room_name and valid2:
-                self._pending_pid[session_id] = valid2
-                log_engine("debug", session_id[:8], msg=f"pending pID {valid2} for next room", room=room.room_id[:8])
+                # timestamped: a stale code must not stamp a much later room
+                # (e.g. ranked attempt, then a public match joins in between)
+                self._pending_pid[session_id] = (valid2, time.time())
+                log_engine("debug", session_id[:13], msg=f"pending pID {valid2} for next room", room=room.room_id[:8])
             elif room_name and not room.short_code and session_id in self._pending_pid:
-                pending = self._pending_pid.pop(session_id, None)
-                if pending:
+                pending, _pts = self._pending_pid.pop(session_id, (None, 0.0))
+                try:
+                    fresh = (time.time() - float(_pts or 0)) <= 120
+                except Exception:
+                    fresh = False
+                if pending and fresh:
                     room.short_code = pending
-                    log_engine("room", session_id[:8], action="pID", code=room.short_code, room=room.room_id[:8], note="from pending")
+                    log_engine("room", session_id[:13], action="pID", code=room.short_code, room=room.room_id[:8], note="from pending")
+                elif pending:
+                    log_engine("debug", session_id[:13], msg=f"stale pending pID {pending} dropped", room=room.room_id[:8])
             # Pending GM: JoinRandomRoom with gm but no RoomName → next room gets it (wwzw vs BF2V2 mix)
             if packet.game_mode and not room_name:
                 self._pending_gm[session_id] = packet.game_mode
-                log_engine("debug", session_id[:8], msg=f"pending gm {packet.game_mode.value} for next room", room=room.room_id[:8])
+                log_engine("debug", session_id[:13], msg=f"pending gm {packet.game_mode.value} for next room", room=room.room_id[:8])
             elif room_name and room.game_mode in (None, GameMode.UNKNOWN) and session_id in self._pending_gm:
                 pending_gm = self._pending_gm.pop(session_id, None)
                 if pending_gm:
                     room.game_mode = pending_gm
-                    log_engine("room", session_id[:8], action="gm", gm=pending_gm.value, room=room.room_id[:8], note="from pending")
+                    log_engine("room", session_id[:13], action="gm", gm=pending_gm.value, room=room.room_id[:8], note="from pending")
         except Exception:
             pass
 
@@ -705,9 +736,9 @@ class Engine:
                 gv_val = str(gpb["properties"]["gv"])
             if gv_val and not room.gv:
                 room.gv = gv_val
-                log_engine("room", session_id[:8], action="gv", gv=room.gv, duo=room.is_duo, room=room.room_id[:8])
+                log_engine("room", session_id[:13], action="gv", gv=room.gv, duo=room.is_duo, room=room.room_id[:8])
             if is_first_join and gpb.get("opName") in ("CreateRoom", "JoinRoom", "JoinRandomRoom"):
-                log_engine("room", session_id[:8], action="discover", op=gpb.get("opName"),
+                log_engine("room", session_id[:13], action="discover", op=gpb.get("opName"),
                            gm=gpb.get("gm"), gv=room.gv or gv_val, max=room.max_players,
                            curScn=cur_scn, room_name=(room_name or "")[:12], room=room.room_id[:8],
                            gp_keys=gp_keys or None)
@@ -752,7 +783,7 @@ class Engine:
                         try:
                             # Strip color tags so map names match _names_equal comparisons
                             room.actor_map[int(actor_nr)] = _strip_color_tags(str(pp["255"])).strip()
-                            log_engine("debug", session_id[:8], msg=f"actor_map single actor={int(actor_nr)} name={room.actor_map[int(actor_nr)]} map={sorted(list(room.actor_map.items()))[:8]}", room=room.room_id[:8])
+                            log_engine("debug", session_id[:13], msg=f"actor_map single actor={int(actor_nr)} name={room.actor_map[int(actor_nr)]} map={sorted(list(room.actor_map.items()))[:8]}", room=room.room_id[:8])
                         except Exception:
                             pass
                     pp_norm: dict | None = None  # flat props: skip the actorNr-map loop below
@@ -792,7 +823,7 @@ class Engine:
                                 _pte = entry.get("_pt", entry.get("pt")) if isinstance(entry, dict) else None
                                 if _apply_roster_pt(room, actor_nr, uname, _pte):
                                     _rebuild_teams(room)
-                                    log_engine("team_pt", session_id[:8], team=str(_pte)[:8], target=actor_nr, player=uname, via="roster harvest", room=room.room_id[:8])
+                                    log_engine("team_pt", session_id[:13], team=str(_pte)[:8], target=actor_nr, player=uname, via="roster harvest", room=room.room_id[:8])
                             except Exception:
                                 pass
                             # Also ensure player exists in room.players if not already
@@ -808,7 +839,7 @@ class Engine:
                         al_ints = [int(a["value"] if isinstance(a, dict) and "value" in a else a) for a in actor_list[:8]]
                     except Exception:
                         al_ints = actor_list[:8]
-                    log_engine("debug", session_id[:8], msg=f"actor_map built actors={al_ints} pp_keys={sorted(list(pp_norm.keys()))[:8]} added={added[:6]} missing={missing[:6]} map={sorted(list(room.actor_map.items()))[:8]}", room=room.room_id[:8])
+                    log_engine("debug", session_id[:13], msg=f"actor_map built actors={al_ints} pp_keys={sorted(list(pp_norm.keys()))[:8]} added={added[:6]} missing={missing[:6]} map={sorted(list(room.actor_map.items()))[:8]}", room=room.room_id[:8])
         except Exception:
             pass
         # Also handle single Join event to fill actor_map incrementally
@@ -837,7 +868,7 @@ class Engine:
                             break
                 if _ln:
                     packet.player_name = _ln
-                    log_engine("leave", session_id[:8], name=_ln, room=room.room_id[:8], via="actor resolve")
+                    log_engine("leave", session_id[:13], name=_ln, room=room.room_id[:8], via="actor resolve")
         except Exception:
             pass
 
@@ -860,13 +891,13 @@ class Engine:
                 try:
                     _cm = GameMode.from_curscn(cur_scn)
                     if _cm is not None and room.adopt_game_mode(_cm):
-                        log_engine("room", session_id[:8], action="gm", gm=_cm.value, room=room.room_id[:8], note="scene repair")
+                        log_engine("room", session_id[:13], action="gm", gm=_cm.value, room=room.room_id[:8], note="scene repair")
                 except Exception:
                     pass
                 if cur_scn == "MainLobby":
                     view.usernameChangeCount = 0
         except Exception as e:
-            log_engine("debug", session_id[:8], msg=f"fsm error {e}", room=room.room_id[:8])
+            log_engine("debug", session_id[:13], msg=f"fsm error {e}", room=room.room_id[:8])
 
         # Zone (room-scoped) — hard 4:59 (299) for zw_lg/wwzw, stG is match marker not zone
         def _valid_zone_time(v):
@@ -890,7 +921,7 @@ class Engine:
                 stg = int(float(gpb["properties"]["stG"]))
                 # Log every stG change (match progress 1→2→3) like KILL lines
                 if stg != room.last_stg:
-                    log_engine("stg", session_id[:8], stg=stg, gm=room.game_mode.value if room.game_mode else None, room=room.room_id[:8])
+                    log_engine("stg", session_id[:13], stg=stg, gm=room.game_mode.value if room.game_mode else None, room=room.room_id[:8])
                 # stG=1: new match starting = new life. Party rooms stay MATCH
                 # across versions, so without this deaths/defeats in later
                 # matches are wrongly skipped as "already counted this life".
@@ -898,12 +929,32 @@ class Engine:
                 # the ended match's guards were wiped before its drain ran.)
                 if _stg_starts_new_life(stg, room.last_stg):
                     if room.had_self_death or room.had_self_defeat:
-                        log_engine("debug", session_id[:8], msg="stG 1 new life flags reset", room=room.room_id[:8])
+                        log_engine("debug", session_id[:13], msg="stG 1 new life flags reset", room=room.room_id[:8])
                     room.had_self_death = False
                     room.had_self_defeat = False
+                    # per-match combat feed: kills belong to the ended match —
+                    # drop them so the next seal only sees the new match.
+                    # "left" entries are presence (walkover wins) and survive.
+                    try:
+                        room.recent_kills = [k for k in (room.recent_kills or [])
+                                             if getattr(k, "event_type", None) != "killed"]
+                        room.recent_knocks = []
+                    except Exception:
+                        pass
+                    # re-arm the stG=3 one-shot (consumed by the version bump)
+                    try:
+                        room.stg3_armed = True
+                    except Exception:
+                        pass
                 # stG=3: match end marker — Processor handles win/defeat calculation
                 if stg == 3 and room.last_stg != 3 and room.game_mode and room.game_mode in _STG_PHASE_MODES:
-                    if room.last_stg is None or room.last_stg <= 2:
+                    if _stg_bumps_version(stg, room.last_stg, getattr(room, "stg3_armed", True)):
+                        # one-shot: a 3->2->3 flap must not bump twice (second
+                        # bump seals an empty version -> missed toasts/awards)
+                        try:
+                            room.stg3_armed = False
+                        except Exception:
+                            pass
                         room.stg_is_phase_end = True  # arm win path (repeats/timers leave it)
                         me_name = (view.me.username if view.me else None) or (room.me.username if room.me else None)
                         if me_name and room.state == State.MATCH:
@@ -915,7 +966,20 @@ class Engine:
                             if len(room.recent_kills) > 20:
                                 room.recent_kills = room.recent_kills[-10:]
                             room.recent_knocks = []
-                            log_engine("match", session_id[:8], action="new_version", version=room.match_version, room=room.room_id[:8], via="stG 3")
+                            log_engine("match", session_id[:13], action="new_version", version=room.match_version, room=room.room_id[:8], via="stG 3")
+                            try:
+                                code = getattr(room, "short_code", None)
+                                if code:
+                                    log_ranked(f"[ranked] stg=3 bump code={code} v={room.match_version} room={room.room_id[:8]}")
+                            except Exception:
+                                pass
+                    elif stg == 3 and room.last_stg != 3 and (room.last_stg is None or room.last_stg <= 2) \
+                            and getattr(room, "stg3_armed", True) is False:
+                        # one-shot consumed: 3->2->3 flap blocked (no double bump)
+                        try:
+                            log_ranked(f"[ranked] stg=3 flap blocked code={getattr(room, 'short_code', None)} room={room.room_id[:8]}")
+                        except Exception:
+                            pass
                     # else: timer ticking down through 3 — leave flag untouched
                 room.last_stg = stg
             except Exception:
@@ -936,14 +1000,14 @@ class Engine:
                 if vt is not None:
                     room.zone.set_time(vt, packet.zone_phase)
                     if packet.zone_phase and room.zone.phase != packet.zone_phase:
-                        log_engine("zone", session_id[:8], old=room.zone.phase, new=packet.zone_phase, mmss=room.zone.remaining_mmss(), room=room.room_id[:8])
+                        log_engine("zone", session_id[:13], old=room.zone.phase, new=packet.zone_phase, mmss=room.zone.remaining_mmss(), room=room.room_id[:8])
                 elif packet.zone_time is not None:
-                    log_engine("debug", session_id[:8], msg=f"zone_time ignored {packet.zone_time!r} >600", room=room.room_id[:8])
+                    log_engine("debug", session_id[:13], msg=f"zone_time ignored {packet.zone_time!r} >600", room=room.room_id[:8])
             elif packet.zone_phase is not None:
                 old_phase = room.zone.phase
                 room.zone.set_time(room.zone.time, packet.zone_phase)
                 if old_phase != packet.zone_phase:
-                    log_engine("zone", session_id[:8], old=old_phase, new=packet.zone_phase, mmss=room.zone.remaining_mmss(), room=room.room_id[:8])
+                    log_engine("zone", session_id[:13], old=old_phase, new=packet.zone_phase, mmss=room.zone.remaining_mmss(), room=room.room_id[:8])
         if gpb and gpb.get("properties"):
             props = gpb["properties"]
             # Only bz_* for zone, stG already handled above
@@ -958,16 +1022,18 @@ class Engine:
                 room.zone.set_time(room.zone.time, str(props.get("bz_zone") or props.get("bz_phase")))
             if "bz_pattern" in props:
                 room.zone.pattern = str(props["bz_pattern"])
-            # pID update for existing room (private join code) — validated len==5
-            if "pID" in props and not room.short_code:
+            # pID update for existing room (private join code) — validated len==5.
+            # Lobby pseudo-room excluded (see above: ghost BLOCK otherwise).
+            if "pID" in props and not room.short_code and room.room_id != "lobby":
                 valid = _is_valid_pid(props["pID"])
                 if valid:
                     room.short_code = valid
-                    log_engine("room", session_id[:8], action="pID", code=room.short_code, room=room.room_id[:8])
+                    log_engine("room", session_id[:13], action="pID", code=room.short_code, room=room.room_id[:8])
                 elif props["pID"]:
-                    log_engine("debug", session_id[:8], msg=f"pID ghost ignored {props['pID']!r}", room=room.room_id[:8])
-        # pID from GameProperties (CreateRoom with pID PBS05) — validated
-        if not room.short_code and gpb and gpb.get("params", {}).get("GameProperties"):
+                    log_engine("debug", session_id[:13], msg=f"pID ghost ignored {props['pID']!r}", room=room.room_id[:8])
+        # pID from GameProperties (CreateRoom with pID PBS05) — validated.
+        # Lobby pseudo-room excluded (see above).
+        if not room.short_code and room.room_id != "lobby" and gpb and gpb.get("params", {}).get("GameProperties"):
             try:
                 gp = gpb["params"]["GameProperties"]
                 from ..gpbinary import _unwrap as _uw3
@@ -976,9 +1042,9 @@ class Engine:
                     valid = _is_valid_pid(gp_val["pID"])
                     if valid:
                         room.short_code = valid
-                        log_engine("room", session_id[:8], action="pID", code=room.short_code, room=room.room_id[:8])
+                        log_engine("room", session_id[:13], action="pID", code=room.short_code, room=room.room_id[:8])
                     elif gp_val["pID"]:
-                        log_engine("debug", session_id[:8], msg=f"pID ghost ignored {gp_val['pID']!r}", room=room.room_id[:8])
+                        log_engine("debug", session_id[:13], msg=f"pID ghost ignored {gp_val['pID']!r}", room=room.room_id[:8])
             except Exception:
                 pass
 
@@ -1011,7 +1077,7 @@ class Engine:
                     if was_dead and (room.players[existing_key].is_self or (view.me and _names_equal(join_name, view.me.username))):
                         room.had_self_death = False
                         room.had_self_defeat = False
-                        log_engine("debug", session_id[:8], msg=f"rejoin reset flags for {join_name}", room=room.room_id[:8])
+                        log_engine("debug", session_id[:13], msg=f"rejoin reset flags for {join_name}", room=room.room_id[:8])
                     skid, pid, pfid, pt = _other_props()
                     if skid: room.players[existing_key].skin = skid
                     if pid: room.players[existing_key].pickaxe = pid
@@ -1020,9 +1086,9 @@ class Engine:
                     elif existing_key in room.pending_pt:
                         pt = room.pending_pt.pop(existing_key)
                         room.players[existing_key].pt = pt
-                        log_engine("team_pt", session_id[:8], team=pt, target=existing_key, player=join_name, via="pending apply on existing", room=room.room_id[:8])
+                        log_engine("team_pt", session_id[:13], team=pt, target=existing_key, player=join_name, via="pending apply on existing", room=room.room_id[:8])
                     if pt: _rebuild_teams(room)
-                    log_engine("join", session_id[:8], name=join_name, status="existing", room=room.room_id[:8], pt=pt)
+                    log_engine("join", session_id[:13], name=join_name, status="existing", room=room.room_id[:8], pt=pt)
                 else:
                     key = int(p_actor) if p_actor is not None else hash(join_name) % 100000
                     # ensure unique
@@ -1032,7 +1098,7 @@ class Engine:
                     # apply pending _pt from TargetActorNr (private duos) if no pt in join props
                     if not pt and key in room.pending_pt:
                         pt = room.pending_pt.pop(key)
-                        log_engine("team_pt", session_id[:8], team=pt, target=key, player=join_name, via="pending apply on join", room=room.room_id[:8])
+                        log_engine("team_pt", session_id[:13], team=pt, target=key, player=join_name, via="pending apply on join", room=room.room_id[:8])
                     room.players[key] = Player(
                         actor_nr=key if p_actor is not None else -1,
                         username=join_name,
@@ -1048,16 +1114,16 @@ class Engine:
                     # Increment count for private rooms (CreateRoom) — for random rooms count is seeded from max, don't increment
                     if room.max_players is None or room.players_count < room.max_players or gpb.get("opName") == "CreateRoom":
                         room.players_count += 1
-                    log_engine("join", session_id[:8], name=join_name, status="new", count=room.players_count, room=room.room_id[:8])
+                    log_engine("join", session_id[:13], name=join_name, status="new", count=room.players_count, room=room.room_id[:8])
             # Debug if we missed player_name extraction
             if not packet.player_name and join_name:
-                log_engine("debug", session_id[:8], msg=f"JOIN fallback used gpb playerProps {join_name} type={packet.packet_type.value}", room=room.room_id[:8])
+                log_engine("debug", session_id[:13], msg=f"JOIN fallback used gpb playerProps {join_name} type={packet.packet_type.value}", room=room.room_id[:8])
         elif packet.packet_type == PacketType.JOIN and not packet.player_name:
             # Debug: JOIN packet without name — log gpb keys to trace
             gpb_keys = list(gpb.keys()) if gpb else []
             props_keys = list(gpb.get("properties", {}).keys()) if gpb and gpb.get("properties") else []
             pp_keys = list(gpb.get("playerProps", {}).keys()) if gpb and gpb.get("playerProps") else []
-            log_engine("debug", session_id[:8], msg=f"JOIN no name gpb={gpb.get('evName')}/{gpb.get('opName')} playerProps={pp_keys} props={props_keys} gpb_keys={gpb_keys}", room=room.room_id[:8])
+            log_engine("debug", session_id[:13], msg=f"JOIN no name gpb={gpb.get('evName')}/{gpb.get('opName')} playerProps={pp_keys} props={props_keys} gpb_keys={gpb_keys}", room=room.room_id[:8])
 
         # ---- LEAVE (room-scoped, log explicitly) ----
         # Removes the player from players AND actor_map so rosters never accumulate
@@ -1079,12 +1145,12 @@ class Engine:
                 room.players.pop(to_del, None)
                 if room.players_count > 0:
                     room.players_count -= 1
-                log_engine("leave", session_id[:8], name=packet.player_name, count=room.players_count, room=room.room_id[:8])
+                log_engine("leave", session_id[:13], name=packet.player_name, count=room.players_count, room=room.room_id[:8])
                 room.recent_kills.append(KillInfo(instigator=packet.player_name, instigated="", event_type="left"))
             else:
                 # still record leave for processor
                 room.recent_kills.append(KillInfo(instigator=packet.player_name, instigated="", event_type="left"))
-                log_engine("leave", session_id[:8], name=packet.player_name, count=room.players_count, room=room.room_id[:8], status="not_found")
+                log_engine("leave", session_id[:13], name=packet.player_name, count=room.players_count, room=room.room_id[:8], status="not_found")
 
         # Self-leave of the current room -> back to lobby pseudo-room so stats,
         # drawer and bot show In Lobby instead of the stale party/match room.
@@ -1095,7 +1161,7 @@ class Engine:
                 if _me_lv and _names_equal(packet.player_name, _me_lv):
                     if view.current_room_id != "lobby":
                         _ensure_room("lobby")
-                        log_engine("room", session_id[:8], action="left-to-lobby", room=room.room_id[:8])
+                        log_engine("room", session_id[:13], action="left-to-lobby", room=room.room_id[:8])
         except Exception:
             pass
 
@@ -1106,7 +1172,7 @@ class Engine:
         try:
             if packet.packet_type == PacketType.AUTHENTICATE and view.current_room_id != "lobby":
                 _ensure_room("lobby")
-                log_engine("room", session_id[:8], action="auth-to-lobby", room=room.room_id[:8])
+                log_engine("room", session_id[:13], action="auth-to-lobby", room=room.room_id[:8])
         except Exception:
             pass
 
@@ -1125,7 +1191,7 @@ class Engine:
                 _me_self = room.me or view.me
                 if _me_self is not None and getattr(_me_self, "username", None):
                     packet.player_name = _me_self.username
-                    log_engine("alv", session_id[:8], name=_me_self.username, alive=bool(packet.is_alive), room=room.room_id[:8], via="self-report")
+                    log_engine("alv", session_id[:13], name=_me_self.username, alive=bool(packet.is_alive), room=room.room_id[:8], via="self-report")
         except Exception:
             pass
         if packet.packet_type in (PacketType.ALIVE, PacketType.ELIMINATED) and (packet.player_name or actor_nr is not None or (gpb and gpb.get("params", {}).get("TargetActorNr") is not None)):
@@ -1185,7 +1251,7 @@ class Engine:
                     target_key = key
                     if packet.packet_type == PacketType.ALIVE:
                         room.players_count += 1
-                        log_engine("alv", session_id[:8], name=alv_name, alive=True, count=room.players_count, room=room.room_id[:8], actor=actor_nr, target=target_actor_nr)
+                        log_engine("alv", session_id[:13], name=alv_name, alive=True, count=room.players_count, room=room.room_id[:8], actor=actor_nr, target=target_actor_nr)
             if target:
                 was_alive = target.is_alive
                 target.is_alive = packet.is_alive
@@ -1206,15 +1272,15 @@ class Engine:
                 if not target.is_alive and was_alive:
                     if room.players_count > 0:
                         room.players_count = max(0, room.players_count - 1)
-                    log_engine("alv", session_id[:8], name=target.username, alive=False, count=room.players_count, room=room.room_id[:8], actor=actor_nr, target=target_actor_nr)
+                    log_engine("alv", session_id[:13], name=target.username, alive=False, count=room.players_count, room=room.room_id[:8], actor=actor_nr, target=target_actor_nr)
                 elif target.is_alive and not was_alive:
                     room.players_count += 1
-                    log_engine("alv", session_id[:8], name=target.username, alive=True, count=room.players_count, room=room.room_id[:8], actor=actor_nr, target=target_actor_nr)
+                    log_engine("alv", session_id[:13], name=target.username, alive=True, count=room.players_count, room=room.room_id[:8], actor=actor_nr, target=target_actor_nr)
                     # revive/respawn/round-reset for self = new life: reset per-life flags
                     if target.is_self or (view.me and _names_equal(target.username, view.me.username)):
                         room.had_self_death = False
                         room.had_self_defeat = False
-                        log_engine("debug", session_id[:8], msg=f"revive reset flags for {target.username}", room=room.room_id[:8])
+                        log_engine("debug", session_id[:13], msg=f"revive reset flags for {target.username}", room=room.room_id[:8])
                 if target.is_self or (view.me and _names_equal(target.username, view.me.username)):
                     if view.me:
                         view.me.is_alive = target.is_alive
@@ -1236,10 +1302,10 @@ class Engine:
                     if pt and tgt.pt != pt:
                         tgt.pt = pt
                         _rebuild_teams(room)
-                        log_engine("team_pt", session_id[:8], team=pt, target=_tk, player=tgt.username, via="props", room=room.room_id[:8])
+                        log_engine("team_pt", session_id[:13], team=pt, target=_tk, player=tgt.username, via="props", room=room.room_id[:8])
                     if skid and not tgt.skin:
                         tgt.skin = skid
-                        log_engine("skin", session_id[:8], name=tgt.username, skin=skid, room=room.room_id[:8])
+                        log_engine("skin", session_id[:13], name=tgt.username, skin=skid, room=room.room_id[:8])
                         feed_hint = f"skin filled for {tgt.username} via PropertiesChanged"
                     if pid and not tgt.pickaxe:
                         tgt.pickaxe = pid
@@ -1251,7 +1317,7 @@ class Engine:
                     # Subject not in room yet (late joiner): stash _pt for JOIN to apply
                     try:
                         room.pending_pt[int(target_actor_nr)] = pt
-                        log_engine("team_pt", session_id[:8], team=pt, target=int(target_actor_nr), via="pending stash", room=room.room_id[:8])
+                        log_engine("team_pt", session_id[:13], team=pt, target=int(target_actor_nr), via="pending stash", room=room.room_id[:8])
                     except Exception:
                         pass
 
@@ -1265,18 +1331,18 @@ class Engine:
             killer = _strip(str(packet.killer)).strip()
             victim = _strip(str(packet.victim)).strip()
             if not killer or not victim or "<" in killer or "<" in victim:
-                log_engine("debug", session_id[:8], msg=f"kill dropped empty killer={killer!r} victim={victim!r}", room=room.room_id[:8])
+                log_engine("debug", session_id[:13], msg=f"kill dropped empty killer={killer!r} victim={victim!r}", room=room.room_id[:8])
             elif packet.is_echo:
-                log_engine("debug", session_id[:8], msg=f"kill echo ignored {killer}->{victim} (broadcast counts)", room=room.room_id[:8])
+                log_engine("debug", session_id[:13], msg=f"kill echo ignored {killer}->{victim} (broadcast counts)", room=room.room_id[:8])
             else:
                 try:
                     _now = time.time() * 1000.0
                 except Exception:
                     _now = 0.0
                 if _kill_content_dup(room.recent_kills, killer, victim, "killed", _now):
-                    log_engine("debug", session_id[:8], msg=f"kill dup ignored {killer}->{victim} (retransmit window)", room=room.room_id[:8])
+                    log_engine("debug", session_id[:13], msg=f"kill dup ignored {killer}->{victim} (retransmit window)", room=room.room_id[:8])
                 else:
-                    log_engine("killfeed", session_id[:8], killer=killer, victim=victim, room=room.room_id[:8])
+                    log_engine("killfeed", session_id[:13], killer=killer, victim=victim, room=room.room_id[:8])
                     room.recent_kills.append(KillInfo(instigator=killer, instigated=victim, event_type="killed", t=_now, hx=packet.raw_hex))
                     if len(room.recent_kills) > 100:
                         room.recent_kills = room.recent_kills[-100:]
@@ -1295,17 +1361,17 @@ class Engine:
                                     is_self=(view.me and _names_equal(name, view.me.username)),
                                     late_join=(room.state == State.MATCH),
                                 )
-                                log_engine("join", session_id[:8], name=name, source="killfeed", alive=not is_target, room=room.room_id[:8])
+                                log_engine("join", session_id[:13], name=name, source="killfeed", alive=not is_target, room=room.room_id[:8])
         elif packet.is_knock and packet.killer and packet.victim:
             if packet.is_echo:
-                log_engine("debug", session_id[:8], msg="knock echo ignored (broadcast counts)", room=room.room_id[:8])
+                log_engine("debug", session_id[:13], msg="knock echo ignored (broadcast counts)", room=room.room_id[:8])
             else:
                 try:
                     _now2 = time.time() * 1000.0
                 except Exception:
                     _now2 = 0.0
                 if _kill_content_dup(room.recent_knocks, str(packet.killer), str(packet.victim), "knocked", _now2):
-                    log_engine("debug", session_id[:8], msg="knock dup ignored (retransmit window)", room=room.room_id[:8])
+                    log_engine("debug", session_id[:13], msg="knock dup ignored (retransmit window)", room=room.room_id[:8])
                 else:
                     room.recent_knocks.append(KillInfo(instigator=str(packet.killer), instigated=str(packet.victim), event_type="knocked", t=_now2, hx=packet.raw_hex))
                     if len(room.recent_knocks) > 100:

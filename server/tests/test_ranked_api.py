@@ -146,6 +146,20 @@ def _live_session(code="ABCDE", mver=3, warnings=None, state="match", players=No
                              "game_mode": "zw_lg", "players_count": 4}}}
 
 
+def _blip_session(fresh=True):
+    """Lone-Authenticate shape: current parked on the lobby pseudo-room while
+    the ranked room does (fresh) or doesn't (stale ghost) keep capturing."""
+    import time as _t
+    ts = _t.time() - (10 if fresh else 3600)
+    return {"current_room_id": "lobby",
+            "rooms": {"lobby": {"room_id": "lobby"},
+                      "r1": {"room_id": "r1", "short_code": "ABCDE",
+                             "match_version": 3, "state": "lobby",
+                             "ranked_warnings": [], "players": {},
+                             "game_mode": "zw_lg", "players_count": 2,
+                             "last_packet_at": ts}}}
+
+
 _ROOM = {"id": "R-X", "short_code": "ABCDE", "host_discord_id": "H",
          "status": "live", "min_points": 0, "max_points": None, "fee": 0}
 
@@ -215,6 +229,102 @@ def test_stats_non_ranked_null(fakes, monkeypatch):
     body = _stats(monkeypatch, session=_live_session(code="ZZZZZ"), room=None)
     assert body["ranked"] is None
     assert body["session"]["short_code"] == "ZZZZZ"  # rest untouched
+
+
+def test_stats_lobby_blip_rescue(fakes, monkeypatch):
+    # lone Authenticate parked current on the lobby pseudo-room, but the
+    # ranked room keeps capturing -> BLOCK survives, code intact
+    body = _stats(monkeypatch, session=_blip_session(fresh=True), room=dict(_ROOM))
+    assert body["ranked"] and body["ranked"]["rid"] == "R-X"
+    assert body["session"]["short_code"] == "ABCDE"
+
+
+def test_stats_stale_ghost_stays_buried(fakes, monkeypatch):
+    # same shape but the room's packets are stale (kick/reload ghost) ->
+    # no rescue, stays null
+    body = _stats(monkeypatch, session=_blip_session(fresh=False), room=dict(_ROOM))
+    assert body["ranked"] is None
+    assert body["session"]["short_code"] is None
+
+
+# ---------------------------------------------------------------------------
+# get_ranked_room_fresh read-through (new rooms visible before the 30s refresh)
+# ---------------------------------------------------------------------------
+
+class _RoomDB:
+    def __init__(self, rooms):
+        self.rooms = list(rooms)
+        self.calls = 0
+
+    def table(self, name):
+        assert name == "ranked_rooms"
+        outer = self
+
+        class _RQ:
+            def __init__(self):
+                self.filters = []
+
+            def select(self, *a):
+                return self
+
+            def eq(self, col, val):
+                self.filters.append((col, val))
+                return self
+
+            def limit(self, n):
+                return self
+
+            def execute(self):
+                outer.calls += 1
+                rows = list(outer.rooms)
+                for col, val in self.filters:
+                    rows = [r for r in rows if str(r.get(col)) == str(val)]
+                return _Res(data=rows)
+
+        return _RQ()
+
+
+@pytest.fixture
+def fresh_env(monkeypatch):
+    ranked_mod._rooms.clear()
+    ranked_mod._miss_cache.clear()
+    monkeypatch.setattr(ranked_mod, "_sb", lambda: None)  # default: no DB
+    yield
+    ranked_mod._rooms.clear()
+    ranked_mod._miss_cache.clear()
+
+
+def test_fresh_hit_no_db(monkeypatch, fresh_env):
+    ranked_mod._rooms["ABCDE"] = {"id": "R-1"}
+    db = _RoomDB([])
+    monkeypatch.setattr(ranked_mod, "_sb", lambda: db)
+    assert ranked_mod.get_ranked_room_fresh("abcde") == {"id": "R-1"}
+    assert db.calls == 0
+
+
+def test_fresh_miss_reads_db_and_caches(monkeypatch, fresh_env):
+    db = _RoomDB([{"id": "R-2", "short_code": "FGHIJ", "status": "lobby"}])
+    monkeypatch.setattr(ranked_mod, "_sb", lambda: db)
+    assert ranked_mod.get_ranked_room_fresh("FGHIJ")["id"] == "R-2"
+    assert db.calls == 2  # live miss + lobby hit
+    assert ranked_mod._rooms["FGHIJ"]["id"] == "R-2"  # cached for next poll
+
+
+def test_fresh_negative_cached(monkeypatch, fresh_env):
+    db = _RoomDB([])
+    monkeypatch.setattr(ranked_mod, "_sb", lambda: db)
+    assert ranked_mod.get_ranked_room_fresh("ZZZZZ") is None
+    assert ranked_mod.get_ranked_room_fresh("ZZZZZ") is None
+    assert db.calls == 2  # one live+lobby round; second call served from miss cache
+
+
+def test_fresh_prefers_live(monkeypatch, fresh_env):
+    db = _RoomDB([
+        {"id": "R-old", "short_code": "ABCDE", "status": "lobby"},
+        {"id": "R-new", "short_code": "ABCDE", "status": "live"},
+    ])
+    monkeypatch.setattr(ranked_mod, "_sb", lambda: db)
+    assert ranked_mod.get_ranked_room_fresh("ABCDE")["id"] == "R-new"
 
 
 def test_stats_no_session_null(fakes, monkeypatch):

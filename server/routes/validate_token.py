@@ -213,7 +213,7 @@ async def validate_token(request: Request):
             log_err(f"failed to create session: {e}")
             return JSONResponse({"error": "Failed to create session"}, status_code=500)
 
-        log_ok(f"VALIDATE OK {login_token['discord_id']} token={str(token)[:4]}… session={session_id[:8]} issued")
+        log_ok(f"VALIDATE OK {login_token['discord_id']} token={str(token)[:4]}… session={session_id[:13]} issued")
 
         # Fetch user for response
         try:

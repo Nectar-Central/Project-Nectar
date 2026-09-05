@@ -1429,6 +1429,116 @@ async def _post_thread(room: dict, content=None, embed=None):
         return False
 
 
+def _ord(n) -> str:
+    """1 -> 1st, 2 -> 2nd, 3 -> 3rd, 11-13 -> th. Never raises."""
+    try:
+        n = int(n)
+        if 11 <= (n % 100) <= 13:
+            return f"{n}th"
+        return f"{n}{({1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th'))}"
+    except Exception:
+        return str(n)
+
+
+async def _display_name(did: str) -> str:
+    """Game username > discord username > raw did. Never raises."""
+    try:
+        row = await db.get_by_discord(str(did))
+        return (row or {}).get("game_username") or (row or {}).get("discord_username") or str(did)
+    except Exception:
+        return str(did)
+
+
+async def _post_match_board(room: dict, seal: dict):
+    """Match-only leaderboard in the session thread: winner + per-player
+    placement/kills/points for THIS sealed match (not global standings).
+    Best-effort, never raises."""
+    try:
+        v = seal.get("match_version")
+        pts = seal.get("points") or {}
+        kills = seal.get("kills") or {}
+        plc = seal.get("placements") or {}
+        if not isinstance(pts, dict):
+            pts = {}
+        winner = str(seal.get("winner_discord_id") or "")
+        wnm = await _display_name(winner) if winner else "—"
+        # order: placement asc, then points desc, then did
+        def _key(did):
+            try:
+                p = plc.get(did)
+                p = int(p) if p is not None else 99
+            except Exception:
+                p = 99
+            try:
+                g = -int(pts.get(did) or 0)
+            except Exception:
+                g = 0
+            return (p, g, str(did))
+        lines = []
+        for did in sorted(pts.keys(), key=_key):
+            try:
+                g = int(pts.get(did) or 0)
+            except Exception:
+                g = 0
+            try:
+                p = plc.get(did)
+                ptxt = _ord(p) if p is not None else "—"
+            except Exception:
+                ptxt = "—"
+            try:
+                k = int((kills or {}).get(did) or 0)
+            except Exception:
+                k = 0
+            nm = await _display_name(did)
+            crown = " 👑" if winner and str(did) == winner else ""
+            lines.append(f"**{ptxt}** {nm} — {'+' if g >= 0 else ''}{g} pts ({k} kill{'s' if k != 1 else ''}){crown}")
+        e = discord.Embed(title=f"Match v{v} sealed — {ranked_mod.gm_name(seal.get('gm') or room.get('gm'))}",
+                          color=0x10b981,
+                          description=f"Winner **{wnm}**\n" + ("\n".join(lines) or "No points awarded."))
+        e.set_footer(text=f"{room['id']} · match-only results")
+        await _post_thread(room, embed=e)
+        print(f"[ranked] match board posted {room['id']} v{v}")
+    except Exception as e:
+        print(f"[ranked] match board failed: {e}")
+
+
+async def _close_thread(room: dict) -> bool:
+    """Close (archive+lock) then delete the session thread. The session is
+    over — nothing should linger. True when the thread is gone (or was
+    already gone); False only when Discord refused. Never raises."""
+    try:
+        tid = room.get("thread_id")
+        if not tid:
+            return True
+        try:
+            th = bot.get_channel(int(tid))
+            if th is None:
+                th = await bot.fetch_channel(int(tid))
+        except discord.errors.NotFound:
+            return True  # already gone
+        except Exception as e:
+            print(f"[ranked] thread close fetch failed: {e}")
+            return False
+        try:
+            await th.edit(archived=True, locked=True)
+        except discord.errors.NotFound:
+            return True
+        except Exception as e:
+            print(f"[ranked] thread archive failed (continuing to delete): {e}")
+        try:
+            await th.delete()
+        except discord.errors.NotFound:
+            return True
+        except Exception as e:
+            print(f"[ranked] thread delete failed: {e}")
+            return False
+        print(f"[ranked] thread closed+deleted {room['id']} tid={tid}")
+        return True
+    except Exception as e:
+        print(f"[ranked] thread close failed: {e}")
+        return False
+
+
 async def _defer(interaction: discord.Interaction) -> bool:
     """Defer an interaction. False = interaction already dead (starved loop),
     caller must abort silently (there is nobody left to answer)."""
@@ -1622,7 +1732,12 @@ async def ranked_end_cmd(interaction: discord.Interaction, rid: str):
         title="Session ended", color=0xef4444,
         description=f"**{room['id']}** closed with {sealed}/{room.get('max_matches')} matches sealed."))
     await _set_lobby_embed(room, ranked_mod.ended_embed(room), 0xef4444)
-    await interaction.followup.send(f"**{room['id']}** ended ({sealed} matches sealed).", ephemeral=True)
+    # session over: close (archive+lock) then delete the private thread
+    closed = await _close_thread(room)
+    if closed:
+        _thread_cleaned.add(room["id"])
+    tail = " Thread closed and deleted." if closed else " Couldn't delete the thread — check my thread perms."
+    await interaction.followup.send(f"**{room['id']}** ended ({sealed} matches sealed).{tail}", ephemeral=True)
 
 
 @ranked_group.command(name="backout", description="Back out to lobby, session continues (host)")
@@ -1741,6 +1856,28 @@ async def ranked_roster_cmd(interaction: discord.Interaction, rid: str):
     await interaction.followup.send(embed=e, ephemeral=True)
 
 
+@ranked_group.command(name="leaderboard", description="Session standings: points earned per player")
+@app_commands.describe(rid="Room ID, e.g. R-ABC123")
+async def ranked_leaderboard_cmd(interaction: discord.Interaction, rid: str):
+    if not await _defer(interaction):
+        return
+    room = ranked_mod.get_room((rid or "").strip().upper())
+    if not room:
+        return await interaction.followup.send("No such ranked room.", ephemeral=True)
+    board, sealed = ranked_mod.session_standings(room["id"])
+    if not board:
+        return await interaction.followup.send(
+            f"**{room['id']}** — no sealed matches yet ({sealed}/{room.get('max_matches')} sealed).", ephemeral=True)
+    lines = []
+    for i, (did, (gained, wins, played)) in enumerate(board, start=1):
+        nm = await _display_name(did)
+        tag = " 👑" if did == str(room.get("host_discord_id")) else ""
+        lines.append(f"**{i}.** {nm} — {'+' if gained >= 0 else ''}{gained} pts ({wins}W · {played} match{'es' if played != 1 else ''}){tag}")
+    e = discord.Embed(title=f"Session standings {room['id']}", color=0x7c3aed, description="\n".join(lines))
+    e.set_footer(text=f"{room['id']} · {sealed}/{room.get('max_matches')} sealed · {room.get('status')}")
+    await interaction.followup.send(embed=e, ephemeral=True)
+
+
 @ranked_group.command(name="ban", description="Ban a player from ranked (admin)")
 @app_commands.describe(member="Player to ban", reason="Why")
 async def ranked_ban_cmd(interaction: discord.Interaction, member: discord.Member, reason: str = ""):
@@ -1795,9 +1932,50 @@ async def ranked_review_cmd(interaction: discord.Interaction, rid: str):
     await interaction.followup.send(embed=e, ephemeral=True)
 
 
+# Seal-watch + auto-end state (module level; the loop owns them).
+_seal_seen: dict = {}      # rid -> max match_version already posted to the thread
+_live_known: set = set()   # rids seen live (detects server-side ended flips)
+_pending_end: set = set()  # ex-live rids awaiting an ended verdict
+_thread_cleaned: set = set()  # rids whose thread is gone
+
+
+async def _finalize_ended_room(room: dict, via: str):
+    """A room the server ended (max matches sealed): final embed, lobby flip,
+    thread close+delete. Idempotent via _thread_cleaned. Never raises."""
+    try:
+        rid = room["id"]
+        if rid in _thread_cleaned:
+            return
+        sealed = ranked_mod.sealed_count(rid)
+        await _post_thread(room, embed=discord.Embed(
+            title="Session ended", color=0xef4444,
+            description=f"**{rid}** closed with {sealed}/{room.get('max_matches')} matches sealed ({via})."))
+        await _set_lobby_embed(room, ranked_mod.ended_embed(room), 0xef4444)
+        if await _close_thread(room):
+            _thread_cleaned.add(rid)
+    except Exception as e:
+        print(f"[ranked] auto-end finalize failed: {e}")
+
+
 async def ranked_loop():
-    """Every 30s: auto-start countdown lobbies whose time came."""
+    """Every 30s: auto-start countdown lobbies; post per-match boards for new
+    seals in live rooms; finalize rooms the server ended (max matches)."""
     await bot.wait_until_ready()
+    # seed: pre-existing seals were (presumably) posted before this boot —
+    # only future seals trigger posts. Logged so a gap is visible.
+    try:
+        for room in await asyncio.to_thread(ranked_mod.list_live_rooms):
+            try:
+                seals = await asyncio.to_thread(ranked_mod.room_seals, room["id"])
+                if seals:
+                    _seal_seen[room["id"]] = max(int(s.get("match_version") or 0) for s in seals)
+                _live_known.add(room["id"])
+            except Exception:
+                continue
+        if _seal_seen:
+            print(f"[ranked] seal-watch seeded (skipping already-sealed): {_seal_seen}")
+    except Exception as e:
+        print(f"[ranked] seal-watch seed failed: {e}")
     while not bot.is_closed():
         try:
             for room in ranked_mod.list_due_starts():
@@ -1807,6 +1985,55 @@ async def ranked_loop():
                 except Exception as e:
                     print(f"[ranked] countdown failed for {room.get('id')}: {e}")
                 await asyncio.sleep(2)  # let interactions interleave between rooms
+            # seal-watch: new sealed versions -> match-only board in the thread
+            try:
+                live = await asyncio.to_thread(ranked_mod.list_live_rooms)
+            except Exception as e:
+                print(f"[ranked] live list failed: {e}")
+                live = []
+            live_ids = set()
+            for room in live:
+                try:
+                    rid = room["id"]
+                    live_ids.add(rid)
+                    _live_known.add(rid)
+                    seals = await asyncio.to_thread(ranked_mod.room_seals, rid)
+                    known = _seal_seen.get(rid, 0)
+                    fresh = sorted(
+                        [s for s in seals if int(s.get("match_version") or 0) > known],
+                        key=lambda s: int(s.get("match_version") or 0))
+                    for seal in fresh:
+                        try:
+                            await _post_match_board(room, seal)
+                        finally:
+                            # mark seen even when the post failed: no 30s retry
+                            # spam, the next seal carries the session forward
+                            # (and /ranked review|leaderboard show it all)
+                            _seal_seen[rid] = max(_seal_seen.get(rid, 0),
+                                                  int(seal.get("match_version") or 0))
+                except Exception as e:
+                    print(f"[ranked] seal-watch failed for {room.get('id')}: {e}")
+                await asyncio.sleep(1)  # let interactions interleave between rooms
+            # ex-live rooms: server-side ended flip (max matches) -> finalize;
+            # backout-to-lobby just drops out of the pending set (thread stays).
+            for rid in _live_known - live_ids:
+                _pending_end.add(rid)
+            _live_known.intersection_update(live_ids)
+            for rid in list(_pending_end):
+                try:
+                    room = await asyncio.to_thread(ranked_mod.get_room, rid)
+                    if not room or room.get("status") != "ended":
+                        _pending_end.discard(rid)
+                        continue
+                    if rid in _thread_cleaned:
+                        _pending_end.discard(rid)
+                        continue
+                    print(f"[ranked] auto-end finalize {rid}")
+                    await _finalize_ended_room(room, "max matches reached")
+                    if rid in _thread_cleaned:
+                        _pending_end.discard(rid)
+                except Exception as e:
+                    print(f"[ranked] auto-end check failed for {rid}: {e}")
         except Exception as e:
             print(f"[ranked] loop failed: {e}")
         await asyncio.sleep(30)

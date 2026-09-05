@@ -231,6 +231,57 @@ def sealed_count(rid: str) -> int:
         return 0
 
 
+def list_live_rooms():
+    """Live rooms (for the seal-watch loop). Empty on error."""
+    try:
+        r = _sb().table("ranked_rooms").select("*").eq("status", "live").limit(50).execute()
+        return r.data or []
+    except Exception:
+        return []
+
+
+def room_seals(rid: str):
+    """Sealed matches for a room, newest first (full rows incl placements).
+    Empty on error."""
+    try:
+        r = _sb().table("ranked_results").select(
+            "match_version,gm,winner_discord_id,kills,points,placements"
+        ).eq("room_id", rid).order("match_version", desc=True).limit(50).execute()
+        return r.data or []
+    except Exception:
+        return []
+
+
+def session_standings(rid: str):
+    """Per-player session totals across sealed matches.
+
+    Returns ([(did, gained, wins, played)] sorted by gained desc, wins desc,
+    matches_sealed). Players with zero sealed rows are absent. Never raises.
+    """
+    try:
+        tot: dict = {}
+        n = 0
+        for row in room_seals(rid):
+            n += 1
+            pts = row.get("points") or {}
+            if not isinstance(pts, dict):
+                continue
+            w = str(row.get("winner_discord_id") or "")
+            for did, d in pts.items():
+                try:
+                    e = tot.setdefault(str(did), [0, 0, 0])  # gained, wins, played
+                    e[0] += int(d or 0)
+                    e[2] += 1
+                    if w and str(did) == w:
+                        e[1] += 1
+                except Exception:
+                    continue
+        board = sorted(tot.items(), key=lambda kv: (-kv[1][0], -kv[1][1], kv[0]))
+        return board, n
+    except Exception:
+        return [], 0
+
+
 def top_points(limit: int = 10):
     """Top arena-point holders: [(discord_id, points)]. Empty on error."""
     try:

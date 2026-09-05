@@ -151,7 +151,7 @@ class RoomFSM:
         # on_enter for new state
         RoomFSM._on_enter(room, view, old, target, via, session_id, packet, gpb, cur_scn)
 
-        log_engine("state", session_id[:8], old=old.value, new=target.value, room=room.room_id[:8], via=via,
+        log_engine("state", session_id[:13], old=old.value, new=target.value, room=room.room_id[:8], via=via,
                    curScn=cur_scn or packet.cur_scn or "-")
         # keep playtime last_state in sync — engine tick reads this
         try:
@@ -191,9 +191,9 @@ class RoomFSM:
             if gm:
                 try:
                     if room.adopt_game_mode(gm):
-                        log_engine("room", session_id[:8], action="gm", gm=room.game_mode.value, room=room.room_id[:8], via=f"fsm:{via}")
+                        log_engine("room", session_id[:13], action="gm", gm=room.game_mode.value, room=room.room_id[:8], via=f"fsm:{via}")
                     elif gm != room.game_mode:
-                        log_engine("debug", session_id[:8],
+                        log_engine("debug", session_id[:13],
                                    msg=f"gm flicker suppressed {room.game_mode.value} != {gm.value}", room=room.room_id[:8])
                 except Exception:
                     pass
@@ -207,6 +207,12 @@ class RoomFSM:
             # clear any unconsumed phase-end arm from the previous match (drain is
             # edge-triggered now: a batch ending on stG=2 must not leak its arm here)
             room.stg_is_phase_end = False
+            # re-arm the stG=3 one-shot for this match (scene-driven starts
+            # may never emit stG=1; the bump still needs its single shot)
+            try:
+                room.stg3_armed = True
+            except Exception:
+                pass
             # fresh routing + history: drop previous match's actor names, kills, knocks
             # (rebuilt from Join/alv/killfeed packets; players/teams/counts are live-managed)
             try:
@@ -230,7 +236,7 @@ class RoomFSM:
                     room.actor_map[int(_an)] = _un
             except Exception:
                 pass
-            log_engine("debug", session_id[:8], msg="room reset for new match (map/kills cleared)", room=room.room_id[:8])
+            log_engine("debug", session_id[:13], msg="room reset for new match (map/kills cleared)", room=room.room_id[:8])
         elif new == State.LOBBY and via and via.startswith("scene:"):
             # SCENE MainLobby enter -> reset cur_scn and optionally clear pending stg
             room.cur_scn = cur_scn
