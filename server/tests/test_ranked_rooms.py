@@ -388,3 +388,55 @@ def test_seals_and_review(fx):
     assert any(r["discord_id"] == "H" and r["is_host"] for r in out["room"]["roster"])
     code, out = _call(ranked_route.ranked_list, params={"status": "live"})
     assert code == 200 and any(r["id"] == rid for r in out["rooms"])
+
+
+def test_by_code_live_member(fx):
+    rid = _live_room(fx)
+    code, out = _call(ranked_route.ranked_by_code, "abcde", params={"discord_id": "H"})
+    assert code == 200
+    assert out["room"]["id"] == rid and out["room"]["status"] == "live"
+    assert out["on_roster"] is True and out["is_host"] is True
+
+
+def test_by_code_outsider(fx):
+    _live_room(fx)
+    code, out = _call(ranked_route.ranked_by_code, "ABCDE", params={"discord_id": "STRANGER"})
+    assert code == 200
+    assert out["room"] is not None
+    assert out["on_roster"] is False and out["is_host"] is False
+
+
+def test_by_code_unknown_and_bad(fx):
+    code, out = _call(ranked_route.ranked_by_code, "QQQQQ", params={"discord_id": "H"})
+    assert code == 200 and out["room"] is None
+    bad, _ = _call(ranked_route.ranked_by_code, "TOOLONG", params={})
+    assert bad == 400
+
+
+def test_by_code_ended(fx):
+    rid = _live_room(fx)
+    _call(ranked_route.ranked_end, rid, params=None, body={})
+    code, out = _call(ranked_route.ranked_by_code, "ABCDE", params={"discord_id": "H"})
+    assert code == 200
+    assert out["room"]["status"] == "ended"
+    assert out["on_roster"] is True
+
+
+def test_mine_prefers_live(fx):
+    rid = _live_room(fx)
+    code, out = _call(ranked_route.ranked_mine, params={"discord_id": "H"})
+    assert code == 200
+    assert out["room"]["id"] == rid and out["on_roster"] is True
+
+
+def test_mine_none_when_uninvolved(fx):
+    _live_room(fx)
+    code, out = _call(ranked_route.ranked_mine, params={"discord_id": "STRANGER"})
+    assert code == 200 and out["room"] is None
+
+
+def test_mine_none_after_end(fx):
+    rid = _live_room(fx)
+    _call(ranked_route.ranked_end, rid, params=None, body={})
+    code, out = _call(ranked_route.ranked_mine, params={"discord_id": "H"})
+    assert code == 200 and out["room"] is None

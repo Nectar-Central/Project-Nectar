@@ -644,6 +644,86 @@ async def ranked_host(rid: str, request: Request):
 
 
 # ---------------------------------------------------------------------------
+# GET /api/ranked/by-code/{code}?discord_id= — userscript authority check
+# ---------------------------------------------------------------------------
+@router.get("/api/ranked/by-code/{code}")
+async def ranked_by_code(code: str, request: Request):
+    """Am I in a ranked session for this room code?
+
+    Returns the open (live preferred, then lobby) room for the code, or the
+    latest ended one so clients can hide UI deliberately instead of guessing.
+    {room: lite|null, on_roster, is_host}. 200 with room null = not ranked.
+    """
+    if _db() is None:
+        return _err("Server not configured", 500)
+    try:
+        code = str(code or "").strip().upper()
+        if len(code) != 5 or not code.isalnum():
+            return _err("code must be 5 letters/digits")
+        did = str(request.query_params.get("discord_id") or "").strip()
+        room = None
+        try:
+            for status in ("live", "lobby"):
+                r = _db().table("ranked_rooms").select("*").eq("short_code", code).eq("status", status).limit(1).execute()
+                if r.data:
+                    room = r.data[0]
+                    break
+            if room is None:
+                r = _db().table("ranked_rooms").select("*").eq("short_code", code).eq("status", "ended").order("created_at", desc=True).limit(1).execute()
+                if r.data:
+                    room = r.data[0]
+        except Exception:
+            room = None
+        if room is None:
+            return JSONResponse({"room": None, "on_roster": False, "is_host": False})
+        ids = _roster_ids(room)
+        return JSONResponse({
+            "room": _room_lite(room),
+            "on_roster": did in ids if did else False,
+            "is_host": bool(did) and did == str(room.get("host_discord_id")),
+        })
+    except Exception as exc:
+        return _err(str(exc), 500)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/ranked/mine?discord_id= — my open ranked room, if any
+# ---------------------------------------------------------------------------
+@router.get("/api/ranked/mine")
+async def ranked_mine(request: Request):
+    """Which ranked session (if any) involves me? Open rooms only — an ended
+    room means you're not in a session anymore, so it returns room null."""
+    if _db() is None:
+        return _err("Server not configured", 500)
+    try:
+        did = str(request.query_params.get("discord_id") or "").strip()
+        if not did:
+            return _err("discord_id required")
+        found = None
+        try:
+            r = _db().table("ranked_rooms").select("*").in_("status", ["lobby", "live"]).order("created_at", desc=True).limit(50).execute()
+            cands = r.data or []
+            for status in ("live", "lobby"):
+                for row in cands:
+                    if row.get("status") == status and did in _roster_ids(row):
+                        found = row
+                        break
+                if found:
+                    break
+        except Exception:
+            found = None
+        if found is None:
+            return JSONResponse({"room": None, "on_roster": False, "is_host": False})
+        return JSONResponse({
+            "room": _room_lite(found),
+            "on_roster": True,
+            "is_host": did == str(found.get("host_discord_id")),
+        })
+    except Exception as exc:
+        return _err(str(exc), 500)
+
+
+# ---------------------------------------------------------------------------
 # GET /api/ranked/rooms/{rid}/seals — sealed matches
 # ---------------------------------------------------------------------------
 @router.get("/api/ranked/rooms/{rid}/seals")

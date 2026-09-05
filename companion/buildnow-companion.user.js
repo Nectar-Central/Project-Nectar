@@ -908,8 +908,84 @@
       const sc=statsCache;
       const rk=sc && sc.ranked && sc.ranked.active ? sc.ranked : null;
       if(!rk || !captureFresh()) return null;
+      // Endpoint authority (auth/create/join triggers + 30s poll below):
+      // no data or API error -> stats rule (fail-open); a definitive answer
+      // (unknown code, ended room, off-roster) hides ranked UI even when the
+      // stats block lingers.
+      const st=rankedNet.state;
+      if(!st || st.error) return rk;
+      if(!st.room) return null;
+      if(st.room.status==='ended') return null;
+      if(!st.on_roster && !st.is_host) return null;
       return rk;
     }catch{ return null; }
+  }
+  // --- RANKED ROOM TRACKING via ranked endpoints ---
+  // Auth (230/231) -> "mine" check; private Join/Create (226/227, pID
+  // present) -> by-code check; public join/create (no pID) -> clear.
+  // The endpoint answers; stats stays the points source. Never raises.
+  let rankedNet={code:null, state:null, at:0, mineAt:0};
+  function sniffPid(hex){
+    // Photon strings are length-prefixed, so the code may glue to a prefix
+    // byte ("07"+"PBS05") — slide a 5-char window over the post-key bytes.
+    // Trigger-happy by design: the by-code endpoint is authoritative and a
+    // wrong guess just resolves to room null (cached 30s).
+    try{
+      const h=String(hex||'').toUpperCase();
+      const key='704944'; // "pID"
+      let i=h.indexOf(key);
+      while(i>=0){
+        const win=h.slice(i+key.length, i+key.length+96); // value follows the key
+        for(let j=0; j+10<=win.length; j+=2){
+          const g=win.slice(j, j+10);
+          if(!/^[0-9A-F]{10}$/.test(g)) continue;
+          let s='';
+          for(let k=0;k<10;k+=2) s+=String.fromCharCode(parseInt(g.slice(k,k+2),16));
+          if(/^[A-Z0-9]{5}$/.test(s)) return s;
+        }
+        i=h.indexOf(key, i+1);
+      }
+    }catch{}
+    return null;
+  }
+  function checkRankedRoom(code, force){
+    code=String(code||'').trim().toUpperCase();
+    if(!code || code.length!==5) return;
+    const now=Date.now();
+    if(!force && rankedNet.code===code && rankedNet.state && now-rankedNet.at<30000) return;
+    rankedNet.code=code;
+    let did=''; try{ did=String(discordId||''); }catch{}
+    let base=''; try{ base=resolveApiBase(); }catch{}
+    if(!did || !base) return;
+    fetch(base+'/api/ranked/by-code/'+encodeURIComponent(code)+'?discord_id='+encodeURIComponent(did),{method:'GET'})
+      .then(r=>r.text().then(t=>{
+        try{
+          const j=JSON.parse(t);
+          rankedNet={code, state:{room:j.room||null, on_roster:!!j.on_roster, is_host:!!j.is_host, error:false}, at:Date.now(), mineAt:rankedNet.mineAt};
+        }catch{ rankedNet={code, state:{error:true}, at:Date.now(), mineAt:rankedNet.mineAt}; }
+        try{ renderInfoPanel(); }catch{}
+      })).catch(()=>{ rankedNet={code, state:{error:true}, at:Date.now(), mineAt:rankedNet.mineAt}; });
+  }
+  function checkRankedMine(){
+    const now=Date.now();
+    if(now-rankedNet.mineAt<30000) return;
+    rankedNet.mineAt=now;
+    let did=''; try{ did=String(discordId||''); }catch{}
+    let base=''; try{ base=resolveApiBase(); }catch{}
+    if(!did || !base) return;
+    fetch(base+'/api/ranked/mine?discord_id='+encodeURIComponent(did),{method:'GET'})
+      .then(r=>r.text().then(t=>{
+        try{
+          const j=JSON.parse(t);
+          if(j.room && j.room.short_code){
+            const c=String(j.room.short_code).toUpperCase();
+            rankedNet={code:c, state:{room:j.room, on_roster:!!j.on_roster, is_host:!!j.is_host, error:false}, at:now, mineAt:now};
+          } else {
+            rankedNet={code:null, state:{room:null, on_roster:false, is_host:false, error:false}, at:now, mineAt:now};
+          }
+        }catch{}
+        try{ renderInfoPanel(); }catch{}
+      })).catch(()=>{});
   }
   function getBindKb(b){
     try{
@@ -1782,8 +1858,12 @@
     }
     _lastRankedPts=pts;
   }
-  // ranked tick: drawer poll only runs when open — keep the overlay fresh when closed
-  setInterval(()=>{ try{ if(!drawerOpen && rankedActive) fetchStats(false); }catch{} }, 30000);
+  // ranked tick: drawer poll only runs when open — keep the overlay fresh when closed.
+  // Also re-checks the tracked ranked code (catches ended rooms -> UI hides).
+  setInterval(()=>{ try{
+    if(!drawerOpen && rankedActive) fetchStats(false);
+    if(rankedNet.code) checkRankedRoom(rankedNet.code);
+  }catch{} }, 30000);
 
   // --- RANKED LOBBY CARD: lobby-only medium card, center-left ---
   // Nectar Ranked Season X / icon / points (milestone) / footer points-to-next.
@@ -2258,6 +2338,16 @@
     const rawHex = hexOf(bytes);
     const type = bytes[1], code = bytes[2];
     const rec = { seq:++seq, t:Date.now(), dir, url: shortUrl(url), fullUrl: String(url).slice(0,256), label: labelForUrl(url), rawHex, _isEssential: isEssential, _type:type, _code:code };
+    // ranked room tracking (cheap type/code gate; endpoint does the truth):
+    // auth -> mine check; private join/create (pID) -> by-code check.
+    try{
+      if((type===2||type===3)&&(code===230||code===231)) checkRankedMine();
+      else if((type===2||type===3)&&(code===226||code===227)){
+        const pid=sniffPid(rawHex);
+        if(pid){ if(rankedNet.code!==pid) checkRankedRoom(pid, true); }
+        else if(rankedNet.code){ rankedNet={code:null,state:null,at:Date.now(),mineAt:rankedNet.mineAt}; try{renderInfoPanel();}catch{} }
+      }
+    }catch{}
     if(collectMode){
       collectedPackets.push({...rec, _bytes: new Uint8Array(bytes)});
       if(collectedPackets.length > COLLECT_MAX) collectedPackets.shift();
