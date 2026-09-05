@@ -221,6 +221,7 @@
     if(path!=='/api/validate-token' && sessionId && currentReqToken){
       if(path==='/api/capture'){
         body = { ...body, authSessionId: sessionId, discord_id: discordId, req_token: currentReqToken };
+        try{ lastCaptureSentAt=Date.now(); }catch{}
       } else {
         body = { ...body, session_id: sessionId, discord_id: discordId, req_token: currentReqToken };
       }
@@ -896,6 +897,20 @@
     return null;
   }
   function isDev(){ try{ return !!(statsCache && statsCache.is_dev); }catch{ return false; } }
+  // Capture liveness: stamped on every /api/capture send (live + replay).
+  // A ghost ranked block (dead session served from server cache after a
+  // kick/reload) must not render when WE haven't captured in minutes.
+  let lastCaptureSentAt=0;
+  const CAPTURE_FRESH_MS=120000;
+  function captureFresh(){ try{ return Date.now()-lastCaptureSentAt<=CAPTURE_FRESH_MS; }catch{ return false; } }
+  function liveRanked(){
+    try{
+      const sc=statsCache;
+      const rk=sc && sc.ranked && sc.ranked.active ? sc.ranked : null;
+      if(!rk || !captureFresh()) return null;
+      return rk;
+    }catch{ return null; }
+  }
   function getBindKb(b){
     try{
       const raw=GMGet(b.key, null);
@@ -1468,7 +1483,9 @@
       stateGmLine = hasGm ? `In Party - ${stateLabel} - ${gmLive}` : `In Party - ${stateLabel}`;
     }
     // ranked overrides party: "In Match - Ranked Match - GM"
-    const _ranked = sc && sc.ranked && sc.ranked.active ? sc.ranked : null;
+    // liveRanked() also requires fresh captures — a ghost block from a dead
+    // session (kick/reload) never renders as ranked.
+    const _ranked = liveRanked();
     if(_ranked){
       stateGmLine = hasGm ? `${stateLabel} - Ranked Match - ${gmLive}` : `${stateLabel} - Ranked Match`;
     }
@@ -1736,7 +1753,7 @@
   }
   function updateRankedOverlay(){
     const sc=statsCache;
-    const rk=sc && sc.ranked && sc.ranked.active ? sc.ranked : null;
+    const rk=liveRanked();
     const sess=sc && sc.session ? sc.session : null;
     const inMatch=sess && String(sess.state||'').toLowerCase()==='match';
     rankedActive=!!(rk && inMatch);
@@ -1843,7 +1860,7 @@
   }
   function updatePtsToast(){
     const sc=statsCache;
-    const rk=sc && sc.ranked && sc.ranked.active ? sc.ranked : null;
+    const rk=liveRanked();
     const snap=rk
       ? {active:true, rid:String(rk.rid||''), v:Number(rk.match_version)||0, pts:Number(rk.points)||0}
       : {active:false, rid:'', v:0, pts:0};
@@ -1882,7 +1899,7 @@
   function updateRankedStart(){
     if(!IS_GAME_FRAME) return;
     const sc=statsCache;
-    const rk=sc && sc.ranked && sc.ranked.active ? sc.ranked : null;
+    const rk=liveRanked();
     const sess=sc && sc.session ? sc.session : null;
     const inMatch=sess && String(sess.state||'').toLowerCase()==='match';
     if(!rk || !inMatch) return;
@@ -1974,8 +1991,8 @@
   // panel stays locked (leaderboard/milestones would be a live aid).
   function rankedLocked(){
     try{
-      const rk=statsCache && statsCache.ranked ? statsCache.ranked : null;
-      if(!rk || !rk.active) return false;
+      const rk=liveRanked();
+      if(!rk) return false;
       const sess=statsCache.session;
       return !!(sess && String(sess.state||'').toLowerCase()==='match');
     }catch{ return false; }
