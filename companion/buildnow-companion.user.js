@@ -1600,10 +1600,11 @@
     const _gmUname = GMGet('bnc_game_username', null);
     const noStats = (kills==null) && (!_gmUname || _gmUname==='-');
     const emptyStatsHtml = `<div style="display:flex;flex-direction:column;gap:8px;align-items:center;width:100%;max-width:240px;padding:18px 14px;background:#171717;border:1px dashed rgba(255,255,255,0.16);border-radius:12px;text-align:center"><div style="font-size:26px">📊</div><div style="font-size:14px;font-weight:800;color:#fff">No stats yet</div><div style="font-size:12px;color:#9ca3af;line-height:1.5">Play 1-2 matches to get your account ready.<br>Kills, deaths, wins and skins will show up here.</div></div>`;
-    // ranked arena rows (below K/D): session-independent block (works in lobby),
-    // falls back to the session-scoped ranked block for old API responses.
+    // ranked arena rows (below K/D): ranked-session ONLY. Casual lobbies and
+    // matches never show points/tier rows — liveRanked() (_ranked above) is
+    // the gate; the session-independent arena block is deliberately unused.
     const fmtPts = n => n==null ? '-' : Number(n).toLocaleString('en-US');
-    const _arena = (sc && sc.arena) ? sc.arena : _ranked;
+    const _arena = _ranked;
     let arenaRowsHtml = '';
     if(_arena && _arena.points!=null){
       const _msColor = _arena.milestone_color || '#fff';
@@ -1917,30 +1918,30 @@
   }
   function updateRankedLobby(){
     const sc=statsCache;
-    const arena=sc && sc.arena ? sc.arena : null;
+    const rk=liveRanked();
     const sess=sc && sc.session ? sc.session : null;
     const inMatch=sess && String(sess.state||'').toLowerCase()==='match';
     const el=ensureRankedLobby();
     if(!el) return;
-    // Lobby-only card: needs a live session in lobby state. Sessionless (or
-    // match) never shows — location-dependent UI with no location is a ghost.
-    const show=!!(arena && sess && !inMatch);
-    const sig=(arena?`${arena.points}/${arena.milestone}`:'-')+'|'+(sess?String(sess.state||'?'):'none')+'|'+(show?'SHOW':'HIDE');
+    // Ranked-session ONLY: arena data alone (casual lobby) never shows the
+    // card. Needs a live ranked block + a lobby-state session.
+    const show=!!(rk && sess && !inMatch);
+    const sig=(rk?`${rk.rid}:${rk.points}/${rk.milestone}`:'-')+'|'+(sess?String(sess.state||'?'):'none')+'|'+(show?'SHOW':'HIDE');
     if(sig!==_lastLobbySig){
       _lastLobbySig=sig;
-      try{ logInfo(`[RANKED] lobby-card -> ${show?'SHOW':'HIDE'} arena=${arena?arena.points+'pts/'+arena.milestone:'none'} session=${sess?sess.state:'none'}`); }catch{}
+      try{ logInfo(`[RANKED] lobby-card -> ${show?'SHOW':'HIDE'} ranked=${rk?rk.rid+' '+rk.points+'pts/'+rk.milestone:'none'} session=${sess?sess.state:'none'}`); }catch{}
     }
     if(!show){ el.style.display='none'; return; }
-    const color=arena.milestone_color || '#fff';
-    const icon=arena.milestone_icon_url
-      ? `<img src="${String(arena.milestone_icon_url).replace(/"/g,'')}" alt="" style="width:48px;height:48px;object-fit:contain" onerror="this.style.display='none'" />`
+    const color=rk.milestone_color || '#fff';
+    const icon=rk.milestone_icon_url
+      ? `<img src="${String(rk.milestone_icon_url).replace(/"/g,'')}" alt="" style="width:48px;height:48px;object-fit:contain" onerror="this.style.display='none'" />`
       : '';
-    const pts=Number(arena.points||0).toLocaleString('en-US');
-    const ms=String(arena.milestone||'Unranked').replace(/</g,'&lt;');
-    const foot=arena.next_milestone
-      ? `${Number(arena.points_to_next||0).toLocaleString('en-US')} to reach ${String(arena.next_milestone).replace(/</g,'&lt;')}`
+    const pts=Number(rk.points||0).toLocaleString('en-US');
+    const ms=String(rk.milestone||'Unranked').replace(/</g,'&lt;');
+    const foot=rk.next_milestone
+      ? `${Number(rk.points_to_next||0).toLocaleString('en-US')} to reach ${String(rk.next_milestone).replace(/</g,'&lt;')}`
       : 'Max rank reached';
-    const season=arena.season!=null ? `Nectar Ranked Season ${arena.season}` : 'Nectar Ranked';
+    const season=(sc && sc.arena && sc.arena.season!=null) ? `Nectar Ranked Season ${sc.arena.season}` : 'Nectar Ranked';
     el.innerHTML=`<div style="font-size:13px;font-weight:800;color:#fff">${season}</div>${icon}<div style="font-size:16px;font-weight:800;color:${color}">${pts} (${ms})</div><div style="font-size:11px;color:#9ca3af">${foot}</div>`;
     el.style.display='flex';
   }
