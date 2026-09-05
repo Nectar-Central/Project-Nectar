@@ -177,11 +177,19 @@ def test_create_ok(fx):
     assert out["room"]["status"] == "lobby"
 
 
-def test_create_host_only_empty_roster(fx):
+def test_create_host_on_roster(fx):
+    code, out = _call(ranked_route.ranked_create, params=None, body={
+        "short_code": "ABCDE", "host_discord_id": "H", "gm": "df"})
+    assert code == 200
+    assert out["room"]["players"] == 1
+
+
+def test_create_host_only_flag_ignored(fx):
+    # legacy host_only flag no longer excludes the host — always on roster
     code, out = _call(ranked_route.ranked_create, params=None, body={
         "short_code": "ABCDE", "host_discord_id": "H", "gm": "df", "host_only": True})
     assert code == 200
-    assert out["room"]["players"] == 0
+    assert out["room"]["players"] == 1
 
 
 def test_create_unregistered_host(fx):

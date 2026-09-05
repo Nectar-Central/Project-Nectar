@@ -94,7 +94,7 @@ def get_open_room_by_code(code: str):
 
 def create_room(*, code, host_discord_id, gm, max_players, max_matches,
                 min_points=0, max_points=None, fee=0, starts_at=None,
-                lobby_channel_id=None, lobby_message_id=None, host_only=False):
+                lobby_channel_id=None, lobby_message_id=None):
     for _ in range(5):
         rid = new_rid()
         if get_room(rid) is None:
@@ -113,8 +113,7 @@ def create_room(*, code, host_discord_id, gm, max_players, max_matches,
         "fee": fee or 0,
         "starts_at": starts_at,
         "status": "lobby",
-        "host_only": bool(host_only),
-        "roster": [] if host_only else [{"discord_id": str(host_discord_id), "joined_at": _now()}],
+        "roster": [{"discord_id": str(host_discord_id), "joined_at": _now()}],
         "lobby_channel_id": str(lobby_channel_id) if lobby_channel_id else None,
         "lobby_message_id": str(lobby_message_id) if lobby_message_id else None,
         "thread_id": None,
@@ -261,8 +260,6 @@ def lobby_embed(room: dict) -> dict:
         except Exception:
             starts = str(room.get("starts_at"))
     host_line = f"<@{room.get('host_discord_id')}>"
-    if str(room.get("host_only") or "").lower() in ("1", "true", "yes"):
-        host_line += " (hosting only)"
     return {
         "title": f"Ranked Lobby {room['id']} — {gm_name(room.get('gm'))}",
         "fields": [

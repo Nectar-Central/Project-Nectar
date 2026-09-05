@@ -1273,15 +1273,14 @@ class RankedLobbyView(discord.ui.View):
                        min_points="Minimum points to join, 0 = open",
                        max_points="Maximum points to join, 0 = no cap",
                        fee="Join fee in points (burned)",
-                       starts_in_min="Auto-start countdown in minutes, 0 = manual start",
-                       host_only="True = you only host (not on roster)")
+                       starts_in_min="Auto-start countdown in minutes, 0 = manual start")
 @app_commands.choices(gm=[app_commands.Choice(name="Late Game Zonewars", value="zw_lg"),
                           app_commands.Choice(name="Free Mode", value="df"),
                           app_commands.Choice(name="Wild West", value="wwzw")])
 async def ranked_create_cmd(interaction: discord.Interaction, short_code: str, max_players: app_commands.Range[int, 2, 16],
                             gm: str, max_matches: app_commands.Range[int, 1, 50],
                             min_points: int = 0, max_points: int = 0,
-                            fee: int = 0, starts_in_min: int = 0, host_only: bool = False):
+                            fee: int = 0, starts_in_min: int = 0):
     if not await _defer(interaction):
         return
     did = str(interaction.user.id)
@@ -1308,12 +1307,11 @@ async def ranked_create_cmd(interaction: discord.Interaction, short_code: str, m
         room = ranked_mod.create_room(code=code, host_discord_id=did, gm=gm,
                                       max_players=max_players, max_matches=max_matches,
                                       min_points=min_points or 0, max_points=capped_max,
-                                      fee=fee or 0, starts_at=starts_at,
-                                      host_only=bool(host_only))
+                                      fee=fee or 0, starts_at=starts_at)
     except Exception as exc:
         print(f"[ranked] create failed: {exc}")
         return await interaction.followup.send("Couldn't create the room (DB error).", ephemeral=True)
-    print(f"[ranked] room created {room['id']} code={code} gm={gm} host={did} host_only={bool(host_only)} max={max_players}x{max_matches}")
+    print(f"[ranked] room created {room['id']} code={code} gm={gm} host={did} max={max_players}x{max_matches}")
     # post lobby embed (configured channel, else current channel)
     target = None
     try:
@@ -1342,7 +1340,7 @@ async def ranked_create_cmd(interaction: discord.Interaction, short_code: str, m
     except Exception as exc:
         print(f"[ranked] lobby post failed: {exc}")
         return await interaction.followup.send(f"Room **{room['id']}** created, but I couldn't post the lobby — check my channel access.", ephemeral=True)
-    await interaction.followup.send(f"Ranked room **{room['id']}** open — lobby posted." + (" You are hosting only (not on the roster)." if host_only else " You (host) are on the roster."), ephemeral=True)
+    await interaction.followup.send(f"Ranked room **{room['id']}** open — lobby posted. You (host) are on the roster.", ephemeral=True)
 
 
 bot.tree.add_command(ranked_group)

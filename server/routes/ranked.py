@@ -245,7 +245,6 @@ async def ranked_create(request: Request):
             max_points = int(maxp_raw) if maxp_raw not in (None, "", 0, "0") else None
         except Exception:
             return _err("max_points must be an int")
-        host_only = bool(body.get("host_only"))
         starts_at = body.get("starts_at")
         if not host or not _registered(host):
             return _err("host must be a registered player", 403)
@@ -293,8 +292,7 @@ async def ranked_create(request: Request):
             "fee": fee,
             "starts_at": starts_at,
             "status": "lobby",
-            "host_only": host_only,
-            "roster": [] if host_only else [{"discord_id": host, "joined_at": datetime.now(timezone.utc).isoformat()}],
+            "roster": [{"discord_id": host, "joined_at": datetime.now(timezone.utc).isoformat()}],
         }
         try:
             _db().table("ranked_rooms").insert(row).execute()
