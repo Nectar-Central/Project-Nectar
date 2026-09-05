@@ -11,6 +11,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from ..lib.supabase_client import supabase
+from ..lib import ranked as ranked_mod
 
 router = APIRouter()
 
@@ -167,6 +168,55 @@ async def leaderboard(request: Request):
     if order not in ("asc", "desc"):
         order = "desc"
 
+    # Ranked leaderboard (?ranked=true): arena points from ranked_points,
+    # usernames merged from bngc_users, tier attached per row. Sort is always
+    # points (param ignored); order asc/desc respected.
+    ranked_q = (request.query_params.get("ranked") or "").strip().lower() in ("1", "true", "yes")
+    if ranked_q:
+        if not supabase:
+            return JSONResponse({"error": "Server not configured"}, status_code=500)
+        try:
+            desc = order == "desc"
+            res = supabase.table("ranked_points").select("discord_id,points").order("points", desc=desc).range(offset, offset + limit - 1).execute()
+            prows = res.data or []
+            dids = [str(r.get("discord_id")) for r in prows if r.get("discord_id")]
+            users = {}
+            if dids:
+                try:
+                    ures = supabase.table("bngc_users").select("discord_id,discord_username,game_username,game_id,skin").in_("discord_id", dids[:100]).execute()
+                    for u in (ures.data or []):
+                        users[str(u.get("discord_id"))] = u
+                except Exception:
+                    pass
+            rows = []
+            for i, pr in enumerate(prows):
+                did = str(pr.get("discord_id"))
+                try:
+                    pts = int(pr.get("points") or 0)
+                except Exception:
+                    pts = 0
+                tier = ranked_mod.milestone_for(pts)
+                u = users.get(did) or {}
+                rows.append({
+                    "discord_id": did,
+                    "discord_username": u.get("discord_username"),
+                    "game_username": u.get("game_username"),
+                    "game_id": u.get("game_id"),
+                    "skin": u.get("skin"),
+                    "points": pts,
+                    "milestone": tier.get("name"),
+                    "milestone_icon_url": tier.get("icon_url"),
+                    "milestone_color": tier.get("color"),
+                    "rank": offset + i + 1,
+                })
+            season, reset_at = ranked_mod.get_current_season()
+            return JSONResponse({"ranked": True, "sort": "points", "order": order,
+                                 "limit": limit, "offset": offset,
+                                 "count": len(rows), "results": rows,
+                                 "season": season, "reset_at": reset_at})
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
     allowed = {"kills", "deaths", "wins", "defeats", "playtime_global", "kd", "win_rate"}
     if sort not in allowed:
         return JSONResponse({"error": f"sort must be one of {', '.join(sorted(allowed))}"}, status_code=400)
@@ -213,6 +263,91 @@ async def leaderboard(request: Request):
             for i, r in enumerate(sliced):
                 r["rank"] = offset + i + 1
             return JSONResponse({"sort": sort, "order": order, "limit": limit, "offset": offset, "count": len(sliced), "results": sliced})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/ranked/verify?code=XXXXX&host=Name
+# Bot start-gate: is this room code live in-game, and is the host in it?
+# Evidence = recent bngc_game_events carrying the code (15-min window).
+# Usernames harvested from killer/victim/winner fields + discord resolution.
+# ---------------------------------------------------------------------------
+_VERIFY_WINDOW_S = 900
+
+
+def _strip_dc(name: str) -> str:
+    try:
+        s = str(name or "").strip()
+        return s[3:].strip() if s.lower().startswith("dc:") else s
+    except Exception:
+        return ""
+
+
+@router.get("/api/ranked/verify")
+async def ranked_verify(request: Request):
+    qp = request.query_params
+    code = (qp.get("code") or "").strip().upper()
+    host = (qp.get("host") or "").strip()
+    if len(code) != 5 or not code.isalnum():
+        return JSONResponse({"error": "code must be 5 letters/digits"}, status_code=400)
+    if not supabase:
+        return JSONResponse({"error": "Server not configured"}, status_code=500)
+    try:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        res = supabase.table("bngc_game_events").select(
+            "event_type,event_data,discord_id,created_at"
+        ).order("created_at", desc=True).limit(300).execute()
+        names: set = set()
+        dids: set = set()
+        events_seen = 0
+        for row in (res.data or []):
+            try:
+                ed = (row or {}).get("event_data") or {}
+                c = str(ed.get("code") or ed.get("short_code") or "").strip().upper()
+                if c != code:
+                    continue
+                try:
+                    ts = str((row or {}).get("created_at") or "").replace("Z", "+00:00")
+                    age = (now - datetime.fromisoformat(ts)).total_seconds()
+                except Exception:
+                    continue
+                if age < 0 or age > _VERIFY_WINDOW_S:
+                    continue
+                events_seen += 1
+                for key in ("killer", "victim", "winner"):
+                    v = ed.get(key)
+                    if v and str(v).strip():
+                        names.add(str(v).strip())
+                if (row or {}).get("discord_id"):
+                    dids.add(str(row["discord_id"]))
+            except Exception:
+                continue
+        # resolve seen discord_ids to game usernames (catches quiet players)
+        if dids:
+            try:
+                ures = supabase.table("bngc_users").select("game_username").in_("discord_id", sorted(dids)[:64]).execute()
+                for u in (ures.data or []):
+                    if u.get("game_username"):
+                        names.add(str(u["game_username"]))
+            except Exception:
+                pass
+        room_active = events_seen > 0
+        host_in_room = False
+        if host:
+            hn = _strip_dc(host)
+            for n in names:
+                if n and (n == host or _strip_dc(n) == hn):
+                    host_in_room = True
+                    break
+        return JSONResponse({
+            "code": code,
+            "room_active": room_active,
+            "host_in_room": host_in_room,
+            "players_seen": sorted(names)[:32],
+            "events_seen": events_seen,
+        })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 

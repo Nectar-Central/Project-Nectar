@@ -442,6 +442,10 @@ class Engine:
         # Playtime tick — account elapsed since last packet (session + per-room)
         import time as _t
         now = _t.time()
+        try:
+            room.last_packet_at = now  # host freshness for ranked sealing
+        except Exception:
+            pass
         if view.playtime.last_state_at is None:
             view.playtime.last_state_at = now
             view.playtime.last_state = room.state.value if room else State.LOBBY.value

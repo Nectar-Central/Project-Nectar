@@ -143,6 +143,12 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
     # Get session view after batch
     view = engine.get_session(auth_session_id) if auth_session_id else None
     session_dict = view.to_dict() if view else None
+    if session_dict:
+        try:
+            import time as _t
+            session_dict["_cached_at"] = _t.time()  # stats expiry for kicked/closed clients
+        except Exception:
+            pass
 
     # Persist Engine state to Upstash so any lambda can serve currentmatch (Vercel serverless)
     if auth_session_id and session_dict:
@@ -173,7 +179,10 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
     # stale markers and re-records defeats/wins (doubles on Vercel).
     if auth_session_id and view is not None:
         try:
-            _final_ok = await cache.set_session_state(auth_session_id, view.to_dict(), ttl=3600)
+            import time as _t2
+            _final = view.to_dict()
+            _final["_cached_at"] = _t2.time()
+            _final_ok = await cache.set_session_state(auth_session_id, _final, ttl=3600)
             if not _final_ok:
                 log_err(f"CAPTURE final persist FAILED for {auth_session_id[:8]}")
         except Exception:

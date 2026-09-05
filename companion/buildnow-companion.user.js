@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Nectar Buildnow Companion
 // @namespace    https://github.com/Nectar-Central
-// @version      2.14.4
-// @description  Nectar Buildnow Companion v2.14.4 — tracker plus loading-screen branding (all CrazyGames frames).
+// @version      2.15.0
+// @description  Nectar Buildnow Companion v2.15.0 — tracker plus loading-screen branding (all CrazyGames frames).
 // @author       Nectar Labs
 // @match        https://buildnow-gg.game-files.crazygames.com/*
 // @match        https://*.crazygames.com/*
@@ -29,7 +29,7 @@
 
 (function () {
   'use strict';
-  const BNC_VERSION = '2.14.4';
+  const BNC_VERSION = '2.15.0';
   const HREF = (() => { try { return location.href; } catch { return ''; } })();
   const IS_GAME_FRAME = HREF.includes('buildnow-gg.game-files.crazygames.com');
   // Loading shell lives inside an intermediate iframe (games.crazygames.com),
@@ -845,15 +845,101 @@
     const ae = document.activeElement;
     return !!(ae && (ae.id === 'bnc-token-field' || ae.closest && ae.closest('#bnc-login-wrap')) || document.getElementById('bnc-login-wrap')?.contains(ae));
   }
-  document.addEventListener('keydown', (e)=>{
-    if (isModalOrInputFocused()) return;
-    if(modKey(e) && e.shiftKey){
-      const k=(e.key||'').toUpperCase();
-      if(k==='C'){ e.preventDefault(); e.stopPropagation(); toggleCollectMode(); }
-      else if(k==='S'){ e.preventDefault(); e.stopPropagation(); downloadCollected(); }
-      else if(k==='L'){ e.preventDefault(); e.stopPropagation(); document.getElementById('bnc-file-input')?.click(); }
-      else if(k==='R'){ e.preventDefault(); e.stopPropagation(); replayCollected(); }
+  // --- KEYBIND REGISTRY: every rebindable action lives here. The Ctrl+Shift+K
+  // panel renders one row per bind (dev binds hidden unless isDev()); the
+  // dispatcher below matches presses against the registry. Drawer (I) and
+  // ranked panel (F9) keep their legacy GM keys; the K menu itself is fixed.
+  //
+  // Defaults use Alt+Shift: Chrome/Edge/Firefox swallow Ctrl+Shift+C/I/J/R/T
+  // (DevTools, reload, tabs) before page JS ever sees them, so Ctrl+Shift
+  // letter defaults silently never fire. Alt+Shift reaches the page.
+  // Stored binds win over defaults — existing users keep what they set.
+  const BNC_BINDS=[
+    {id:'collect', label:'Collect toggle', key:'bnc_bind_collect', dev:false, def:{ctrl:false,shift:true,alt:true,meta:false,key:'C'}, run:()=>toggleCollectMode()},
+    {id:'save', label:'Save collected', key:'bnc_bind_save', dev:false, def:{ctrl:false,shift:true,alt:true,meta:false,key:'S'}, run:()=>downloadCollected()},
+    {id:'load', label:'Load file', key:'bnc_bind_load', dev:false, def:{ctrl:false,shift:true,alt:true,meta:false,key:'L'}, run:()=>{ try{ document.getElementById('bnc-file-input')?.click(); }catch{} }},
+    {id:'replay', label:'Replay', key:'bnc_bind_replay', dev:false, def:{ctrl:false,shift:true,alt:true,meta:false,key:'R'}, run:()=>replayCollected()},
+    {id:'feed', label:'Feed toggle (dev)', key:'bnc_bind_feed', dev:true, def:{ctrl:false,shift:true,alt:true,meta:false,key:'F'}, run:()=>toggleFeed()},
+    {id:'pause', label:'Pause feed (dev)', key:'bnc_bind_pause', dev:true, def:{ctrl:false,shift:true,alt:true,meta:false,key:'P'}, run:()=>togglePauseFeed()},
+    {id:'drawer', label:'Player info', key:'bnc_drawer_keybind', dev:false, def:{ctrl:false,shift:true,alt:true,meta:false,key:'I'}, run:()=>toggleInfoPanel()},
+    {id:'ranked', label:'Ranked panel', key:'bnc_ranked_keybind', dev:false, def:{ctrl:false,shift:false,alt:false,meta:false,key:'F9'}, run:()=>toggleRankedPanel()},
+  ];
+  // Combos the browser takes before the page (per registration order they
+  // can't be intercepted no matter the capture phase). Capture warns instead
+  // of saving a dead bind. Key: "ctrl+shift+C" style + bare function keys.
+  function bindWarning(kb, selfId){
+    const k=String(kb.key||'').toUpperCase();
+    const mods=[];
+    if(kb.ctrl||kb.meta) mods.push('ctrl');
+    if(kb.shift) mods.push('shift');
+    if(kb.alt) mods.push('alt');
+    const sig=mods.join('+')+(mods.length?'+':'')+k;
+    const reserved={
+      'ctrl+shift+C':'DevTools inspect', 'ctrl+shift+I':'DevTools', 'ctrl+shift+J':'DevTools console',
+      'ctrl+shift+R':'hard reload', 'ctrl+shift+T':'reopen tab', 'ctrl+shift+W':'close window',
+      'ctrl+shift+N':'incognito window', 'ctrl+shift+O':'bookmark manager', 'ctrl+shift+B':'bookmark bar',
+      'ctrl+shift+D':'bookmark tabs', 'ctrl+shift+Q':'quit browser', 'ctrl+shift+DELETE':'clear browsing data',
+      'ctrl+shift+G':'find previous', 'ctrl+shift+M':'switch profile', 'ctrl+shift+K':'keybinds menu',
+      'F5':'reload', 'F11':'fullscreen', 'F12':'DevTools', 'F1':'help', 'F3':'find next',
+    };
+    if(reserved[sig]) return `Browser takes ${formatKeybind(kb)} (${reserved[sig]}) — pick another.`;
+    for(const b of BNC_BINDS){
+      if(b.id===selfId) continue;
+      const cur=getBindKb(b);
+      const sameMod=!!(cur.ctrl||cur.meta)===!!(kb.ctrl||kb.meta) && !!cur.shift===!!kb.shift && !!cur.alt===!!kb.alt;
+      if(!sameMod) continue;
+      const ck=String(cur.code||'').toUpperCase(), nk=String(kb.code||'').toUpperCase();
+      const sameKey=(ck && nk) ? ck===nk : String(cur.key||'').toUpperCase()===k;
+      if(sameKey)
+        return `${formatKeybind(kb)} is already ${b.label} — pick another.`;
     }
+    return null;
+  }
+  function isDev(){ try{ return !!(statsCache && statsCache.is_dev); }catch{ return false; } }
+  function getBindKb(b){
+    try{
+      const raw=GMGet(b.key, null);
+      if(raw && typeof raw==='object' && raw.key) return raw;
+      if(typeof raw==='string' && raw){
+        try{ const j=JSON.parse(raw); if(j && j.key) return j; }catch{}
+        const parts=String(raw).split('+');
+        const kb={ctrl:false,shift:false,alt:false,meta:false,key:b.def.key};
+        for(const p of parts){ const l=p.trim().toLowerCase(); if(l==='ctrl'||l==='control') kb.ctrl=true; else if(l==='cmd'||l==='meta'||l==='command') kb.meta=true; else if(l==='shift') kb.shift=true; else if(l==='alt') kb.alt=true; else if(p.trim()) kb.key=p.trim().toUpperCase(); }
+        return kb;
+      }
+    }catch{}
+    return Object.assign({}, b.def);
+  }
+  function matchBindKb(e, kb){
+    return bindMatches(e, kb);
+  }
+  // Layout-proof matching: Alt+Shift switches Windows layouts and Ctrl+Alt
+  // composes AltGr chars, so e.key arrives as 'z'/'å'/etc. instead of 'W'.
+  // e.code is the physical key (KeyW) — layout- and modifier-independent.
+  // Stored binds without a code (saved before this fix) fall back to e.key.
+  function bindMatches(e, kb){
+    try{
+      if(kb && kb.code && e.code && String(e.code).toUpperCase()===String(kb.code).toUpperCase())
+        return modKey(e)===!!(kb.ctrl||kb.meta) && !!e.shiftKey===!!kb.shift && !!e.altKey===!!kb.alt;
+    }catch{}
+    const k=(e.key||'').toUpperCase();
+    return k===String(kb && kb.key || '').toUpperCase() && modKey(e)===!!(kb.ctrl||kb.meta) && !!e.shiftKey===!!kb.shift && !!e.altKey===!!kb.alt;
+  }
+  function matchBind(e){
+    for(const b of BNC_BINDS){
+      // drawer + ranked panel have their own dispatcher below (Esc/panel
+      // handling) — matching them here too would fire twice.
+      if(b.id==='drawer' || b.id==='ranked') continue;
+      if(b.dev && !isDev()) continue;
+      if(matchBindKb(e, getBindKb(b))) return b;
+    }
+    return null;
+  }
+  document.addEventListener('keydown', (e)=>{
+    if(_keybindCapturing) return;
+    if (isModalOrInputFocused()) return;
+    const b=matchBind(e);
+    if(b){ e.preventDefault(); e.stopPropagation(); try{ b.run(); }catch(err){ try{ logErr(`[KEYS] bind ${b.id} failed ${err && err.message}`); }catch{} } }
   }, true);
 
   const fileInput = document.createElement('input');
@@ -898,7 +984,7 @@
     display: 'flex', gap: '6px', padding: '2px 6px', background: 'rgba(0,0,0,0.92)', borderTop: '1px solid rgba(255,255,255,0.12)',
     fontFamily: 'monospace', fontSize: '10px', pointerEvents: 'auto'
   });
-  feedBar.innerHTML = `<span style="opacity:0.5">BNC feed - zone/stG/alv full</span><button id="bnc-feed-pause" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:0 6px;cursor:pointer">${feedPaused?'▶ Resume':'⏸ Pause'}</button><button id="bnc-feed-expand" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:0 6px;cursor:pointer">⤢ Expand</button><span style="opacity:0.5">Ctrl/Cmd+Shift+F toggle · Ctrl/Cmd+Shift+P pause · hover to scroll · drag top edge to resize</span>`;
+  feedBar.innerHTML = `<span style="opacity:0.5">BNC feed - zone/stG/alv full</span><button id="bnc-feed-pause" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:0 6px;cursor:pointer">${feedPaused?'▶ Resume':'⏸ Pause'}</button><button id="bnc-feed-expand" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:0 6px;cursor:pointer">⤢ Expand</button><span id="bnc-feed-hint" style="opacity:0.5">toggle · pause · hover to scroll · drag top edge to resize</span>`;
   const feedEl = document.createElement('div');
   feedEl.id = 'bnc-log-feed';
   Object.assign(feedEl.style, {
@@ -943,25 +1029,40 @@
     if(wasAtBottom) feedEl.scrollTop = feedEl.scrollHeight;
   }
   function feedInfo(msg){ feedLog('info', {msg}); }
-  document.addEventListener('keydown', (e)=>{
-    if (isModalOrInputFocused()) return;
-    const k=(e.key||'').toUpperCase();
-    if(modKey(e) && e.shiftKey && k==='F'){
-      e.preventDefault(); e.stopPropagation();
-      feedEnabled = !feedEnabled;
-      GMSet('bnc_feed_enabled', feedEnabled);
-      feedWrap.style.display = feedEnabled ? 'block' : 'none';
-      showToast(feedEnabled ? 'Feed ON' : 'Feed OFF', false);
-    } else if(modKey(e) && e.shiftKey && k==='P'){
-      e.preventDefault(); e.stopPropagation();
-      feedPaused = !feedPaused;
-      GMSet('bnc_feed_paused', feedPaused);
-      const btn=document.getElementById('bnc-feed-pause');
-      if(btn) btn.textContent = feedPaused ? '▶ Resume' : '⏸ Pause';
-      feedLog('info', {msg: feedPaused ? 'paused (scrollable)' : 'resumed'});
-      showToast(feedPaused ? 'Feed paused' : 'Feed resumed', false);
-    }
-  }, true);
+  function toggleFeed(){
+    feedEnabled = !feedEnabled;
+    GMSet('bnc_feed_enabled', feedEnabled);
+    syncDevUI();
+    showToast(feedEnabled ? 'Feed ON' : 'Feed OFF', false);
+  }
+  function togglePauseFeed(){
+    feedPaused = !feedPaused;
+    GMSet('bnc_feed_paused', feedPaused);
+    const btn=document.getElementById('bnc-feed-pause');
+    if(btn) btn.textContent = feedPaused ? '▶ Resume' : '⏸ Pause';
+    feedLog('info', {msg: feedPaused ? 'paused (scrollable)' : 'resumed'});
+    showToast(feedPaused ? 'Feed paused' : 'Feed resumed', false);
+  }
+  // Dev gating: feed UI + dev keybinds exist only when the DB row says so.
+  // Called on every stats render (stats arrive async — hidden until then).
+  function syncDevUI(){
+    const dev=isDev();
+    try{
+      const dt=document.getElementById('bnc-dev-row');
+      if(dt) dt.style.display=dev?'':'none';
+    }catch{}
+    try{
+      if(feedWrap) feedWrap.style.display=(dev && DEV_MODE && feedEnabled)?'block':'none';
+    }catch{}
+    try{
+      const h=document.getElementById('bnc-feed-hint');
+      if(h){
+        const fb=BNC_BINDS.find(x=>x.id==='feed'), pb=BNC_BINDS.find(x=>x.id==='pause');
+        h.textContent=`${formatKeybind(getBindKb(fb))} toggle · ${formatKeybind(getBindKb(pb))} pause · hover to scroll · drag top edge to resize`;
+      }
+    }catch{}
+    try{ if(typeof renderKeybindRows==='function') renderKeybindRows(); }catch{}
+  }
   setTimeout(()=>{
     const btn=document.getElementById('bnc-feed-pause');
     if(btn) btn.onclick=()=>{
@@ -1005,15 +1106,11 @@
         return kb;
       }
     }catch{}
-    return {ctrl:true, shift:true, alt:false, key:'I'};
+    return {ctrl:false, shift:true, alt:true, meta:false, key:'I'};
   }
   function formatKeybind(kb){ const a=[]; if(kb.meta) a.push('Cmd'); if(kb.ctrl) a.push('Ctrl'); if(kb.shift) a.push('Shift'); if(kb.alt) a.push('Alt'); a.push(String(kb.key||'').toUpperCase()); return a.join('+'); }
   function isDrawerKeybind(e){
-    const kb=getDrawerKeybind();
-    const k=(e.key||'').toUpperCase();
-    // normalize: for letter keys compare uppercase, for others compare as is
-    const want=k===String(kb.key).toUpperCase();
-    return want && modKey(e)===!!(kb.ctrl||kb.meta) && !!e.shiftKey===!!kb.shift && !!e.altKey===!!kb.alt;
+    return bindMatches(e, getDrawerKeybind());
   }
   let _keybindCapturing=false;
   let apiOnline=false;
@@ -1207,8 +1304,9 @@
       <div id="bnc-drawer-body" style="flex:1;overflow-y:auto;overflow-x:hidden;padding:8px 20px 16px 20px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;text-align:center;scrollbar-width:thin">
         <div style="opacity:0.7;font-size:12px">Loading…</div>
       </div>
-      <div id="bnc-drawer-footer" style="padding:10px 14px;border-top:1px solid rgba(255,255,255,0.06);display:flex;justify-content:space-between;align-items:center;flex-shrink:0;font-size:11px;color:#6b7280">
+      <div id="bnc-drawer-footer" style="padding:10px 14px;border-top:1px solid rgba(255,255,255,0.06);display:flex;justify-content:space-between;align-items:center;gap:8px;flex-shrink:0;font-size:11px;color:#6b7280">
         <span id="bnc-drawer-version">v${BNC_VERSION}</span>
+        <span id="bnc-drawer-ranked" style="display:none;cursor:pointer;color:#9ca3af;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45%" title="Click to copy — use it to report abuse"></span>
         <span id="bnc-drawer-api" style="display:flex;align-items:center;gap:6px"><span id="bnc-drawer-dot" style="width:8px;height:8px;border-radius:50%;background:#6b7280;display:inline-block"></span><span id="bnc-drawer-api-text">Offline</span></span>
       </div>`;
     // non-passthrough: stop game from seeing wheel/keys inside drawer
@@ -1369,16 +1467,39 @@
     if(isInParty){
       stateGmLine = hasGm ? `In Party - ${stateLabel} - ${gmLive}` : `In Party - ${stateLabel}`;
     }
+    // ranked overrides party: "In Match - Ranked Match - GM"
+    const _ranked = sc && sc.ranked && sc.ranked.active ? sc.ranked : null;
+    if(_ranked){
+      stateGmLine = hasGm ? `${stateLabel} - Ranked Match - ${gmLive}` : `${stateLabel} - Ranked Match`;
+    }
     const smallRow = (label,val)=> `<div style="display:flex;justify-content:space-between;align-items:center;width:100%;max-width:240px;font-size:11px"><span style="color:#9ca3af">${label}</span><span style="font-weight:600;color:#fff">${val==null? '-' : val}</span></div>`;
     const perGmRow = hasGm && perGmCurrent!=null ? smallRow('Playtime ('+gmLive+')', fmtPlaytimeDrawer(perGmCurrent)) : '';
     // Empty account (no game username and no stats yet): placeholder instead of blank rows
     const _gmUname = GMGet('bnc_game_username', null);
     const noStats = (kills==null) && (!_gmUname || _gmUname==='-');
     const emptyStatsHtml = `<div style="display:flex;flex-direction:column;gap:8px;align-items:center;width:100%;max-width:240px;padding:18px 14px;background:#171717;border:1px dashed rgba(255,255,255,0.16);border-radius:12px;text-align:center"><div style="font-size:26px">📊</div><div style="font-size:14px;font-weight:800;color:#fff">No stats yet</div><div style="font-size:12px;color:#9ca3af;line-height:1.5">Play 1-2 matches to get your account ready.<br>Kills, deaths, wins and skins will show up here.</div></div>`;
+    // ranked arena rows (below K/D): session-independent block (works in lobby),
+    // falls back to the session-scoped ranked block for old API responses.
+    const fmtPts = n => n==null ? '-' : Number(n).toLocaleString('en-US');
+    const _arena = (sc && sc.arena) ? sc.arena : _ranked;
+    let arenaRowsHtml = '';
+    if(_arena && _arena.points!=null){
+      const _msColor = _arena.milestone_color || '#fff';
+      const _msIcon = _arena.milestone_icon_url
+        ? `<img src="${String(_arena.milestone_icon_url).replace(/"/g,'')}" alt="" style="width:16px;height:16px;object-fit:contain;vertical-align:-3px;margin-right:4px" onerror="this.style.display='none'" />`
+        : '';
+      arenaRowsHtml = `<div style="display:flex;justify-content:space-between;align-items:center;width:100%;max-width:240px;font-size:13px"><span style="color:#9ca3af">Arena Points</span><span style="font-weight:700;color:${_msColor}">${_msIcon}${fmtPts(_arena.points)} (${String(_arena.milestone||'').replace(/</g,'&lt;')})</span></div>`;
+      if(_arena.next_milestone){
+        arenaRowsHtml += `<div style="font-size:12px;color:#9ca3af;text-align:center;margin-top:2px">${fmtPts(_arena.points_to_next)} points needed to reach ${String(_arena.next_milestone).replace(/</g,'&lt;')} (${_arena.next_points_pct||0}%)</div>`;
+      } else {
+        arenaRowsHtml += `<div style="font-size:12px;color:#9ca3af;text-align:center;margin-top:2px">Max rank reached</div>`;
+      }
+    }
     const statsRowsHtml = noStats ? emptyStatsHtml : `
           ${row('Kills', kills)}
           ${row('Deaths', deaths)}
           ${row('K/D', kd)}
+          ${arenaRowsHtml}
           ${row('Wins', wins)}
           ${row('Defeats', defeats)}
           ${row('Playtime', pGlobal!=null? fmtPlaytimeDrawer(pGlobal):null)}
@@ -1473,6 +1594,37 @@
     const apiTxt=document.getElementById('bnc-drawer-api-text');
     if(dot) dot.style.background = apiOnline? '#10b981' : '#6b7280';
     if(apiTxt) apiTxt.textContent = apiOnline? 'Online' : 'Offline';
+    // footer ranked match id (click to copy for abuse reports)
+    const rkFoot=document.getElementById('bnc-drawer-ranked');
+    if(rkFoot){
+      if(_ranked && _ranked.match_id){
+        rkFoot.style.display='inline';
+        rkFoot.textContent = _ranked.match_id + ' · report abuse';
+        rkFoot.onclick=(e)=>{
+          try{ if(e) e.stopPropagation(); }catch{}
+          const mid=String(_ranked.match_id);
+          const done=()=> showToast('Match ID copied — paste it in your abuse report', false);
+          try{
+            if(typeof GM_setClipboard==='function'){ GM_setClipboard(mid); done(); }
+            else if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(mid).then(done, done); }
+            else done();
+          }catch{ try{ done(); }catch{} }
+        };
+      } else {
+        rkFoot.style.display='none';
+        rkFoot.onclick=null;
+      }
+    }
+    // ranked overlay follows every stats render (drawer open or not)
+    try{ updateRankedOverlay(); }catch{}
+    // ranked lobby card follows every stats render
+    try{ updateRankedLobby(); }catch{}
+    // ranked points toast follows every stats render
+    try{ updatePtsToast(); }catch{}
+    // ranked start overlay (first match only)
+    try{ updateRankedStart(); }catch{}
+    // dev gating follows every stats render (stats arrive async)
+    try{ syncDevUI(); }catch{}
     // keybind button handler (only in stats tab)
     const kbBtn=document.getElementById('bnc-keybind-set');
     const kbHint=document.getElementById('bnc-keybind-hint');
@@ -1486,8 +1638,10 @@
           if(e.key==='Escape'){ _keybindCapturing=false; kbBtn.textContent='Set open keybind: '+formatKeybind(getDrawerKeybind()); if(kbHint) kbHint.textContent='Cancelled.'; document.removeEventListener('keydown', handler, true); return; }
           if(['Control','Shift','Alt','Meta'].includes(e.key)) return;
           e.preventDefault(); e.stopPropagation();
-          const nb={ctrl:!!e.ctrlKey, meta:!!e.metaKey, shift:!!e.shiftKey, alt:!!e.altKey, key:String(e.key).toUpperCase()};
+          const nb={ctrl:!!e.ctrlKey, meta:!!e.metaKey, shift:!!e.shiftKey, alt:!!e.altKey, key:String(e.key).toUpperCase(), code:String(e.code||'').toUpperCase()||null};
           if(!nb.key) return;
+          const dwarn=bindWarning(nb, 'drawer');
+          if(dwarn){ if(kbHint) kbHint.textContent='⚠ '+dwarn; return; }
           try{ GMSet('bnc_drawer_keybind', JSON.stringify(nb)); }catch{ GMSet('bnc_drawer_keybind', nb); }
           _keybindCapturing=false;
           kbBtn.textContent='Set open keybind: '+formatKeybind(nb);
@@ -1565,6 +1719,402 @@
   let _lastSid = sessionId;
   setInterval(()=>{ if(sessionId!==_lastSid){ _lastSid=sessionId; renderInfoPanel(); if(drawerOpen){ fetchStats(false); if(drawerTab==='players') fetchPlayers(false); } else if(sessionId){ startBgLobbyPoll(); fetchStats(false); } } }, 1000);
 
+  // --- RANKED OVERLAY (Phase 5): bottom-left box, milestone icon + points ---
+  // Game frame only, pointer-transparent, driven by the stats poll. Shows in
+  // matches only; flashes the tier color when points change.
+  let rankedOverlay=null, _lastRankedPts=null, _rankedFlashT=null, rankedActive=false;
+  function ensureRankedOverlay(){
+    if(!IS_GAME_FRAME) return null;
+    if(rankedOverlay) return rankedOverlay;
+    if(document.getElementById('bnc-ranked-overlay')){ rankedOverlay=document.getElementById('bnc-ranked-overlay'); return rankedOverlay; }
+    const el=document.createElement('div');
+    el.id='bnc-ranked-overlay';
+    Object.assign(el.style,{position:'fixed', left:'30%', bottom:'20px', zIndex:'2147483640', display:'none', alignItems:'center', gap:'8px', background:'rgba(0,0,0,0.75)', border:'1px solid rgba(255,255,255,0.12)', borderRadius:'10px', padding:'8px 14px', fontFamily:'Inter, system-ui, sans-serif', fontSize:'14px', fontWeight:'700', color:'#fff', pointerEvents:'none', transition:'box-shadow 200ms, border-color 200ms', whiteSpace:'nowrap'});
+    (document.body||document.documentElement).appendChild(el);
+    rankedOverlay=el;
+    return el;
+  }
+  function updateRankedOverlay(){
+    const sc=statsCache;
+    const rk=sc && sc.ranked && sc.ranked.active ? sc.ranked : null;
+    const sess=sc && sc.session ? sc.session : null;
+    const inMatch=sess && String(sess.state||'').toLowerCase()==='match';
+    rankedActive=!!(rk && inMatch);
+    const el=ensureRankedOverlay();
+    if(!el) return;
+    if(!rk || !inMatch){
+      el.style.display='none';
+      if(rk && rk.points!=null) _lastRankedPts=rk.points;  // keep baseline synced in lobby
+      return;
+    }
+    const pts=rk.points==null ? 0 : rk.points;
+    const color=rk.milestone_color || '#fff';
+    const msIcon=rk.milestone_icon_url
+      ? `<img src="${String(rk.milestone_icon_url).replace(/"/g,'')}" alt="" style="width:22px;height:22px;object-fit:contain" onerror="this.style.display='none'" />`
+      : '';
+    const arenaIcon=rk.arena_icon_url
+      ? `<img src="${String(rk.arena_icon_url).replace(/"/g,'')}" alt="" style="width:18px;height:18px;object-fit:contain" onerror="this.style.display='none'" />`
+      : '';
+    el.innerHTML=`${msIcon}<span>${Number(pts).toLocaleString('en-US')}</span>${arenaIcon}`;
+    el.style.display='flex';
+    if(_lastRankedPts!=null && pts!==_lastRankedPts){
+      el.style.borderColor=color;
+      el.style.boxShadow=`0 0 18px ${color}`;
+      try{ clearTimeout(_rankedFlashT); }catch{}
+      _rankedFlashT=setTimeout(()=>{ try{ el.style.borderColor='rgba(255,255,255,0.12)'; el.style.boxShadow='none'; }catch{} }, 700);
+    }
+    _lastRankedPts=pts;
+  }
+  // ranked tick: drawer poll only runs when open — keep the overlay fresh when closed
+  setInterval(()=>{ try{ if(!drawerOpen && rankedActive) fetchStats(false); }catch{} }, 30000);
+
+  // --- RANKED LOBBY CARD: lobby-only medium card, center-left ---
+  // Nectar Ranked Season X / icon / points (milestone) / footer points-to-next.
+  // Session-independent (reads the arena block) — visible whenever the player
+  // isn't mid-match. Pointer-transparent, game frame only.
+  let rankedLobbyCard=null;
+  function ensureRankedLobby(){
+    if(!IS_GAME_FRAME) return null;
+    if(rankedLobbyCard) return rankedLobbyCard;
+    if(document.getElementById('bnc-ranked-lobby')){ rankedLobbyCard=document.getElementById('bnc-ranked-lobby'); return rankedLobbyCard; }
+    const el=document.createElement('div');
+    el.id='bnc-ranked-lobby';
+    Object.assign(el.style,{position:'fixed', left:'24px', top:'50%', transform:'translateY(-50%)', zIndex:'2147483640', display:'none', flexDirection:'column', alignItems:'center', gap:'6px', width:'220px', background:'rgba(0,0,0,0.78)', border:'1px solid rgba(255,255,255,0.12)', borderRadius:'14px', padding:'14px 12px', fontFamily:'Inter, system-ui, sans-serif', textAlign:'center', pointerEvents:'none'});
+    (document.body||document.documentElement).appendChild(el);
+    rankedLobbyCard=el;
+    return el;
+  }
+  function updateRankedLobby(){
+    const sc=statsCache;
+    const arena=sc && sc.arena ? sc.arena : null;
+    const sess=sc && sc.session ? sc.session : null;
+    const inMatch=sess && String(sess.state||'').toLowerCase()==='match';
+    const el=ensureRankedLobby();
+    if(!el) return;
+    if(!arena || inMatch){ el.style.display='none'; return; }
+    const color=arena.milestone_color || '#fff';
+    const icon=arena.milestone_icon_url
+      ? `<img src="${String(arena.milestone_icon_url).replace(/"/g,'')}" alt="" style="width:48px;height:48px;object-fit:contain" onerror="this.style.display='none'" />`
+      : '';
+    const pts=Number(arena.points||0).toLocaleString('en-US');
+    const ms=String(arena.milestone||'Unranked').replace(/</g,'&lt;');
+    const foot=arena.next_milestone
+      ? `${Number(arena.points_to_next||0).toLocaleString('en-US')} to reach ${String(arena.next_milestone).replace(/</g,'&lt;')}`
+      : 'Max rank reached';
+    const season=arena.season!=null ? `Nectar Ranked Season ${arena.season}` : 'Nectar Ranked';
+    el.innerHTML=`<div style="font-size:13px;font-weight:800;color:#fff">${season}</div>${icon}<div style="font-size:16px;font-weight:800;color:${color}">${pts} (${ms})</div><div style="font-size:11px;color:#9ca3af">${foot}</div>`;
+    el.style.display='flex';
+  }
+
+  // --- RANKED POINTS TOAST (Phase 6): center-left slide-in, two lines ---
+  // Victory / Placement: Xth / Elimination / Join Fee + delta. Fires on
+  // match seals (version bump + last_result) and on entry-fee detection.
+  // Baseline persists in GM storage so fees are caught across reloads.
+  let _prevRankSnap=null;
+  const _ptsToastQueue=[];
+  let _ptsToastBusy=false;
+  function _ord(n){
+    n=Math.trunc(Number(n)||0);
+    const teen=n%100;
+    if(teen>=11 && teen<=13) return n+'th';
+    const d=n%10;
+    return n+(d===1?'st':d===2?'nd':d===3?'rd':'th');
+  }
+  function queuePtsToast(title, delta){
+    _ptsToastQueue.push({title:String(title), delta:Number(delta)||0});
+    if(_ptsToastQueue.length>3) _ptsToastQueue.shift();  // never backlog
+    _pumpPtsToasts();
+  }
+  function _pumpPtsToasts(){
+    if(_ptsToastBusy || !_ptsToastQueue.length) return;
+    if(!IS_GAME_FRAME){ _ptsToastQueue.length=0; return; }
+    _ptsToastBusy=true;
+    const {title, delta}=_ptsToastQueue.shift();
+    const gain=delta>=0;
+    const el=document.createElement('div');
+    Object.assign(el.style,{position:'fixed', left:'0', top:'50%', transform:'translate(-120%,-50%)', transition:'transform 300ms cubic-bezier(0.22,1,0.36,1)', zIndex:'2147483641', background:'#0f0f0f', border:'1px solid rgba(255,255,255,0.12)', borderLeft:'3px solid '+(gain?'#10b981':'#ef4444'), borderRadius:'0 12px 12px 0', padding:'12px 18px 12px 14px', fontFamily:'Inter, system-ui, sans-serif', pointerEvents:'none', boxShadow:'8px 0 32px rgba(0,0,0,0.45)'});
+    el.innerHTML=`<div style="font-size:15px;font-weight:800;color:#fff">${title.replace(/</g,'&lt;')}</div><div style="font-size:22px;font-weight:800;color:${gain?'#10b981':'#ef4444'}">${gain?'+':''}${Number(delta).toLocaleString('en-US')} Points</div>`;
+    try{ (document.body||document.documentElement).appendChild(el); }catch{ _ptsToastBusy=false; return; }
+    requestAnimationFrame(()=>{ requestAnimationFrame(()=>{ try{ el.style.transform='translate(0,-50%)'; }catch{} }); });
+    setTimeout(()=>{
+      try{ el.style.transform='translate(-120%,-50%)'; }catch{}
+      setTimeout(()=>{ try{ el.remove(); }catch{} _ptsToastBusy=false; _pumpPtsToasts(); }, 350);
+    }, 4000);
+  }
+  function updatePtsToast(){
+    const sc=statsCache;
+    const rk=sc && sc.ranked && sc.ranked.active ? sc.ranked : null;
+    const snap=rk
+      ? {active:true, rid:String(rk.rid||''), v:Number(rk.match_version)||0, pts:Number(rk.points)||0}
+      : {active:false, rid:'', v:0, pts:0};
+    const prev=_prevRankSnap;
+    _prevRankSnap=snap;
+    let storedPts=null;
+    try{ const sv=GMGet('bnc_last_rank_pts', null); storedPts=(sv==null||sv==='')?null:Number(sv); }catch{}
+    if(rk && snap.pts>=0){ try{ GMSet('bnc_last_rank_pts', snap.pts); }catch{} }
+    if(!prev) return;  // first sighting: baseline only
+    if(!IS_GAME_FRAME) return;  // track baseline everywhere, toast in game only
+    if(!prev.active && snap.active){
+      // fresh entry: a drop vs the persisted baseline is the entry fee
+      if(storedPts!=null && snap.pts<storedPts) queuePtsToast('Join Fee', snap.pts-storedPts);
+      return;
+    }
+    if(!snap.active || snap.rid!==prev.rid) return;  // left room / new room: re-baseline silently
+    if(snap.v>prev.v && rk.last_result && Number(rk.last_result.match_version)===snap.v){
+      const lr=rk.last_result;
+      const gained=Number(lr.gained)||0;
+      if(lr.won && gained>0) queuePtsToast('Victory', gained);
+      else if(!lr.won && lr.placement>=1 && lr.placement<=3 && gained>0) queuePtsToast('Placement: '+_ord(lr.placement), gained);
+      else if(!lr.won && gained>0) queuePtsToast('Elimination', gained);
+    }
+  }
+
+  // --- RANKED START OVERLAY (Phase 7): first match of the room only ---
+  // Full-screen card: host name + skin + hosting/playing rules line.
+  // Click or 5s auto-dismiss. Late joiners (match_version > 1) never see it.
+  const _rankedStartShown={};
+  let _rankedStartTimer=null;
+  function _dismissRankedStart(){
+    try{ clearTimeout(_rankedStartTimer); }catch{}
+    _rankedStartTimer=null;
+    try{ const el=document.getElementById('bnc-ranked-start'); if(el) el.remove(); }catch{}
+  }
+  function updateRankedStart(){
+    if(!IS_GAME_FRAME) return;
+    const sc=statsCache;
+    const rk=sc && sc.ranked && sc.ranked.active ? sc.ranked : null;
+    const sess=sc && sc.session ? sc.session : null;
+    const inMatch=sess && String(sess.state||'').toLowerCase()==='match';
+    if(!rk || !inMatch) return;
+    const rid=String(rk.rid||'');
+    if(!rid || _rankedStartShown[rid]) return;
+    _rankedStartShown[rid]=true;
+    const mver=Number(rk.match_version)||0;
+    if(mver>1) return;  // joined mid-session: first match already passed
+    if(document.getElementById('bnc-ranked-start')) return;
+    const host=String(rk.host_game_username||'the host').replace(/</g,'&lt;');
+    const playing=!!rk.host_playing;
+    const line=playing
+      ? "He's hosting and playing — you can kill him while respecting the rules."
+      : "He's hosting only — killing him will not give you points.";
+    let skinHtml='';
+    try{
+      const su=rk.host_skin ? skinUrlDrawer(rk.host_skin) : null;
+      if(su) skinHtml=`<img src="${su}" alt="" style="width:96px;height:96px;object-fit:contain;background:#0a0a0a;border:1px solid rgba(255,255,255,0.10);border-radius:14px;image-rendering:pixelated;margin:6px auto;display:block" onerror="this.style.display='none'" />`;
+    }catch{}
+    const ov=document.createElement('div');
+    ov.id='bnc-ranked-start';
+    Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483643', background:'rgba(0,0,0,0.72)', display:'flex', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif', cursor:'pointer'});
+    ov.innerHTML=`<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:16px;padding:28px;width:420px;max-width:92vw;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,0.5)"><div style="font-size:20px;font-weight:800;color:#fff">This is a Ranked Match</div><div style="font-size:14px;color:#9ca3af;margin-top:6px">hosted by <span style="color:#fff;font-weight:700">${host}</span></div>${skinHtml}<div style="font-size:13px;color:#e5e7eb;line-height:1.6;margin-top:10px">${line}</div><div style="font-size:11px;color:#6b7280;margin-top:14px">click anywhere to close</div></div>`;
+    ov.addEventListener('click', ()=> _dismissRankedStart());
+    try{ (document.body||document.documentElement).appendChild(ov); }catch{ return; }
+    _rankedStartTimer=setTimeout(()=> _dismissRankedStart(), 5000);
+  }
+
+  function getRankedKeybind(){
+    try{
+      const raw=GMGet('bnc_ranked_keybind', null);
+      if(raw && typeof raw==='object' && raw.key) return raw;
+      if(typeof raw==='string' && raw){
+        try{ const j=JSON.parse(raw); if(j && j.key) return j; }catch{}
+        const parts=String(raw).split('+');
+        const kb={ctrl:false,shift:false,alt:false,meta:false,key:'F9'};
+        for(const p of parts){ const l=p.trim().toLowerCase(); if(l==='ctrl'||l==='control') kb.ctrl=true; else if(l==='cmd'||l==='meta'||l==='command') kb.meta=true; else if(l==='shift') kb.shift=true; else if(l==='alt') kb.alt=true; else if(p.trim()) kb.key=p.trim().toUpperCase(); }
+        return kb;
+      }
+    }catch{}
+    return {ctrl:false, shift:false, alt:false, meta:false, key:'F9'};
+  }
+  function isRankedKeybind(e){
+    return bindMatches(e, getRankedKeybind());
+  }
+
+  // --- RANKED PANEL (Phase 8): F9 — milestones map + ranked leaderboard ---
+  const RANKED_ASSETS='https://mnpwvwjqawmuqmickteu.supabase.co/storage/v1/object/public/assets';
+  const RANKED_TIERS=[
+    {name:'Unranked', min:0, fee:0, color:'#6b7280'},
+    {name:'Bronze', min:200, fee:10, color:'#CD7F32'},
+    {name:'Silver', min:500, fee:25, color:'#C0C0C0'},
+    {name:'Gold', min:1000, fee:50, color:'#FFD700'},
+    {name:'Platinum', min:1500, fee:75, color:'#E5E7EB'},
+    {name:'Diamond', min:2000, fee:100, color:'#B9F2FF'},
+    {name:'Emerald', min:3000, fee:150, color:'#10b981'},
+    {name:'Champion', min:4000, fee:200, color:'#f59e0b'},
+    {name:'Master', min:5000, fee:250, color:'#9333EA'},
+    {name:'Grandmaster', min:7500, fee:300, color:'#ef4444'},
+  ];
+  // Bucket filenames: platinum is stored as platinium.png (typo upstream).
+  const RANKED_ICON_SLUG=t=>t==='Platinum'?'platinium':t.toLowerCase();
+  RANKED_TIERS.forEach(t=>{ t.icon=`${RANKED_ASSETS}/${RANKED_ICON_SLUG(t.name)}.png`; });
+  let rankedPanel=null, rankedTab='milestones', rankedLbCache=null, _rankedFadeT=null;
+  function ensureRankedStyle(){
+    if(document.getElementById('bnc-ranked-style')) return;
+    try{
+      const st=document.createElement('style');
+      st.id='bnc-ranked-style';
+      st.textContent='@keyframes bncPulse{0%,100%{opacity:1}50%{opacity:0.3}}';
+      (document.head||document.documentElement).appendChild(st);
+    }catch{}
+  }
+  function createRankedPanel(){
+    if(document.getElementById('bnc-ranked')){ rankedPanel=document.getElementById('bnc-ranked'); return; }
+    ensureRankedStyle();
+    const ov=document.createElement('div');
+    ov.id='bnc-ranked';
+    Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483646', background:'rgba(0,0,0,0.64)', display:'none', opacity:'0', transition:'opacity 180ms ease-out', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif'});
+    ov.innerHTML=`<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:14px;width:700px;max-width:94vw;height:500px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden"><div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.08)"><div><b style="font-size:16px;color:#fff">Nectar Ranked</b><div id="bnc-ranked-season" style="font-size:11px;color:#9ca3af;margin-top:2px">Season —</div></div><button id="bnc-ranked-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px">Close</button></div><div style="display:flex;gap:8px;padding:12px 18px 0 18px"><button id="bnc-ranked-tab-ms" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Milestones</button><button id="bnc-ranked-tab-lb" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Leaderboard</button></div><div id="bnc-ranked-body" style="flex:1;overflow:auto;padding:16px 18px"></div></div>`;
+    (document.body||document.documentElement).appendChild(ov);
+    ov.addEventListener('click', (e)=>{ if(e.target===ov) toggleRankedPanel(false); });
+    ov.querySelector('#bnc-ranked-close').onclick=()=> toggleRankedPanel(false);
+    ov.querySelector('#bnc-ranked-tab-ms').onclick=()=>{ rankedTab='milestones'; renderRankedPanel(); };
+    ov.querySelector('#bnc-ranked-tab-lb').onclick=()=>{ rankedTab='leaderboard'; renderRankedPanel(); fetchRankedLb(); };
+    rankedPanel=ov;
+  }
+  // True while the player is mid-match in an active ranked room: the ranked
+  // panel stays locked (leaderboard/milestones would be a live aid).
+  function rankedLocked(){
+    try{
+      const rk=statsCache && statsCache.ranked ? statsCache.ranked : null;
+      if(!rk || !rk.active) return false;
+      const sess=statsCache.session;
+      return !!(sess && String(sess.state||'').toLowerCase()==='match');
+    }catch{ return false; }
+  }
+  function toggleRankedPanel(force){
+    createRankedPanel();
+    const isHidden=rankedPanel.style.display==='none' || !rankedPanel.style.display;
+    const show=typeof force==='boolean' ? force : isHidden;
+    if(show && rankedLocked()){ showToast('Ranked panel is locked during a ranked match', true); return; }
+    try{ clearTimeout(_rankedFadeT); }catch{}
+    if(show){
+      rankedPanel.style.display='flex';
+      requestAnimationFrame(()=>{ requestAnimationFrame(()=>{ try{ rankedPanel.style.opacity='1'; }catch{} }); });
+      renderRankedPanel();
+      fetchRankedLb(true);
+    } else {
+      try{ rankedPanel.style.opacity='0'; }catch{}
+      _rankedFadeT=setTimeout(()=>{ try{ rankedPanel.style.display='none'; }catch{} }, 180);
+    }
+  }
+  // "12d 4h" style countdown to the season reset. Null when unknown/passed.
+  function _resetIn(iso){
+    try{
+      if(!iso) return null;
+      const ms=new Date(iso).getTime()-Date.now();
+      if(!(ms>0)) return null;
+      const m=Math.floor(ms/60000), d=Math.floor(m/1440), h=Math.floor((m%1440)/60);
+      if(d>0) return `${d}d ${h}h`;
+      if(h>0) return `${h}h ${m%60}m`;
+      return `${m}m`;
+    }catch{ return null; }
+  }
+  function updateRankedSeason(){
+    if(!rankedPanel) return;
+    const el=rankedPanel.querySelector('#bnc-ranked-season');
+    if(!el) return;
+    const a=currentArena();
+    const c=rankedLbCache;
+    const season=a && a.season!=null ? a.season : (c && c.season!=null ? c.season : null);
+    const reset=a && a.reset_at ? a.reset_at : (c ? c.reset_at : null);
+    if(season!=null){
+      const left=_resetIn(reset);
+      el.textContent=`Season ${season}`+(left?` · Resets in ${left}`:'');
+      el.title=reset?`Resets at ${reset}`:'';
+    } else {
+      el.textContent='Season —';
+      el.title='';
+    }
+  }
+  function currentTierName(){
+    try{
+      const a=statsCache && statsCache.arena ? statsCache.arena : null;
+      if(a && a.milestone) return String(a.milestone);
+      const rk=statsCache && statsCache.ranked ? statsCache.ranked : null;
+      if(rk && rk.milestone) return String(rk.milestone);
+      const pts=a && a.points!=null ? Number(a.points) : (rk && rk.points!=null ? Number(rk.points) : 0);
+      let name='Unranked';
+      for(const t of RANKED_TIERS){ if(pts>=t.min) name=t.name; }
+      return name;
+    }catch{ return 'Unranked'; }
+  }
+  function currentArena(){
+    try{
+      if(statsCache && statsCache.arena) return statsCache.arena;
+      if(statsCache && statsCache.ranked) return statsCache.ranked;
+    }catch{}
+    return null;
+  }
+  function renderRankedPanel(){
+    if(!rankedPanel) return;
+    const body=rankedPanel.querySelector('#bnc-ranked-body');
+    const msBtn=rankedPanel.querySelector('#bnc-ranked-tab-ms');
+    const lbBtn=rankedPanel.querySelector('#bnc-ranked-tab-lb');
+    const tabStyle=(active)=>`flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer;border:1px solid ${active?'#fff':'rgba(255,255,255,0.12)'};background:${active?'#fff':'#171717'};color:${active?'#000':'#9ca3af'}`;
+    if(msBtn) msBtn.style.cssText=tabStyle(rankedTab==='milestones');
+    if(lbBtn) lbBtn.style.cssText=tabStyle(rankedTab==='leaderboard');
+    if(!body) return;
+    updateRankedSeason();
+    if(rankedTab==='milestones'){
+      const here=currentTierName();
+      const ar=currentArena();
+      const pts=ar && ar.points!=null ? Number(ar.points) : 0;
+      const tier=RANKED_TIERS.find(t=>t.name===here) || RANKED_TIERS[0];
+      const pct=ar && ar.next_points_pct!=null ? Math.max(0, Math.min(100, Number(ar.next_points_pct))) : 0;
+      const toNext=ar && ar.next_milestone
+        ? `${Number(ar.points_to_next||0).toLocaleString('en-US')} points to ${String(ar.next_milestone).replace(/</g,'&lt;')}`
+        : 'Max rank reached';
+      const summary=`<div style="display:flex;align-items:center;gap:10px;background:#171717;border:1px solid ${tier.color};border-radius:10px;padding:10px 12px;margin-bottom:12px"><img src="${tier.icon}" alt="" style="width:32px;height:32px;object-fit:contain" onerror="this.style.display='none'" /><div style="flex:1;min-width:0"><div style="font-size:13px;font-weight:800;color:#fff">${tier.name} · ${Number(pts).toLocaleString('en-US')} pts</div><div style="height:6px;background:rgba(255,255,255,0.10);border-radius:999px;margin-top:6px;overflow:hidden"><div style="height:100%;width:${pct}%;background:${tier.color};border-radius:999px"></div></div><div style="font-size:11px;color:#9ca3af;margin-top:4px">${toNext} (${pct}%)</div></div></div>`;
+      const cards=RANKED_TIERS.map(t=>{
+        const isHere=t.name===here;
+        return `<div style="background:#171717;border:1px solid ${isHere?t.color:'rgba(255,255,255,0.10)'};${isHere?`box-shadow:0 0 14px ${t.color};`:''}border-radius:10px;padding:10px 6px;text-align:center;position:relative"><img src="${t.icon}" alt="${t.name}" style="width:40px;height:40px;object-fit:contain" onerror="this.style.display='none'" /><div style="font-size:11px;font-weight:800;color:${t.color};margin-top:6px">${t.name}</div><div style="font-size:10px;color:#9ca3af;margin-top:2px">${Number(t.min).toLocaleString('en-US')}+</div><div style="font-size:10px;color:#6b7280">Fee ${t.fee}</div>${isHere?`<div style="font-size:9px;font-weight:800;color:#fff;margin-top:6px">● YOU ARE HERE</div>`:''}</div>`;
+      }).join('');
+      body.innerHTML=`${summary}<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px">${cards}</div><div style="font-size:11px;color:#6b7280;text-align:center;margin-top:10px">Entry fees burn on every ranked start — higher tier, steeper entry.</div>`;
+    } else {
+      renderRankedLb(rankedLbCache ? rankedLbCache.rows : null);
+    }
+  }
+  function renderRankedLb(rows){
+    if(!rankedPanel) return;
+    const body=rankedPanel.querySelector('#bnc-ranked-body');
+    if(!body) return;
+    if(!rows){
+      body.innerHTML=`<div style="text-align:center;color:#9ca3af;font-size:13px;padding:40px 0">Loading leaderboard…</div>`;
+      return;
+    }
+    if(!rows.length){
+      body.innerHTML=`<div style="text-align:center;color:#9ca3af;font-size:13px;padding:40px 0">No ranked players yet — be the first.</div>`;
+      return;
+    }
+    let meDid=null;
+    try{ meDid=String(discordId||''); }catch{}
+    const lines=rows.map(r=>{
+      const did=String(r.discord_id||'');
+      const isMe=meDid && did===meDid;
+      const nm=String(r.game_username||r.discord_username||did).replace(/</g,'&lt;');
+      const icon=r.milestone_icon_url?`<img src="${String(r.milestone_icon_url).replace(/"/g,'')}" alt="" style="width:18px;height:18px;object-fit:contain;vertical-align:-3px;margin-right:6px" onerror="this.style.display='none'" />`:'';
+      return `<div style="display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:8px;background:${isMe?'rgba(255,255,255,0.08)':'transparent'};border:1px solid ${isMe?'rgba(255,255,255,0.25)':'transparent'}"><span style="width:28px;font-size:12px;font-weight:800;color:#9ca3af">#${r.rank}</span><span style="flex:1;font-size:13px;font-weight:${isMe?'800':'600'};color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${icon}${nm}</span><span style="font-size:13px;font-weight:800;color:${r.milestone_color||'#fff'}">${Number(r.points||0).toLocaleString('en-US')}</span><span style="width:90px;text-align:right;font-size:11px;color:#9ca3af">${String(r.milestone||'').replace(/</g,'&lt;')}</span></div>`;
+    }).join('');
+    body.innerHTML=`<div style="display:flex;flex-direction:column;gap:2px">${lines}</div>`;
+  }
+  function fetchRankedLb(quiet){
+    const now=Date.now();
+    if(rankedLbCache && now-rankedLbCache.at<60000){
+      if(rankedTab==='leaderboard' && !quiet) renderRankedLb(rankedLbCache.rows);
+      updateRankedSeason();
+      return;
+    }
+    if(rankedTab==='leaderboard' && !quiet) renderRankedLb(null);
+    try{
+      const base=resolveApiBase();
+      fetch(base+'/api/leaderboard?ranked=true&limit=20',{method:'GET'}).then(r=>r.text().then(t=>{
+        try{ const j=JSON.parse(t); rankedLbCache={at:Date.now(), rows:j.results||[], season:j.season!=null?j.season:null, reset_at:j.reset_at||null}; }
+        catch{ rankedLbCache={at:Date.now(), rows:[], season:null, reset_at:null}; }
+        updateRankedSeason();
+        if(rankedTab==='leaderboard') renderRankedPanel();
+      })).catch(()=>{ rankedLbCache={at:Date.now(), rows:[], season:null, reset_at:null}; updateRankedSeason(); if(rankedTab==='leaderboard') renderRankedPanel(); });
+    }catch{ rankedLbCache={at:Date.now(), rows:[], season:null, reset_at:null}; updateRankedSeason(); renderRankedPanel(); }
+  }
+
   // --- KEYBINDS / SETTINGS MENU (Ctrl+Shift+K) ---
   let keybindOverlay=null;
   function createKeybindOverlay(){
@@ -1572,22 +2122,82 @@
     const ov=document.createElement('div');
     ov.id='bnc-keys';
     Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483646', background:'rgba(0,0,0,0.54)', display:'none', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif'});
-    ov.innerHTML = `<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:20px;min-width:360px;max-width:520px;color:#e5e7eb"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><b style="font-size:15px;color:#fff">BuildNow Companion - Shortcuts & Settings</b><button id="bnc-keys-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 8px;cursor:pointer">Close</button></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;line-height:1.6"><div><code>Ctrl+Shift+C</code> - Collect toggle<br><code>Ctrl+Shift+S</code> - Save collected<br><code>Ctrl+Shift+L</code> - Load file<br><code>Ctrl+Shift+R</code> - Replay</div><div><code>Ctrl+Shift+F</code> - Feed (dev only)<br><code>Ctrl+Shift+P</code> - Pause feed<br><code id="bnc-keys-drawer-label">Ctrl+Shift+I</code> - Player info<br><code>Ctrl+Shift+K</code> - This menu</div></div><div style="margin-top:10px;font-size:11px;opacity:0.7">Mac tip: use ⌘ instead of Ctrl — Cmd+Shift+&lt;key&gt; works the same.</div><div style="margin-top:14px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);font-size:11px;opacity:0.7">Settings: <label style="cursor:pointer"><input type="checkbox" id="bnc-dev-toggle"> Dev mode (feed)</label></div></div>`;
+    ov.innerHTML = `<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:20px;min-width:360px;max-width:520px;color:#e5e7eb"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><b style="font-size:15px;color:#fff">BuildNow Companion - Shortcuts & Settings</b><button id="bnc-keys-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 8px;cursor:pointer">Close</button></div><div id="bnc-keys-list" style="display:flex;flex-direction:column;gap:6px;font-size:12px"></div><div style="display:flex;gap:8px;margin-top:12px"><button id="bnc-keys-open-drawer" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open player info</button><button id="bnc-keys-open-ranked" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open ranked panel</button></div><div style="margin-top:8px;font-size:11px;color:#9ca3af"><code>Ctrl+Shift+K</code> - This menu (fixed)</div><div style="margin-top:10px;font-size:11px;opacity:0.7">Mac tip: use ⌘ instead of Ctrl — Cmd+Shift+&lt;key&gt; works the same.</div><div id="bnc-dev-row" style="margin-top:14px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);font-size:11px;opacity:0.7">Settings: <label style="cursor:pointer"><input type="checkbox" id="bnc-dev-toggle"> Dev mode (feed)</label></div></div>`;
     (document.body||document.documentElement).appendChild(ov);
     ov.addEventListener('click', (e)=>{ if(e.target===ov) ov.style.display='none'; });
     ov.querySelector('#bnc-keys-close').onclick=()=> ov.style.display='none';
+    // mouse fallback openers: keybinds are the fast path, but a dead combo
+    // (browser/OS eats it) must never lock the user out of the panels.
+    try{
+      const od=ov.querySelector('#bnc-keys-open-drawer');
+      if(od) od.onclick=()=>{ try{ toggleInfoPanel(true); }catch{} };
+      const or_=ov.querySelector('#bnc-keys-open-ranked');
+      if(or_) or_.onclick=()=>{ try{ toggleRankedPanel(true); }catch{} };
+    }catch{}
     const devT = ov.querySelector('#bnc-dev-toggle');
     devT.checked = !!GMGet('bnc_dev_mode', false);
-    devT.onchange=()=>{ GMSet('bnc_dev_mode', devT.checked); showToast(devT.checked? 'Dev mode ON':'Dev mode OFF', false); if(devT.checked){ feedEnabled=true; feedWrap.style.display='block'; } else feedWrap.style.display='none'; };
-    try{ const dl=ov.querySelector('#bnc-keys-drawer-label'); if(dl) dl.textContent=formatKeybind(getDrawerKeybind()); }catch{}
+    devT.onchange=()=>{ GMSet('bnc_dev_mode', devT.checked); showToast(devT.checked? 'Dev mode ON':'Dev mode OFF', false); if(devT.checked){ feedEnabled=true; feedWrap.style.display='block'; } else feedWrap.style.display='none'; try{ syncDevUI(); }catch{} };
+    try{ renderKeybindRows(); }catch{}
+    try{ syncDevUI(); }catch{}
     keybindOverlay=ov;
   }
-  function toggleKeybinds(){ if(!keybindOverlay) createKeybindOverlay(); const isHidden=keybindOverlay.style.display==='none' || !keybindOverlay.style.display; keybindOverlay.style.display = isHidden ? 'flex' : 'none'; if(isHidden){ try{ const dl=keybindOverlay.querySelector('#bnc-keys-drawer-label'); if(dl) dl.textContent=formatKeybind(getDrawerKeybind()); }catch{} } }
+  // Render one editable row per bind (dev binds hidden unless isDev()).
+  // Re-rendered on every open + every stats poll; skipped mid-capture.
+  function renderKeybindRows(){
+    if(typeof _keybindCapturing!=='undefined' && _keybindCapturing) return;
+    const list=document.getElementById('bnc-keys-list');
+    if(!list) return;
+    const dev=isDev();
+    const rows=BNC_BINDS.filter(b=>!b.dev||dev).map(b=>
+      `<div style="display:flex;align-items:center;gap:8px"><span style="flex:1;color:#e5e7eb">${b.label.replace(/</g,'&lt;')}</span><code style="background:#1f2937;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:2px 8px;white-space:nowrap">${formatKeybind(getBindKb(b))}</code><button data-bind="${b.id}" style="background:#171717;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px;font-weight:600">Change</button></div>`
+    ).join('');
+    list.innerHTML=rows;
+    list.querySelectorAll('button[data-bind]').forEach(btn=>{
+      btn.onclick=()=>{
+        const b=BNC_BINDS.find(x=>x.id===btn.dataset.bind);
+        if(b) captureBind(b, btn);
+      };
+    });
+  }
+  // Capture flow shared by every row: any key or combo, Esc cancels, 8s timeout.
+  function captureBind(b, btn){
+    if(_keybindCapturing) return;
+    _keybindCapturing=true;
+    const orig=btn.textContent;
+    btn.textContent='Press…';
+    const hint=document.createElement('span');
+    hint.style.cssText='font-size:11px;color:#6b7280';
+    hint.textContent='Press any key or combo. Esc to cancel.';
+    btn.after(hint);
+    const done=(msg)=>{
+      _keybindCapturing=false;
+      try{ hint.remove(); }catch{}
+      try{ renderKeybindRows(); }catch{}
+      if(msg) showToast(msg, false);
+      document.removeEventListener('keydown', handler, true);
+    };
+    const handler=(e)=>{
+      if(e.key==='Escape'){ btn.textContent=orig; done(); return; }
+      if(['Control','Shift','Alt','Meta'].includes(e.key)) return;
+      e.preventDefault(); e.stopPropagation();
+      const nb={ctrl:!!e.ctrlKey, meta:!!e.metaKey, shift:!!e.shiftKey, alt:!!e.altKey, key:String(e.key).toUpperCase(), code:String(e.code||'').toUpperCase()||null};
+      if(!nb.key) return;
+      const warn=bindWarning(nb, b.id);
+      if(warn){ hint.textContent='⚠ '+warn; return; }  // stay capturing
+      try{ GMSet(b.key, JSON.stringify(nb)); }catch{ try{ GMSet(b.key, nb); }catch{} }
+      done(`${b.label} set to ${formatKeybind(nb)}`);
+    };
+    document.addEventListener('keydown', handler, true);
+    setTimeout(()=>{ if(_keybindCapturing){ btn.textContent=orig; done(); } }, 8000);
+  }
+  function toggleKeybinds(){ if(!keybindOverlay) createKeybindOverlay(); const isHidden=keybindOverlay.style.display==='none' || !keybindOverlay.style.display; keybindOverlay.style.display = isHidden ? 'flex' : 'none'; if(isHidden){ try{ renderKeybindRows(); }catch{} try{ syncDevUI(); }catch{} } }
   // Hotkeys: drawer (customizable) + Ctrl+Shift+K keybinds (guard modal focus)
   document.addEventListener('keydown', (e)=>{
     if(_keybindCapturing) return;
     if (isModalOrInputFocused()) return;
+    if((e.key||'')==='Escape' && typeof rankedPanel!=='undefined' && rankedPanel && rankedPanel.style.display!=='none' && rankedPanel.style.display){ e.preventDefault(); toggleRankedPanel(false); return; }
     if(isDrawerKeybind(e)){ e.preventDefault(); e.stopPropagation(); toggleInfoPanel(); return; }
+    if(isRankedKeybind(e)){ e.preventDefault(); e.stopPropagation(); toggleRankedPanel(); return; }
     if(modKey(e) && e.shiftKey && (e.key||'').toUpperCase()==='K'){ e.preventDefault(); e.stopPropagation(); toggleKeybinds(); }
   }, true);
 

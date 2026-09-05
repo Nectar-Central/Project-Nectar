@@ -14,7 +14,24 @@ Response:
     "playtime_global": 1234, "playtime_per_gm": {...},
     "kd": 2.4, "win_rate": 0.27,
     "rank": {"by": "kills", "pct": 87, "rank": 5, "total": 120},
-    "session": { "game_mode": "zw_lg", "cur_scn": "Game", "players_count": 4, "zone": {...} } | null
+    "is_dev": false,
+    "arena": {
+      "points": 750, "milestone": "Silver",
+      "milestone_icon_url": "...", "milestone_color": "#C0C0C0",
+      "points_to_next": 250, "next_milestone": "Gold", "next_points_pct": 50,
+      "season": 1, "reset_at": "2026-10-01T00:00:00+00:00" | null
+    },
+    "session": { "game_mode": "zw_lg", "cur_scn": "Game", "players_count": 4, "zone": {...} } | null,
+    "ranked": {
+      "active": true, "rid": "R-ABC123", "short_code": "PBS05", "status": "live",
+      "is_host": false, "points": 750, "milestone": "Gold",
+      "milestone_icon_url": "...", "milestone_color": "#FFD700", "arena_icon_url": "...",
+      "points_to_next": 250, "next_milestone": "Diamond", "next_points_pct": 50,
+      "warnings": [], "match_id": "R-ABC123-2", "match_version": 2,
+      "last_result": {"match_version": 2, "gained": 85, "won": true, "placement": 1, "kills": 1} | null,
+      "host_game_username": "True Jew", "host_skin": "cct_0_default", "host_playing": true,
+      "min_points": 0, "max_points": null, "fee": 0
+    } | null
   }
 """
 
@@ -23,6 +40,7 @@ from fastapi.responses import JSONResponse
 
 from ..lib.supabase_client import supabase, db
 from ..lib.redis_client import cache
+from ..lib import ranked as ranked_mod
 from .capture import engine as capture_engine
 
 router = APIRouter()
@@ -41,6 +59,45 @@ def better_than_pct(total: int, above: int) -> int:
     if total < 2 or above < 0 or above >= total:
         return 0
     return round((total - 1 - above) / total * 100)
+
+
+_SESSION_STALE_S = 120  # no packets this long = kicked/closed/reloaded
+
+
+def _session_fresh(live_session) -> bool:
+    """False when the session stopped capturing (kick/close/reload).
+
+    Without this the drawer keeps showing the last cached room — including
+    the ranked block with its match ID — for up to the cache TTL. Prefers
+    the current room's last_packet_at (stamped per engine feed), falls back
+    to the persist-time _cached_at. No timestamps at all (old caches) fails
+    open. Never raises (fail-open True).
+    """
+    try:
+        import time as _t
+        now = _t.time()
+        rooms = (live_session or {}).get("rooms") or {}
+        cur = None
+        if isinstance(rooms, dict):
+            cur = rooms.get((live_session or {}).get("current_room_id"))
+            if not cur and rooms:
+                cur = next(reversed(list(rooms.values())), None)
+        if isinstance(cur, dict):
+            try:
+                lp = cur.get("last_packet_at")
+                if lp:
+                    return (now - float(lp)) <= _SESSION_STALE_S
+            except Exception:
+                pass
+        try:
+            ca = (live_session or {}).get("_cached_at")
+            if ca:
+                return (now - float(ca)) <= _SESSION_STALE_S
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return True
 
 
 @router.get("/api/stats")
@@ -77,6 +134,10 @@ async def get_stats(request: Request):
                     live_session = cached
             except Exception:
                 pass
+        # Dead sessions (kick/close/reload stops captures): never serve them,
+        # or the drawer shows a ghost room + stale ranked block for an hour.
+        if live_session and not _session_fresh(live_session):
+            live_session = None
         # Resolve discord_id from DB session row if not already
         if not discord_id:
             try:
@@ -117,6 +178,7 @@ async def get_stats(request: Request):
 
     # live session fallback: if no live view but user has game_mode hints, leave null
     session_out = None
+    cur_room = None  # current room dict (for ranked match_version/warnings)
     if live_session:
         # live_session is SessionView dict — extract current room fields
         try:
@@ -174,6 +236,132 @@ async def get_stats(request: Request):
     except Exception:
         pass
 
+    # Ranked block (Phase 3): null unless the live room is a lobby/live ranked
+    # room. Additive — non-ranked responses keep "ranked": null.
+    ranked_out = None
+    try:
+        code = (session_out or {}).get("short_code")
+        if code:
+            rdata = ranked_mod.get_ranked_room(code)
+            if rdata and rdata.get("status") in ("lobby", "live"):
+                pts = ranked_mod.get_ranked_points(discord_id)
+                tier = ranked_mod.milestone_for(pts)
+                nxt, need, pct = ranked_mod.next_milestone(pts)
+                rid = str(rdata.get("id") or "")
+                try:
+                    mver = int(cur_room.get("match_version") or 0)
+                except Exception:
+                    mver = 0
+                try:
+                    warnings = list(cur_room.get("ranked_warnings") or [])[:32]
+                except Exception:
+                    warnings = []
+                # host identity for the match-start overlay (name + skin for the
+                # card, host_playing to pick the rules line). Skin is the raw
+                # skin id — the userscript resolves it via its skin CDN helper.
+                host_game_username = None
+                host_skin = None
+                host_playing = False
+                try:
+                    hid = str(rdata.get("host_discord_id") or "")
+                    if hid:
+                        hres = supabase.table("bngc_users").select("game_username,skin").eq("discord_id", hid).limit(1).execute()
+                        hrows = hres.data or []
+                        if hrows:
+                            host_game_username = hrows[0].get("game_username")
+                            host_skin = hrows[0].get("skin")
+                    if host_game_username and cur_room:
+                        hn = str(host_game_username)
+                        hstrip = hn[3:].strip() if hn.lower().startswith("dc:") else hn
+                        try:
+                            pyns = [str((p or {}).get("username") or "") for p in (cur_room.get("players") or {}).values()]
+                        except Exception:
+                            pyns = []
+                        for pn in pyns:
+                            ps = pn[3:].strip() if pn.lower().startswith("dc:") else pn
+                            if pn and (pn == hn or ps == hstrip):
+                                host_playing = True
+                                break
+                except Exception:
+                    pass
+                # last sealed result for this room (drives the points toast):
+                # what I gained, whether I won, my placement and kills.
+                last_result = None
+                try:
+                    lr = supabase.table("ranked_results").select(
+                        "match_version,winner_discord_id,kills,points,placements"
+                    ).eq("room_id", rid).order("match_version", desc=True).limit(1).execute()
+                    rows = lr.data or []
+                    if rows:
+                        row = rows[0]
+                        pts_map = row.get("points") or {}
+                        kills_map = row.get("kills") or {}
+                        plc_map = row.get("placements") or {}
+                        me = str(discord_id or "")
+                        try:
+                            plc = plc_map.get(me)
+                            plc = int(plc) if plc is not None else None
+                        except Exception:
+                            plc = None
+                        last_result = {
+                            "match_version": row.get("match_version"),
+                            "gained": int(pts_map.get(me) or 0),
+                            "won": bool(me) and str(row.get("winner_discord_id") or "") == me,
+                            "placement": plc,
+                            "kills": int(kills_map.get(me) or 0),
+                        }
+                except Exception:
+                    last_result = None
+                ranked_out = {
+                    "active": True,
+                    "rid": rid,
+                    "short_code": str(code or "").strip().upper(),
+                    "status": rdata.get("status"),
+                    "is_host": str(discord_id or "") == str(rdata.get("host_discord_id") or ""),
+                    "points": pts,
+                    "milestone": tier.get("name"),
+                    "milestone_icon_url": tier.get("icon_url"),
+                    "milestone_color": tier.get("color"),
+                    "arena_icon_url": ranked_mod.ARENA_ICON_URL,
+                    "points_to_next": need,
+                    "next_milestone": (nxt.get("name") if nxt else None),
+                    "next_points_pct": pct,
+                    "warnings": warnings,
+                    "match_id": f"{rid}-{mver}" if rid and mver > 0 else (rid or None),
+                    "match_version": mver,
+                    "last_result": last_result,
+                    "host_game_username": host_game_username,
+                    "host_skin": host_skin,
+                    "host_playing": host_playing,
+                    "min_points": rdata.get("min_points") or 0,
+                    "max_points": rdata.get("max_points"),
+                    "fee": rdata.get("fee") or 0,
+                }
+    except Exception:
+        ranked_out = None
+
+    # Arena block: session-independent points/tier/season. The ranked block
+    # only exists inside a ranked room; drawer/panel/lobby-card read this.
+    arena = None
+    try:
+        apts = ranked_mod.get_ranked_points(discord_id)
+        atier = ranked_mod.milestone_for(apts)
+        anxt, aneed, apct = ranked_mod.next_milestone(apts)
+        aseason, areset = ranked_mod.get_current_season()
+        arena = {
+            "points": apts,
+            "milestone": atier.get("name"),
+            "milestone_icon_url": atier.get("icon_url"),
+            "milestone_color": atier.get("color"),
+            "points_to_next": aneed,
+            "next_milestone": (anxt.get("name") if anxt else None),
+            "next_points_pct": apct,
+            "season": aseason,
+            "reset_at": areset,
+        }
+    except Exception:
+        arena = None
+
     return JSONResponse({
         "discord_id": user.get("discord_id"),
         "discord_username": user.get("discord_username"),
@@ -190,8 +378,11 @@ async def get_stats(request: Request):
         "kd": kd,
         "win_rate": win_rate,
         "rank": rank,
+        "is_dev": bool(user.get("is_dev")),
+        "arena": arena,
         "is_locked": bool(user.get("is_locked")),
         "lobby_music_url": user.get("lobby_music_url"),
         "lobby_music_volume": user.get("lobby_music_volume", 0.5),
         "session": session_out,
+        "ranked": ranked_out,
     })

@@ -377,13 +377,21 @@ async def warn_cmd(interaction: discord.Interaction, user: discord.Member, reaso
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     print(f"Command error in {getattr(interaction.command, 'name', 'unknown')}: {error}")
-    message = "Something went wrong while running that command. Please try again."
-    if isinstance(error, app_commands.MissingPermissions):
-        message = "You do not have permission to use that command."
-    if interaction.response.is_done():
-        await interaction.followup.send(message, ephemeral=True)
-    else:
-        await interaction.response.send_message(message, ephemeral=True)
+    try:
+        inner = getattr(error, "original", None)
+        if isinstance(inner, discord.errors.NotFound):
+            return  # interaction expired (starved loop) — nothing left to answer
+        message = "Something went wrong while running that command. Please try again."
+        if isinstance(error, app_commands.MissingPermissions):
+            message = "You do not have permission to use that command."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except (discord.errors.NotFound, discord.errors.HTTPException):
+        pass  # interaction died while we answered — nothing to do
+    except Exception as e:
+        print(f"[error-handler] failed: {e}")
 
 
 @bot.tree.command(name="token", description="Show your current token")
@@ -1265,15 +1273,17 @@ class RankedLobbyView(discord.ui.View):
                        min_points="Minimum points to join, 0 = open",
                        max_points="Maximum points to join, 0 = no cap",
                        fee="Join fee in points (burned)",
-                       starts_in_min="Auto-start countdown in minutes, 0 = manual start")
+                       starts_in_min="Auto-start countdown in minutes, 0 = manual start",
+                       host_only="True = you only host (not on roster)")
 @app_commands.choices(gm=[app_commands.Choice(name="Late Game Zonewars", value="zw_lg"),
                           app_commands.Choice(name="Free Mode", value="df"),
                           app_commands.Choice(name="Wild West", value="wwzw")])
 async def ranked_create_cmd(interaction: discord.Interaction, short_code: str, max_players: app_commands.Range[int, 2, 16],
                             gm: str, max_matches: app_commands.Range[int, 1, 50],
                             min_points: int = 0, max_points: int = 0,
-                            fee: int = 0, starts_in_min: int = 0):
-    await interaction.response.defer(ephemeral=True)
+                            fee: int = 0, starts_in_min: int = 0, host_only: bool = False):
+    if not await _defer(interaction):
+        return
     did = str(interaction.user.id)
     try:
         row = await db.get_by_discord(did)
@@ -1298,10 +1308,12 @@ async def ranked_create_cmd(interaction: discord.Interaction, short_code: str, m
         room = ranked_mod.create_room(code=code, host_discord_id=did, gm=gm,
                                       max_players=max_players, max_matches=max_matches,
                                       min_points=min_points or 0, max_points=capped_max,
-                                      fee=fee or 0, starts_at=starts_at)
+                                      fee=fee or 0, starts_at=starts_at,
+                                      host_only=bool(host_only))
     except Exception as exc:
         print(f"[ranked] create failed: {exc}")
         return await interaction.followup.send("Couldn't create the room (DB error).", ephemeral=True)
+    print(f"[ranked] room created {room['id']} code={code} gm={gm} host={did} host_only={bool(host_only)} max={max_players}x{max_matches}")
     # post lobby embed (configured channel, else current channel)
     target = None
     try:
@@ -1330,23 +1342,173 @@ async def ranked_create_cmd(interaction: discord.Interaction, short_code: str, m
     except Exception as exc:
         print(f"[ranked] lobby post failed: {exc}")
         return await interaction.followup.send(f"Room **{room['id']}** created, but I couldn't post the lobby — check my channel access.", ephemeral=True)
-    await interaction.followup.send(f"Ranked room **{room['id']}** open — lobby posted. You (host) are on the roster.", ephemeral=True)
+    await interaction.followup.send(f"Ranked room **{room['id']}** open — lobby posted." + (" You are hosting only (not on the roster)." if host_only else " You (host) are on the roster."), ephemeral=True)
 
 
 bot.tree.add_command(ranked_group)
 
 
+async def _verify_host_present(code: str, game_username: str | None):
+    """Ask the API if the room code is live and the host is in it.
+
+    Returns (True/False/None, detail). None = API unreachable or no name to
+    check (fail-open: start proceeds with a logged warning, since a fake room
+    seals nothing without real host packets).
+    """
+    if not game_username:
+        return None, "no game username to check"
+    if aiohttp is None:
+        return None, "http client unavailable"
+    try:
+        from urllib.parse import quote
+        url = f"{SERVER_URL}/api/ranked/verify?code={quote(code)}&host={quote(game_username)}"
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=10) as r:
+                if r.status != 200:
+                    return None, f"api {r.status}"
+                j = await r.json()
+        if not j.get("room_active"):
+            return False, "room not active in game"
+        if not j.get("host_in_room"):
+            return False, "host not in room"
+        return True, f"{j.get('events_seen', 0)} recent events"
+    except Exception as e:
+        print(f"[ranked] verify failed: {e}")
+        return None, "api unreachable"
+
+
+async def _post_thread_leaderboard(thread, rid: str):
+    """Top-10 arena standings in the session thread. Best-effort."""
+    try:
+        top = ranked_mod.top_points(10)
+        if not top:
+            return
+        lines = []
+        for i, (did, pts) in enumerate(top, start=1):
+            tier, _f = ranked_mod.milestone_for(pts)
+            try:
+                row = await db.get_by_discord(did)
+                nm = (row or {}).get("game_username") or (row or {}).get("discord_username") or did
+            except Exception:
+                nm = did
+            lines.append(f"**{i}.** {nm} — {pts} pts ({tier})")
+        e = discord.Embed(title="Arena leaderboard", color=0x7c3aed,
+                          description="\n".join(lines))
+        e.set_footer(text=f"{rid} · live standings")
+        await thread.send(embed=e)
+    except Exception as e:
+        print(f"[ranked] thread leaderboard failed: {e}")
+
+
+async def _set_lobby_embed(room: dict, spec: dict, color: int, buttons: bool = False):
+    """Edit the lobby message to a spec embed. Best-effort."""
+    try:
+        e = discord.Embed(title=spec["title"], color=color)
+        for name, value, inline in spec["fields"]:
+            e.add_field(name=name, value=value, inline=inline)
+        e.set_footer(text=spec["footer"])
+        if room.get("lobby_channel_id") and room.get("lobby_message_id"):
+            ch = bot.get_channel(int(room["lobby_channel_id"])) or await bot.fetch_channel(int(room["lobby_channel_id"]))
+            msg = await ch.fetch_message(int(room["lobby_message_id"]))
+            await msg.edit(embed=e, view=RankedLobbyView(room["id"]) if buttons else None)
+    except Exception as e:
+        print(f"[ranked] lobby flip failed: {e}")
+
+
+async def _post_thread(room: dict, content=None, embed=None):
+    """Post into the session thread. Returns True on success."""
+    try:
+        tid = room.get("thread_id")
+        if not tid:
+            return False
+        th = bot.get_channel(int(tid))
+        if th is None:
+            th = await bot.fetch_channel(int(tid))
+        await th.send(content=content, embed=embed)
+        return True
+    except Exception as e:
+        print(f"[ranked] thread post failed: {e}")
+        return False
+
+
+async def _defer(interaction: discord.Interaction) -> bool:
+    """Defer an interaction. False = interaction already dead (starved loop),
+    caller must abort silently (there is nobody left to answer)."""
+    try:
+        await interaction.response.defer(ephemeral=True)
+        return True
+    except discord.errors.NotFound:
+        print(f"[ranked] interaction expired before defer (loop starved?)")
+        return False
+    except Exception as e:
+        print(f"[ranked] defer failed: {e}")
+        return False
+
+
+def _host_or_admin(interaction: discord.Interaction, room: dict) -> bool:
+    did = str(interaction.user.id)
+    if did == str(room.get("host_discord_id")):
+        return True
+    try:
+        return bool(interaction.guild and interaction.user.guild_permissions.administrator)
+    except Exception:
+        return False
+
+
 async def _start_ranked_room(room: dict, via: str = "manual"):
-    """Shared manual/countdown start. Returns (ok, message). Steps: fee pass
-    (drop + DM the broke), thread + code/rules post, code DMs, go live."""
+    """Shared manual/countdown start. Returns (ok, message). Steps: eligibility
+    re-check (drop banned/under-lock), host-in-room verify, fee pass (drop +
+    DM the broke), thread + code/rules post, code DMs (incl. host), go live."""
     room = ranked_mod.get_room(room["id"])
     if not room or room.get("status") != "lobby":
         return False, "Room is no longer in lobby."
+    print(f"[ranked] start {room['id']} via={via} code={room.get('short_code')}")
     roster = ranked_mod.roster_ids(room)
-    # fee pass first (no thread yet — aborts cleanly if roster collapses)
-    dropped = []
+    # eligibility re-check: bans / points locks can change after joining.
+    # Batched reads (one roundtrip) — per-player reads starve the event loop
+    # past the 3s interaction window (see _defer).
+    banned = ranked_mod.banned_many(roster)
+    pts_map = ranked_mod.get_points_many(roster)
     for did in list(roster):
-        pts = ranked_mod.get_points(did)
+        reason = None
+        if did in banned:
+            reason = "you are banned from ranked"
+        else:
+            pts = pts_map.get(did, 0)
+            if pts < (room.get("min_points") or 0):
+                reason = f"needs **{room['min_points']}+** points (you have {pts})"
+            elif room.get("max_points") is not None and pts > room["max_points"]:
+                reason = f"capped at **{room['max_points']}** points (you have {pts})"
+        if reason:
+            ranked_mod.roster_remove(ranked_mod.get_room(room["id"]), did)
+            try:
+                user = await bot.fetch_user(int(did))
+                await user.send(f"Removed from **{room['id']}** before start: {reason}.")
+            except Exception:
+                pass
+    # host-in-room verify (fail-open with warning — a fake room seals nothing)
+    host_status = "unverified"
+    try:
+        hrow = await db.get_by_discord(str(room.get("host_discord_id")))
+        hname = (hrow or {}).get("game_username")
+    except Exception:
+        hname = None
+    verified, detail = await _verify_host_present(str(room.get("short_code") or ""), hname)
+    if verified is True:
+        host_status = "in room ✓"
+    elif verified is False:
+        print(f"[ranked] start {room['id']} host NOT verified: {detail}")
+        return False, f"Can't start — host isn't in the room ({detail}). Join the room first, then start."
+    else:
+        print(f"[ranked] start {room['id']} host verify skipped: {detail}")
+        host_status = "unverified"
+    room = ranked_mod.get_room(room["id"])
+    roster = ranked_mod.roster_ids(room)  # refresh: eligibility may have dropped players
+    # fee pass (no thread yet — aborts cleanly if roster collapses)
+    dropped = []
+    pts_map = ranked_mod.get_points_many(roster)
+    for did in list(roster):
+        pts = pts_map.get(did, 0)
         fee = ranked_mod.entry_fee(room, pts)
         if fee > 0 and pts < fee:
             ranked_mod.roster_remove(ranked_mod.get_room(room["id"]), did)
@@ -1381,12 +1543,12 @@ async def _start_ranked_room(room: dict, via: str = "manual"):
     if parent is None:
         return False, "Matches channel not reachable — check my access."
     try:
-        thread = await parent.create_thread(name=f"Ranked {room['id']} {room.get('gm','').upper()}",
+        thread = await parent.create_thread(name=f"Ranked {room['id']} {ranked_mod.gm_name(room.get('gm'))}",
                                             type=discord.ChannelType.private_thread)
         private = True
     except Exception:
         try:
-            thread = await parent.create_thread(name=f"Ranked {room['id']} {room.get('gm','').upper()}",
+            thread = await parent.create_thread(name=f"Ranked {room['id']} {ranked_mod.gm_name(room.get('gm'))}",
                                                 type=discord.ChannelType.public_thread)
             private = False
         except Exception as e:
@@ -1404,45 +1566,33 @@ async def _start_ranked_room(room: dict, via: str = "manual"):
             except Exception:
                 pass
     code_embed = discord.Embed(title=f"Room code: {code}", color=0x10b981,
-                               description=f"Mode **{room.get('gm','').upper()}** · first to finish {room.get('max_matches')} matches")
+                               description=f"Mode **{ranked_mod.gm_name(room.get('gm'))}** · first to finish {room.get('max_matches')} matches")
     code_embed.add_field(name="Rules", value=ranked_mod.RULES_TEXT, inline=False)
     code_embed.set_footer(text=f"{room['id']} · started {via}")
     try:
         await thread.send(embed=code_embed)
+        await _post_thread_leaderboard(thread, room["id"])
     except Exception as e:
         print(f"[ranked] thread post failed: {e}")
     for did in roster:
-        if did == str(room.get("host_discord_id")):
-            continue
         try:
             user = await bot.fetch_user(int(did))
-            await user.send(f"**{room['id']}** is live — code: **{code}** ({room.get('gm','').upper()}). Join in game now.")
+            tag = " (host)" if did == str(room.get("host_discord_id")) else ""
+            await user.send(f"**{room['id']}** is live{tag} — code: **{code}** ({ranked_mod.gm_name(room.get('gm'))}). Join in game now.")
         except Exception:
             pass
+    print(f"[ranked] room live {room['id']} players={len(roster)} via={via} host={host_status}")
     ranked_mod.update_room(room["id"], {"status": "live", "thread_id": str(thread.id)})
     # flip lobby embed
-    try:
-        spec = ranked_mod.live_embed(room, thread.id)
-        e = discord.Embed(title=spec["title"], color=0x10b981)
-        for name, value, inline in spec["fields"]:
-            e.add_field(name=name, value=value, inline=inline)
-        e.set_footer(text=spec["footer"])
-        if room.get("lobby_channel_id") and room.get("lobby_message_id"):
-            try:
-                ch = bot.get_channel(int(room["lobby_channel_id"])) or await bot.fetch_channel(int(room["lobby_channel_id"]))
-                msg = await ch.fetch_message(int(room["lobby_message_id"]))
-                await msg.edit(embed=e, view=None)
-            except Exception:
-                pass
-    except Exception:
-        pass
+    await _set_lobby_embed(room, ranked_mod.live_embed(room, thread.id, host_status), 0x10b981)
     return True, f"**{room['id']}** live with {len(roster)} players ({'countdown' if via == 'countdown' else 'manual'} start)."
 
 
 @ranked_group.command(name="start", description="Start your ranked room (host)")
 @app_commands.describe(rid="Room ID, e.g. R-ABC123")
 async def ranked_start_cmd(interaction: discord.Interaction, rid: str):
-    await interaction.response.defer(ephemeral=True)
+    if not await _defer(interaction):
+        return
     room = ranked_mod.get_room((rid or "").strip().upper())
     if not room:
         return await interaction.followup.send("No such ranked room.", ephemeral=True)
@@ -1452,6 +1602,199 @@ async def ranked_start_cmd(interaction: discord.Interaction, rid: str):
         return await interaction.followup.send("Only the host (or an admin) can start.", ephemeral=True)
     ok, msg = await _start_ranked_room(room, via="manual")
     await interaction.followup.send(msg, ephemeral=True)
+
+
+@ranked_group.command(name="end", description="End the ranked session (host)")
+@app_commands.describe(rid="Room ID, e.g. R-ABC123")
+async def ranked_end_cmd(interaction: discord.Interaction, rid: str):
+    if not await _defer(interaction):
+        return
+    room = ranked_mod.get_room((rid or "").strip().upper())
+    if not room:
+        return await interaction.followup.send("No such ranked room.", ephemeral=True)
+    if not _host_or_admin(interaction, room):
+        return await interaction.followup.send("Only the host (or an admin) can end.", ephemeral=True)
+    if room.get("status") == "ended":
+        return await interaction.followup.send("Session already ended.", ephemeral=True)
+    print(f"[ranked] end {room['id']} by={interaction.user.id}")
+    ranked_mod.update_room(room["id"], {"status": "ended"})
+    room = ranked_mod.get_room(room["id"])
+    sealed = ranked_mod.sealed_count(room["id"])
+    await _post_thread(room, embed=discord.Embed(
+        title="Session ended", color=0xef4444,
+        description=f"**{room['id']}** closed with {sealed}/{room.get('max_matches')} matches sealed."))
+    await _set_lobby_embed(room, ranked_mod.ended_embed(room), 0xef4444)
+    await interaction.followup.send(f"**{room['id']}** ended ({sealed} matches sealed).", ephemeral=True)
+
+
+@ranked_group.command(name="backout", description="Back out to lobby, session continues (host)")
+@app_commands.describe(rid="Room ID, e.g. R-ABC123", reason="Why (shown to players)")
+async def ranked_backout_cmd(interaction: discord.Interaction, rid: str, reason: str = ""):
+    if not await _defer(interaction):
+        return
+    room = ranked_mod.get_room((rid or "").strip().upper())
+    if not room:
+        return await interaction.followup.send("No such ranked room.", ephemeral=True)
+    if not _host_or_admin(interaction, room):
+        return await interaction.followup.send("Only the host (or an admin) can back out.", ephemeral=True)
+    if room.get("status") != "live":
+        return await interaction.followup.send("Only a live room can back out (this one isn't live).", ephemeral=True)
+    print(f"[ranked] backout {room['id']} by={interaction.user.id} reason={reason!r}")
+    ranked_mod.update_room(room["id"], {"status": "lobby"})
+    room = ranked_mod.get_room(room["id"])
+    sealed = ranked_mod.sealed_count(room["id"])
+    note = f" — {reason}" if reason else ""
+    await _post_thread(room, embed=discord.Embed(
+        title="Backed out to lobby", color=0xf59e0b,
+        description=f"Host called a backout{note}. Sealed matches stand ({sealed}). Rejoin the lobby — the count stays where it was."))
+    for did in ranked_mod.roster_ids(room):
+        try:
+            user = await bot.fetch_user(int(did))
+            await user.send(f"**{room['id']}** backed out to lobby{note}. Sealed matches stand — rejoin when the host restarts.")
+        except Exception:
+            pass
+    await _set_lobby_embed(room, ranked_mod.lobby_embed(room), 0x7c3aed, buttons=True)
+    await interaction.followup.send(f"**{room['id']}** back to lobby — session continues ({sealed} sealed).", ephemeral=True)
+
+
+@ranked_group.command(name="change-code", description="Change the room code (host)")
+@app_commands.describe(rid="Room ID, e.g. R-ABC123", short_code="New 5-char room code from game")
+async def ranked_chcode_cmd(interaction: discord.Interaction, rid: str, short_code: str):
+    if not await _defer(interaction):
+        return
+    room = ranked_mod.get_room((rid or "").strip().upper())
+    if not room:
+        return await interaction.followup.send("No such ranked room.", ephemeral=True)
+    if not _host_or_admin(interaction, room):
+        return await interaction.followup.send("Only the host (or an admin) can change the code.", ephemeral=True)
+    if room.get("status") == "ended":
+        return await interaction.followup.send("Session ended — code can't change.", ephemeral=True)
+    code = (short_code or "").strip().upper()
+    if len(code) != 5 or not code.isalnum():
+        return await interaction.followup.send("Code must be 5 letters/digits.", ephemeral=True)
+    if code != room.get("short_code") and ranked_mod.get_open_room_by_code(code):
+        return await interaction.followup.send(f"Code **{code}** already has an open ranked room.", ephemeral=True)
+    print(f"[ranked] change-code {room['id']} {room.get('short_code')}->{code} by={interaction.user.id}")
+    ranked_mod.update_room(room["id"], {"short_code": code})
+    room = ranked_mod.get_room(room["id"])
+    await _post_thread(room, embed=discord.Embed(
+        title="Room code changed", color=0xf59e0b,
+        description=f"New code: **{code}**. Host — join the new room, sealing follows your packets."))
+    if room.get("status") == "lobby":
+        await _set_lobby_embed(room, ranked_mod.lobby_embed(room), 0x7c3aed, buttons=True)
+    await interaction.followup.send(f"**{room['id']}** code is now **{code}**.", ephemeral=True)
+
+
+@ranked_group.command(name="change-host", description="Transfer host to another player (host)")
+@app_commands.describe(rid="Room ID, e.g. R-ABC123", member="New host")
+async def ranked_chhost_cmd(interaction: discord.Interaction, rid: str, member: discord.Member):
+    if not await _defer(interaction):
+        return
+    room = ranked_mod.get_room((rid or "").strip().upper())
+    if not room:
+        return await interaction.followup.send("No such ranked room.", ephemeral=True)
+    if not _host_or_admin(interaction, room):
+        return await interaction.followup.send("Only the host (or an admin) can transfer.", ephemeral=True)
+    if room.get("status") == "ended":
+        return await interaction.followup.send("Session ended — host can't change.", ephemeral=True)
+    ndid = str(member.id)
+    try:
+        row = await db.get_by_discord(ndid)
+    except Exception:
+        row = None
+    if not row:
+        return await interaction.followup.send(f"{member.mention} isn't registered.", ephemeral=True)
+    if ranked_mod.is_banned(ndid):
+        return await interaction.followup.send(f"{member.mention} is banned from ranked.", ephemeral=True)
+    print(f"[ranked] change-host {room['id']} {room.get('host_discord_id')}->{ndid} by={interaction.user.id}")
+    ranked_mod.update_room(room["id"], {"host_discord_id": ndid})
+    room = ranked_mod.get_room(room["id"])
+    ranked_mod.roster_add(room, ndid)
+    room = ranked_mod.get_room(room["id"])
+    await _post_thread(room, content=f"Host transferred to {member.mention} — sealing now follows their packets.")
+    if room.get("status") == "lobby":
+        await _set_lobby_embed(room, ranked_mod.lobby_embed(room), 0x7c3aed, buttons=True)
+    await interaction.followup.send(f"**{room['id']}** host is now {member.mention}.", ephemeral=True)
+
+
+@ranked_group.command(name="roster", description="Show the room roster with points")
+@app_commands.describe(rid="Room ID, e.g. R-ABC123")
+async def ranked_roster_cmd(interaction: discord.Interaction, rid: str):
+    if not await _defer(interaction):
+        return
+    room = ranked_mod.get_room((rid or "").strip().upper())
+    if not room:
+        return await interaction.followup.send("No such ranked room.", ephemeral=True)
+    lines = []
+    pts_map = ranked_mod.get_points_many(ranked_mod.roster_ids(room))
+    for did in ranked_mod.roster_ids(room):
+        pts = pts_map.get(did, 0)
+        tier, _f = ranked_mod.milestone_for(pts)
+        tag = " 👑" if did == str(room.get("host_discord_id")) else ""
+        try:
+            row = await db.get_by_discord(did)
+            nm = (row or {}).get("game_username") or (row or {}).get("discord_username") or did
+        except Exception:
+            nm = did
+        lines.append(f"<@{did}> {nm} — {pts} pts ({tier}){tag}")
+    e = discord.Embed(title=f"Roster {room['id']} ({len(lines)}/{room.get('max_players')})",
+                      color=0x7c3aed, description="\n".join(lines) or "Empty.")
+    e.set_footer(text=f"{room['id']} · {room.get('status')}")
+    await interaction.followup.send(embed=e, ephemeral=True)
+
+
+@ranked_group.command(name="ban", description="Ban a player from ranked (admin)")
+@app_commands.describe(member="Player to ban", reason="Why")
+async def ranked_ban_cmd(interaction: discord.Interaction, member: discord.Member, reason: str = ""):
+    if not await _defer(interaction):
+        return
+    if not (interaction.guild and interaction.user.guild_permissions.administrator):
+        return await interaction.followup.send("Admins only.", ephemeral=True)
+    ok = ranked_mod.ban_player(str(member.id), reason, str(interaction.user.id))
+    print(f"[ranked] ban {member.id} reason={reason!r} by={interaction.user.id} ok={ok}")
+    await interaction.followup.send(f"{member.mention} banned from ranked." if ok else "Ban failed (DB error).", ephemeral=True)
+
+
+@ranked_group.command(name="unban", description="Unban a player from ranked (admin)")
+@app_commands.describe(member="Player to unban")
+async def ranked_unban_cmd(interaction: discord.Interaction, member: discord.Member):
+    if not await _defer(interaction):
+        return
+    if not (interaction.guild and interaction.user.guild_permissions.administrator):
+        return await interaction.followup.send("Admins only.", ephemeral=True)
+    ok = ranked_mod.unban_player(str(member.id))
+    print(f"[ranked] unban {member.id} by={interaction.user.id} ok={ok}")
+    await interaction.followup.send(f"{member.mention} unbanned." if ok else "Unban failed (DB error).", ephemeral=True)
+
+
+@ranked_group.command(name="review", description="Review a ranked room: status, seals, results")
+@app_commands.describe(rid="Room ID, e.g. R-ABC123")
+async def ranked_review_cmd(interaction: discord.Interaction, rid: str):
+    if not await _defer(interaction):
+        return
+    room = ranked_mod.get_room((rid or "").strip().upper())
+    if not room:
+        return await interaction.followup.send("No such ranked room.", ephemeral=True)
+    sealed = ranked_mod.sealed_count(room["id"])
+    lines = [f"Status **{room.get('status')}** · code **{room.get('short_code')}** · {ranked_mod.gm_name(room.get('gm'))}",
+             f"Host <@{room.get('host_discord_id')}> · {len(ranked_mod.roster_ids(room))}/{room.get('max_players')} players",
+             f"Sealed **{sealed}/{room.get('max_matches')}** · fee {room.get('fee') or 0} · lock {room.get('min_points') or 0}"]
+    try:
+        r = ranked_mod._sb().table("ranked_results").select(
+            "match_version,winner_discord_id,kills,points").eq("room_id", room["id"]).order("match_version").limit(50).execute()
+        for row in (r.data or []):
+            try:
+                wrow = await db.get_by_discord(str(row.get("winner_discord_id") or ""))
+                wnm = (wrow or {}).get("game_username") or row.get("winner_discord_id") or "—"
+            except Exception:
+                wnm = row.get("winner_discord_id") or "—"
+            pts = row.get("points") or {}
+            tot = sum(int(v or 0) for v in pts.values()) if isinstance(pts, dict) else 0
+            lines.append(f"v{row.get('match_version')}: winner **{wnm}** · {tot} pts awarded")
+    except Exception as e:
+        lines.append(f"(results lookup failed: {e})")
+    e = discord.Embed(title=f"Review {room['id']}", color=0x7c3aed, description="\n".join(lines))
+    await interaction.followup.send(embed=e, ephemeral=True)
 
 
 async def ranked_loop():
@@ -1465,6 +1808,7 @@ async def ranked_loop():
                     print(f"[ranked] countdown start {room.get('id')}: {msg}")
                 except Exception as e:
                     print(f"[ranked] countdown failed for {room.get('id')}: {e}")
+                await asyncio.sleep(2)  # let interactions interleave between rooms
         except Exception as e:
             print(f"[ranked] loop failed: {e}")
         await asyncio.sleep(30)

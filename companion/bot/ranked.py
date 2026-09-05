@@ -14,10 +14,27 @@ MATCHES_CHANNEL_ID = 1545584792978981006  # channel where private session thread
 
 ALLOWED_GMS = ("zw_lg", "df", "wwzw")
 
+# Human-readable mode names for embeds (never show raw ids like ZW_LG).
+GM_NAMES = {
+    "zw_lg": "Late Game Zonewars",
+    "df": "Free Mode",
+    "wwzw": "Wild West Zonewars",
+}
+
+
+def gm_name(gm: str) -> str:
+    try:
+        return GM_NAMES.get(str(gm or "").lower(), str(gm or "").upper())
+    except Exception:
+        return "Unknown"
+
 # Milestone entry fees: at/above each tier you burn the fee on every start.
-# (Bronze <200 pays nothing.) Tune freely — (threshold, name, fee).
-MILESTONE_FEES = [(2000, "Masters", 100), (1000, "Diamond", 50),
-                  (500, "Gold", 25), (200, "Silver", 10)]
+# (Unranked <200 pays nothing.) Tune freely — (threshold, name, fee).
+MILESTONE_FEES = [(7500, "Grandmaster", 300), (5000, "Master", 250),
+                  (4000, "Champion", 200), (3000, "Emerald", 150),
+                  (2000, "Diamond", 100), (1500, "Platinum", 75),
+                  (1000, "Gold", 50), (500, "Silver", 25),
+                  (200, "Bronze", 10)]
 
 
 def milestone_for(points: int):
@@ -28,7 +45,7 @@ def milestone_for(points: int):
     for threshold, name, fee in MILESTONE_FEES:
         if p >= threshold:
             return name, fee
-    return "Bronze", 0
+    return "Unranked", 0
 
 
 def entry_fee(room: dict, player_points: int) -> int:
@@ -77,7 +94,7 @@ def get_open_room_by_code(code: str):
 
 def create_room(*, code, host_discord_id, gm, max_players, max_matches,
                 min_points=0, max_points=None, fee=0, starts_at=None,
-                lobby_channel_id=None, lobby_message_id=None):
+                lobby_channel_id=None, lobby_message_id=None, host_only=False):
     for _ in range(5):
         rid = new_rid()
         if get_room(rid) is None:
@@ -96,7 +113,8 @@ def create_room(*, code, host_discord_id, gm, max_players, max_matches,
         "fee": fee or 0,
         "starts_at": starts_at,
         "status": "lobby",
-        "roster": [{"discord_id": str(host_discord_id), "joined_at": _now()}],
+        "host_only": bool(host_only),
+        "roster": [] if host_only else [{"discord_id": str(host_discord_id), "joined_at": _now()}],
         "lobby_channel_id": str(lobby_channel_id) if lobby_channel_id else None,
         "lobby_message_id": str(lobby_message_id) if lobby_message_id else None,
         "thread_id": None,
@@ -141,6 +159,18 @@ def is_banned(discord_id: str) -> bool:
         return False
 
 
+def banned_many(discord_ids) -> set:
+    """Banned subset of the given ids (single query). Empty set on error."""
+    try:
+        ids = [str(x) for x in (discord_ids or []) if x]
+        if not ids:
+            return set()
+        r = _sb().table("ranked_bans").select("discord_id").in_("discord_id", ids[:64]).execute()
+        return {str(x.get("discord_id")) for x in (r.data or []) if x.get("discord_id")}
+    except Exception:
+        return set()
+
+
 def list_due_starts():
     """Lobby rooms whose countdown passed (for the scheduler loop)."""
     try:
@@ -161,6 +191,28 @@ def get_points(discord_id: str) -> int:
     return 0
 
 
+def get_points_many(discord_ids) -> dict:
+    """Points for many players in one query (keeps the event loop alive during
+    starts — per-player reads starve interactions past the 3s defer window).
+    Missing ids default to 0. Never raises."""
+    try:
+        ids = [str(x) for x in (discord_ids or []) if x]
+        if not ids:
+            return {}
+        r = _sb().table("ranked_points").select("discord_id,points").in_("discord_id", ids[:64]).execute()
+        out = {}
+        for x in (r.data or []):
+            try:
+                out[str(x.get("discord_id"))] = int(x.get("points") or 0)
+            except Exception:
+                continue
+        for i in ids:
+            out.setdefault(i, 0)
+        return out
+    except Exception:
+        return {str(x): 0 for x in (discord_ids or []) if x}
+
+
 def add_points(discord_id: str, delta: int):
     cur = get_points(discord_id)
     _sb().table("ranked_points").upsert({
@@ -171,15 +223,34 @@ def add_points(discord_id: str, delta: int):
     return cur + int(delta)
 
 
+def sealed_count(rid: str) -> int:
+    """How many matches sealed for this room. 0 on error."""
+    try:
+        r = _sb().table("ranked_results").select("match_version").eq("room_id", rid).execute()
+        return len(r.data or [])
+    except Exception:
+        return 0
+
+
+def top_points(limit: int = 10):
+    """Top arena-point holders: [(discord_id, points)]. Empty on error."""
+    try:
+        r = _sb().table("ranked_points").select("discord_id,points").order("points", desc=True).limit(limit).execute()
+        return [(str(x.get("discord_id")), int(x.get("points") or 0)) for x in (r.data or []) if x.get("discord_id")]
+    except Exception:
+        return []
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
 def lobby_embed(room: dict) -> dict:
     """Spec for the lobby embed (bot.py renders it): title, fields, footer."""
-    lock = ""
+    lock = "Open"
     if (room.get("min_points") or 0) > 0:
-        lock = f"🔒 {room['min_points']}+ points"
+        tier, _fee = milestone_for(room.get("min_points") or 0)
+        lock = f"🔒 {tier} ({room['min_points']}+ points)"
         if room.get("max_points"):
             lock += f" (max {room['max_points']})"
     starts = "Manual start"
@@ -189,13 +260,17 @@ def lobby_embed(room: dict) -> dict:
             starts = f"<t:{ts}:R>"
         except Exception:
             starts = str(room.get("starts_at"))
+    host_line = f"<@{room.get('host_discord_id')}>"
+    if str(room.get("host_only") or "").lower() in ("1", "true", "yes"):
+        host_line += " (hosting only)"
     return {
-        "title": f"Ranked Lobby {room['id']} — {room.get('gm', '').upper()}",
+        "title": f"Ranked Lobby {room['id']} — {gm_name(room.get('gm'))}",
         "fields": [
+            ("Host", host_line, True),
             ("Status", "Lobby — code hidden until start", True),
             ("Players", f"{len(roster_ids(room))}/{room.get('max_players')}", True),
             ("Matches", str(room.get("max_matches")), True),
-            ("Lock", lock or "Open", True),
+            ("Lock", lock, True),
             ("Join fee", str(room.get("fee") or 0), True),
             ("Starts", starts, True),
         ],
@@ -203,14 +278,53 @@ def lobby_embed(room: dict) -> dict:
     }
 
 
-def live_embed(room: dict, thread_id=None) -> dict:
+def live_embed(room: dict, thread_id=None, host_status: str = "") -> dict:
     """Spec for the flipped-live lobby embed."""
+    host_line = f"<@{room.get('host_discord_id')}>"
+    if host_status:
+        host_line += f" ({host_status})"
     return {
-        "title": f"Ranked LIVE {room['id']} — {room.get('gm', '').upper()}",
+        "title": f"Ranked LIVE {room['id']} — {gm_name(room.get('gm'))}",
         "fields": [
+            ("Host", host_line, True),
             ("Status", "Live — code sent to roster DMs", True),
             ("Players", f"{len(roster_ids(room))}/{room.get('max_players')}", True),
-            ("Matches", f"0/{room.get('max_matches')}", True),
+            ("Matches", f"{sealed_count(room['id'])}/{room.get('max_matches')}", True),
         ],
         "footer": f"{room['id']} · thread: {thread_id or '—'}",
     }
+
+
+def ended_embed(room: dict, thread_id=None) -> dict:
+    """Spec for the ended lobby embed."""
+    return {
+        "title": f"Ranked ENDED {room['id']} — {gm_name(room.get('gm'))}",
+        "fields": [
+            ("Host", f"<@{room.get('host_discord_id')}>", True),
+            ("Status", "Ended", True),
+            ("Players", f"{len(roster_ids(room))}/{room.get('max_players')}", True),
+            ("Matches", f"{sealed_count(room['id'])}/{room.get('max_matches')}", True),
+        ],
+        "footer": f"{room['id']} · session over · thread: {thread_id or room.get('thread_id') or '—'}",
+    }
+
+
+def ban_player(discord_id: str, reason: str = "", banned_by: str = "") -> bool:
+    try:
+        _sb().table("ranked_bans").upsert({
+            "discord_id": str(discord_id),
+            "reason": reason or "",
+            "banned_by": str(banned_by or ""),
+            "created_at": _now(),
+        }, on_conflict="discord_id").execute()
+        return True
+    except Exception:
+        return False
+
+
+def unban_player(discord_id: str) -> bool:
+    try:
+        _sb().table("ranked_bans").delete().eq("discord_id", str(discord_id)).execute()
+        return True
+    except Exception:
+        return False

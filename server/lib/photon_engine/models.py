@@ -357,6 +357,8 @@ class RoomView:
     stg_is_phase_end: bool = False                 # True only when stG=3 arrived as phase end (from below), never timer ticks
     winner: str | None = None                        # last match winner (username or team_id)
     created_at: str | None = None
+    ranked_warnings: list = field(default_factory=list)  # non-roster usernames seen in a ranked room (exposed via /api/stats)
+    last_packet_at: float | None = None              # engine feed timestamp (host freshness for ranked sealing)
     # zone bookend for zone modes (zw_lg/wwzw): first zone = start, second zone = win/defeat evaluation
     zone_match_active: bool = False
     last_zone_hex: str | None = None
@@ -428,6 +430,8 @@ class RoomView:
             "last_stg": self.last_stg,
             "winner": self.winner,
             "created_at": self.created_at,
+            "ranked_warnings": list(self.ranked_warnings or []),
+            "last_packet_at": self.last_packet_at,
         }
 
     @classmethod
@@ -521,6 +525,15 @@ class RoomView:
                     pass
             r.winner = d.get("winner")
             r.created_at = d.get("created_at")
+            try:
+                rw = d.get("ranked_warnings") or []
+                r.ranked_warnings = [str(x) for x in rw][:32]
+            except Exception:
+                pass
+            try:
+                r.last_packet_at = float(d["last_packet_at"]) if d.get("last_packet_at") is not None else None
+            except Exception:
+                pass
             return r
         except Exception:
             return None

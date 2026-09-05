@@ -556,6 +556,193 @@ def _sync_playtime(view, user, discord_id):
 
 
 # ---------------------------------------------------------------------------
+# Ranked sealing (host authority) — Phase 2
+# ---------------------------------------------------------------------------
+
+_HOST_FRESH_S = 60  # host packets older than this pause sealing (crash-safe)
+
+
+def _resolve_ranked_dids(usernames) -> dict:
+    """Map game usernames -> discord_ids via bngc_users (single batched query).
+
+    Unmapped names are absent from the result (fail-open: they become
+    non-roster warnings, never fake points). Never raises.
+    """
+    try:
+        names = sorted({str(n).strip() for n in (usernames or []) if str(n or "").strip()})
+    except Exception:
+        return {}
+    if not names:
+        return {}
+    try:
+        res = supabase.table("bngc_users").select("discord_id,game_username").in_("game_username", names[:64]).execute()
+        out = {}
+        for row in (res.data or []):
+            try:
+                if row.get("game_username") and row.get("discord_id"):
+                    out[str(row["game_username"])] = str(row["discord_id"])
+            except Exception:
+                continue
+        return out
+    except Exception as exc:
+        log_err(f"processor ranked did-resolve failed {exc}")
+        return {}
+
+
+def seal_ranked_match(session_id, discord_id, room, room_id, gm) -> None:
+    """Seal one ranked match from the host session. Never raises.
+
+    Gates (all must hold): room is a live ranked room, this session is the
+    host, host packets are fresh, and (rid, match_version) isn't sealed yet.
+    Harvests roster kills from recent_kills, derives placements (alive = 1st,
+    killfeed-reverse order for the dead, unknown = 99 baseline), flags
+    non-roster players on room.ranked_warnings, awards ELO via
+    ranked.seal_match, and flips the room to ended at max_matches.
+    Non-host sessions return silently (personal win/defeat already ran).
+    """
+    try:
+        import time as _t
+        from server.lib import ranked as ranked_mod
+    except Exception as exc:
+        log_err(f"processor ranked import failed {exc}")
+        return
+    try:
+        code = getattr(room, "short_code", None)
+        if not code:
+            return
+        room_data = ranked_mod.get_ranked_room(code)
+        if not room_data or room_data.get("status") != "live":
+            return  # not a live ranked room
+        if str(discord_id or "") != str(room_data.get("host_discord_id") or ""):
+            return  # not the host — personal stats only
+        try:
+            last_pkt = float(getattr(room, "last_packet_at", 0) or 0)
+        except Exception:
+            last_pkt = 0
+        if last_pkt and (_t.time() - last_pkt) > _HOST_FRESH_S:
+            log_err(f"[ranked] host stale in {room_data.get('id')} — seal paused (crash-safe)")
+            return
+        rid = str(room_data.get("id"))
+        try:
+            mver = int(getattr(room, "match_version", 0) or 0)
+        except Exception:
+            mver = 0
+        if not rid or mver <= 0:
+            return
+        # idempotency: additive bumps must never double-fire (restore/retry safe)
+        try:
+            chk = supabase.table("ranked_results").select("room_id").eq("room_id", rid).eq("match_version", mver).limit(1).execute()
+            if chk.data:
+                return  # already sealed
+        except Exception as exc:
+            log_err(f"[ranked] seal check failed {rid} v{mver}: {exc}")
+            return  # fail-closed: a blip must not double-award
+        roster = set(ranked_mod.room_roster_ids(room_data))
+        if not roster:
+            return
+        # username -> did for everyone in the room (one batched query)
+        try:
+            room_names = [p.username for p in (getattr(room, "players", None) or {}).values() if getattr(p, "username", None)]
+        except Exception:
+            room_names = []
+        try:
+            feed_names = [k.instigator for k in (getattr(room, "recent_kills", None) or []) if getattr(k, "instigator", None)]
+            feed_names += [k.instigated for k in (getattr(room, "recent_kills", None) or []) if getattr(k, "instigated", None)]
+        except Exception:
+            pass
+        name2did = _resolve_ranked_dids(room_names + feed_names)
+        # non-roster: in-room players whose did is unknown or off-roster
+        warnings = []
+        try:
+            for p in (getattr(room, "players", None) or {}).values():
+                uname = getattr(p, "username", None)
+                if not uname:
+                    continue
+                if name2did.get(str(uname)) not in roster:
+                    if str(uname) not in warnings:
+                        warnings.append(str(uname))
+        except Exception:
+            pass
+        try:
+            room.ranked_warnings = warnings[:32]
+        except Exception:
+            pass
+        # placements: alive roster = 1st; dead ordered by killfeed-reverse
+        # (last victim = 2nd); dead with no killfeed entry = 99 (baseline mult)
+        placements: dict = {}
+        alive_dids = []
+        try:
+            for p in (getattr(room, "players", None) or {}).values():
+                if getattr(p, "is_alive", False):
+                    did = name2did.get(str(getattr(p, "username", "")))
+                    if did and did in roster and did not in alive_dids:
+                        alive_dids.append(did)
+        except Exception:
+            pass
+        for did in alive_dids:
+            placements[did] = 1
+        try:
+            dead_order: list = []  # victim dids, most-recent death first
+            for k in reversed(getattr(room, "recent_kills", None) or []):
+                try:
+                    if getattr(k, "event_type", None) != "killed":
+                        continue
+                    vdid = name2did.get(str(getattr(k, "instigated", "")))
+                    if vdid and vdid in roster and vdid not in placements and vdid not in dead_order:
+                        dead_order.append(vdid)
+                except Exception:
+                    continue
+            place = 2
+            for vdid in dead_order:
+                placements[vdid] = place
+                place += 1
+        except Exception:
+            pass
+        # exact per-kill events (roster killer + mapped victim; victim may be
+        # non-roster — their points still scale the reward, they earn nothing)
+        kill_events: list = []
+        kills_count: dict = {}
+        try:
+            for k in (getattr(room, "recent_kills", None) or []):
+                try:
+                    if getattr(k, "event_type", None) != "killed":
+                        continue
+                    kdid = name2did.get(str(getattr(k, "instigator", "")))
+                    if not kdid or kdid not in roster:
+                        continue
+                    vdid = name2did.get(str(getattr(k, "instigated", "")))
+                    kill_events.append((kdid, vdid or kdid))
+                    kills_count[kdid] = kills_count.get(kdid, 0) + 1
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        winner = alive_dids[0] if alive_dids else None
+        res = ranked_mod.seal_match(rid=rid, match_version=mver, gm=gm or room_data.get("gm") or "zw_lg",
+                                    winner_discord_id=winner, kills=kills_count,
+                                    placements=placements, kill_events=kill_events or None)
+        if not res.get("ok"):
+            log_err(f"[ranked] seal failed {rid} v{mver}: {res.get('error')}")
+            return
+        log_sys(f"[ranked] sealed {rid} v{mver} winner={winner} points={res.get('points')}")
+        # room end: sealed count hit max_matches -> ended (bot finalizes embed)
+        try:
+            mx = int(room_data.get("max_matches") or 0)
+        except Exception:
+            mx = 0
+        if mx > 0:
+            try:
+                cnt = supabase.table("ranked_results").select("match_version").eq("room_id", rid).execute()
+                if len(cnt.data or []) >= mx:
+                    supabase.table("ranked_rooms").update({"status": "ended"}).eq("id", rid).execute()
+                    log_sys(f"[ranked] room {rid} ended ({mx} matches sealed)")
+            except Exception as exc:
+                log_err(f"[ranked] end check failed {rid}: {exc}")
+    except Exception as exc:
+        log_err(f"[ranked] seal_ranked_match failed {exc}")
+
+
+# ---------------------------------------------------------------------------
 # Main processor — called by POST /api/capture via BackgroundTasks
 # ---------------------------------------------------------------------------
 
@@ -1062,6 +1249,7 @@ async def process_batch(
                             if my_team:
                                 winner = my_team.team_id
                         _write_win(discord_id, session_id, user, gm, room_id, room.short_code, room.match_version, winner, room)
+                        seal_ranked_match(session_id, discord_id, room, room_id, gm)  # host only; no-op otherwise
                         room.stg_is_phase_end = False  # consume arm (version bump re-arms)
 
                     # Note: defeat is handled by alv/kill/leave logic below
@@ -1178,6 +1366,8 @@ async def process_batch(
             if room2.last_defeat_version == room2.match_version and room2.last_defeat_version != -1:
                 if room2.had_self_defeat:
                     log_sys(f"PROCESSOR DEFEAT skip already recorded this life gm={gm2}")
+                    if room2.stg_is_phase_end:  # phase-end skip (not a mid-match live drain) -> seal ranked
+                        seal_ranked_match(session_id, discord_id, room2, room_id2, gm2)
                     room2.last_defeat_version = -1  # Discard stale marker
                     room2.stg_is_phase_end = False  # resolved — arm must not outlive the guard
                 elif room2.last_win_version == room2.match_version:
@@ -1187,6 +1377,8 @@ async def process_batch(
                     pass  # hold marker silently — teammate still alive, re-evaluated next batch
                 elif _defeat_recorded(session_id, room_id2, room2.match_version):
                     log_sys(f"PROCESSOR DEFEAT skip already recorded gm={gm2} room={room_id2[:8]} ver={room2.match_version}")
+                    if room2.stg_is_phase_end:  # phase-end heal (not a mid-match live drain) -> seal ranked
+                        seal_ranked_match(session_id, discord_id, room2, room_id2, gm2)
                     room2.had_self_defeat = True  # heal marker so it isn't retried
                     room2.last_defeat_version = -1  # Discard stale marker
                     room2.stg_is_phase_end = False
@@ -1203,6 +1395,8 @@ async def process_batch(
                     log_engine("defeat", session_id[:8], gm=gm2, duo=room2.is_duo, room=room_id2[:8])
                     log_sys(f"PROCESSOR DEFEAT gm={gm2} defeats {user.get('defeats',0)}->{new_def}")
                     user["defeats"] = new_def
+                    if room2.stg_is_phase_end:  # phase-end write (not a mid-match live drain) -> seal ranked
+                        seal_ranked_match(session_id, discord_id, room2, room_id2, gm2)
                     room2.had_self_defeat = True  # One defeat per life
                     room2.last_defeat_version = -1  # Drain (prevent re-processing)
                     room2.stg_is_phase_end = False  # consume phase-end arm for this version
