@@ -675,12 +675,18 @@ async def ranked_by_code(code: str, request: Request):
         except Exception:
             room = None
         if room is None:
+            try: log_sys(f"[ranked] by-code did={did[:6]} code={code} -> not-ranked")
+            except: pass
             return JSONResponse({"room": None, "on_roster": False, "is_host": False})
         ids = _roster_ids(room)
+        on_roster = did in ids if did else False
+        is_host = bool(did) and did == str(room.get("host_discord_id"))
+        try: log_sys(f"[ranked] by-code did={did[:6]} code={code} -> {room.get('status')} rid={room.get('id')} roster={on_roster} host={is_host}")
+        except: pass
         return JSONResponse({
             "room": _room_lite(room),
-            "on_roster": did in ids if did else False,
-            "is_host": bool(did) and did == str(room.get("host_discord_id")),
+            "on_roster": on_roster,
+            "is_host": is_host,
         })
     except Exception as exc:
         return _err(str(exc), 500)
@@ -713,7 +719,11 @@ async def ranked_mine(request: Request):
         except Exception:
             found = None
         if found is None:
+            try: log_sys(f"[ranked] mine did={did[:6]} -> not-in-session")
+            except: pass
             return JSONResponse({"room": None, "on_roster": False, "is_host": False})
+        try: log_sys(f"[ranked] mine did={did[:6]} -> {found.get('status')} rid={found.get('id')} code={found.get('short_code')}")
+        except: pass
         return JSONResponse({
             "room": _room_lite(found),
             "on_roster": True,

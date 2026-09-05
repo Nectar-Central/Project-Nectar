@@ -347,8 +347,9 @@ async def get_stats(request: Request):
             log_sys(f"[ranked] stats did={str(discord_id)[:6]} code={_rk_code} "
                     f"state={_rk_state} -> BLOCK rid={ranked_out.get('rid')} "
                     f"status={ranked_out.get('status')} host={ranked_out.get('is_host')} "
-                    f"v={ranked_out.get('match_version')}")
-        elif _rk_code:
+                    f"v={ranked_out.get('match_version')} pts={ranked_out.get('points')} "
+                    f"tier={ranked_out.get('milestone')}")
+        else:
             log_sys(f"[ranked] stats did={str(discord_id)[:6]} code={_rk_code} "
                     f"state={_rk_state} -> none")
     except Exception:
@@ -375,6 +376,15 @@ async def get_stats(request: Request):
         }
     except Exception:
         arena = None
+    try:
+        log_sys(f"[stats] did={str(discord_id)[:6]} arena={bool(arena)} "
+                f"pts={arena['points'] if arena else '-'} "
+                f"tier={arena['milestone'] if arena else '-'} "
+                f"session={session_out.get('state') if session_out else 'none'} "
+                f"session_code={session_out.get('short_code') if session_out else '-'} "
+                f"ranked={bool(ranked_out)}")
+    except Exception:
+        pass
 
     return JSONResponse({
         "discord_id": user.get("discord_id"),

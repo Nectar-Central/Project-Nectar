@@ -982,12 +982,13 @@
     let did=''; try{ did=String(discordId||''); }catch{}
     if(!did) return;
     rankedApiGet('/api/ranked/by-code/'+encodeURIComponent(code)+'?discord_id='+encodeURIComponent(did), (j)=>{
+      try{
+        const s=(j&&j.room)?`${j.room.status} rid=${j.room.id} code=${j.room.short_code} roster=${j.on_roster} host=${j.is_host}`:(j?'not-ranked':'error');
+        logInfo(`[RANKED] by-code ${code} -> ${s}`);
+        if(j && j.room) logInfo(`[RANKED] by-code room_json: ${JSON.stringify({id:j.room.id,short_code:j.room.short_code,status:j.room.status,gm:j.room.gm,host_discord_id:(j.room.host_discord_id||'').slice(0,8)+'...'})}`);
+      }catch{}
       if(j) rankedNet={code, state:{room:j.room||null, on_roster:!!j.on_roster, is_host:!!j.is_host, error:false}, at:Date.now(), mineAt:rankedNet.mineAt};
       else rankedNet={code, state:{error:true}, at:Date.now(), mineAt:rankedNet.mineAt};
-      try{
-        const s=rankedNet.state;
-        logInfo(`[RANKED] by-code ${code} -> ${s.error?'ERROR':(s.room?`${s.room.status}${s.on_roster?'/roster':''}${s.is_host?'/host':''}`:'not-ranked')}`);
-      }catch{}
       try{ renderInfoPanel(); }catch{}
     });
   }
@@ -998,15 +999,18 @@
     let did=''; try{ did=String(discordId||''); }catch{}
     if(!did) return;
     rankedApiGet('/api/ranked/mine?discord_id='+encodeURIComponent(did), (j)=>{
-      if(!j){ try{ logInfo('[RANKED] mine -> ERROR'); }catch{} return; }
+      if(!j){ try{ logInfo('[RANKED] mine -> ERROR (null response)'); }catch{} return; }
+      try{
+        const s=(j.room)?`${j.room.status} rid=${j.room.id} code=${j.room.short_code} roster=${j.on_roster} host=${j.is_host}`:'not-in-session';
+        logInfo(`[RANKED] mine -> ${s}`);
+        if(j.room) logInfo(`[RANKED] mine room_json: ${JSON.stringify({id:j.room.id,short_code:j.room.short_code,status:j.room.status,gm:j.room.gm,host_discord_id:(j.room.host_discord_id||'').slice(0,8)+'...'})}`);
+      }catch{}
       try{
         if(j.room && j.room.short_code){
           const c=String(j.room.short_code).toUpperCase();
           rankedNet={code:c, state:{room:j.room, on_roster:!!j.on_roster, is_host:!!j.is_host, error:false}, at:now, mineAt:now};
-          logInfo(`[RANKED] mine -> ${j.room.id} ${j.room.status}${j.on_roster?'/roster':''}${j.is_host?'/host':''}`);
         } else {
           rankedNet={code:null, state:{room:null, on_roster:false, is_host:false, error:false}, at:now, mineAt:now};
-          logInfo('[RANKED] mine -> not-in-session');
         }
       }catch{}
       try{ renderInfoPanel(); }catch{}
