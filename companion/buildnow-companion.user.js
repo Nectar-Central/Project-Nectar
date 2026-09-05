@@ -973,8 +973,35 @@
     }catch{}
     return null;
   }
-  function checkRankedRoom(code, force){
-    code=String(code||'').trim().toUpperCase();
+  // Ranked mode OFF: purge tracking + stale session block, hide every ranked
+  // surface, close the panel. Silent except the log (leaves happen often).
+  function disableRanked(reason){
+    try{
+      const had=!!(rankedNet.code || rankedNet.state || (statsCache&&statsCache.ranked));
+      rankedNet={code:null, state:null, at:Date.now(), mineAt:rankedNet.mineAt};
+      if(statsCache) statsCache.ranked=null;
+      _lastLiveRankedSig='?'; _lastLobbySig='?'; _lastOvSig='?';
+      try{ const el=document.getElementById('bnc-ranked-start'); if(el) el.remove(); }catch{}
+      try{ _rankedStartTimer=null; }catch{}
+      try{ if(typeof rankedPanel!=='undefined' && rankedPanel && rankedPanel.style.display!=='none') toggleRankedPanel(false); }catch{}
+      try{ renderInfoPanel(); }catch{}
+      if(had) logInfo(`[RANKED] mode OFF (${reason})`);
+    }catch{}
+  }
+  // Stats-level safety net: server session moved on (different code / gone)
+  // with no ranked block and no FRESH endpoint verdict -> ranked is over.
+  // Skips while the endpoint recently spoke (it outranks slower stats).
+  function _reconcileRankedSession(sess){
+    try{
+      if(!rankedNet.code && !(statsCache&&statsCache.ranked)) return;
+      if(rankedNet.state && !rankedNet.state.error && (Date.now()-rankedNet.at<45000)) return;
+      if(statsCache && statsCache.ranked && statsCache.ranked.active) return;
+      const code=sess && sess.short_code ? String(sess.short_code).toUpperCase() : null;
+      if(code && rankedNet.code && code===rankedNet.code) return; // same room, verdict pending
+      disableRanked(!code ? 'session-gone' : 'session-changed');
+    }catch{}
+  }
+  function checkRankedRoom(code, force){    code=String(code||'').trim().toUpperCase();
     if(!code || code.length!==5) return;
     const now=Date.now();
     if(!force && rankedNet.code===code && rankedNet.state && now-rankedNet.at<30000) return;
@@ -989,6 +1016,12 @@
       }catch{}
       if(j) rankedNet={code, state:{room:j.room||null, on_roster:!!j.on_roster, is_host:!!j.is_host, error:false}, at:Date.now(), mineAt:rankedNet.mineAt};
       else rankedNet={code, state:{error:true}, at:Date.now(), mineAt:rankedNet.mineAt};
+      // Positive verdict but no session block yet -> pull stats now so ranked
+      // UI enables in seconds instead of waiting for the next poll.
+      if(j && j.room && (j.room.status==='lobby'||j.room.status==='live') && !(statsCache&&statsCache.ranked&&statsCache.ranked.active)){
+        try{ logInfo(`[RANKED] session ${code} confirmed -> refreshing stats`); }catch{}
+        try{ fetchStats(false); }catch{}
+      }
       try{ renderInfoPanel(); }catch{}
     });
   }
@@ -1009,6 +1042,10 @@
         if(j.room && j.room.short_code){
           const c=String(j.room.short_code).toUpperCase();
           rankedNet={code:c, state:{room:j.room, on_roster:!!j.on_roster, is_host:!!j.is_host, error:false}, at:now, mineAt:now};
+          if((j.room.status==='lobby'||j.room.status==='live') && !(statsCache&&statsCache.ranked&&statsCache.ranked.active)){
+            try{ logInfo(`[RANKED] session ${c} confirmed -> refreshing stats`); }catch{}
+            try{ fetchStats(false); }catch{}
+          }
         } else {
           rankedNet={code:null, state:{room:null, on_roster:false, is_host:false, error:false}, at:now, mineAt:now};
         }
@@ -1815,13 +1852,13 @@
       if(useGM && GM){
         try{
           GM({method:'GET', url, headers:{'Content-Type':'application/json'}, timeout:8000,
-            onload: r=>{ if(r.status>=200&&r.status<300){ try{ const j=JSON.parse(r.responseText); statsCache=j; logInfo(`[AUDIO] stats fetched lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } try{ _reconcileServerState(j.session); }catch{} renderInfoPanel(); try{ const _pi=getPartyInfo(j.session); const _inMatch=j.session&&String(j.session.state||'').toLowerCase()==='match'; if((_pi.isParty&&_pi.code)||_inMatch) fetchPlayers(false); }catch{} }catch(e){ logErr(`[AUDIO] stats parse err ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ const d=document.getElementById('bnc-drawer-dot'); const t=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background=apiOnline?'#10b981':'#6b7280'; if(t) t.textContent=apiOnline?'Online':'Offline'; }catch{} },
+            onload: r=>{ if(r.status>=200&&r.status<300){ try{ const j=JSON.parse(r.responseText); statsCache=j; logInfo(`[AUDIO] stats fetched lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } try{ _reconcileServerState(j.session); }catch{} try{ _reconcileRankedSession(j.session); }catch{} renderInfoPanel(); try{ const _pi=getPartyInfo(j.session); const _inMatch=j.session&&String(j.session.state||'').toLowerCase()==='match'; if((_pi.isParty&&_pi.code)||_inMatch) fetchPlayers(false); }catch{} }catch(e){ logErr(`[AUDIO] stats parse err ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ const d=document.getElementById('bnc-drawer-dot'); const t=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background=apiOnline?'#10b981':'#6b7280'; if(t) t.textContent=apiOnline?'Online':'Offline'; }catch{} },
             onerror: ()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const t=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(t) t.textContent='Offline'; }catch{} },
             ontimeout: ()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const t=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(t) t.textContent='Offline'; }catch{} }});
           return;
         }catch{}
       }
-      fetch(url, {method:'GET'}).then(r=>r.text().then(t=>{ if(r.ok){ try{ const j=JSON.parse(t); statsCache=j; logInfo(`[AUDIO] stats fetched (fetch) lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats-fetch', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} try{ _reconcileServerState(j.session); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } renderInfoPanel(); try{ const _pi2=getPartyInfo(j.session); const _inMatch2=j.session&&String(j.session.state||'').toLowerCase()==='match'; if((_pi2.isParty&&_pi2.code)||_inMatch2) fetchPlayers(false); }catch{} }catch(e){ logErr(`[AUDIO] stats parse err (fetch) ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background=apiOnline?'#10b981':'#6b7280'; if(tt) tt.textContent=apiOnline?'Online':'Offline'; }catch{} }).catch(()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(tt) tt.textContent='Offline'; }catch{} })).catch(()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(tt) tt.textContent='Offline'; }catch{} });
+      fetch(url, {method:'GET'}).then(r=>r.text().then(t=>{ if(r.ok){ try{ const j=JSON.parse(t); statsCache=j; logInfo(`[AUDIO] stats fetched (fetch) lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats-fetch', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} try{ _reconcileServerState(j.session); }catch{} try{ _reconcileRankedSession(j.session); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } renderInfoPanel(); try{ const _pi2=getPartyInfo(j.session); const _inMatch2=j.session&&String(j.session.state||'').toLowerCase()==='match'; if((_pi2.isParty&&_pi2.code)||_inMatch2) fetchPlayers(false); }catch{} }catch(e){ logErr(`[AUDIO] stats parse err (fetch) ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background=apiOnline?'#10b981':'#6b7280'; if(tt) tt.textContent=apiOnline?'Online':'Offline'; }catch{} }).catch(()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(tt) tt.textContent='Offline'; }catch{} })).catch(()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ const d=document.getElementById('bnc-drawer-dot'); const tt=document.getElementById('bnc-drawer-api-text'); if(d) d.style.background='#6b7280'; if(tt) tt.textContent='Offline'; }catch{} });
     };
     doFetch(true);
   }
@@ -1902,8 +1939,8 @@
 
   // --- RANKED LOBBY CARD: lobby-only medium card, center-left ---
   // Nectar Ranked Season X / icon / points (milestone) / footer points-to-next.
-  // Session-independent (reads the arena block) — visible whenever the player
-  // isn't mid-match. Pointer-transparent, game frame only.
+  // Ranked-session ONLY (liveRanked gate) — never in casual lobbies or matches.
+  // Pointer-transparent, game frame only.
   let rankedLobbyCard=null, _lastLobbySig='?';
   function ensureRankedLobby(){
     if(!IS_GAME_FRAME) return null;
@@ -2126,6 +2163,9 @@
     createRankedPanel();
     const isHidden=rankedPanel.style.display==='none' || !rankedPanel.style.display;
     const show=typeof force==='boolean' ? force : isHidden;
+    // Panel is ranked-session only: blocked outside one, and locked mid-match
+    // inside one (leaderboard/milestones would be a live aid).
+    if(show && !liveRanked()){ showToast('Ranked panel is only available during a ranked session', true); try{ logInfo('[RANKED] panel blocked - not in ranked session'); }catch{} return; }
     if(show && rankedLocked()){ showToast('Ranked panel is locked during a ranked match', true); return; }
     try{ clearTimeout(_rankedFadeT); }catch{}
     if(show){
@@ -2381,13 +2421,17 @@
     const type = bytes[1], code = bytes[2];
     const rec = { seq:++seq, t:Date.now(), dir, url: shortUrl(url), fullUrl: String(url).slice(0,256), label: labelForUrl(url), rawHex, _isEssential: isEssential, _type:type, _code:code };
     // ranked room tracking (cheap type/code gate; endpoint does the truth):
-    // auth -> mine check; private join/create (pID) -> by-code check.
+    // auth -> mine check; MY private join/create (pID, outgoing) -> by-code
+    // check + prompt stats refresh on positive verdict; MY leave op (254 out)
+    // and MY public joins (no pID = normal room) -> ranked mode OFF now.
+    // Incoming 226/227 (server responses/echoes) never touch tracking.
     try{
       if((type===2||type===3)&&(code===230||code===231)) checkRankedMine();
-      else if((type===2||type===3)&&(code===226||code===227)){
+      else if((type===2||type===3)&&code===254&&dir==='out') disableRanked('leave-op');
+      else if((type===2||type===3)&&(code===226||code===227)&&dir==='out'){
         const pid=sniffPid(rawHex);
         if(pid){ if(rankedNet.code!==pid) checkRankedRoom(pid, true); }
-        else if(rankedNet.code){ rankedNet={code:null,state:null,at:Date.now(),mineAt:rankedNet.mineAt}; try{renderInfoPanel();}catch{} }
+        else disableRanked('public-join');
       }
     }catch{}
     if(collectMode){
