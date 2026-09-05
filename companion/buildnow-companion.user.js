@@ -2140,6 +2140,10 @@
   // Bucket filenames: platinum is stored as platinium.png (typo upstream).
   const RANKED_ICON_SLUG=t=>t==='Platinum'?'platinium':t.toLowerCase();
   RANKED_TIERS.forEach(t=>{ t.icon=`${RANKED_ASSETS}/${RANKED_ICON_SLUG(t.name)}.png`; });
+  // Icon art normalization: Unranked + Platinum PNGs are tightly cropped while
+  // the other eight carry transparent padding, so equal boxes render unequal
+  // art. Compensate with per-tier render sizes for one visual size.
+  const RANKED_ICON_PX=t=>((t==='Unranked'||t==='Platinum')?44:72);
   let rankedPanel=null, rankedTab='milestones', rankedLbCache=null, _rankedFadeT=null;
   function ensureRankedStyle(){
     if(document.getElementById('bnc-ranked-style')) return;
@@ -2260,12 +2264,14 @@
       const toNext=ar && ar.next_milestone
         ? `${Number(ar.points_to_next||0).toLocaleString('en-US')} points to ${String(ar.next_milestone).replace(/</g,'&lt;')}`
         : 'Max rank reached';
-      const summary=`<div style="display:flex;align-items:center;gap:10px;background:#171717;border:1px solid ${tier.color};border-radius:10px;padding:10px 12px;margin-bottom:12px"><img src="${tier.icon}" alt="" style="width:32px;height:32px;object-fit:contain" onerror="this.style.display='none'" /><div style="flex:1;min-width:0"><div style="font-size:13px;font-weight:800;color:#fff">${tier.name} · ${Number(pts).toLocaleString('en-US')} pts</div><div style="height:6px;background:rgba(255,255,255,0.10);border-radius:999px;margin-top:6px;overflow:hidden"><div style="height:100%;width:${pct}%;background:${tier.color};border-radius:999px"></div></div><div style="font-size:11px;color:#9ca3af;margin-top:4px">${toNext} (${pct}%)</div></div></div>`;
+      const summaryPx=RANKED_ICON_PX(tier.name);
+      const summary=`<div style="display:flex;align-items:center;gap:12px;background:#171717;border:1px solid ${tier.color};border-radius:10px;padding:12px 14px;margin-bottom:16px"><img src="${tier.icon}" alt="" style="width:${summaryPx}px;height:${summaryPx}px;object-fit:contain;flex-shrink:0" onerror="this.style.display='none'" /><div style="flex:1;min-width:0"><div style="font-size:13px;font-weight:700;color:#fff">${tier.name} · ${Number(pts).toLocaleString('en-US')} pts</div><div style="height:6px;background:rgba(255,255,255,0.10);border-radius:999px;margin-top:8px;overflow:hidden"><div style="height:100%;width:${pct}%;background:${tier.color};border-radius:999px"></div></div><div style="font-size:11px;color:rgba(255,255,255,0.56);margin-top:6px">${toNext} (${pct}%)</div></div></div>`;
       const cards=RANKED_TIERS.map(t=>{
         const isHere=t.name===here;
-        return `<div style="background:#171717;border:1px solid ${isHere?t.color:'rgba(255,255,255,0.10)'};${isHere?`box-shadow:0 0 14px ${t.color};`:''}border-radius:10px;padding:10px 6px;text-align:center;position:relative"><img src="${t.icon}" alt="${t.name}" style="width:40px;height:40px;object-fit:contain" onerror="this.style.display='none'" /><div style="font-size:11px;font-weight:800;color:${t.color};margin-top:6px">${t.name}</div><div style="font-size:10px;color:#9ca3af;margin-top:2px">${Number(t.min).toLocaleString('en-US')}+</div><div style="font-size:10px;color:#6b7280">Fee ${t.fee}</div>${isHere?`<div style="font-size:9px;font-weight:800;color:#fff;margin-top:6px">● YOU ARE HERE</div>`:''}</div>`;
+        const px=RANKED_ICON_PX(t.name);
+        return `<div style="background:#171717;border:1px solid ${isHere?t.color:'rgba(255,255,255,0.10)'};border-radius:10px;padding:14px 8px 12px 8px;text-align:center"><div style="height:72px;display:flex;align-items:center;justify-content:center"><img src="${t.icon}" alt="${t.name}" style="width:${px}px;height:${px}px;object-fit:contain" onerror="this.style.display='none'" /></div><div style="font-size:12px;font-weight:700;color:${t.color};margin-top:10px">${t.name}</div><div style="font-size:11px;color:rgba(255,255,255,0.56);margin-top:2px">${Number(t.min).toLocaleString('en-US')}+</div><div style="font-size:11px;color:rgba(255,255,255,0.36)">Fee ${t.fee}</div>${isHere?`<div style="font-size:11px;font-weight:700;color:#fff;margin-top:8px">● You are here</div>`:''}</div>`;
       }).join('');
-      body.innerHTML=`${summary}<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px">${cards}</div><div style="font-size:11px;color:#6b7280;text-align:center;margin-top:10px">Entry fees burn on every ranked start — higher tier, steeper entry.</div>`;
+      body.innerHTML=`${summary}<div style="display:grid;grid-template-columns:repeat(5,1fr);grid-auto-rows:1fr;gap:12px">${cards}</div><div style="font-size:11px;color:rgba(255,255,255,0.36);text-align:center;margin-top:12px">Entry fees burn on every ranked start — higher tier, steeper entry.</div>`;
     } else {
       renderRankedLb(rankedLbCache ? rankedLbCache.rows : null);
     }
