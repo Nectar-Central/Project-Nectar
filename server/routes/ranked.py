@@ -14,10 +14,10 @@ fail-CLOSED on anything that moves points. Never raises out (500 JSON).
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+import json
 
 from ..lib.supabase_client import supabase as _supabase_global
 from ..lib import ranked as ranked_mod
-
 router = APIRouter()
 
 ALLOWED_GMS = ("zw_lg", "df", "wwzw")
@@ -675,19 +675,21 @@ async def ranked_by_code(code: str, request: Request):
         except Exception:
             room = None
         if room is None:
-            try: log_sys(f"[ranked] by-code did={did[:6]} code={code} -> not-ranked")
+            payload = {"room": None, "on_roster": False, "is_host": False}
+            try: log_sys(f"[ranked] by-code did={did[:6]} code={code} -> {json.dumps(payload)}")
             except: pass
-            return JSONResponse({"room": None, "on_roster": False, "is_host": False})
+            return JSONResponse(payload)
         ids = _roster_ids(room)
         on_roster = did in ids if did else False
         is_host = bool(did) and did == str(room.get("host_discord_id"))
-        try: log_sys(f"[ranked] by-code did={did[:6]} code={code} -> {room.get('status')} rid={room.get('id')} roster={on_roster} host={is_host}")
-        except: pass
-        return JSONResponse({
+        payload = {
             "room": _room_lite(room),
             "on_roster": on_roster,
             "is_host": is_host,
-        })
+        }
+        try: log_sys(f"[ranked] by-code did={did[:6]} code={code} -> {json.dumps(payload, default=str)}")
+        except: pass
+        return JSONResponse(payload)
     except Exception as exc:
         return _err(str(exc), 500)
 
@@ -719,16 +721,18 @@ async def ranked_mine(request: Request):
         except Exception:
             found = None
         if found is None:
-            try: log_sys(f"[ranked] mine did={did[:6]} -> not-in-session")
+            payload = {"room": None, "on_roster": False, "is_host": False}
+            try: log_sys(f"[ranked] mine did={did[:6]} -> {json.dumps(payload)}")
             except: pass
-            return JSONResponse({"room": None, "on_roster": False, "is_host": False})
-        try: log_sys(f"[ranked] mine did={did[:6]} -> {found.get('status')} rid={found.get('id')} code={found.get('short_code')}")
-        except: pass
-        return JSONResponse({
+            return JSONResponse(payload)
+        payload = {
             "room": _room_lite(found),
             "on_roster": True,
             "is_host": did == str(found.get("host_discord_id")),
-        })
+        }
+        try: log_sys(f"[ranked] mine did={did[:6]} -> {json.dumps(payload, default=str)}")
+        except: pass
+        return JSONResponse(payload)
     except Exception as exc:
         return _err(str(exc), 500)
 
