@@ -40,6 +40,7 @@ from fastapi.responses import JSONResponse
 
 from ..lib.supabase_client import supabase, db
 from ..lib.redis_client import cache
+from ..lib.logger import log_sys
 from ..lib import ranked as ranked_mod
 from .capture import engine as capture_engine
 
@@ -339,6 +340,19 @@ async def get_stats(request: Request):
                 }
     except Exception:
         ranked_out = None
+    try:
+        _rk_state = (session_out or {}).get("state")
+        _rk_code = (session_out or {}).get("short_code")
+        if ranked_out:
+            log_sys(f"[ranked] stats did={str(discord_id)[:6]} code={_rk_code} "
+                    f"state={_rk_state} -> BLOCK rid={ranked_out.get('rid')} "
+                    f"status={ranked_out.get('status')} host={ranked_out.get('is_host')} "
+                    f"v={ranked_out.get('match_version')}")
+        elif _rk_code:
+            log_sys(f"[ranked] stats did={str(discord_id)[:6]} code={_rk_code} "
+                    f"state={_rk_state} -> none")
+    except Exception:
+        pass
 
     # Arena block: session-independent points/tier/season. The ranked block
     # only exists inside a ranked room; drawer/panel/lobby-card read this.

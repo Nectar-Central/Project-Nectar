@@ -903,21 +903,28 @@
   let lastCaptureSentAt=0;
   const CAPTURE_FRESH_MS=120000;
   function captureFresh(){ try{ return Date.now()-lastCaptureSentAt<=CAPTURE_FRESH_MS; }catch{ return false; } }
+  // Change-only decision log (diagnosing ghost UI): logs only when the verdict flips.
+  let _lastLiveRankedSig='?';
   function liveRanked(){
     try{
       const sc=statsCache;
       const rk=sc && sc.ranked && sc.ranked.active ? sc.ranked : null;
-      if(!rk || !captureFresh()) return null;
-      // Endpoint authority (auth/create/join triggers + 30s poll below):
-      // no data or API error -> stats rule (fail-open); a definitive answer
-      // (unknown code, ended room, off-roster) hides ranked UI even when the
-      // stats block lingers.
+      const fresh=captureFresh();
       const st=rankedNet.state;
-      if(!st || st.error) return rk;
-      if(!st.room) return null;
-      if(st.room.status==='ended') return null;
-      if(!st.on_roster && !st.is_host) return null;
-      return rk;
+      let verdict='no-block', out=null;
+      if(!rk) verdict='no-block';
+      else if(!fresh) verdict='stale-captures';
+      else if(!st || st.error) { verdict='endpoint-missing'; out=rk; }
+      else if(!st.room) verdict='unknown-code';
+      else if(st.room.status==='ended') verdict='ended';
+      else if(!st.on_roster && !st.is_host) verdict='off-roster';
+      else { verdict='in-session'; out=rk; }
+      const sig=(rk?String(rk.rid||'?'):'-')+'|'+(fresh?'F':'S')+'|'+verdict;
+      if(sig!==_lastLiveRankedSig){
+        _lastLiveRankedSig=sig;
+        try{ logInfo(`[RANKED] liveRanked -> ${out?'SHOW':'HIDE'} (${verdict}) rid=${rk?rk.rid:'-'} code=${rk?rk.short_code:'-'} fresh=${fresh} ep=${st?(st.error?'err':(st.room?st.room.status+(st.on_roster?'/roster':'')+(st.is_host?'/host':''):'no-room')):'none'}`); }catch{}
+      }
+      return out;
     }catch{ return null; }
   }
   // --- RANKED ROOM TRACKING via ranked endpoints ---
@@ -977,6 +984,10 @@
     rankedApiGet('/api/ranked/by-code/'+encodeURIComponent(code)+'?discord_id='+encodeURIComponent(did), (j)=>{
       if(j) rankedNet={code, state:{room:j.room||null, on_roster:!!j.on_roster, is_host:!!j.is_host, error:false}, at:Date.now(), mineAt:rankedNet.mineAt};
       else rankedNet={code, state:{error:true}, at:Date.now(), mineAt:rankedNet.mineAt};
+      try{
+        const s=rankedNet.state;
+        logInfo(`[RANKED] by-code ${code} -> ${s.error?'ERROR':(s.room?`${s.room.status}${s.on_roster?'/roster':''}${s.is_host?'/host':''}`:'not-ranked')}`);
+      }catch{}
       try{ renderInfoPanel(); }catch{}
     });
   }
@@ -987,13 +998,15 @@
     let did=''; try{ did=String(discordId||''); }catch{}
     if(!did) return;
     rankedApiGet('/api/ranked/mine?discord_id='+encodeURIComponent(did), (j)=>{
-      if(!j) return;
+      if(!j){ try{ logInfo('[RANKED] mine -> ERROR'); }catch{} return; }
       try{
         if(j.room && j.room.short_code){
           const c=String(j.room.short_code).toUpperCase();
           rankedNet={code:c, state:{room:j.room, on_roster:!!j.on_roster, is_host:!!j.is_host, error:false}, at:now, mineAt:now};
+          logInfo(`[RANKED] mine -> ${j.room.id} ${j.room.status}${j.on_roster?'/roster':''}${j.is_host?'/host':''}`);
         } else {
           rankedNet={code:null, state:{room:null, on_roster:false, is_host:false, error:false}, at:now, mineAt:now};
+          logInfo('[RANKED] mine -> not-in-session');
         }
       }catch{}
       try{ renderInfoPanel(); }catch{}
@@ -1827,7 +1840,7 @@
   // --- RANKED OVERLAY (Phase 5): bottom-left box, milestone icon + points ---
   // Game frame only, pointer-transparent, driven by the stats poll. Shows in
   // matches only; flashes the tier color when points change.
-  let rankedOverlay=null, _lastRankedPts=null, _rankedFlashT=null, rankedActive=false;
+  let rankedOverlay=null, _lastRankedPts=null, _rankedFlashT=null, rankedActive=false, _lastOvSig='?';
   function ensureRankedOverlay(){
     if(!IS_GAME_FRAME) return null;
     if(rankedOverlay) return rankedOverlay;
@@ -1847,6 +1860,11 @@
     rankedActive=!!(rk && inMatch);
     const el=ensureRankedOverlay();
     if(!el) return;
+    const sig=(rk?rk.rid:'-')+'|'+(inMatch?'M':'L')+'|'+(rk?rk.points:'-');
+    if(sig!==_lastOvSig){
+      _lastOvSig=sig;
+      try{ logInfo(`[RANKED] match-overlay -> ${(rk&&inMatch)?'SHOW':'HIDE'} rid=${rk?rk.rid:'-'} inMatch=${inMatch} pts=${rk?rk.points:'-'}`); }catch{}
+    }
     if(!rk || !inMatch){
       el.style.display='none';
       if(rk && rk.points!=null) _lastRankedPts=rk.points;  // keep baseline synced in lobby
@@ -1881,7 +1899,7 @@
   // Nectar Ranked Season X / icon / points (milestone) / footer points-to-next.
   // Session-independent (reads the arena block) — visible whenever the player
   // isn't mid-match. Pointer-transparent, game frame only.
-  let rankedLobbyCard=null;
+  let rankedLobbyCard=null, _lastLobbySig='?';
   function ensureRankedLobby(){
     if(!IS_GAME_FRAME) return null;
     if(rankedLobbyCard) return rankedLobbyCard;
@@ -1900,7 +1918,15 @@
     const inMatch=sess && String(sess.state||'').toLowerCase()==='match';
     const el=ensureRankedLobby();
     if(!el) return;
-    if(!arena || inMatch){ el.style.display='none'; return; }
+    // Lobby-only card: needs a live session in lobby state. Sessionless (or
+    // match) never shows — location-dependent UI with no location is a ghost.
+    const show=!!(arena && sess && !inMatch);
+    const sig=(arena?`${arena.points}/${arena.milestone}`:'-')+'|'+(sess?String(sess.state||'?'):'none')+'|'+(show?'SHOW':'HIDE');
+    if(sig!==_lastLobbySig){
+      _lastLobbySig=sig;
+      try{ logInfo(`[RANKED] lobby-card -> ${show?'SHOW':'HIDE'} arena=${arena?arena.points+'pts/'+arena.milestone:'none'} session=${sess?sess.state:'none'}`); }catch{}
+    }
+    if(!show){ el.style.display='none'; return; }
     const color=arena.milestone_color || '#fff';
     const icon=arena.milestone_icon_url
       ? `<img src="${String(arena.milestone_icon_url).replace(/"/g,'')}" alt="" style="width:48px;height:48px;object-fit:contain" onerror="this.style.display='none'" />`
@@ -1932,6 +1958,7 @@
   function queuePtsToast(title, delta){
     _ptsToastQueue.push({title:String(title), delta:Number(delta)||0});
     if(_ptsToastQueue.length>3) _ptsToastQueue.shift();  // never backlog
+    try{ logInfo(`[RANKED] points-toast queued "${title}" ${delta>=0?'+':''}${delta}`); }catch{}
     _pumpPtsToasts();
   }
   function _pumpPtsToasts(){
@@ -2001,6 +2028,7 @@
     const mver=Number(rk.match_version)||0;
     if(mver>1) return;  // joined mid-session: first match already passed
     if(document.getElementById('bnc-ranked-start')) return;
+    try{ logInfo(`[RANKED] start-overlay SHOW rid=${rid} host=${String(rk.host_game_username||'the host')} playing=${!!rk.host_playing}`); }catch{}
     const host=String(rk.host_game_username||'the host').replace(/</g,'&lt;');
     const playing=!!rk.host_playing;
     const line=playing
