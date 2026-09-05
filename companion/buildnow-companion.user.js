@@ -996,7 +996,7 @@
   function _reconcileRankedSession(sess){
     try{
       if(!rankedNet.code && !(statsCache&&statsCache.ranked)) return;
-      if(rankedNet.state && !rankedNet.state.error && (Date.now()-rankedNet.at<45000)) return;
+      if(rankedNet.state && !rankedNet.state.error && (Date.now()-rankedNet.at<20000)) return;
       if(statsCache && statsCache.ranked && statsCache.ranked.active) return;
       const code=sess && sess.short_code ? String(sess.short_code).toUpperCase() : null;
       if(code && rankedNet.code && code===rankedNet.code) return; // same room, verdict pending
@@ -1006,7 +1006,7 @@
   function checkRankedRoom(code, force){    code=String(code||'').trim().toUpperCase();
     if(!code || code.length!==5) return;
     const now=Date.now();
-    if(!force && rankedNet.code===code && rankedNet.state && now-rankedNet.at<30000) return;
+    if(!force && rankedNet.code===code && rankedNet.state && now-rankedNet.at<10000) return;
     rankedNet.code=code;
     let did=''; try{ did=String(discordId||''); }catch{}
     if(!did) return;
@@ -1029,7 +1029,7 @@
   }
   function checkRankedMine(){
     const now=Date.now();
-    if(now-rankedNet.mineAt<30000) return;
+    if(now-rankedNet.mineAt<10000) return;
     rankedNet.mineAt=now;
     let did=''; try{ did=String(discordId||''); }catch{}
     if(!did) return;
@@ -1981,7 +1981,7 @@
   setInterval(()=>{ try{
     if(!drawerOpen && rankedActive) fetchStats(false);
     if(rankedNet.code) checkRankedRoom(rankedNet.code);
-  }catch{} }, 30000);
+  }catch{} }, 10000);
 
   // --- RANKED LOBBY CARD: lobby-only medium card, center-left ---
   // Nectar Ranked Season X / icon / points (milestone) / footer points-to-next.
