@@ -1099,6 +1099,17 @@ class Engine:
         except Exception:
             pass
 
+        # Fresh authenticate (new connection: reload, disconnect, room switch)
+        # means "in no room yet" — drop the stale current room the same way,
+        # or stats keeps serving the previous (possibly ranked) room as live.
+        # The following join/create re-points current within the same burst.
+        try:
+            if packet.packet_type == PacketType.AUTHENTICATE and view.current_room_id != "lobby":
+                _ensure_room("lobby")
+                log_engine("room", session_id[:8], action="auth-to-lobby", room=room.room_id[:8])
+        except Exception:
+            pass
+
         # ---- ALIVE / ELIMINATED (room-scoped, also fill skin) ----
         # Contract: RoomView.actor_map[actorNr] resolves alv without 255 (bare alv packets)
         # Outbound self-report fallback: our client sets its OWN alive flag via
