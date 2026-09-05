@@ -387,6 +387,30 @@ def _result_event_exists(session_id, event_type, room_id, match_ver) -> bool:
     return False
 
 
+def _defeat_recorded(session_id, room_id, match_ver) -> bool:
+    """Phase-end-tolerant defeat check: matches the current version OR the
+    pre-bump one.
+
+    The stG=3 bump renumbers the room (N -> N+1) AFTER an early elimination
+    already wrote its defeat at N. A stale arm firing post-bump (flags reset
+    by the next stG=1, killfeed death evidence still present) must see that
+    write or it records a second defeat for the same match. Versions bump
+    exactly once per real phase end, so a V-1 hit can only be this match's
+    own pre-bump write — never a neighbouring match. Live (pre-bump) paths
+    must NOT use this: same-version-only there, or a new match's legitimate
+    defeat would be swallowed by the previous match's record.
+    """
+    try:
+        cur = int(match_ver)
+    except Exception:
+        return _result_event_exists(session_id, "defeat", room_id, match_ver)
+    if _result_event_exists(session_id, "defeat", room_id, cur):
+        return True
+    if cur > 0 and _result_event_exists(session_id, "defeat", room_id, cur - 1):
+        return True
+    return False
+
+
 def _write_win(discord_id, session_id, user, gm, room_id, short_code, match_ver, winner, room):
     """Write one win to DB (bngc_users + bngc_game_events) + log lines.
     Marks room.last_win_version (NOT drained — version bump re-enables next match).
@@ -609,8 +633,14 @@ async def process_batch(
     try:
         updates = {}                 # Build update dict
         if view.me:                  # Only if we have player data
-            if view.me.username and view.me.username != user.get("game_username"):
-                updates["game_username"] = view.me.username  # Username changed
+            # Usernames arrive tag-wrapped from some props ("<color=black>Bob").
+            # The engine cleans at ingestion, but strip here too so the DB can
+            # never store tags (and heals rows dirtied before the engine fix).
+            clean_name = _strip_color_tags(view.me.username).strip() if view.me.username else None
+            if not clean_name:
+                clean_name = view.me.username
+            if clean_name and clean_name != user.get("game_username"):
+                updates["game_username"] = clean_name  # Username changed
             if view.me.game_id and view.me.game_id != user.get("game_id"):
                 updates["game_id"] = view.me.game_id        # Game ID changed
             if view.me.skin and view.me.skin != user.get("skin"):
@@ -1010,6 +1040,7 @@ async def process_batch(
             # stG=3 detection: match_version incremented means stG was 3
             # Check if win was already recorded for this match_version
             if room.last_win_version == room.match_version:
+                room.stg_is_phase_end = False  # resolved — don't let a stale arm linger
                 continue  # Already recorded
 
             # Check if stG=3 just happened as a real phase end (not a zone-timer tick
@@ -1148,12 +1179,13 @@ async def process_batch(
                 if room2.had_self_defeat:
                     log_sys(f"PROCESSOR DEFEAT skip already recorded this life gm={gm2}")
                     room2.last_defeat_version = -1  # Discard stale marker
+                    room2.stg_is_phase_end = False  # resolved — arm must not outlive the guard
                 elif room2.last_win_version == room2.match_version:
                     log_sys(f"PROCESSOR DEFEAT skip win already recorded gm={gm2}")
                     room2.last_defeat_version = -1  # Discard stale marker
                 elif _team_alive_for_me(room2, view, me_name_local2) is True:
                     pass  # hold marker silently — teammate still alive, re-evaluated next batch
-                elif _result_event_exists(session_id, "defeat", room_id2, room2.match_version):
+                elif _defeat_recorded(session_id, room_id2, room2.match_version):
                     log_sys(f"PROCESSOR DEFEAT skip already recorded gm={gm2} room={room_id2[:8]} ver={room2.match_version}")
                     room2.had_self_defeat = True  # heal marker so it isn't retried
                     room2.last_defeat_version = -1  # Discard stale marker

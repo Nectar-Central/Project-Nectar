@@ -1,5 +1,5 @@
 import os, secrets, asyncio, discord, json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 try:
     from dotenv import load_dotenv
@@ -14,6 +14,7 @@ import database as db
 import formatters as fmt
 import views
 import alerts as alert_mod
+import ranked as ranked_mod
 try:
     import aiohttp
 except: aiohttp = None
@@ -31,6 +32,36 @@ def gen_token(): return secrets.token_hex(8).upper()  # 16-char hex, e.g. A1B2C3
 WARNINGS_FILE = Path(__file__).resolve().parent / "warnings.json"
 ANNOUNCED_FILE = Path(__file__).resolve().parent / "announced_updates.json"
 USERSCRIPT_URL = "https://raw.githubusercontent.com/Nectar-Central/Project-Nectar/main/companion/buildnow-companion.user.js"
+REGISTERED_ROLE_ID = 1533401163137810544
+PATCH_CHANNEL_ID = 1512793466852212846
+
+
+async def _grant_registered_role(guild, user_id):
+    """Best-effort: give the registered-player role. Never raises (returns bool).
+
+    Requires the bot's top role to sit above the registered role in
+    Server Settings → Roles, or Discord rejects with Forbidden (logged).
+    """
+    try:
+        if guild is None:
+            return False
+        role = guild.get_role(REGISTERED_ROLE_ID)
+        if role is None:
+            print(f"[role] registered role {REGISTERED_ROLE_ID} not found in guild {guild.id}")
+            return False
+        member = guild.get_member(int(user_id))
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(user_id))
+            except Exception:
+                return False
+        if member is None or role in member.roles:
+            return True
+        await member.add_roles(role, reason="Nectar registration")
+        return True
+    except Exception as e:
+        print(f"[role] grant failed: {e}")
+        return False
 
 
 def load_warnings():
@@ -159,6 +190,11 @@ async def on_ready():
         bot.loop.create_task(alert_mod.alert_loop(bot))
     except Exception as e:
         print(f"[alerts] failed to start loop: {e}")
+    # ranked countdown scheduler
+    try:
+        bot.loop.create_task(ranked_loop())
+    except Exception as e:
+        print(f"[ranked] failed to start loop: {e}")
 
 
 @bot.tree.command(name="register", description="Get a login token and optionally publish your game profile")
@@ -192,6 +228,9 @@ async def register_cmd(interaction: discord.Interaction, game_handle: app_comman
                 msg += f"\nDashboard profile updated for **{game_handle}**."
             elif game_handle:
                 msg += "\nI could not save the dashboard profile yet; run the Supabase schema and try again."
+            try:
+                await _grant_registered_role(interaction.guild, interaction.user.id)
+            except: pass
             return await interaction.followup.send(msg, ephemeral=True)
         except Exception as exc:
             print(f"register already-registered path failed: {exc}")
@@ -224,7 +263,12 @@ async def register_cmd(interaction: discord.Interaction, game_handle: app_comman
         await interaction.user.send(f"Your BuildNow login token is **{token}**\nEnter it in the userscript prompt (once, 5 min expiry). Keep it secret!\nPlay a match to get your stats saved.")
     except discord.Forbidden:
         pass
+    try:
+        role_ok = await _grant_registered_role(interaction.guild, interaction.user.id)
+    except: role_ok = False
     message = f"Token sent to your DMs: **{token}**\nEnter it in the game iframe prompt on first run. One-time use.\nPlay a match to get your stats saved."
+    if role_ok:
+        message += "\nRegistered role granted. ✅"
     if game_handle and profile_error is None:
         message += f"\nDashboard profile saved for **{game_handle}**."
     elif game_handle:
@@ -1049,6 +1093,25 @@ async def leaderboard_cmd(interaction: discord.Interaction, stat: str = "kills",
     await interaction.followup.send(embed=e)
 
 
+async def _post_patch_channel(embed, view=None):
+    """Best-effort: mirror patch notes to the updates channel. Never raises."""
+    try:
+        channel = bot.get_channel(PATCH_CHANNEL_ID)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(PATCH_CHANNEL_ID)
+            except Exception:
+                return False
+        if view is not None:
+            await channel.send(embed=embed, view=view)
+        else:
+            await channel.send(embed=embed)
+        return True
+    except Exception as e:
+        print(f"[announce] channel post failed: {e}")
+        return False
+
+
 async def _all_registered_discord_ids():
     """Every registered discord_id (DM targets for update broadcasts)."""
     if db.USE_SUPABASE and db.supabase:
@@ -1116,9 +1179,295 @@ async def announce_update_cmd(interaction: discord.Interaction,
     announced[version] = {"at": datetime.now(timezone.utc).isoformat(),
                           "by": str(interaction.user.id), "sent": sent, "failed": failed}
     save_announced(announced)
+    posted = await _post_patch_channel(embed, view)
     await interaction.followup.send(
-        f"Update **{version}** announced: **{sent}** DMs sent, **{failed}** failed (DMs closed).",
+        f"Update **{version}** announced: **{sent}** DMs sent, **{failed}** failed (DMs closed)."
+        + (" Posted to patch channel." if posted else " Patch-channel post failed — check channel access."),
         ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# Ranked v1 — host-authored rooms (/ranked create/start/end/...)
+# ---------------------------------------------------------------------------
+
+ranked_group = app_commands.Group(name="ranked", description="Ranked rooms")
+
+
+def _ranked_lobby_embed(room: dict) -> discord.Embed:
+    spec = ranked_mod.lobby_embed(room)
+    e = discord.Embed(title=spec["title"], color=0x7c3aed)
+    for name, value, inline in spec["fields"]:
+        e.add_field(name=name, value=value, inline=inline)
+    e.set_footer(text=spec["footer"])
+    return e
+
+
+class RankedLobbyView(discord.ui.View):
+    """Join/Leave buttons for a ranked lobby (timeout=None while alive)."""
+
+    def __init__(self, rid: str):
+        super().__init__(timeout=None)
+        self.rid = rid
+
+    async def _refresh_embed(self, interaction: discord.Interaction):
+        try:
+            room = ranked_mod.get_room(self.rid)
+            if room and interaction.message:
+                await interaction.message.edit(embed=_ranked_lobby_embed(room), view=self)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="Join", style=discord.ButtonStyle.success, custom_id="ranked-join")
+    async def join_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        did = str(interaction.user.id)
+        try:
+            row = await db.get_by_discord(did)
+        except Exception:
+            row = None
+        if not row:
+            return await interaction.followup.send("Registered players only — use **/register** first.", ephemeral=True)
+        room = ranked_mod.get_room(self.rid)
+        if not room or room.get("status") != "lobby":
+            return await interaction.followup.send("This lobby is no longer open.", ephemeral=True)
+        if ranked_mod.is_banned(did):
+            return await interaction.followup.send("You are banned from ranked.", ephemeral=True)
+        pts = ranked_mod.get_points(did)
+        if pts < (room.get("min_points") or 0):
+            return await interaction.followup.send(f"Needs **{room['min_points']}+** points (you have {pts}).", ephemeral=True)
+        if room.get("max_points") is not None and pts > room["max_points"]:
+            return await interaction.followup.send(f"Capped at **{room['max_points']}** points (you have {pts}).", ephemeral=True)
+        room = ranked_mod.get_room(self.rid)  # refresh: capacity check on live roster
+        if len(ranked_mod.roster_ids(room)) >= (room.get("max_players") or 16):
+            return await interaction.followup.send("Lobby is full.", ephemeral=True)
+        ranked_mod.roster_add(room, did)
+        await self._refresh_embed(interaction)
+        await interaction.followup.send(f"You're in **{self.rid}**. Wait for start — the code is DM'd at start.", ephemeral=True)
+
+    @discord.ui.button(label="Leave", style=discord.ButtonStyle.danger, custom_id="ranked-leave")
+    async def leave_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        did = str(interaction.user.id)
+        room = ranked_mod.get_room(self.rid)
+        if not room or room.get("status") != "lobby":
+            return await interaction.followup.send("This lobby is no longer open.", ephemeral=True)
+        if did == str(room.get("host_discord_id")):
+            return await interaction.followup.send("Host can't leave — use **/ranked change-host** or **/ranked end**.", ephemeral=True)
+        ranked_mod.roster_remove(room, did)
+        await self._refresh_embed(interaction)
+        await interaction.followup.send(f"You left **{self.rid}**.", ephemeral=True)
+
+
+@ranked_group.command(name="create", description="Host a ranked room")
+@app_commands.describe(short_code="5-char room code from game",
+                       max_players="Roster cap",
+                       max_matches="Matches per session",
+                       min_points="Minimum points to join, 0 = open",
+                       max_points="Maximum points to join, 0 = no cap",
+                       fee="Join fee in points (burned)",
+                       starts_in_min="Auto-start countdown in minutes, 0 = manual start")
+@app_commands.choices(gm=[app_commands.Choice(name="Late Game Zonewars", value="zw_lg"),
+                          app_commands.Choice(name="Free Mode", value="df"),
+                          app_commands.Choice(name="Wild West", value="wwzw")])
+async def ranked_create_cmd(interaction: discord.Interaction, short_code: str, max_players: app_commands.Range[int, 2, 16],
+                            gm: str, max_matches: app_commands.Range[int, 1, 50],
+                            min_points: int = 0, max_points: int = 0,
+                            fee: int = 0, starts_in_min: int = 0):
+    await interaction.response.defer(ephemeral=True)
+    did = str(interaction.user.id)
+    try:
+        row = await db.get_by_discord(did)
+    except Exception:
+        row = None
+    if not row:
+        return await interaction.followup.send("Registered players only — use **/register** first.", ephemeral=True)
+    if ranked_mod.is_banned(did):
+        return await interaction.followup.send("You are banned from ranked.", ephemeral=True)
+    code = (short_code or "").strip().upper()
+    if len(code) != 5 or not code.isalnum():
+        return await interaction.followup.send("Short code must be 5 letters/digits (the code players type in game).", ephemeral=True)
+    if gm not in ranked_mod.ALLOWED_GMS:
+        return await interaction.followup.send("Mode must be zw_lg, df or wwzw.", ephemeral=True)
+    if ranked_mod.get_open_room_by_code(code):
+        return await interaction.followup.send(f"Code **{code}** already has an open ranked room.", ephemeral=True)
+    starts_at = None
+    if starts_in_min and starts_in_min > 0:
+        starts_at = (datetime.now(timezone.utc) + timedelta(minutes=min(starts_in_min, 180))).isoformat()
+    capped_max = max_points if max_points and max_points > 0 else None
+    try:
+        room = ranked_mod.create_room(code=code, host_discord_id=did, gm=gm,
+                                      max_players=max_players, max_matches=max_matches,
+                                      min_points=min_points or 0, max_points=capped_max,
+                                      fee=fee or 0, starts_at=starts_at)
+    except Exception as exc:
+        print(f"[ranked] create failed: {exc}")
+        return await interaction.followup.send("Couldn't create the room (DB error).", ephemeral=True)
+    # post lobby embed (configured channel, else current channel)
+    target = None
+    try:
+        cid = ranked_mod.CREATE_CHANNEL_ID or (interaction.channel_id)
+        if cid:
+            try:
+                target = interaction.guild.get_channel(cid) if interaction.guild else None
+            except Exception:
+                target = None
+            if target is None:
+                try:
+                    target = await bot.fetch_channel(cid)
+                except Exception:
+                    target = None
+        if target is None:
+            target = interaction.channel
+    except Exception:
+        target = interaction.channel
+    ping = f"<@&{ranked_mod.RANKED_PING_ROLE_ID}>" if ranked_mod.RANKED_PING_ROLE_ID else ""
+    try:
+        msg = await target.send(content=ping or None, embed=_ranked_lobby_embed(room), view=RankedLobbyView(room["id"]))
+        try:
+            ranked_mod.update_room(room["id"], {"lobby_channel_id": str(getattr(target, 'id', '')), "lobby_message_id": str(msg.id)})
+        except Exception:
+            pass
+    except Exception as exc:
+        print(f"[ranked] lobby post failed: {exc}")
+        return await interaction.followup.send(f"Room **{room['id']}** created, but I couldn't post the lobby — check my channel access.", ephemeral=True)
+    await interaction.followup.send(f"Ranked room **{room['id']}** open — lobby posted. You (host) are on the roster.", ephemeral=True)
+
+
+bot.tree.add_command(ranked_group)
+
+
+async def _start_ranked_room(room: dict, via: str = "manual"):
+    """Shared manual/countdown start. Returns (ok, message). Steps: fee pass
+    (drop + DM the broke), thread + code/rules post, code DMs, go live."""
+    room = ranked_mod.get_room(room["id"])
+    if not room or room.get("status") != "lobby":
+        return False, "Room is no longer in lobby."
+    roster = ranked_mod.roster_ids(room)
+    # fee pass first (no thread yet — aborts cleanly if roster collapses)
+    dropped = []
+    for did in list(roster):
+        pts = ranked_mod.get_points(did)
+        fee = ranked_mod.entry_fee(room, pts)
+        if fee > 0 and pts < fee:
+            ranked_mod.roster_remove(ranked_mod.get_room(room["id"]), did)
+            dropped.append(did)
+            try:
+                user = await bot.fetch_user(int(did))
+                await user.send(f"Dropped from **{room['id']}**: need **{fee}** points to enter (you have {pts}).")
+            except Exception:
+                pass
+        elif fee > 0:
+            try:
+                ranked_mod.add_points(did, -fee)
+            except Exception as e:
+                print(f"[ranked] fee charge failed for {did}: {e}")
+    room = ranked_mod.get_room(room["id"])
+    roster = ranked_mod.roster_ids(room)
+    if len(roster) < 2:
+        return False, "Need at least 2 players to start."
+    # thread (private, public fallback when the server isn't boosted)
+    parent = None
+    try:
+        cid = ranked_mod.MATCHES_CHANNEL_ID or ranked_mod.CREATE_CHANNEL_ID
+        if cid:
+            try:
+                parent = bot.get_channel(cid)
+            except Exception:
+                parent = None
+            if parent is None:
+                parent = await bot.fetch_channel(cid)
+    except Exception as e:
+        print(f"[ranked] parent channel failed: {e}")
+    if parent is None:
+        return False, "Matches channel not reachable — check my access."
+    try:
+        thread = await parent.create_thread(name=f"Ranked {room['id']} {room.get('gm','').upper()}",
+                                            type=discord.ChannelType.private_thread)
+        private = True
+    except Exception:
+        try:
+            thread = await parent.create_thread(name=f"Ranked {room['id']} {room.get('gm','').upper()}",
+                                                type=discord.ChannelType.public_thread)
+            private = False
+        except Exception as e:
+            print(f"[ranked] thread create failed: {e}")
+            return False, "Couldn't create the session thread — check my thread perms."
+    code = room.get("short_code")
+    if private:
+        for did in roster:
+            try:
+                member = parent.guild.get_member(int(did)) if hasattr(parent, "guild") and parent.guild else None
+                if member is None and hasattr(parent, "guild") and parent.guild:
+                    member = await parent.guild.fetch_member(int(did))
+                if member is not None:
+                    await thread.add_user(member)
+            except Exception:
+                pass
+    code_embed = discord.Embed(title=f"Room code: {code}", color=0x10b981,
+                               description=f"Mode **{room.get('gm','').upper()}** · first to finish {room.get('max_matches')} matches")
+    code_embed.add_field(name="Rules", value=ranked_mod.RULES_TEXT, inline=False)
+    code_embed.set_footer(text=f"{room['id']} · started {via}")
+    try:
+        await thread.send(embed=code_embed)
+    except Exception as e:
+        print(f"[ranked] thread post failed: {e}")
+    for did in roster:
+        if did == str(room.get("host_discord_id")):
+            continue
+        try:
+            user = await bot.fetch_user(int(did))
+            await user.send(f"**{room['id']}** is live — code: **{code}** ({room.get('gm','').upper()}). Join in game now.")
+        except Exception:
+            pass
+    ranked_mod.update_room(room["id"], {"status": "live", "thread_id": str(thread.id)})
+    # flip lobby embed
+    try:
+        spec = ranked_mod.live_embed(room, thread.id)
+        e = discord.Embed(title=spec["title"], color=0x10b981)
+        for name, value, inline in spec["fields"]:
+            e.add_field(name=name, value=value, inline=inline)
+        e.set_footer(text=spec["footer"])
+        if room.get("lobby_channel_id") and room.get("lobby_message_id"):
+            try:
+                ch = bot.get_channel(int(room["lobby_channel_id"])) or await bot.fetch_channel(int(room["lobby_channel_id"]))
+                msg = await ch.fetch_message(int(room["lobby_message_id"]))
+                await msg.edit(embed=e, view=None)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return True, f"**{room['id']}** live with {len(roster)} players ({'countdown' if via == 'countdown' else 'manual'} start)."
+
+
+@ranked_group.command(name="start", description="Start your ranked room (host)")
+@app_commands.describe(rid="Room ID, e.g. R-ABC123")
+async def ranked_start_cmd(interaction: discord.Interaction, rid: str):
+    await interaction.response.defer(ephemeral=True)
+    room = ranked_mod.get_room((rid or "").strip().upper())
+    if not room:
+        return await interaction.followup.send("No such ranked room.", ephemeral=True)
+    did = str(interaction.user.id)
+    is_admin = bool(interaction.user.guild_permissions.administrator) if interaction.guild else False
+    if did != str(room.get("host_discord_id")) and not is_admin:
+        return await interaction.followup.send("Only the host (or an admin) can start.", ephemeral=True)
+    ok, msg = await _start_ranked_room(room, via="manual")
+    await interaction.followup.send(msg, ephemeral=True)
+
+
+async def ranked_loop():
+    """Every 30s: auto-start countdown lobbies whose time came."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            for room in ranked_mod.list_due_starts():
+                try:
+                    ok, msg = await _start_ranked_room(room, via="countdown")
+                    print(f"[ranked] countdown start {room.get('id')}: {msg}")
+                except Exception as e:
+                    print(f"[ranked] countdown failed for {room.get('id')}: {e}")
+        except Exception as e:
+            print(f"[ranked] loop failed: {e}")
+        await asyncio.sleep(30)
 
 
 if __name__ == "__main__":

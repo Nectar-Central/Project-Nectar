@@ -23,6 +23,7 @@ USERSCRIPT_URL = (
     or "https://raw.githubusercontent.com/Nectar-Central/Project-Nectar/main/companion/buildnow-companion.user.js"
 )
 DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+PATCH_CHANNEL_ID = 1512793466852212846
 
 
 class Announcer(discord.Client):
@@ -66,6 +67,14 @@ class Announcer(discord.Client):
                 self.failed += 1
             await asyncio.sleep(0.6)  # stay under DM rate limits
         print(f"done: {self.sent} sent, {self.failed} failed")
+        try:
+            channel = await self.fetch_channel(PATCH_CHANNEL_ID)
+            view = discord.ui.View(timeout=None)
+            view.add_item(discord.ui.Button(label="Reinstall userscript", url=USERSCRIPT_URL))
+            await channel.send(embed=embed, view=view)
+            print("posted to patch channel")
+        except Exception as exc:
+            print(f"patch channel post failed: {exc}")
         await self.close()
 
 

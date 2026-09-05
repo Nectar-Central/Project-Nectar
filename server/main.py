@@ -110,6 +110,22 @@ app.include_router(health_router)
 # For now, GET /api/session/{id}/state is the poll endpoint for the photon-client SDK
 
 # ---------------------------------------------------------------------------
+# Startup — background loops
+# ---------------------------------------------------------------------------
+
+@app.on_event("startup")
+async def _startup_loops():
+    """Prime + schedule the ranked room cache (30s refresh). Never fatal."""
+    import asyncio
+
+    try:
+        from server.lib import ranked as ranked_mod
+
+        asyncio.create_task(ranked_mod.load_loop())
+    except Exception as exc:
+        log_err(f"[ranked] failed to start loop: {exc}")
+
+# ---------------------------------------------------------------------------
 # Request logging middleware (like logReq in Node)
 # ---------------------------------------------------------------------------
 

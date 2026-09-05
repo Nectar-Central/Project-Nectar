@@ -67,6 +67,28 @@ def _names_equal(a, b) -> bool:
     return bool(na and nb and na == nb)
 
 
+def _clean_username(raw) -> str:
+    """Strip color/formatting tags from a player name at ingestion.
+
+    The game wraps names in tags (e.g. '<color=black>Nryx!hhhj') in some
+    props; storing them raw leaks tags into game_username, player lists and
+    the actor map. Falls back to the original when stripping empties it, and
+    leaves innocent '<' content ('jesus loves u <3') untouched — the stripper
+    has no generic <...> fallback on purpose. Never raises.
+    """
+    try:
+        s = str(raw) if raw is not None else ""
+    except Exception:
+        return ""
+    if not s:
+        return ""
+    try:
+        clean = _strip_color_tags(s).strip()
+    except Exception:
+        return s
+    return clean if clean else s
+
+
 def _apply_roster_pt(room, actor_nr, uname, pt_raw) -> bool:
     """Fill a missing team id from roster data (ActorList + PlayerProperties).
 
@@ -112,9 +134,22 @@ def _apply_roster_pt(room, actor_nr, uname, pt_raw) -> bool:
     return False
 
 
+def _stg_starts_new_life(stg, last_stg) -> bool:
+    """True only on a fresh stG=1 (match start) arrival.
+
+    Per-life death/defeat flags reset here — NOT at the stG=3 version bump
+    (match end), where resetting wipes the just-ended match's guards and the
+    drain re-records its death+defeat (double defeat). Edge-triggered so
+    mid-match stG=1 repeats can't wipe a life mid-flight.
+    """
+    try:
+        return int(float(stg)) == 1 and (last_stg is None or int(float(last_stg)) != 1)
+    except Exception:
+        return False
+
+
 def _resolve_alv_subject(room, player_name, gpb, actor_nr):
     """Return (name|None, actor|None) for a nameless alv packet.
-
     TargetActorNr (the subject) wins over sender ActorNr (often the room
     master, not the subject) — sender-first resolution misattributed
     teammate deaths to whoever the sender mapped to. Falls back to the
@@ -528,7 +563,7 @@ class Engine:
         new_name = None
         new_gid = None
         if gpb and gpb.get("playerProps"):
-            new_name = gpb["playerProps"].get("255")
+            new_name = _clean_username(gpb["playerProps"].get("255"))
             new_gid = gpb["playerProps"].get("pfid")
 
         # First join for this session — set up me (session-scoped)
@@ -775,7 +810,7 @@ class Engine:
         # Also handle single Join event to fill actor_map incrementally
         if gpb and gpb.get("playerProps", {}).get("255") and actor_nr is not None:
             try:
-                room.actor_map[int(actor_nr)] = str(gpb["playerProps"]["255"])
+                room.actor_map[int(actor_nr)] = _clean_username(gpb["playerProps"]["255"])
             except Exception:
                 pass
 
@@ -852,6 +887,16 @@ class Engine:
                 # Log every stG change (match progress 1→2→3) like KILL lines
                 if stg != room.last_stg:
                     log_engine("stg", session_id[:8], stg=stg, gm=room.game_mode.value if room.game_mode else None, room=room.room_id[:8])
+                # stG=1: new match starting = new life. Party rooms stay MATCH
+                # across versions, so without this deaths/defeats in later
+                # matches are wrongly skipped as "already counted this life".
+                # (Resetting at the stG=3 bump instead caused double defeats:
+                # the ended match's guards were wiped before its drain ran.)
+                if _stg_starts_new_life(stg, room.last_stg):
+                    if room.had_self_death or room.had_self_defeat:
+                        log_engine("debug", session_id[:8], msg="stG 1 new life flags reset", room=room.room_id[:8])
+                    room.had_self_death = False
+                    room.had_self_defeat = False
                 # stG=3: match end marker — Processor handles win/defeat calculation
                 if stg == 3 and room.last_stg != 3 and room.game_mode and room.game_mode in _STG_PHASE_MODES:
                     if room.last_stg is None or room.last_stg <= 2:
@@ -859,14 +904,10 @@ class Engine:
                         me_name = (view.me.username if view.me else None) or (room.me.username if room.me else None)
                         if me_name and room.state == State.MATCH:
                             # bump version for next match — Processor checks stG==3 to calculate win/defeat
+                            # (per-life flags are left untouched: the ended match's
+                            # drain still needs them; they reset on next stG=1)
                             room.match_version += 1
                             room.zone_match_active = False
-                            # new match = new life: party rooms stay MATCH across versions,
-                            # so without this deaths/defeats in later versions are wrongly
-                            # skipped as "already counted this life" (version markers are
-                            # owned by the processor drain, left untouched here)
-                            room.had_self_death = False
-                            room.had_self_defeat = False
                             if len(room.recent_kills) > 20:
                                 room.recent_kills = room.recent_kills[-10:]
                             room.recent_knocks = []
@@ -947,7 +988,7 @@ class Engine:
         join_name = packet.player_name
         # Fallback: if packet has no name but gpb has playerProps 255, use that (covers JoinRoom from joiner)
         if not join_name and gpb and gpb.get("playerProps", {}).get("255"):
-            join_name = str(gpb["playerProps"]["255"])
+            join_name = _clean_username(gpb["playerProps"]["255"])
         is_join_packet = packet.packet_type in (PacketType.JOIN, PacketType.JOIN_ROOM, PacketType.CREATE_ROOM)
         if is_join_packet and join_name:
             # If this is not the self's first join (already handled), treat as other player joining existing room (normalized for dc: prefix)
@@ -1390,7 +1431,7 @@ class Engine:
 
         # player_name
         if "255" in props:
-            pkt.player_name = str(props["255"])
+            pkt.player_name = _clean_username(props["255"])
 
         # killfeed
         kill_raw = gpb.get("killfeed")
@@ -1440,7 +1481,7 @@ class Engine:
                 pkt.packet_type = PacketType.ELIMINATED
                 pkt.is_eliminated = True
             if not pkt.player_name and "255" in props:
-                pkt.player_name = str(props["255"])
+                pkt.player_name = _clean_username(props["255"])
         elif gpb.get("opName") in ("CreateRoom", "JoinRoom", "JoinRandomRoom"):
             pkt.packet_type = PacketType.JOIN_ROOM if "Join" in str(gpb.get("opName")) else PacketType.CREATE_ROOM
         elif gpb.get("opName") in ("Authenticate", "AuthenticateOnce"):
