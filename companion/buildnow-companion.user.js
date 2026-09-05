@@ -925,6 +925,24 @@
   // present) -> by-code check; public join/create (no pID) -> clear.
   // The endpoint answers; stats stays the points source. Never raises.
   let rankedNet={code:null, state:null, at:0, mineAt:0};
+  // Privileged GET (GM_xmlhttpRequest first): bare fetch() is subject to page
+  // CORS + Chrome's loopback block (public origin -> 127.0.0.1), which kills
+  // local-API calls. Same pattern as the capture/stats paths.
+  function rankedApiGet(path, cb){
+    let base=''; try{ base=resolveApiBase(); }catch{}
+    if(!base){ try{cb(null);}catch{} return; }
+    const url=base+path;
+    const done=(ok,txt)=>{
+      let j=null;
+      try{ j=(ok && txt) ? JSON.parse(txt) : null; }catch{ j=null; }
+      try{ cb(j); }catch{}
+    };
+    try{
+      const GM=typeof GM_xmlhttpRequest!=='undefined' ? GM_xmlhttpRequest : (typeof unsafeWindow!=='undefined' && unsafeWindow.GM_xmlhttpRequest) || null;
+      if(GM){ GM({method:'GET', url, timeout:10000, onload:r=>done(r.status>=200&&r.status<300, r.responseText), onerror:()=>done(false,''), ontimeout:()=>done(false,'')}); return; }
+    }catch{}
+    fetch(url,{method:'GET'}).then(r=>r.text().then(t=>done(r.ok,t)).catch(()=>done(false,''))).catch(()=>done(false,''));
+  }
   function sniffPid(hex){
     // Photon strings are length-prefixed, so the code may glue to a prefix
     // byte ("07"+"PBS05") — slide a 5-char window over the post-key bytes.
@@ -955,37 +973,31 @@
     if(!force && rankedNet.code===code && rankedNet.state && now-rankedNet.at<30000) return;
     rankedNet.code=code;
     let did=''; try{ did=String(discordId||''); }catch{}
-    let base=''; try{ base=resolveApiBase(); }catch{}
-    if(!did || !base) return;
-    fetch(base+'/api/ranked/by-code/'+encodeURIComponent(code)+'?discord_id='+encodeURIComponent(did),{method:'GET'})
-      .then(r=>r.text().then(t=>{
-        try{
-          const j=JSON.parse(t);
-          rankedNet={code, state:{room:j.room||null, on_roster:!!j.on_roster, is_host:!!j.is_host, error:false}, at:Date.now(), mineAt:rankedNet.mineAt};
-        }catch{ rankedNet={code, state:{error:true}, at:Date.now(), mineAt:rankedNet.mineAt}; }
-        try{ renderInfoPanel(); }catch{}
-      })).catch(()=>{ rankedNet={code, state:{error:true}, at:Date.now(), mineAt:rankedNet.mineAt}; });
+    if(!did) return;
+    rankedApiGet('/api/ranked/by-code/'+encodeURIComponent(code)+'?discord_id='+encodeURIComponent(did), (j)=>{
+      if(j) rankedNet={code, state:{room:j.room||null, on_roster:!!j.on_roster, is_host:!!j.is_host, error:false}, at:Date.now(), mineAt:rankedNet.mineAt};
+      else rankedNet={code, state:{error:true}, at:Date.now(), mineAt:rankedNet.mineAt};
+      try{ renderInfoPanel(); }catch{}
+    });
   }
   function checkRankedMine(){
     const now=Date.now();
     if(now-rankedNet.mineAt<30000) return;
     rankedNet.mineAt=now;
     let did=''; try{ did=String(discordId||''); }catch{}
-    let base=''; try{ base=resolveApiBase(); }catch{}
-    if(!did || !base) return;
-    fetch(base+'/api/ranked/mine?discord_id='+encodeURIComponent(did),{method:'GET'})
-      .then(r=>r.text().then(t=>{
-        try{
-          const j=JSON.parse(t);
-          if(j.room && j.room.short_code){
-            const c=String(j.room.short_code).toUpperCase();
-            rankedNet={code:c, state:{room:j.room, on_roster:!!j.on_roster, is_host:!!j.is_host, error:false}, at:now, mineAt:now};
-          } else {
-            rankedNet={code:null, state:{room:null, on_roster:false, is_host:false, error:false}, at:now, mineAt:now};
-          }
-        }catch{}
-        try{ renderInfoPanel(); }catch{}
-      })).catch(()=>{});
+    if(!did) return;
+    rankedApiGet('/api/ranked/mine?discord_id='+encodeURIComponent(did), (j)=>{
+      if(!j) return;
+      try{
+        if(j.room && j.room.short_code){
+          const c=String(j.room.short_code).toUpperCase();
+          rankedNet={code:c, state:{room:j.room, on_roster:!!j.on_roster, is_host:!!j.is_host, error:false}, at:now, mineAt:now};
+        } else {
+          rankedNet={code:null, state:{room:null, on_roster:false, is_host:false, error:false}, at:now, mineAt:now};
+        }
+      }catch{}
+      try{ renderInfoPanel(); }catch{}
+    });
   }
   function getBindKb(b){
     try{
@@ -2201,15 +2213,12 @@
       return;
     }
     if(rankedTab==='leaderboard' && !quiet) renderRankedLb(null);
-    try{
-      const base=resolveApiBase();
-      fetch(base+'/api/leaderboard?ranked=true&limit=20',{method:'GET'}).then(r=>r.text().then(t=>{
-        try{ const j=JSON.parse(t); rankedLbCache={at:Date.now(), rows:j.results||[], season:j.season!=null?j.season:null, reset_at:j.reset_at||null}; }
-        catch{ rankedLbCache={at:Date.now(), rows:[], season:null, reset_at:null}; }
-        updateRankedSeason();
-        if(rankedTab==='leaderboard') renderRankedPanel();
-      })).catch(()=>{ rankedLbCache={at:Date.now(), rows:[], season:null, reset_at:null}; updateRankedSeason(); if(rankedTab==='leaderboard') renderRankedPanel(); });
-    }catch{ rankedLbCache={at:Date.now(), rows:[], season:null, reset_at:null}; updateRankedSeason(); renderRankedPanel(); }
+    rankedApiGet('/api/leaderboard?ranked=true&limit=20', (j)=>{
+      if(j) rankedLbCache={at:Date.now(), rows:j.results||[], season:j.season!=null?j.season:null, reset_at:j.reset_at||null};
+      else rankedLbCache={at:Date.now(), rows:[], season:null, reset_at:null};
+      updateRankedSeason();
+      if(rankedTab==='leaderboard') renderRankedPanel();
+    });
   }
 
   // --- KEYBINDS / SETTINGS MENU (Ctrl+Shift+K) ---
