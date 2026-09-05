@@ -1574,6 +1574,21 @@
   }
   function startPlayersPoll(){ stopPlayersPoll(); fetchPlayers(false); playersPollTimer=setInterval(()=> fetchPlayers(false), 15000); }
   function stopPlayersPoll(){ if(playersPollTimer){ clearInterval(playersPollTimer); playersPollTimer=null; } }
+  // Prompt roster refresh after membership changes (queue/match leave or
+  // join). Delayed 3s so the leave/join capture batch reaches the server
+  // first (server prunes on Leave, /api/players is correct after that);
+  // debounced to one refresh per 8s for mass-leave bursts.
+  let _playersRefreshT=null, _lastPlayersRefresh=0;
+  function schedulePlayersRefresh(reason){
+    try{
+      const now=Date.now();
+      if(now-_lastPlayersRefresh<8000) return;
+      _lastPlayersRefresh=now;
+      if(_playersRefreshT){ try{ clearTimeout(_playersRefreshT); }catch{} _playersRefreshT=null; }
+      try{ logInfo(`[PLAYERS] refresh scheduled (${reason})`); }catch{}
+      _playersRefreshT=setTimeout(()=>{ _playersRefreshT=null; try{ fetchPlayers(false); }catch{} }, 3000);
+    }catch{}
+  }
   // centered drawer - skin top, username, discord - game_id, state - gm, separator, stats, footer, keybind button + tabs
   function renderInfoPanel(){
     if(!infoPanel) createInfoPanel();
@@ -2425,13 +2440,16 @@
     // check + prompt stats refresh on positive verdict; MY leave op (254 out)
     // and MY public joins (no pID = normal room) -> ranked mode OFF now.
     // Incoming 226/227 (server responses/echoes) never touch tracking.
+    // Any Leave event (254 in = someone left queue/match) and any of MY
+    // room changes -> prompt player-list refresh (server prunes on Leave).
     try{
       if((type===2||type===3)&&(code===230||code===231)) checkRankedMine();
-      else if((type===2||type===3)&&code===254&&dir==='out') disableRanked('leave-op');
+      else if((type===2||type===3)&&code===254&&dir==='out'){ disableRanked('leave-op'); schedulePlayersRefresh('leave-op'); }
+      else if(type===4&&code===254&&dir==='in') schedulePlayersRefresh('leave-ev');
       else if((type===2||type===3)&&(code===226||code===227)&&dir==='out'){
         const pid=sniffPid(rawHex);
-        if(pid){ if(rankedNet.code!==pid) checkRankedRoom(pid, true); }
-        else disableRanked('public-join');
+        if(pid){ if(rankedNet.code!==pid) checkRankedRoom(pid, true); schedulePlayersRefresh('join-room'); }
+        else { disableRanked('public-join'); schedulePlayersRefresh('join-room'); }
       }
     }catch{}
     if(collectMode){
