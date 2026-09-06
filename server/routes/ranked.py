@@ -19,6 +19,7 @@ import json
 from ..lib.supabase_client import supabase as _supabase_global
 from ..lib import ranked as ranked_mod
 from ..lib.logger import log_ranked
+from .capture import engine as _capture_engine
 router = APIRouter()
 
 ALLOWED_GMS = ("zw_lg", "df", "wwzw")
@@ -92,6 +93,40 @@ def _entry_fee(room: dict, player_points: int) -> int:
         return int(room.get("fee") or 0) + int(tier_fee or 0)
     except Exception:
         return int(room.get("fee") or 0)
+
+
+# GM verification: match the user's live capture session GM against the
+# room's declared GM.  Returns (ok, error_msg).  ok=True when either:
+#   - user has no active session (can't verify, allow — they may start later)
+#   - session GM matches the room GM
+def _verify_session_gm(discord_id: str, room_gm: str, session_id: str = None) -> tuple:
+    """Check that the user's capture session GM matches the room's GM.
+
+    Returns (ok, error_message).  ok=True when:
+      - user has no active session (can't verify, allow)
+      - session GM matches the room GM
+    """
+    if not session_id:
+        return True, None
+    try:
+        view = _capture_engine.get_session(session_id)
+        if not view:
+            return True, None
+        sess_gm = None
+        try:
+            sess_gm = view.game_mode.value if view.game_mode else None
+        except Exception:
+            pass
+        if not sess_gm:
+            return True, None
+        # Normalize for comparison (lowercase, strip)
+        sess_gm = str(sess_gm).strip().lower()
+        room_gm = str(room_gm).strip().lower()
+        if sess_gm == room_gm:
+            return True, None
+        return False, f"Your session is in {sess_gm.upper()} but this room requires {room_gm.upper()}"
+    except Exception:
+        return True, None
 
 
 def _roster_ids(room: dict) -> list:
@@ -261,6 +296,12 @@ async def ranked_create(request: Request):
             return _err("max_matches must be 1-50")
         if min_points < 0 or fee < 0:
             return _err("min_points/fee must be >= 0")
+        # GM verification: if host has an active capture session, verify their
+        # session GM matches the declared room GM.
+        session_id = str(body.get("session_id") or "").strip() or None
+        gm_ok, gm_err = _verify_session_gm(host, gm, session_id)
+        if not gm_ok:
+            return _err(gm_err, 403)
         try:
             dup = _db().table("ranked_rooms").select("id").eq("short_code", code).in_("status", ["lobby", "live"]).limit(1).execute()
             if dup.data:
@@ -398,6 +439,12 @@ async def ranked_roster(rid: str, request: Request):
             problem = _check_join(room, did)
             if problem:
                 return _err(problem, 403)
+            # GM verification: if player has an active capture session, verify
+            # their session GM matches the room's declared GM.
+            session_id = str(body.get("session_id") or "").strip() or None
+            gm_ok, gm_err = _verify_session_gm(did, room.get("gm") or "zw_lg", session_id)
+            if not gm_ok:
+                return _err(gm_err, 403)
             ids.append(did)
         else:
             if did == str(room.get("host_discord_id")):
@@ -481,6 +528,18 @@ async def ranked_start(rid: str, request: Request):
                 if isinstance(exc, KeyError):
                     raise
                 host_status = "unverified"
+        # GM verification: if host has an active capture session, verify their
+        # session GM matches the room's declared GM.
+        session_id = str((body or {}).get("session_id") or "").strip() or None
+        if session_id:
+            gm_ok, gm_err = _verify_session_gm(
+                str(room.get("host_discord_id")), room.get("gm") or "zw_lg", session_id)
+            if not gm_ok:
+                try:
+                    _save_roster(room["id"], kept)
+                except Exception:
+                    pass
+                return _err(gm_err, 403)
         # fee burn on the survivors
         pts = _fresh_points(kept)
         broke = []

@@ -448,3 +448,80 @@ def test_mine_none_after_end(fx):
     _call(ranked_route.ranked_end, rid, params=None, body={})
     code, out = _call(ranked_route.ranked_mine, params={"discord_id": "H"})
     assert code == 200 and out["room"] is None
+
+
+# ---------------------------------------------------------------------------
+# GM verification (create / join)
+# ---------------------------------------------------------------------------
+
+class _FakeView:
+    """Minimal capture session view for GM verification tests."""
+    def __init__(self, gm=None):
+        self._gm = gm
+    @property
+    def game_mode(self):
+        if self._gm is None:
+            return None
+        class _GM:
+            def __init__(self, v):
+                self.value = v
+        return _GM(self._gm)
+
+
+def test_create_gm_match_allows(fx, monkeypatch):
+    monkeypatch.setattr(ranked_route._capture_engine, "get_session",
+                        lambda sid: _FakeView("zw_lg"))
+    code, out = _call(ranked_route.ranked_create, params=None, body={
+        "short_code": "ABCDE", "host_discord_id": "H", "gm": "zw_lg",
+        "session_id": "s1"})
+    assert code == 200
+
+
+def test_create_gm_mismatch_rejects(fx, monkeypatch):
+    monkeypatch.setattr(ranked_route._capture_engine, "get_session",
+                        lambda sid: _FakeView("df"))
+    code, out = _call(ranked_route.ranked_create, params=None, body={
+        "short_code": "ABCDE", "host_discord_id": "H", "gm": "zw_lg",
+        "session_id": "s1"})
+    assert code == 403
+    assert "ZW_LG" in out["error"] and "DF" in out["error"]
+
+
+def test_create_no_session_allows(fx, monkeypatch):
+    monkeypatch.setattr(ranked_route._capture_engine, "get_session",
+                        lambda sid: None)
+    code, out = _call(ranked_route.ranked_create, params=None, body={
+        "short_code": "ABCDE", "host_discord_id": "H", "gm": "zw_lg"})
+    assert code == 200
+
+
+def test_join_gm_match_allows(fx, monkeypatch):
+    rid = _mkroom(fx)
+    monkeypatch.setattr(ranked_route._capture_engine, "get_session",
+                        lambda sid: _FakeView("zw_lg"))
+    code, out = _call(ranked_route.ranked_roster, rid, params=None,
+                      body={"discord_id": "P1", "action": "add",
+                            "session_id": "s1"})
+    assert code == 200
+    assert "P1" in out["roster"]
+
+
+def test_join_gm_mismatch_rejects(fx, monkeypatch):
+    rid = _mkroom(fx)
+    monkeypatch.setattr(ranked_route._capture_engine, "get_session",
+                        lambda sid: _FakeView("wwzw"))
+    code, out = _call(ranked_route.ranked_roster, rid, params=None,
+                      body={"discord_id": "P1", "action": "add",
+                            "session_id": "s1"})
+    assert code == 403
+    assert "ZW_LG" in out["error"] and "WWZW" in out["error"]
+
+
+def test_join_no_session_allows(fx, monkeypatch):
+    rid = _mkroom(fx)
+    monkeypatch.setattr(ranked_route._capture_engine, "get_session",
+                        lambda sid: None)
+    code, out = _call(ranked_route.ranked_roster, rid, params=None,
+                      body={"discord_id": "P1", "action": "add"})
+    assert code == 200
+    assert "P1" in out["roster"]
