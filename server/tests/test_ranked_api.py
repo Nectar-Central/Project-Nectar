@@ -429,10 +429,12 @@ def test_stats_fresh_session_kept(fakes, monkeypatch):
 
 
 def test_stats_stale_session_dropped(fakes, monkeypatch):
-    # kicked/reloaded 5 min ago: ghost room must not serve, ranked must clear
+    # kicked/reloaded 5 min ago: ghost room must not serve (session is None)
+    # but ranked block is preserved via the stale short_code (user was in a
+    # ranked room — the capture just stopped sending packets).
     body = _stats(monkeypatch, session=_timed_session(300), room=dict(_ROOM))
     assert body["session"] is None
-    assert body["ranked"] is None
+    assert body["ranked"] is not None and body["ranked"]["rid"] == "R-X"
 
 
 def test_stats_stale_cached_at_fallback(fakes, monkeypatch):
@@ -440,7 +442,8 @@ def test_stats_stale_cached_at_fallback(fakes, monkeypatch):
     sess = _timed_session(300)
     del sess["rooms"]["r1"]["last_packet_at"]
     body = _stats(monkeypatch, session=sess, room=dict(_ROOM))
-    assert body["session"] is None and body["ranked"] is None
+    assert body["session"] is None
+    assert body["ranked"] is not None and body["ranked"]["rid"] == "R-X"
 
 
 def test_stats_no_timestamps_fail_open(fakes, monkeypatch):
@@ -449,6 +452,15 @@ def test_stats_no_timestamps_fail_open(fakes, monkeypatch):
     del sess["_cached_at"]
     body = _stats(monkeypatch, session=sess, room=dict(_ROOM))
     assert body["session"] is not None  # old caches keep working
+
+
+def test_stats_stale_casual_room_no_ranked(fakes, monkeypatch):
+    # Stale session in a casual room (no short_code) must not show ranked.
+    # Override get_ranked_room to return None for the casual code "ZZZZZ".
+    monkeypatch.setattr(ranked_mod, "get_ranked_room", lambda code: None)
+    body = _stats(monkeypatch, session=_timed_session(300, ranked=False), room=None)
+    assert body["session"] is None
+    assert body["ranked"] is None
 
 
 def _event(code, minutes_ago, ed, did="D9"):

@@ -137,7 +137,20 @@ async def get_stats(request: Request):
                 pass
         # Dead sessions (kick/close/reload stops captures): never serve them,
         # or the drawer shows a ghost room + stale ranked block for an hour.
+        # Preserve the short_code before discarding so ranked lookup still works
+        # when the capture stopped but the user is still in the ranked room.
+        _stale_short_code = None
         if live_session and not _session_fresh(live_session):
+            try:
+                _rooms = live_session.get("rooms") or {}
+                _cur_id = live_session.get("current_room_id")
+                _cur = _rooms.get(_cur_id) if _cur_id and _cur_id in _rooms else None
+                if not _cur and _rooms:
+                    _cur = next(reversed(list(_rooms.values())), None)
+                if _cur:
+                    _stale_short_code = _cur.get("short_code")
+            except Exception:
+                pass
             live_session = None
         # Resolve discord_id from DB session row if not already
         if not discord_id:
@@ -274,6 +287,11 @@ async def get_stats(request: Request):
     ranked_out = None
     try:
         code = (session_out or {}).get("short_code")
+        # Fallback: if session is stale (no short_code), use the preserved
+        # short_code from the last known room. This keeps the ranked block
+        # visible when the capture stopped but the user is still in the room.
+        if not code and _stale_short_code:
+            code = _stale_short_code
         if code:
             # read-through on miss: a room created seconds ago isn't in the
             # 30s cache yet (by-code sees it via direct DB read; without this
@@ -385,101 +403,16 @@ async def get_stats(request: Request):
                 }
     except Exception:
         ranked_out = None
-    # Fallback: when session is stale (no short_code), look up ranked room by
-    # discord_id directly. The user may still be in a ranked room even though
-    # the capture session stopped sending packets.
-    if ranked_out is None and discord_id:
-        try:
-            r = supabase.table("ranked_rooms").select("*").in_(
-                "status", ["lobby", "live"]).order("created_at", desc=True).limit(50).execute()
-            cands = r.data or []
-            found = None
-            for status in ("live", "lobby"):
-                for row in cands:
-                    if row.get("status") == status:
-                        roster_ids = [
-                            str(x.get("discord_id"))
-                            for x in (row.get("roster") or [])
-                            if x.get("discord_id")
-                        ]
-                        if str(discord_id) in roster_ids:
-                            found = row
-                            break
-                if found:
-                    break
-            if found:
-                try:
-                    log_ranked(f"[ranked] stats did={str(discord_id)[:6]} code=None state=None -> fallback by-roster rid={found.get('id')} status={found.get('status')}")
-                except Exception:
-                    pass
-                pts = ranked_mod.get_ranked_points(discord_id)
-                tier = ranked_mod.milestone_for(pts)
-                nxt, need, pct = ranked_mod.next_milestone(pts)
-                rid = str(found.get("id") or "")
-                code_fb = str(found.get("short_code") or "").strip().upper()
-                host_game_username = None
-                host_skin = None
-                host_playing = False
-                try:
-                    hid = str(found.get("host_discord_id") or "")
-                    if hid:
-                        hres = supabase.table("bngc_users").select(
-                            "game_username,skin"
-                        ).eq("discord_id", hid).limit(1).execute()
-                        hrows = hres.data or []
-                        if hrows:
-                            host_game_username = hrows[0].get("game_username")
-                            host_skin = hrows[0].get("skin")
-                except Exception:
-                    pass
-                sealed = 0
-                try:
-                    scnt = supabase.table("ranked_results").select(
-                        "match_version", count="exact"
-                    ).eq("room_id", rid).execute()
-                    sealed = int(getattr(scnt, "count", 0) or 0)
-                except Exception:
-                    sealed = 0
-                ranked_out = {
-                    "active": True,
-                    "rid": rid,
-                    "short_code": code_fb,
-                    "status": found.get("status"),
-                    "is_host": str(discord_id) == str(
-                        found.get("host_discord_id") or ""
-                    ),
-                    "points": pts,
-                    "milestone": tier.get("name"),
-                    "milestone_icon_url": tier.get("icon_url"),
-                    "milestone_color": tier.get("color"),
-                    "arena_icon_url": ranked_mod.ARENA_ICON_URL,
-                    "points_to_next": need,
-                    "next_milestone": (nxt.get("name") if nxt else None),
-                    "next_points_pct": pct,
-                    "warnings": [],
-                    "match_id": rid,
-                    "match_version": 0,
-                    "last_result": None,
-                    "host_game_username": host_game_username,
-                    "host_skin": host_skin,
-                    "host_playing": host_playing,
-                    "min_points": found.get("min_points") or 0,
-                    "max_points": found.get("max_points"),
-                    "fee": found.get("fee") or 0,
-                    "sealed": sealed,
-                    "max_matches": found.get("max_matches"),
-                }
-        except Exception:
-            pass
     try:
         _rk_state = (session_out or {}).get("state")
-        _rk_code = (session_out or {}).get("short_code")
+        _rk_code = (session_out or {}).get("short_code") or _stale_short_code
         if ranked_out:
             log_ranked(f"[ranked] stats did={str(discord_id)[:6]} code={_rk_code} "
                     f"state={_rk_state} -> BLOCK rid={ranked_out.get('rid')} "
                     f"status={ranked_out.get('status')} host={ranked_out.get('is_host')} "
                     f"v={ranked_out.get('match_version')} pts={ranked_out.get('points')} "
-                    f"tier={ranked_out.get('milestone')}")
+                    f"tier={ranked_out.get('milestone')}"
+                    f"{' stale' if _stale_short_code and not (session_out or {}).get('short_code') else ''}")
         else:
             log_ranked(f"[ranked] stats did={str(discord_id)[:6]} code={_rk_code} "
                     f"state={_rk_state} -> none")
