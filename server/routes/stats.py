@@ -38,13 +38,18 @@ Response:
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from ..lib.supabase_client import supabase, db
+import time as _time
+
+from ..lib.supabase_client import supabase, db, db_io
 from ..lib.redis_client import cache
 from ..lib.logger import log_sys, log_ranked, log_dbg
 from ..lib import ranked as ranked_mod
 from .capture import engine as capture_engine
 
 router = APIRouter()
+
+# Last logged ranked verdict per discord_id: (sig, ts) for log sampling.
+_stats_ranked_sig: dict = {}
 
 
 def better_than_pct(total: int, above: int) -> int:
@@ -63,6 +68,12 @@ def better_than_pct(total: int, above: int) -> int:
 
 
 _SESSION_STALE_S = 120  # no packets this long = kicked/closed/reloaded
+
+_LOBBY_BLIP_RESCUE_S = 20  # lone Authenticate parks current on the lobby
+# pseudo-room while the game keeps capturing in the real room — the rescue
+# covers that blip (seconds). A real leave also parks on lobby, but then no
+# new packets arrive for the old room, so it ages out of this window fast
+# instead of haunting stats (with its ranked BLOCK) for the full 120s.
 
 
 def _session_fresh(live_session) -> bool:
@@ -155,7 +166,7 @@ async def get_stats(request: Request):
         # Resolve discord_id from DB session row if not already
         if not discord_id:
             try:
-                sres = db.get_session_sync(session_id)
+                sres = await db_io(db.get_session_sync, session_id)
                 sdata = sres.get("data") if isinstance(sres, dict) else None
                 if sdata and sdata.get("discord_id"):
                     discord_id = sdata["discord_id"]
@@ -172,7 +183,7 @@ async def get_stats(request: Request):
         return JSONResponse({"error": "Server not configured"}, status_code=500)
 
     try:
-        res = supabase.table("bngc_users").select("*").eq("discord_id", discord_id).single().execute()
+        res = await db_io(lambda: supabase.table("bngc_users").select("*").eq("discord_id", discord_id).single().execute())
         user = res.data
     except Exception as e:
         if "PGRST116" in str(e):
@@ -207,10 +218,12 @@ async def get_stats(request: Request):
             # Lobby-blip rescue: a lone Authenticate (or self-leave echo) parks
             # current on the lobby pseudo-room while the game keeps capturing
             # in a real room — no join follows, the player never actually left.
-            # If current is the lobby pseudo-room but another room has FRESH
-            # packets, serve the fresh room. Freshness-gated (same window as
-            # _SESSION_STALE_S) so kicked/reloaded ghosts with no packets stay
-            # buried and keep serving lobby/null.
+            # If current is the lobby pseudo-room but another room has packets
+            # within _LOBBY_BLIP_RESCUE_S, serve it. Deliberately much shorter
+            # than _SESSION_STALE_S: a real leave freezes the old room's
+            # last_packet_at at leave time, so it drops out of the rescue
+            # within seconds instead of re-serving its ranked BLOCK for 2min
+            # while the player sits in no room.
             try:
                 if cur_room and cur_room.get("room_id") == "lobby":
                     import time as _t2
@@ -227,7 +240,7 @@ async def get_stats(request: Request):
                                 best = r
                         except Exception:
                             continue
-                    if best is not None and (now2 - best_ts) <= _SESSION_STALE_S:
+                    if best is not None and (now2 - best_ts) <= _LOBBY_BLIP_RESCUE_S:
                         cur_room = best
                         try:
                             log_dbg(f"[stats] lobby-blip rescue -> room {(best.get('short_code') or best.get('room_id'))} "
@@ -273,17 +286,19 @@ async def get_stats(request: Request):
     # Lightweight exact counts (no row data); hidden when unavailable.
     rank = {"by": "kills", "pct": 0, "rank": 0, "total": 0}
     try:
-        t = supabase.table("bngc_users").select("discord_id", count="exact").execute()
+        t = await db_io(lambda: supabase.table("bngc_users").select("discord_id", count="exact").execute())
         total = t.count or 0
-        a = supabase.table("bngc_users").select("discord_id", count="exact").gt("kills", kills).execute()
+        a = await db_io(lambda: supabase.table("bngc_users").select("discord_id", count="exact").gt("kills", kills).execute())
         above = a.count or 0
         rank = {"by": "kills", "pct": better_than_pct(total, above),
                 "rank": above + 1 if total else 0, "total": total or 0}
     except Exception:
         pass
 
-    # Ranked block (Phase 3): null unless the live room is a lobby/live ranked
-    # room. Additive — non-ranked responses keep "ranked": null.
+    # Ranked block: null unless the live room is a lobby/live ranked room.
+    # Response-only UI: the userscript renders lobby vs match UI from this
+    # (lobby = create/join bind confirmed here; match = curScn flip locally).
+    # Additive — non-ranked responses keep "ranked": null.
     ranked_out = None
     try:
         code = (session_out or {}).get("short_code")
@@ -293,87 +308,36 @@ async def get_stats(request: Request):
         if not code and _stale_short_code:
             code = _stale_short_code
         if code:
-            # read-through on miss: a room created seconds ago isn't in the
-            # 30s cache yet (by-code sees it via direct DB read; without this
-            # stats stays blind until the next refresh).
-            rdata = ranked_mod.get_ranked_room_fresh(code)
+            rdata = await db_io(ranked_mod.get_ranked_room, code)
             if rdata and rdata.get("status") in ("lobby", "live"):
-                pts = ranked_mod.get_ranked_points(discord_id)
+                pts = await db_io(ranked_mod.get_ranked_points, discord_id)
                 tier = ranked_mod.milestone_for(pts)
-                nxt, need, pct = ranked_mod.next_milestone(pts)
                 rid = str(rdata.get("id") or "")
                 try:
                     mver = int(cur_room.get("match_version") or 0)
                 except Exception:
                     mver = 0
-                try:
-                    warnings = list(cur_room.get("ranked_warnings") or [])[:32]
-                except Exception:
-                    warnings = []
-                # host identity for the match-start overlay (name + skin for the
-                # card, host_playing to pick the rules line). Skin is the raw
-                # skin id — the userscript resolves it via its skin CDN helper.
-                host_game_username = None
-                host_skin = None
-                host_playing = False
-                try:
-                    hid = str(rdata.get("host_discord_id") or "")
-                    if hid:
-                        hres = supabase.table("bngc_users").select("game_username,skin").eq("discord_id", hid).limit(1).execute()
-                        hrows = hres.data or []
-                        if hrows:
-                            host_game_username = hrows[0].get("game_username")
-                            host_skin = hrows[0].get("skin")
-                    if host_game_username and cur_room:
-                        hn = str(host_game_username)
-                        hstrip = hn[3:].strip() if hn.lower().startswith("dc:") else hn
-                        try:
-                            pyns = [str((p or {}).get("username") or "") for p in (cur_room.get("players") or {}).values()]
-                        except Exception:
-                            pyns = []
-                        for pn in pyns:
-                            ps = pn[3:].strip() if pn.lower().startswith("dc:") else pn
-                            if pn and (pn == hn or ps == hstrip):
-                                host_playing = True
-                                break
-                except Exception:
-                    pass
                 # last sealed result for this room (drives the points toast):
-                # what I gained, whether I won, my placement and kills.
+                # what I gained, whether I won, and my kills.
                 last_result = None
                 try:
-                    lr = supabase.table("ranked_results").select(
-                        "match_version,winner_discord_id,kills,points,placements"
-                    ).eq("room_id", rid).order("match_version", desc=True).limit(1).execute()
+                    lr = await db_io(lambda: supabase.table("ranked_results").select(
+                        "match_version,winner_discord_id,kills,points"
+                    ).eq("room_id", rid).order("match_version", desc=True).limit(1).execute())
                     rows = lr.data or []
                     if rows:
                         row = rows[0]
                         pts_map = row.get("points") or {}
                         kills_map = row.get("kills") or {}
-                        plc_map = row.get("placements") or {}
                         me = str(discord_id or "")
-                        try:
-                            plc = plc_map.get(me)
-                            plc = int(plc) if plc is not None else None
-                        except Exception:
-                            plc = None
                         last_result = {
                             "match_version": row.get("match_version"),
                             "gained": int(pts_map.get(me) or 0),
                             "won": bool(me) and str(row.get("winner_discord_id") or "") == me,
-                            "placement": plc,
                             "kills": int(kills_map.get(me) or 0),
                         }
                 except Exception:
                     last_result = None
-                # Sealed-match count for this room (lobby card "sealed/max" line
-                # + session-ended detection). A count query, not row data.
-                sealed = 0
-                try:
-                    scnt = supabase.table("ranked_results").select("match_version", count="exact").eq("room_id", rid).execute()
-                    sealed = int(getattr(scnt, "count", 0) or 0)
-                except Exception:
-                    sealed = 0
                 ranked_out = {
                     "active": True,
                     "rid": rid,
@@ -384,38 +348,35 @@ async def get_stats(request: Request):
                     "milestone": tier.get("name"),
                     "milestone_icon_url": tier.get("icon_url"),
                     "milestone_color": tier.get("color"),
-                    "arena_icon_url": ranked_mod.ARENA_ICON_URL,
-                    "points_to_next": need,
-                    "next_milestone": (nxt.get("name") if nxt else None),
-                    "next_points_pct": pct,
-                    "warnings": warnings,
                     "match_id": f"{rid}-{mver}" if rid and mver > 0 else (rid or None),
                     "match_version": mver,
                     "last_result": last_result,
-                    "host_game_username": host_game_username,
-                    "host_skin": host_skin,
-                    "host_playing": host_playing,
-                    "min_points": rdata.get("min_points") or 0,
-                    "max_points": rdata.get("max_points"),
-                    "fee": rdata.get("fee") or 0,
-                    "sealed": sealed,
-                    "max_matches": rdata.get("max_matches"),
                 }
     except Exception:
         ranked_out = None
+    # Per-poll verdict log, sampled: a BLOCK line only when the verdict
+    # flips (none<->BLOCK, version/points change) or every 60s. Polls land
+    # every few seconds per client — an unconditional line buries real logs.
     try:
         _rk_state = (session_out or {}).get("state")
         _rk_code = (session_out or {}).get("short_code") or _stale_short_code
-        if ranked_out:
-            log_ranked(f"[ranked] stats did={str(discord_id)[:6]} code={_rk_code} "
-                    f"state={_rk_state} -> BLOCK rid={ranked_out.get('rid')} "
-                    f"status={ranked_out.get('status')} host={ranked_out.get('is_host')} "
-                    f"v={ranked_out.get('match_version')} pts={ranked_out.get('points')} "
-                    f"tier={ranked_out.get('milestone')}"
-                    f"{' stale' if _stale_short_code and not (session_out or {}).get('short_code') else ''}")
-        else:
-            log_ranked(f"[ranked] stats did={str(discord_id)[:6]} code={_rk_code} "
-                    f"state={_rk_state} -> none")
+        _rk_sig = (str(ranked_out.get("rid")) if ranked_out else None,
+                   ranked_out.get("match_version") if ranked_out else None,
+                   ranked_out.get("points") if ranked_out else None)
+        _rk_last = _stats_ranked_sig.get(str(discord_id or ""))
+        _rk_now = _time.time()
+        if _rk_last is None or _rk_last[0] != _rk_sig or _rk_now - _rk_last[1] >= 60:
+            _stats_ranked_sig[str(discord_id or "")] = (_rk_sig, _rk_now)
+            if ranked_out:
+                log_ranked(f"[ranked] stats did={str(discord_id)[:6]} code={_rk_code} "
+                        f"state={_rk_state} -> BLOCK rid={ranked_out.get('rid')} "
+                        f"status={ranked_out.get('status')} host={ranked_out.get('is_host')} "
+                        f"v={ranked_out.get('match_version')} pts={ranked_out.get('points')} "
+                        f"tier={ranked_out.get('milestone')}"
+                        f"{' stale' if _stale_short_code and not (session_out or {}).get('short_code') else ''}")
+            else:
+                log_ranked(f"[ranked] stats did={str(discord_id)[:6]} code={_rk_code} "
+                        f"state={_rk_state} -> none")
     except Exception:
         pass
 
@@ -423,7 +384,7 @@ async def get_stats(request: Request):
     # only exists inside a ranked room; drawer/panel/lobby-card read this.
     arena = None
     try:
-        apts = ranked_mod.get_ranked_points(discord_id)
+        apts = await db_io(ranked_mod.get_ranked_points, discord_id)
         atier = ranked_mod.milestone_for(apts)
         anxt, aneed, apct = ranked_mod.next_milestone(apts)
         aseason, areset = ranked_mod.get_current_season()
@@ -437,6 +398,14 @@ async def get_stats(request: Request):
             "next_points_pct": apct,
             "season": aseason,
             "reset_at": areset,
+            "streaks": {
+                "daily": int(user.get("daily_streak") or 0),
+                "win": int(user.get("win_streak") or 0),
+                "best_win": int(user.get("best_win_streak") or 0),
+                "best_match_kills": int(user.get("best_match_kills") or 0),
+                "last_daily_claim": user.get("last_daily_claim"),
+            },
+            "ranked_sleeping": bool(getattr(ranked_mod, "RANKED_ENABLED", True) is False),
         }
     except Exception:
         arena = None

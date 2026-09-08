@@ -289,6 +289,10 @@ async def ranked_verify(request: Request):
     qp = request.query_params
     code = (qp.get("code") or "").strip().upper()
     host = (qp.get("host") or "").strip()
+    if getattr(ranked_mod, "RANKED_ENABLED", True) is False:
+        return JSONResponse({"code": code or None, "room_active": False,
+                             "host_in_room": False, "players_seen": [],
+                             "events_seen": 0, "sleeping": True})
     if len(code) != 5 or not code.isalnum():
         return JSONResponse({"error": "code must be 5 letters/digits"}, status_code=400)
     if not supabase:

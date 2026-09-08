@@ -383,6 +383,7 @@ async function fetchAndShowPlayer(query) {
         }
         renderProfileData(data, query);
         loadProfileMatches(data.game_username || data.discord_username || query);
+        loadProfileStreaks(data.discord_id || null);
     } catch (error) {
         console.error("[NECTAR] Player fetch error:", error);
         if (usernameEl) usernameEl.textContent = `Player "${query}" Not Found`;
@@ -719,4 +720,24 @@ if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", startNectar);
 } else {
     startNectar();
+}
+
+// v2.19.0 streak shelf: arena.streaks from /api/stats (read-only).
+async function loadProfileStreaks(discordId) {
+    const ids = { win: "streak-win", daily: "streak-daily", bestWin: "streak-best-win", bestKills: "streak-best-kills" };
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+    try {
+        if (!discordId) { Object.values(ids).forEach(id => set(id, "--")); return; }
+        const r = await fetch(`${API_BASE_URL}/api/stats?discord_id=${encodeURIComponent(discordId)}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const j = await r.json();
+        const st = (j && j.arena && j.arena.streaks) || null;
+        if (!st) { Object.values(ids).forEach(id => set(id, "--")); return; }
+        set(ids.win, `x${st.win ?? 0}`);
+        set(ids.daily, `x${st.daily ?? 0}`);
+        set(ids.bestWin, `x${st.best_win ?? 0}`);
+        set(ids.bestKills, `${st.best_match_kills ?? 0} kills`);
+    } catch (e) {
+        Object.values(ids).forEach(id => set(id, "--"));
+    }
 }

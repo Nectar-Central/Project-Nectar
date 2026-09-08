@@ -16,7 +16,7 @@ happen async (~50ms). If DB is slow, POST still succeeds.
 from __future__ import annotations
 
 # Supabase client for DB queries (table inserts/updates/queries)
-from server.lib.supabase_client import supabase, db
+from server.lib.supabase_client import supabase, db, db_io
 
 # Logging helpers: log_sys for info, log_err for errors, log_engine for pretty event lines
 from server.lib.logger import log_sys, log_err, log_engine, log_ranked, log_dbg
@@ -365,7 +365,56 @@ def _eff_gm(pkt, pkt_room_gm, gm_val):
     return pkt_gm or pkt_room_gm or gm_val  # Fallback chain: packet → room → session
 
 
-def _result_event_exists(session_id, event_type, room_id, match_ver) -> bool:
+def _buf_event(buf, discord_id, session_id, event_type, event_data):
+    """Queue one bngc_game_events row for the batch-end bulk insert.
+
+    When buf is None the row is inserted directly (old behavior, kept for
+    callers outside process_batch). Never raises.
+    """
+    row = {"discord_id": discord_id,       # Which Discord user owns this session
+           "session_id": session_id,       # Which session
+           "event_type": event_type,       # Event type for querying
+           "event_data": event_data}       # Event details
+    try:
+        if buf is None:
+            supabase.table("bngc_game_events").insert(row).execute()
+        else:
+            buf.append(row)
+    except Exception as exc:
+        log_err(f"processor event write failed {event_type}: {exc}")
+
+
+def _flush_events(buf):
+    """Bulk-insert all queued game events in ONE query. Never raises."""
+    try:
+        if buf:
+            supabase.table("bngc_game_events").insert(list(buf)).execute()
+            buf.clear()
+    except Exception as exc:
+        try:
+            n = len(buf) if buf else 0
+        except Exception:
+            n = -1
+        log_err(f"processor bulk event flush failed ({n} rows): {exc}")
+
+
+def _bump_user(user, dirty, key, delta=1):
+    """Increment an in-memory user counter, marking it for the batch-end
+    single UPDATE. Returns the new value. Never raises."""
+    try:
+        new_v = (user.get(key) or 0) + delta
+    except Exception:
+        new_v = delta
+    try:
+        user[key] = new_v
+        if dirty is not None:
+            dirty.add(key)
+    except Exception:
+        pass
+    return new_v
+
+
+def _result_event_exists(session_id, event_type, room_id, match_ver, buf=None) -> bool:
     """Idempotency guard: was this match result already written?
 
     Retried/requeued batches re-run the drain with restored (marker-less)
@@ -373,7 +422,23 @@ def _result_event_exists(session_id, event_type, room_id, match_ver) -> bool:
     on purpose: respawn modes legitimately repeat same-victim kills, and the
     time-window retransmit guard already covers those. Fail-open (False) on
     read errors so a blip never blocks a legitimate first write.
+
+    buf: batch event buffer — a row queued but not yet flushed counts as
+    written, so two triggers inside one batch can't double-record.
     """
+    try:
+        if buf:
+            for r in buf:
+                try:
+                    if r.get("session_id") != session_id or r.get("event_type") != event_type:
+                        continue
+                    ed = r.get("event_data") or {}
+                    if str(ed.get("room_id") or "") == str(room_id or "") and ed.get("match_version") == match_ver:
+                        return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
     try:
         res = supabase.table("bngc_game_events").select("event_data").eq(
             "session_id", session_id).eq(
@@ -387,7 +452,38 @@ def _result_event_exists(session_id, event_type, room_id, match_ver) -> bool:
     return False
 
 
-def _defeat_recorded(session_id, room_id, match_ver) -> bool:
+def _aligned_match_version(room_ver, sealed_count):
+    """Session-continuous version for a fresh Photon room. Pure helper.
+
+    match_version restarts at 0 per Photon room, but seals are keyed
+    (room_id, match_version) per RANKED session — without this, every new
+    Photon room re-seals v1, v2... and collides with already-sealed rows
+    (skipped as duplicates, so no points are ever granted again).
+    Returns sealed_count when the room is still at v0 with seals behind
+    it, else the room version untouched. Never raises.
+    """
+    try:
+        rv = int(room_ver or 0)
+        sc = int(sealed_count or 0)
+    except Exception:
+        return room_ver
+    if rv == 0 and sc > 0:
+        return sc
+    return rv
+
+
+def _sealed_count(rid) -> int:
+    """COUNT ranked_results rows for a room. 0 on any error. Never raises."""
+    try:
+        if not rid:
+            return 0
+        res = supabase.table("ranked_results").select("match_version").eq("room_id", str(rid)).execute()
+        return len(res.data or [])
+    except Exception:
+        return 0
+
+
+def _defeat_recorded(session_id, room_id, match_ver, buf=None) -> bool:
     """Phase-end-tolerant defeat check: matches the current version OR the
     pre-bump one.
 
@@ -403,32 +499,32 @@ def _defeat_recorded(session_id, room_id, match_ver) -> bool:
     try:
         cur = int(match_ver)
     except Exception:
-        return _result_event_exists(session_id, "defeat", room_id, match_ver)
-    if _result_event_exists(session_id, "defeat", room_id, cur):
+        return _result_event_exists(session_id, "defeat", room_id, match_ver, buf)
+    if _result_event_exists(session_id, "defeat", room_id, cur, buf):
         return True
-    if cur > 0 and _result_event_exists(session_id, "defeat", room_id, cur - 1):
+    if cur > 0 and _result_event_exists(session_id, "defeat", room_id, cur - 1, buf):
         return True
     return False
 
 
-def _write_win(discord_id, session_id, user, gm, room_id, short_code, match_ver, winner, room):
-    """Write one win to DB (bngc_users + bngc_game_events) + log lines.
-    Marks room.last_win_version (NOT drained — version bump re-enables next match).
+def _write_win(discord_id, session_id, user, gm, room_id, short_code, match_ver, winner, room,
+               buf=None, dirty=None):
+    """Queue one win (bngc_users counter + bngc_game_events row) + log lines.
+    The counter UPDATE and event INSERT are flushed once at batch end —
+    pass the process_batch buf/dirty pair. Marks room.last_win_version
+    (NOT drained — version bump re-enables next match).
     """
-    if _result_event_exists(session_id, "win", room_id, match_ver):
+    if _result_event_exists(session_id, "win", room_id, match_ver, buf):
         log_sys(f"PROCESSOR WIN skip already recorded gm={gm} room={str(room_id or '')[:8]} ver={match_ver}")
         if room is not None:
             room.last_win_version = match_ver  # heal marker so it isn't retried
         return user.get("wins") or 0
-    new_wins = (user.get("wins") or 0) + 1  # Increment win count
-    supabase.table("bngc_users").update({"wins": new_wins}).eq("discord_id", discord_id).execute()
-    supabase.table("bngc_game_events").insert({
-        "discord_id": discord_id,       # Which Discord user owns this session
-        "session_id": session_id,       # Which session
-        "event_type": "win",            # Win event
-        "event_data": {"gm": gm, "room_id": room_id, "short_code": short_code,
-                       "match_version": match_ver, "winner": winner},
-    }).execute()
+    new_wins = _bump_user(user, dirty, "wins")  # Increment (flushed at batch end)
+    if buf is None:
+        supabase.table("bngc_users").update({"wins": new_wins}).eq("discord_id", discord_id).execute()
+    _buf_event(buf, discord_id, session_id, "win",
+               {"gm": gm, "room_id": room_id, "short_code": short_code,
+                "match_version": match_ver, "winner": winner})
     try:
         _duo = bool(room.is_duo) if room is not None else False
     except Exception:
@@ -443,28 +539,28 @@ def _write_win(discord_id, session_id, user, gm, room_id, short_code, match_ver,
     return new_wins
 
 
-def _write_defeat(discord_id, session_id, user, gm, room_id, short_code, match_ver, room):
-    """Write one defeat to DB (bngc_users + bngc_game_events) + log lines.
+def _write_defeat(discord_id, session_id, user, gm, room_id, short_code, match_ver, room,
+                  buf=None, dirty=None):
+    """Queue one defeat (bngc_users counter + bngc_game_events row) + log lines.
+    The counter UPDATE and event INSERT are flushed once at batch end —
+    pass the process_batch buf/dirty pair.
     Sets room.had_self_defeat so later stG=3 / leave defeats are blocked. DF excluded by caller.
     Suppressed when a win was already recorded for this version (win stands).
     """
-    if room is not None and room.last_win_version == match_ver:
+    if room is not None and (room.last_win_version == match_ver or room.last_win_version > match_ver):
         log_sys(f"PROCESSOR DEFEAT skip win already recorded gm={gm}")  # Win stands
         return user.get("defeats") or 0
-    if _result_event_exists(session_id, "defeat", room_id, match_ver):
+    if _result_event_exists(session_id, "defeat", room_id, match_ver, buf):
         log_sys(f"PROCESSOR DEFEAT skip already recorded gm={gm} room={str(room_id or '')[:8]} ver={match_ver}")
         if room is not None:
             room.had_self_defeat = True  # heal marker so it isn't retried
         return user.get("defeats") or 0
-    new_def = (user.get("defeats") or 0) + 1  # Increment defeat count
-    supabase.table("bngc_users").update({"defeats": new_def}).eq("discord_id", discord_id).execute()
-    supabase.table("bngc_game_events").insert({
-        "discord_id": discord_id,       # Which Discord user owns this session
-        "session_id": session_id,       # Which session
-        "event_type": "defeat",         # Defeat event
-        "event_data": {"gm": gm, "room_id": room_id, "short_code": short_code,
-                       "match_version": match_ver},
-    }).execute()
+    new_def = _bump_user(user, dirty, "defeats")  # Increment (flushed at batch end)
+    if buf is None:
+        supabase.table("bngc_users").update({"defeats": new_def}).eq("discord_id", discord_id).execute()
+    _buf_event(buf, discord_id, session_id, "defeat",
+               {"gm": gm, "room_id": room_id, "short_code": short_code,
+                "match_version": match_ver})
     try:
         _duo = bool(room.is_duo) if room is not None else False
     except Exception:
@@ -556,11 +652,101 @@ def _sync_playtime(view, user, discord_id):
 
 
 # ---------------------------------------------------------------------------
-# Ranked sealing (host authority) — Phase 2
+# v2.19.0 streak rewards — daily / win / kill (batch-end, never raises)
 # ---------------------------------------------------------------------------
 
-_HOST_FRESH_S = 60  # host packets older than this pause sealing (crash-safe)
+def _apply_streaks(user, dirty, ev_rows) -> int:
+    """Update streak counters in-memory + queue for flush. Returns bonus earned.
 
+    Daily: first batch per UTC day advances (continue on 1-day gap, reset
+    otherwise; same-day re-batch pays nothing). Win: any win event bumps
+    win_streak (defeat resets, best kept). Kill: kills in this batch vs
+    best_match_kills, threshold bonus once per batch. Missing columns
+    (pre-migration rows) default to 0. Never raises.
+    """
+    bonus = 0
+    try:
+        from datetime import date as _date
+        from server.lib import streaks as _st
+    except Exception:
+        return 0
+    try:
+        kinds = set()
+        kills_batch = 0
+        for e in (ev_rows or []):
+            try:
+                t = e.get("event_type") if isinstance(e, dict) else None
+                if t:
+                    kinds.add(t)
+                if t == "kill":
+                    kills_batch += 1
+            except Exception:
+                continue
+        # daily
+        try:
+            today = _date.today()
+            lc = user.get("last_daily_claim")
+            if str(lc) != str(today):
+                if lc in (None, ""):
+                    ns, b = 1, _st.DAILY_BONUS.get(1, 0)
+                else:
+                    try:
+                        from datetime import date as _d2
+                        lcd = _d2.fromisoformat(str(lc)[:10])
+                        gap = (today - lcd).days
+                    except Exception:
+                        gap = 99
+                    if gap <= 0:
+                        ns, b = int(user.get("daily_streak") or 0), 0
+                    elif gap == 1:
+                        ns, b = _st.daily_continue(int(user.get("daily_streak") or 0))
+                    else:
+                        ns, b = 1, _st.DAILY_BONUS.get(1, 0)
+                user["daily_streak"] = ns
+                user["last_daily_claim"] = str(today)
+                dirty.add("daily_streak")
+                dirty.add("last_daily_claim")
+                bonus += int(b or 0)
+        except Exception:
+            pass
+        # win / defeat
+        try:
+            if "win" in kinds:
+                ns = int(user.get("win_streak") or 0) + 1
+                user["win_streak"] = ns
+                dirty.add("win_streak")
+                if ns > int(user.get("best_win_streak") or 0):
+                    user["best_win_streak"] = ns
+                    dirty.add("best_win_streak")
+                bonus += int(_st.win_bonus(ns) or 0)
+            elif "defeat" in kinds and int(user.get("win_streak") or 0) != 0:
+                user["win_streak"] = 0
+                dirty.add("win_streak")
+        except Exception:
+            pass
+        # kill batch
+        try:
+            if kills_batch > int(user.get("best_match_kills") or 0):
+                user["best_match_kills"] = kills_batch
+                dirty.add("best_match_kills")
+            bonus += int(_st.kill_bonus(kills_batch) or 0)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return bonus
+
+
+# ---------------------------------------------------------------------------
+# Ranked sealing (host authority) — kills x8 + alive +50 / dead -5.
+#
+# Split authority, matching the match flow:
+#   - kills come from the HOST feed (host sees every killfeed entry);
+#   - win/loss comes from each reporter's own alv (host self-damages when
+#     hosting_only, so he reads dead and is skipped from awards entirely).
+# One writer (host) per (room, version); seal_match is idempotent so
+# retries and multi-trigger drains collapse to a single award.
+# ---------------------------------------------------------------------------
 
 def _resolve_ranked_dids(usernames) -> dict:
     """Map game usernames -> discord_ids via bngc_users (single batched query).
@@ -589,135 +775,131 @@ def _resolve_ranked_dids(usernames) -> dict:
         return {}
 
 
+def _roster_name2did(room_data, room) -> dict:
+    """Map roster game usernames -> discord_ids. Never raises.
+
+    Roster entries written by the bot carry game_username; anything missing
+    is resolved via one bngc_users query for the names the host actually saw
+    (room.players + killfeed). Unmapped names stay absent (no fake points).
+    """
+    out: dict = {}
+    try:
+        for entry in (room_data.get("roster") or []):
+            try:
+                uname = entry.get("game_username") or entry.get("username")
+                did = entry.get("discord_id")
+                if uname and did:
+                    out[str(uname)] = str(did)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        missing = []
+        try:
+            for p in (getattr(room, "players", None) or {}).values():
+                uname = getattr(p, "username", None)
+                if uname and str(uname) not in out and str(uname) not in missing:
+                    missing.append(str(uname))
+        except Exception:
+            pass
+        try:
+            for k in (getattr(room, "recent_kills", None) or []):
+                for uname in (getattr(k, "instigator", None), getattr(k, "instigated", None)):
+                    if uname and str(uname) not in out and str(uname) not in missing:
+                        missing.append(str(uname))
+        except Exception:
+            pass
+        if missing:
+            out.update(_resolve_ranked_dids(missing))
+    except Exception:
+        pass
+    return out
+
+
 def seal_ranked_match(session_id, discord_id, room, room_id, gm) -> None:
     """Seal one ranked match from the host session. Never raises.
 
-    Gates (all must hold): room is a live ranked room, this session is the
-    host, host packets are fresh, and (rid, match_version) isn't sealed yet.
-    Harvests roster kills from recent_kills, derives placements (alive = 1st,
-    killfeed-reverse order for the dead, unknown = 99 baseline), flags
-    non-roster players on room.ranked_warnings, awards static points via
-    ranked.seal_match, and flips the room to ended at max_matches.
+    Gates: room carries a ranked code, the room is live, this session is the
+    host, and the match version is positive. Idempotency lives in
+    ranked.seal_match (re-seals are no-ops), so every phase-end trigger can
+    call this freely — including hosting_only hosts, whose spectator did is
+    skipped from awards but whose feed still seals everyone else's kills.
+
+    Winner = alive roster in the HOST view (alv is broadcast, so this agrees
+    with each client's own alive check); nobody alive (zone double-KO) =>
+    most-recent roster death survived longest. Kills x8, win +50, loss -5.
     Non-host sessions return silently (personal win/defeat already ran).
     """
     try:
-        import time as _t
         from server.lib import ranked as ranked_mod
     except Exception as exc:
         log_err(f"processor ranked import failed {exc}")
         return
     try:
+        try:
+            if getattr(ranked_mod, "RANKED_ENABLED", False) is False:
+                return  # v2.19.0 ranked sleeping: code committed, never seals
+        except Exception:
+            return
         code = getattr(room, "short_code", None)
         if not code:
             return
         room_data = ranked_mod.get_ranked_room(code)
-        if not room_data or room_data.get("status") != "live":
-            return  # not a live ranked room
-        if str(discord_id or "") != str(room_data.get("host_discord_id") or ""):
-            return  # not the host — personal stats only
-        try:
-            last_pkt = float(getattr(room, "last_packet_at", 0) or 0)
-        except Exception:
-            last_pkt = 0
-        if last_pkt and (_t.time() - last_pkt) > _HOST_FRESH_S:
-            log_ranked(f"[ranked] host stale in {room_data.get('id')} — seal paused (crash-safe)")
-            return
-        rid = str(room_data.get("id"))
         try:
             mver = int(getattr(room, "match_version", 0) or 0)
         except Exception:
             mver = 0
+        if not room_data or room_data.get("status") != "live":
+            # Loud skip (once per match version): a match ended in a room
+            # that was never started — run /ranked start in Discord.
+            try:
+                if mver > 0 and getattr(room, "_seal_skip_logged_v", 0) != mver:
+                    room._seal_skip_logged_v = mver
+                    log_ranked(f"[ranked] seal SKIPPED {(room_data or {}).get('id') or code} v{mver} — "
+                               f"room status={((room_data or {}).get('status')) or 'unknown'}, run /ranked start")
+            except Exception:
+                pass
+            return  # not a live ranked room
+        if str(discord_id or "") != str(room_data.get("host_discord_id") or ""):
+            return  # not the host — personal stats only
+        rid = str(room_data.get("id"))
         if not rid or mver <= 0:
             return
-        # idempotency: additive bumps must never double-fire (restore/retry safe)
-        try:
-            chk = supabase.table("ranked_results").select("room_id").eq("room_id", rid).eq("match_version", mver).limit(1).execute()
-            if chk.data:
-                return  # already sealed
-        except Exception as exc:
-            log_ranked(f"[ranked] seal check failed {rid} v{mver}: {exc}")
-            return  # fail-closed: a blip must not double-award
         roster = set(ranked_mod.room_roster_ids(room_data))
         if not roster:
             return
-        # username -> did for everyone in the room (one batched query)
-        try:
-            room_names = [p.username for p in (getattr(room, "players", None) or {}).values() if getattr(p, "username", None)]
-        except Exception:
-            room_names = []
-        try:
-            feed_names = [k.instigator for k in (getattr(room, "recent_kills", None) or []) if getattr(k, "instigator", None)]
-            feed_names += [k.instigated for k in (getattr(room, "recent_kills", None) or []) if getattr(k, "instigated", None)]
-        except Exception:
-            pass
-        name2did = _resolve_ranked_dids(room_names + feed_names)
-        # non-roster: in-room players whose did is unknown or off-roster
-        warnings = []
+        # hosting_only: the host spectates (self-damages, reads dead) — not
+        # counted, but his feed still seals the players' kills.
+        host_did = str(room_data.get("host_discord_id") or "")
+        skip = {host_did} if (room_data.get("host_status") or "").strip() == "hosting_only" and host_did else set()
+        name2did = _roster_name2did(room_data, room)
+        # alive roster in the host view + death recency (most-recent first)
+        # for the double-KO fallback below.
+        alive: list = []
         try:
             for p in (getattr(room, "players", None) or {}).values():
-                uname = getattr(p, "username", None)
-                if not uname:
+                if not getattr(p, "is_alive", False):
                     continue
-                if name2did.get(str(uname)) not in roster:
-                    if str(uname) not in warnings:
-                        warnings.append(str(uname))
-        except Exception:
-            pass
-        try:
-            room.ranked_warnings = warnings[:32]
-        except Exception:
-            pass
-        # placements: alive roster = 1st; dead ordered by killfeed-reverse
-        # (most-recent death = 2nd, survived longest). Roster dead with no
-        # killfeed entry (zone death) take the next free places after the
-        # feed deaths; all placement awards are capped at the lobby size.
-        placements: dict = {}
-        alive_dids = []
-        try:
-            for p in (getattr(room, "players", None) or {}).values():
-                if getattr(p, "is_alive", False):
+                try:
                     did = name2did.get(str(getattr(p, "username", "")))
-                    if did and did in roster and did not in alive_dids:
-                        alive_dids.append(did)
+                except Exception:
+                    did = None
+                if did and did in roster and did not in skip and did not in alive:
+                    alive.append(did)
         except Exception:
             pass
-        for did in alive_dids:
-            placements[did] = 1
+        dead_order: list = []  # victim dids, most-recent death first
         try:
-            dead_order: list = []  # victim dids, most-recent death first
             for k in reversed(getattr(room, "recent_kills", None) or []):
                 try:
                     if getattr(k, "event_type", None) != "killed":
                         continue
                     vdid = name2did.get(str(getattr(k, "instigated", "")))
-                    if vdid and vdid in roster and vdid not in placements and vdid not in dead_order:
+                    if vdid and vdid in roster and vdid not in skip and vdid not in dead_order:
                         dead_order.append(vdid)
                 except Exception:
                     continue
-            if alive_dids:
-                place = 2
-                for vdid in dead_order:
-                    placements[vdid] = place
-                    place += 1
-            else:
-                # nobody alive (zone double-KO): most-recent death survived
-                # longest, so it wins — 1st goes to dead_order[0], rest shift
-                # down instead of leaving winner None with a 2nd-place row.
-                place = 1
-                for vdid in dead_order:
-                    placements[vdid] = place
-                    place += 1
-            # zone deaths: dead in-room roster with no killfeed entry
-            try:
-                for p in (getattr(room, "players", None) or {}).values():
-                    if getattr(p, "is_alive", False):
-                        continue
-                    did = name2did.get(str(getattr(p, "username", "")))
-                    if did and did in roster and did not in placements:
-                        placements[did] = place
-                        place += 1
-            except Exception:
-                pass
         except Exception:
             pass
         # exact per-kill events (roster killer + mapped victim; victim may be
@@ -732,7 +914,7 @@ def seal_ranked_match(session_id, discord_id, room, room_id, gm) -> None:
                     if getattr(k, "event_type", None) != "killed":
                         continue
                     kdid = name2did.get(str(getattr(k, "instigator", "")))
-                    if not kdid or kdid not in roster:
+                    if not kdid or kdid not in roster or kdid in skip:
                         continue
                     vdid = name2did.get(str(getattr(k, "instigated", "")))
                     kill_events.append((kdid, vdid or kdid))
@@ -741,58 +923,19 @@ def seal_ranked_match(session_id, discord_id, room, room_id, gm) -> None:
                     continue
         except Exception:
             pass
-        # death attribution: victim did -> killer did | None (None = zone/unknown).
-        # Feed deaths take the killer from the most-recent matching kill; dead
-        # in-room roster with no feed entry died to the zone.
-        death_killers: dict = {}
-        try:
-            for k in reversed(getattr(room, "recent_kills", None) or []):
-                try:
-                    if getattr(k, "event_type", None) != "killed":
-                        continue
-                    vdid = name2did.get(str(getattr(k, "instigated", "")))
-                    if vdid and vdid in roster and vdid not in death_killers:
-                        kdid = name2did.get(str(getattr(k, "instigator", "")))
-                        death_killers[vdid] = kdid if kdid else None
-                except Exception:
-                    continue
-            for p in (getattr(room, "players", None) or {}).values():
-                try:
-                    if getattr(p, "is_alive", False):
-                        continue
-                    did = name2did.get(str(getattr(p, "username", "")))
-                    if did and did in roster and did not in death_killers:
-                        death_killers[did] = None
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        # winner: a live roster player; else the last to die (most-recent
-        # death survived longest — covers zone double-KOs where nobody is
-        # alive instead of sealing with winner None).
-        winner = alive_dids[0] if alive_dids else (dead_order[0] if dead_order else None)
+        # winner: first alive; total wipe => most-recent death survived
+        # longest (zone double-KO fallback). Every other roster did takes
+        # the flat loss — zone, unknown, and killed alike.
+        winner = alive[0] if alive else (dead_order[0] if dead_order else None)
+        deaths = {did: None for did in roster if did not in skip and did != winner}
         res = ranked_mod.seal_match(rid=rid, match_version=mver, gm=gm or room_data.get("gm") or "zw_lg",
                                     winner_discord_id=winner, kills=kills_count,
-                                    placements=placements, kill_events=kill_events or None,
-                                    players_count=len(roster), death_killers=death_killers or None)
+                                    kill_events=kill_events or None,
+                                    death_killers=deaths or None)
         if not res.get("ok"):
             log_ranked(f"[ranked] seal failed {rid} v{mver}: {res.get('error')}")
             return
-        log_ranked(f"[ranked] sealed {rid} v{mver} winner={winner} points={res.get('points')} "
-                     f"placements={placements} deaths={death_killers} kills={kills_count}")
-        # room end: sealed count hit max_matches -> ended (bot finalizes embed)
-        try:
-            mx = int(room_data.get("max_matches") or 0)
-        except Exception:
-            mx = 0
-        if mx > 0:
-            try:
-                cnt = supabase.table("ranked_results").select("match_version").eq("room_id", rid).execute()
-                if len(cnt.data or []) >= mx:
-                    supabase.table("ranked_rooms").update({"status": "ended"}).eq("id", rid).execute()
-                    log_ranked(f"[ranked] room {rid} ended ({mx} matches sealed)")
-            except Exception as exc:
-                log_ranked(f"[ranked] end check failed {rid}: {exc}")
+        log_ranked(f"[ranked] sealed {rid} v{mver} winner={winner} points={res.get('points')} kills={kills_count}")
     except Exception as exc:
         log_ranked(f"[ranked] seal_ranked_match failed {exc}")
 
@@ -832,7 +975,7 @@ async def process_batch(
 
     # Fetch discord_id from bngc_sessions table
     try:
-        sess_res = db.get_session_sync(session_id)  # Query session by ID
+        sess_res = await db_io(db.get_session_sync, session_id)  # Query session by ID (thread: no loop block)
         sess_data = sess_res.get("data")            # Extract data dict
         discord_id = sess_data.get("discord_id") if sess_data else None  # Get Discord ID
         if not discord_id:            # No Discord ID found
@@ -844,7 +987,7 @@ async def process_batch(
 
     # Fetch user row from bngc_users (kills, deaths, wins, etc.)
     try:
-        user_res = supabase.table("bngc_users").select("*").eq("discord_id", discord_id).single().execute()
+        user_res = await db_io(lambda: supabase.table("bngc_users").select("*").eq("discord_id", discord_id).single().execute())
         user = user_res.data          # Extract user dict
         if not user:                  # No user found
             log_err(f"processor: no user for discord_id {discord_id[:6]}")
@@ -870,8 +1013,29 @@ async def process_batch(
     gm_val = view.game_mode.value if view.game_mode else None  # Current game mode string
     last_zone_phase = getattr(view, "_lastZonePhase", None)  # Last zone phase (persisted on view)
 
+    # hosting_only: host is a spectator in a ranked room — skip personal stat writes
+    _me_hosting_only = False
+    if getattr(view, "host_mode", False):
+        try:
+            from server.lib import ranked as ranked_mod
+            _room_code = getattr(view, "room", None)
+            if _room_code:
+                _rdata = ranked_mod.get_ranked_room(str(getattr(_room_code, "short_code", "") or ""))
+                if _rdata and (_rdata.get("host_status") or "").strip() == "hosting_only":
+                    _me_hosting_only = True
+        except Exception:
+            pass
+
+    # Batch write buffers: game-event rows queue here for ONE bulk insert at
+    # batch end, and user counters accumulate in-memory for ONE update.
+    # This collapses ~30-60 sequential queries per match batch into a few.
+    ev_rows: list = []               # bngc_game_events rows (bulk flushed)
+    dirty: set = set()               # user counter keys changed this batch
+    pending_user_updates: dict = {}  # non-counter user field updates (deferred)
+
     # Sync user fields from SessionView (so /info, /stats are live)
-    # Only updates if values changed to avoid unnecessary DB writes
+    # Only updates if values changed; the DB write is deferred to the
+    # batch-end flush (merged with counter updates into one UPDATE).
     try:
         updates = {}                 # Build update dict
         if view.me:                  # Only if we have player data
@@ -889,10 +1053,10 @@ async def process_batch(
                 updates["skin"] = view.me.skin              # Skin changed
             if view.me.pickaxe and view.me.pickaxe != user.get("pickaxe"):
                 updates["pickaxe"] = view.me.pickaxe        # Pickaxe changed
-        if updates:                  # Only write if something changed
-            supabase.table("bngc_users").update(updates).eq("discord_id", discord_id).execute()
+        if updates:                  # Stash for the batch-end flush
+            pending_user_updates.update(updates)
             log_sys(f"PROCESSOR sync user {discord_id[:6]} {updates}")
-            user.update(updates)     # Keep local copy in sync
+            user.update(updates)     # Keep local copy in sync now
     except Exception as exc:
         log_err(f"processor sync user failed {exc}")
 
@@ -939,41 +1103,31 @@ async def process_batch(
                     log_sys(f"PROCESSOR killfeed dup ignored {instigator}->{instigated} ({kf_type}, retransmit window)")
                 else:
                     skip_kf = False
-                # Insert killfeed event (records ALL kills/knocks in the lobby)
+                # Queue killfeed event (records ALL kills/knocks in the lobby;
+                # bulk-inserted once at batch end)
                 if not skip_kf:
-                    supabase.table("bngc_game_events").insert({
-                        "discord_id": discord_id,       # Which Discord user owns this session
-                        "session_id": session_id,       # Which session
-                        "event_type": "killfeed",       # Event type for querying
-                        "event_data": {                 # Kill details
-                            "gm": eff_gm,              # Game mode
-                            "instigator": instigator,   # Killer name
-                            "instigated": instigated,   # Victim name
-                            "kill_type": kf_type,       # "killed" or "knocked"
-                            "room_id": pkt_room_id,     # Room where it happened
-                            "code": pkt_short,          # Room short code
-                            "short_code": pkt_short,    # Duplicate for querying
-                            "match_version": pkt_match_ver,  # Match version
-                        },
-                    }).execute()
+                    _buf_event(ev_rows, discord_id, session_id, "killfeed",
+                               {"gm": eff_gm,              # Game mode
+                                "instigator": instigator,   # Killer name
+                                "instigated": instigated,   # Victim name
+                                "kill_type": kf_type,       # "killed" or "knocked"
+                                "room_id": pkt_room_id,     # Room where it happened
+                                "code": pkt_short,          # Room short code
+                                "short_code": pkt_short,    # Duplicate for querying
+                                "match_version": pkt_match_ver})  # Match version
                     _kill_count_stamp(_kf_room, instigator, instigated, kf_type, _kf_t)
 
-                # Self-specific kill: increment kills + write kill event.
+                # Self-specific kill: increment kills + queue kill event.
                 # Kills only (kf_type == killed): a knock is not an elimination —
                 # counting it doubled every knock-then-finish.
-                if not skip_kf and kf_type == "killed" and me_name and _names_equal(instigator, me_name):  # I am the killer
-                    new_kills = (user.get("kills") or 0) + 1  # Increment kill count
-                    supabase.table("bngc_users").update({"kills": new_kills}).eq("discord_id", discord_id).execute()
-                    # Write kill event (separate from killfeed for stat tracking)
-                    supabase.table("bngc_game_events").insert({
-                        "discord_id": discord_id,
-                        "session_id": session_id,
-                        "event_type": "kill",       # Self-kill event
-                        "event_data": {"gm": eff_gm, "victim": instigated, "room_id": pkt_room_id,
-                                       "code": pkt_short, "match_version": pkt_match_ver},
-                    }).execute()
-                    log_sys(f"PROCESSOR KILL victim={instigated} kills {user.get('kills',0)}->{new_kills}")
-                    user["kills"] = new_kills       # Update local cache
+                if not skip_kf and not _me_hosting_only and kf_type == "killed" and me_name and _names_equal(instigator, me_name):  # I am the killer
+                    old_kills = user.get("kills", 0)  # Pre-increment value for the log
+                    new_kills = _bump_user(user, dirty, "kills")  # Queued for batch-end flush
+                    # Queue kill event (separate from killfeed for stat tracking)
+                    _buf_event(ev_rows, discord_id, session_id, "kill",
+                               {"gm": eff_gm, "victim": instigated, "room_id": pkt_room_id,
+                                "code": pkt_short, "match_version": pkt_match_ver})
+                    log_sys(f"PROCESSOR KILL victim={instigated} kills {old_kills}->{new_kills}")
                     _precision.schedule("kill", session_id=session_id, discord_id=discord_id,
                                         expected=new_kills, match_version=pkt_match_ver,
                                         room_id=pkt_room_id, extra={"victim": instigated})
@@ -981,7 +1135,7 @@ async def process_batch(
                 # Self-specific death: increment deaths + write death event (one per life).
                 # Kills only: being knocked is not death (revive possible) — the
                 # finishing "killed" feed or alv=false counts it.
-                elif not skip_kf and kf_type == "killed" and me_name and _names_equal(instigated, me_name):  # I am the victim
+                elif not skip_kf and not _me_hosting_only and kf_type == "killed" and me_name and _names_equal(instigated, me_name):  # I am the victim
                     # Dedup key: prevent double-counting from killfeed + alv
                     dedup_key = (discord_id, pkt_match_ver if pkt_match_ver is not None else pkt_room_id)
                     if dedup_key not in death_counted_for_match:  # Not yet counted
@@ -990,18 +1144,13 @@ async def process_batch(
                             log_sys(f"PROCESSOR DEATH via killfeed skip already counted this life killer={instigator}")
                             death_counted_for_match.add(dedup_key)  # Mark as counted
                         else:
-                            new_deaths = (user.get("deaths") or 0) + 1  # Increment death count
-                            supabase.table("bngc_users").update({"deaths": new_deaths}).eq("discord_id", discord_id).execute()
-                            # Write death event (with "via": "killfeed" to track source)
-                            supabase.table("bngc_game_events").insert({
-                                "discord_id": discord_id,
-                                "session_id": session_id,
-                                "event_type": "death",
-                                "event_data": {"gm": eff_gm, "killer": instigator, "via": "killfeed",
-                                               "room_id": pkt_room_id, "code": pkt_short, "match_version": pkt_match_ver},
-                            }).execute()
-                            log_sys(f"PROCESSOR DEATH via killfeed killer={instigator} deaths {user.get('deaths',0)}->{new_deaths}")
-                            user["deaths"] = new_deaths  # Update local cache
+                            old_deaths = user.get("deaths", 0)  # Pre-increment value for the log
+                            new_deaths = _bump_user(user, dirty, "deaths")  # Queued for batch-end flush
+                            # Queue death event (with "via": "killfeed" to track source)
+                            _buf_event(ev_rows, discord_id, session_id, "death",
+                                       {"gm": eff_gm, "killer": instigator, "via": "killfeed",
+                                        "room_id": pkt_room_id, "code": pkt_short, "match_version": pkt_match_ver})
+                            log_sys(f"PROCESSOR DEATH via killfeed killer={instigator} deaths {old_deaths}->{new_deaths}")
                             death_counted_for_match.add(dedup_key)  # Mark as counted
                             _precision.schedule("death", session_id=session_id, discord_id=discord_id,
                                                 expected=new_deaths, match_version=pkt_match_ver,
@@ -1013,14 +1162,15 @@ async def process_batch(
                             # (defeat only when whole team dead). Later stG=3 / leave
                             # defeats are blocked by had_self_defeat.
                             try:
-                                if not _is_kd_only(eff_gm) and not (death_room is not None and death_room.had_self_defeat):
+                                if not _me_hosting_only and not _is_kd_only(eff_gm) and not (death_room is not None and death_room.had_self_defeat):
                                     _tstat = _team_alive_for_me(death_room, view, me_name)
-                                    if _tstat is True:  # duo + teammate alive → hold marker for drain
+                                    if _tstat is True or (_tstat is None and death_room is not None and death_room.is_duo):
+                                        # Duo + teammate alive OR duo + no team data yet → defer defeat for drain
                                         if death_room is not None and death_room.last_defeat_version != death_room.match_version:
                                             death_room.last_defeat_version = death_room.match_version
                                         log_sys(f"PROCESSOR defeat deferred duo teammate alive gm={eff_gm} (held for drain)")
-                                    else:  # solo, no team data, or whole team dead
-                                        _write_defeat(discord_id, session_id, user, eff_gm, pkt_room_id, pkt_short, pkt_match_ver, death_room)
+                                    else:  # solo, no team data (non-duo), or whole team dead
+                                        await db_io(_write_defeat, discord_id, session_id, user, eff_gm, pkt_room_id, pkt_short, pkt_match_ver, death_room, ev_rows, dirty)
                             except Exception as e:
                                 log_err(f"processor defeat-via-kill failed {e}")
 
@@ -1073,25 +1223,20 @@ async def process_batch(
 
                     # Check if this alv packet indicates death
                     is_dead_alv = (alv_is_alive is False) or bool(alv_is_elim)
-                    if is_dead_alv and me_name and alv_player and _names_equal(alv_player, me_name):  # I died
+                    if is_dead_alv and not _me_hosting_only and me_name and alv_player and _names_equal(alv_player, me_name):  # I died
                         dedup_key_alv = (discord_id, pkt_match_ver if pkt_match_ver is not None else pkt_room_id)
                         if dedup_key_alv not in death_counted_for_match:  # Not yet counted
                             room_alv = _get_room(pkt_room_id, view)  # Resolve room
                             # One death per life: stale alv=false repeats (still dead from
                             # an earlier counted death, never revived) must not recount
                             if room_alv and not room_alv.had_self_death:
-                                new_deaths_alv = (user.get("deaths") or 0) + 1  # Increment deaths
-                                supabase.table("bngc_users").update({"deaths": new_deaths_alv}).eq("discord_id", discord_id).execute()
-                                # Write death event (with "via": "alv" to track source)
-                                supabase.table("bngc_game_events").insert({
-                                    "discord_id": discord_id,
-                                    "session_id": session_id,
-                                    "event_type": "death",
-                                    "event_data": {"gm": eff_gm, "killer": None, "via": "alv",
-                                                   "room_id": pkt_room_id, "code": pkt_short, "match_version": pkt_match_ver},
-                                }).execute()
-                                log_sys(f"PROCESSOR DEATH via alv deaths {user.get('deaths',0)}->{new_deaths_alv}")
-                                user["deaths"] = new_deaths_alv  # Update local cache
+                                old_deaths_alv = user.get("deaths", 0)  # Pre-increment value for the log
+                                new_deaths_alv = _bump_user(user, dirty, "deaths")  # Queued for batch-end flush
+                                # Queue death event (with "via": "alv" to track source)
+                                _buf_event(ev_rows, discord_id, session_id, "death",
+                                           {"gm": eff_gm, "killer": None, "via": "alv",
+                                            "room_id": pkt_room_id, "code": pkt_short, "match_version": pkt_match_ver})
+                                log_sys(f"PROCESSOR DEATH via alv deaths {old_deaths_alv}->{new_deaths_alv}")
                                 death_counted_for_match.add(dedup_key_alv)  # Mark as counted
                                 _precision.schedule("death", session_id=session_id, discord_id=discord_id,
                                                     expected=new_deaths_alv, match_version=pkt_match_ver,
@@ -1099,14 +1244,15 @@ async def process_batch(
                                 room_alv.had_self_death = True  # One death per life
                                 # Defeat NOW (same rule as killfeed path, K/D-only excluded)
                                 try:
-                                    if not _is_kd_only(eff_gm) and not room_alv.had_self_defeat:
+                                    if not _me_hosting_only and not _is_kd_only(eff_gm) and not room_alv.had_self_defeat:
                                         _tstat_alv = _team_alive_for_me(room_alv, view, me_name)
-                                        if _tstat_alv is True:  # duo + teammate alive → hold marker for drain
+                                        if _tstat_alv is True or (_tstat_alv is None and room_alv.is_duo):
+                                            # Duo + teammate alive OR duo + no team data yet → defer defeat for drain
                                             if room_alv.last_defeat_version != room_alv.match_version:
                                                 room_alv.last_defeat_version = room_alv.match_version
                                             log_sys(f"PROCESSOR defeat deferred duo teammate alive gm={eff_gm} via=alv (held for drain)")
-                                        else:
-                                            _write_defeat(discord_id, session_id, user, eff_gm, pkt_room_id, pkt_short, pkt_match_ver, room_alv)
+                                        else:  # solo, no team data (non-duo), or whole team dead
+                                            await db_io(_write_defeat, discord_id, session_id, user, eff_gm, pkt_room_id, pkt_short, pkt_match_ver, room_alv, ev_rows, dirty)
                                 except Exception as e_def:
                                     log_err(f"processor defeat-via-alv failed {e_def}")
                             else:
@@ -1115,48 +1261,45 @@ async def process_batch(
                     log_err(f"processor alv death failed {e}")
 
             # --- Join events (new player joined room) ---
-            # Persist so lobby history is visible in the UI
+            # No DB row: the engine tracks players/rooms in-memory and the
+            # batch-end roster sync persists membership. Only stG, alv,
+            # killfeed and leave produce stored events.
             if is_join or pkt_type in ("join", "JOIN", "Join", "create_room", "join_room", "join_random_room"):
                 joiner = player_name or instigator  # Who joined
                 if joiner:             # Have a valid name
-                    try:
-                        supabase.table("bngc_game_events").insert({
-                            "discord_id": discord_id,
-                            "session_id": session_id,
-                            "event_type": "join",    # Join event type
-                            "event_data": {"gm": eff_gm, "player": joiner, "player_name": joiner,
-                                           "room_id": pkt_room_id, "code": pkt_short,
-                                           "short_code": pkt_short, "match_version": pkt_match_ver},
-                        }).execute()
-                        log_sys(f"PROCESSOR JOIN {joiner} gm={eff_gm}")
-                    except Exception as exc_j:
-                        log_err(f"processor join write failed {joiner}: {exc_j}")
+                    log_sys(f"PROCESSOR JOIN {joiner} gm={eff_gm}")
 
             # --- Leave events (player left or was kicked) ---
             if is_leave or pkt_type in ("leave", "LEAVE", "Leave"):
                 leaver = player_name or instigator  # Who left
                 if leaver:              # Have a valid name
-                    # Write as killfeed event with kill_type="left"
-                    supabase.table("bngc_game_events").insert({
-                        "discord_id": discord_id,
-                        "session_id": session_id,
-                        "event_type": "killfeed",   # Killfeed type for querying
-                        "event_data": {"gm": eff_gm, "instigator": leaver, "instigated": None,
-                                       "kill_type": "left", "room_id": pkt_room_id, "code": pkt_short,
-                                       "match_version": pkt_match_ver},
-                    }).execute()
-                    # Write as discrete leave event (separate from killfeed)
-                    try:
-                        supabase.table("bngc_game_events").insert({
-                            "discord_id": discord_id,
-                            "session_id": session_id,
-                            "event_type": "leave",   # Leave event type
-                            "event_data": {"gm": eff_gm, "player": leaver, "player_name": leaver,
-                                           "room_id": pkt_room_id, "code": pkt_short, "match_version": pkt_match_ver},
-                        }).execute()
-                    except Exception:
-                        pass            # Silently ignore leave event write errors
+                    # Queue as killfeed event with kill_type="left"
+                    _buf_event(ev_rows, discord_id, session_id, "killfeed",
+                               {"gm": eff_gm, "instigator": leaver, "instigated": None,
+                                "kill_type": "left", "room_id": pkt_room_id, "code": pkt_short,
+                                "match_version": pkt_match_ver})
+                    # Queue as discrete leave event (separate from killfeed)
+                    _buf_event(ev_rows, discord_id, session_id, "leave",
+                               {"gm": eff_gm, "player": leaver, "player_name": leaver,
+                                "room_id": pkt_room_id, "code": pkt_short, "match_version": pkt_match_ver})
                     log_sys(f"PROCESSOR LEAVE {leaver} gm={eff_gm}")
+
+                    # Host leave destroys the Photon room (creator gone) -> the
+                    # ranked session can never continue or seal. Auto-end the
+                    # DB room so it doesn't linger as a lobby/live zombie and
+                    # clients polling by-code see ended instead of a joinable
+                    # ghost. Independent of defeat bookkeeping (fires in any
+                    # state/mode — the room is gone regardless).
+                    try:
+                        if pkt_short and _names_equal(leaver, me_name):
+                            from server.lib import ranked as _rk_leave
+                            _lr = _rk_leave.get_ranked_room_fresh(str(pkt_short).upper())
+                            if (_lr and str(_lr.get("status") or "") in ("lobby", "live")
+                                    and str(_lr.get("host_discord_id") or "") == str(discord_id or "")):
+                                supabase.table("ranked_rooms").update({"status": "ended", "short_code": None}).eq("id", str(_lr.get("id"))).execute()
+                                log_ranked(f"[ranked] room {_lr.get('id')} auto-ended + code cleared (host left)")
+                    except Exception as e_rl:
+                        log_err(f"processor host-leave auto-end failed {e_rl}")
 
                     # Defeat via leave: quitting mid-match is a personal defeat immediately
                     # (abandon = loss, teammate status irrelevant). Blocked when already
@@ -1168,9 +1311,10 @@ async def process_batch(
                                 room2 = _get_room(pkt_room_id, view)  # Resolve room
                                 # Room must be in MATCH state (pcount unused: I just left it)
                                 if room2 and room2.state.value == "match":
-                                    if (not room2.had_self_defeat
+                                    if (not _me_hosting_only
+                                            and not room2.had_self_defeat
                                             and room2.last_win_version != room2.match_version):
-                                        _write_defeat(discord_id, session_id, user, eff_gm, pkt_room_id, pkt_short, pkt_match_ver, room2)
+                                        await db_io(_write_defeat, discord_id, session_id, user, eff_gm, pkt_room_id, pkt_short, pkt_match_ver, room2, ev_rows, dirty)
                                         log_sys(f"PROCESSOR DEFEAT via leave gm={eff_gm}")
                                     else:
                                         log_sys(f"PROCESSOR defeat-via-leave skip already recorded this life gm={eff_gm}")
@@ -1182,7 +1326,7 @@ async def process_batch(
                     try:
                         _wo_gm = str(eff_gm or "").lower()
                         _wo_room = _get_room(pkt_room_id, view)  # Resolve independently (room2 is self-leave scoped)
-                        if (_wo_gm and not _is_kd_only(eff_gm) and _wo_room is not None
+                        if (not _me_hosting_only and _wo_gm and not _is_kd_only(eff_gm) and _wo_room is not None
                                 and _wo_room.state.value == "match" and me_name
                                 and not _names_equal(leaver, me_name)
                                 and not _wo_room.had_self_defeat
@@ -1206,7 +1350,7 @@ async def process_batch(
                             elif _wo_gm in ("bf", "va", "r_1v1"):
                                 _wo_winner = me_name  # 1v1: opponent left = win
                             if _wo_winner is not None:
-                                _write_win(discord_id, session_id, user, eff_gm, pkt_room_id, pkt_short, _wo_room.match_version, _wo_winner, _wo_room)
+                                await db_io(_write_win, discord_id, session_id, user, eff_gm, pkt_room_id, pkt_short, _wo_room.match_version, _wo_winner, _wo_room, ev_rows, dirty)
                                 log_sys(f"PROCESSOR WIN via walkover winner={_wo_winner} gm={eff_gm}")
                     except Exception as e_wo:
                         log_err(f"processor walkover failed {e_wo}")
@@ -1220,15 +1364,9 @@ async def process_batch(
                     sane_phase = 0 <= phase_int <= 10  # Valid range check
                 except Exception:
                     sane_phase = True   # If can't parse, assume valid (don't block)
-                # Only insert if phase changed and is sane
+                # Track phase changes in-memory only (engine serves the live
+                # zone; only stG, alv, killfeed and leave produce stored events)
                 if sane_phase and str(zone_phase) != str(last_zone_phase):
-                    supabase.table("bngc_game_events").insert({
-                        "discord_id": discord_id,
-                        "session_id": session_id,
-                        "event_type": "zone_change",  # Zone phase change event
-                        "event_data": {"gm": eff_gm, "phase": str(zone_phase), "time": vt,
-                                       "room_id": pkt_room_id, "code": pkt_short, "match_version": pkt_match_ver},
-                    }).execute()
                     log_sys(f"PROCESSOR ZONE {last_zone_phase}→{zone_phase} time={vt}")
                     last_zone_phase = zone_phase  # Update tracker for next comparison
 
@@ -1240,6 +1378,34 @@ async def process_batch(
         view._lastZonePhase = last_zone_phase  # Store for next batch
     except Exception:
         pass                         # Silently ignore if view is read-only
+
+    # --- Ranked version continuity ---
+    # Fresh Photon rooms start match_version at 0, but seals are keyed per
+    # ranked session — fast-forward past already-sealed versions so the next
+    # stG=3 seals a new version instead of colliding (and being skipped).
+    # Self-limiting (only v0 rooms) and idempotent; lobby rooms cost nothing
+    # (no packets means no batches).
+    try:
+        for _avr_id, _avr in list((view.rooms or {}).items()):
+            try:
+                if _avr_id == "lobby" or getattr(_avr, "match_version", 0) != 0:
+                    continue
+                _avc = getattr(_avr, "short_code", None)
+                if not _avc:
+                    continue
+                from server.lib import ranked as _rk_av
+                _avrd = await db_io(_rk_av.get_ranked_room, str(_avc).upper())
+                if not _avrd or str(_avrd.get("status") or "") not in ("lobby", "live"):
+                    continue
+                _avcnt = await db_io(_sealed_count, _avrd.get("id"))
+                _newv = _aligned_match_version(0, _avcnt)
+                if _newv:
+                    _avr.match_version = int(_newv)
+                    log_ranked(f"[ranked] version align {_avrd.get('id')} room={str(_avr_id)[:8]} -> v{_newv} (continuity past sealed)")
+            except Exception:
+                continue
+    except Exception as exc:
+        log_err(f"processor version align failed {exc}")
 
     # -------------------------------------------------------------------
     # Per-room: win / defeat — strict FSM drain
@@ -1295,7 +1461,7 @@ async def process_batch(
                 # duo-team incl. presumed-alive quiet members) and falls back to
                 # killfeed/flag evidence when the room already emptied.
                 me_name_local = (view.me.username if view.me else None) or user.get("game_username")
-                if me_name_local and room.state.value == "match":
+                if me_name_local and room.state.value == "match" and not _me_hosting_only:
                     if _phase_end_result(room, view, me_name_local) == "win":
                         # I'm alive → WIN (helper marks version so it records once)
                         winner = me_name_local
@@ -1303,8 +1469,8 @@ async def process_batch(
                             my_team = room.get_team(me_name_local)
                             if my_team:
                                 winner = my_team.team_id
-                        _write_win(discord_id, session_id, user, gm, room_id, room.short_code, room.match_version, winner, room)
-                        seal_ranked_match(session_id, discord_id, room, room_id, gm)  # host only; no-op otherwise
+                        await db_io(_write_win, discord_id, session_id, user, gm, room_id, room.short_code, room.match_version, winner, room, ev_rows, dirty)
+                        await db_io(seal_ranked_match, session_id, discord_id, room, room_id, gm)  # host only; no-op otherwise
                         room.stg_is_phase_end = False  # consume arm (version bump re-arms)
 
                     # Note: defeat is handled by alv/kill/leave logic below
@@ -1349,11 +1515,11 @@ async def process_batch(
                         break  # Attribute to first matching team only
             my_k = counts.get(my_tid4, 0)  # My team's kills
             foe_best = max([c for tid, c in counts.items() if tid != my_tid4] + [0])
-            if my_k >= 15 and room4.last_win_version != room4.match_version:
-                _write_win(discord_id, session_id, user, gm4, room_id4, room4.short_code, room4.match_version, my_tid4, room4)
+            if not _me_hosting_only and my_k >= 15 and room4.last_win_version != room4.match_version:
+                await db_io(_write_win, discord_id, session_id, user, gm4, room_id4, room4.short_code, room4.match_version, my_tid4, room4, ev_rows, dirty)
                 log_sys(f"PROCESSOR WIN via race-to-15 team={my_tid4} {my_k}-{foe_best} gm={gm4}")
-            elif foe_best >= 15 and not room4.had_self_defeat:
-                _write_defeat(discord_id, session_id, user, gm4, room_id4, room4.short_code, room4.match_version, room4)
+            elif not _me_hosting_only and foe_best >= 15 and not room4.had_self_defeat:
+                await db_io(_write_defeat, discord_id, session_id, user, gm4, room_id4, room4.short_code, room4.match_version, room4, ev_rows, dirty)
                 log_sys(f"PROCESSOR DEFEAT via race-to-15 enemy hit 15 ({my_k}-{foe_best}) gm={gm4}")
     except Exception as exc:
         log_err(f"processor race-to-15 failed {exc}")
@@ -1374,7 +1540,8 @@ async def process_batch(
             # end). Edge-triggered via stg_is_phase_end (a batch ending on stG=2 must
             # still sweep).
             me_name_local2 = (view.me.username if view.me else None) or user.get("game_username")
-            if (room2.last_defeat_version != room2.match_version and not room2.had_self_defeat
+            if (not _me_hosting_only
+                    and room2.last_defeat_version != room2.match_version and not room2.had_self_defeat
                     and room2.stg_is_phase_end
                     and me_name_local2 and room2.state.value == "match"):
                 # Phase-end verdict from live + evidence rules (resolves emptied rooms)
@@ -1391,23 +1558,20 @@ async def process_batch(
                     _ta2 = _team_alive_for_me(room2, view, me_name_local2)
                     if _ta2 is not None:
                         is_dead = not _ta2
+                    elif room2.is_duo:
+                        is_dead = False  # duo + no team data yet → defer to drain
 
                     if is_dead or end_res == "defeat":
                         room2.last_defeat_version = room2.match_version  # Mark for drain
                         log_sys(f"PROCESSOR marked defeat via stG room={room_id2[:8]} gm={gm2}")
                         # Reconcile a death the live paths missed (keeps deaths == defeats)
                         if not room2.had_self_death:
-                            new_def_death = (user.get("deaths") or 0) + 1
-                            supabase.table("bngc_users").update({"deaths": new_def_death}).eq("discord_id", discord_id).execute()
-                            supabase.table("bngc_game_events").insert({
-                                "discord_id": discord_id,
-                                "session_id": session_id,
-                                "event_type": "death",
-                                "event_data": {"gm": gm2, "killer": None, "via": "stG",
-                                               "room_id": room_id2, "code": room2.short_code, "match_version": room2.match_version},
-                            }).execute()
-                            log_sys(f"PROCESSOR DEATH via stG reconcile deaths {user.get('deaths',0)}->{new_def_death}")
-                            user["deaths"] = new_def_death
+                            old_def_death = user.get("deaths", 0)  # Pre-increment value for the log
+                            new_def_death = _bump_user(user, dirty, "deaths")  # Queued for batch-end flush
+                            _buf_event(ev_rows, discord_id, session_id, "death",
+                                       {"gm": gm2, "killer": None, "via": "stG",
+                                        "room_id": room_id2, "code": room2.short_code, "match_version": room2.match_version})
+                            log_sys(f"PROCESSOR DEATH via stG reconcile deaths {old_def_death}->{new_def_death}")
                             room2.had_self_death = True
                             _precision.schedule("death", session_id=session_id, discord_id=discord_id,
                                                 expected=new_def_death, match_version=room2.match_version,
@@ -1422,42 +1586,60 @@ async def process_batch(
                 if room2.had_self_defeat:
                     log_sys(f"PROCESSOR DEFEAT skip already recorded this life gm={gm2}")
                     if room2.stg_is_phase_end:  # phase-end skip (not a mid-match live drain) -> seal ranked
-                        seal_ranked_match(session_id, discord_id, room2, room_id2, gm2)
+                        await db_io(seal_ranked_match, session_id, discord_id, room2, room_id2, gm2)
                     room2.last_defeat_version = -1  # Discard stale marker
                     room2.stg_is_phase_end = False  # resolved — arm must not outlive the guard
                 elif room2.last_win_version == room2.match_version:
                     log_sys(f"PROCESSOR DEFEAT skip win already recorded gm={gm2}")
                     room2.last_defeat_version = -1  # Discard stale marker
-                elif _team_alive_for_me(room2, view, me_name_local2) is True:
-                    pass  # hold marker silently — teammate still alive, re-evaluated next batch
-                elif _defeat_recorded(session_id, room_id2, room2.match_version):
+                elif _team_alive_for_me(room2, view, me_name_local2) is not False:
+                    pass  # hold marker silently — teammate still alive or no team data yet (duo), re-evaluated next batch
+                elif await db_io(_defeat_recorded, session_id, room_id2, room2.match_version, ev_rows):
                     log_sys(f"PROCESSOR DEFEAT skip already recorded gm={gm2} room={room_id2[:8]} ver={room2.match_version}")
                     if room2.stg_is_phase_end:  # phase-end heal (not a mid-match live drain) -> seal ranked
-                        seal_ranked_match(session_id, discord_id, room2, room_id2, gm2)
+                        await db_io(seal_ranked_match, session_id, discord_id, room2, room_id2, gm2)
                     room2.had_self_defeat = True  # heal marker so it isn't retried
                     room2.last_defeat_version = -1  # Discard stale marker
                     room2.stg_is_phase_end = False
-                else:
-                    new_def = (user.get("defeats") or 0) + 1
-                    supabase.table("bngc_users").update({"defeats": new_def}).eq("discord_id", discord_id).execute()
-                    supabase.table("bngc_game_events").insert({
-                        "discord_id": discord_id,
-                        "session_id": session_id,
-                        "event_type": "defeat",
-                        "event_data": {"gm": gm2, "room_id": room_id2, "short_code": room2.short_code,
-                                       "match_version": room2.match_version},
-                    }).execute()
-                    log_engine("defeat", session_id[:13], gm=gm2, duo=room2.is_duo, room=room_id2[:8])
-                    log_sys(f"PROCESSOR DEFEAT gm={gm2} defeats {user.get('defeats',0)}->{new_def}")
-                    user["defeats"] = new_def
-                    if room2.stg_is_phase_end:  # phase-end write (not a mid-match live drain) -> seal ranked
+                elif _me_hosting_only:
+                    log_sys(f"PROCESSOR DEFEAT skip hosting_only gm={gm2}")
+                    room2.had_self_defeat = True
+                    room2.last_defeat_version = -1
+                    room2.stg_is_phase_end = False
+                    if room2.stg_is_phase_end:
                         seal_ranked_match(session_id, discord_id, room2, room_id2, gm2)
+                else:
+                    old_def = user.get("defeats", 0)  # Pre-increment value for the log
+                    new_def = _bump_user(user, dirty, "defeats")  # Queued for batch-end flush
+                    _buf_event(ev_rows, discord_id, session_id, "defeat",
+                               {"gm": gm2, "room_id": room_id2, "short_code": room2.short_code,
+                                "match_version": room2.match_version})
+                    log_engine("defeat", session_id[:13], gm=gm2, duo=room2.is_duo, room=room_id2[:8])
+                    log_sys(f"PROCESSOR DEFEAT gm={gm2} defeats {old_def}->{new_def}")
+                    if room2.stg_is_phase_end:  # phase-end write (not a mid-match live drain) -> seal ranked
+                        await db_io(seal_ranked_match, session_id, discord_id, room2, room_id2, gm2)
                     room2.had_self_defeat = True  # One defeat per life
                     room2.last_defeat_version = -1  # Drain (prevent re-processing)
                     room2.stg_is_phase_end = False  # consume phase-end arm for this version
                     _precision.schedule("defeat", session_id=session_id, discord_id=discord_id,
                                         expected=new_def, match_version=room2.match_version,
                                         room_id=room_id2)
+
+        # --- Ranked seal sweep: one host call per phase end ---
+        # Playing hosts usually sealed already via the win/defeat drains
+        # above (idempotent no-ops here). hosting_only hosts never drain a
+        # win/defeat, so without this their players' kills would never seal.
+        # seal_ranked_match skips the spectating host from awards itself.
+        try:
+            for room_id_s, room_s in list(view.rooms.items()):
+                if room_s.room_id == "lobby":
+                    continue
+                if (room_s.stg_is_phase_end and room_s.match_version > 0
+                        and room_s.state.value == "match"):
+                    await db_io(seal_ranked_match, session_id, discord_id, room_s, room_id_s, gm_val)
+                    room_s.stg_is_phase_end = False
+        except Exception as exc:
+            log_err(f"processor ranked sweep failed {exc}")
 
         # --- Competitive sealing (host collab only) ---
         # Only when host_mode is enabled and room is server-created (short_code)
@@ -1473,44 +1655,80 @@ async def process_batch(
                     is_ended = (room3.last_win_version == -1 and room3.last_defeat_version == -1)
                     try:
                         # Check if competitive record already exists
-                        existing = supabase.table("competitive_matches").select("match_id").eq("match_id", f"{room_id3}_{room3.match_version}").limit(1).execute()
+                        existing = await db_io(lambda: supabase.table("competitive_matches").select("match_id").eq("match_id", f"{room_id3}_{room3.match_version}").limit(1).execute())
                         if not existing.data:    # No existing record → create
                             total_players = len(room3.players)  # Count players
                             total_teams = len(room3.teams) if room3.teams else 1  # Count teams
                             # Insert competitive match record
-                            supabase.table("competitive_matches").insert({
+                            await db_io(lambda: supabase.table("competitive_matches").insert({
                                 "match_id": f"{room_id3}_{room3.match_version}",  # room_id_version
                                 "host_pfid": view.me.game_id if view.me else None,  # Host's player ID
                                 "verified_by_server": False,  # Not yet verified
                                 "total_players": total_players,
                                 "total_teams": total_teams,
-                            }).execute()
+                            }).execute())
                             # Upsert sealed match record
-                            supabase.table("matches").upsert({
+                            await db_io(lambda: supabase.table("matches").upsert({
                                 "match_id": f"{room_id3}_{room3.match_version}",
                                 "match_type": "private_casual" if not room3.teams else "competitive",
                                 "game_mode": room3.game_mode.value if room3.game_mode else "unknown",
                                 "scene": room3.cur_scn,
                                 "host_pfid": view.me.game_id if view.me else None,
                                 "is_sealed": False,   # Not sealed yet (sealed on host upload)
-                            }, on_conflict="match_id").execute()
+                            }, on_conflict="match_id").execute())
                             log_sys(f"PROCESSOR competitive {room_id3[:8]} version={room3.match_version}")
                     except Exception as e:
                         log_err(f"processor competitive failed {room_id3[:8]} {e}")
         except Exception as e:
             log_err(f"processor competitive outer failed {e}")
 
+        # --- v2.19.0 streaks: batch-end accrual (queued into flush) ---
+        # Queues daily/win/kill counter updates + pays bonus into arena
+        # points (ranked_points ledger) best-effort. Never breaks the batch.
+        try:
+            _streak_bonus = _apply_streaks(user, dirty, ev_rows)
+            if _streak_bonus:
+                try:
+                    from server.lib import ranked as _rk_pay
+                    _cur_pts = _rk_pay.get_ranked_points(discord_id)
+                    _rk_pay._bump_points_many({str(discord_id): int(_streak_bonus)})
+                    log_sys(f"PROCESSOR streak bonus did={discord_id[:6]} +{_streak_bonus} pts={_cur_pts}+{_streak_bonus}")
+                except Exception as _e_pay:
+                    log_err(f"processor streak payout failed {_e_pay}")
+        except Exception as _e_st:
+            log_err(f"processor streaks failed {_e_st}")
+
+        # --- Batch-end flush: ONE bulk event insert + ONE user update ---
+        # All killfeed/kill/death/leave/win/defeat rows queued above go out
+        # in a single query, and all counter + field updates merge into one.
+        try:
+            await db_io(_flush_events, ev_rows)
+        except Exception as exc:
+            log_err(f"processor event flush failed {exc}")
+        try:
+            final_user_update = dict(pending_user_updates)
+            for _k in (dirty or set()):
+                try:
+                    final_user_update[_k] = user.get(_k)
+                except Exception:
+                    continue
+            if final_user_update:
+                await db_io(lambda: supabase.table("bngc_users").update(final_user_update).eq("discord_id", discord_id).execute())
+                log_dbg(f"PROCESSOR flush user {discord_id[:6]} {final_user_update}")
+        except Exception as exc:
+            log_err(f"processor user flush failed {exc}")
+
         # --- Playtime sync ---
         # Aggregate per-room playtime into bngc_users and reset counters
         try:
-            _sync_playtime(view, user, discord_id)  # Call helper
+            await db_io(_sync_playtime, view, user, discord_id)  # Call helper
         except Exception as exc:
             log_err(f"processor playtime failed {exc}")
 
         # --- Sync to bngc_player_stats ---
         # Upsert stats table so SELECT * FROM bngc_player_stats is populated
         try:
-            _upsert_stats(discord_id, user)  # Call helper
+            await db_io(_upsert_stats, discord_id, user)  # Call helper
             log_dbg(f"PROCESSOR sync player_stats kills={user.get('kills',0)} defeats={user.get('defeats',0)} wins={user.get('wins',0)}")
         except Exception as exc:
             log_err(f"processor player_stats sync failed {exc}")

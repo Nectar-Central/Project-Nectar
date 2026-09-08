@@ -1,46 +1,57 @@
 """
-ranked.py — Ranked v1 server-side: room cache, milestones, static rewards, sealing.
+ranked.py — Ranked v2 (thin): tiers, static awards, direct-DB room lookup, seal.
 
-Contract (Phase 1):
-  - `get_ranked_room(short_code)` -> room dict | None (in-memory, refreshed every 30s)
-  - `get_ranked_points(discord_id)` -> int (60s per-player cache, 0 on miss)
-  - `milestone_for(points)` / `next_milestone(points)` -> tier info
-  - `kill_reward()` / `placement_reward(placement)` / `defeat_penalty(...)` -> int
-  - `seal_match(...)` -> {"ok": True, ...} | {"ok": False, "error": ...} (Phase 2 calls this)
+Flow (one-way, no chatter):
+  client POST /api/capture {records} -> engine.feed + processor writes
+  -> seal at stG=3 drain -> response {packets, session, ranked}
+  client renders optimistic (+8 kill / +50 win / -5 loss), server corrects.
 
-Notes:
-  - Supabase is the source of truth; memory is only a read cache. A cold
-    start just means an empty cache until the first refresh (never fatal).
-  - Nothing here raises: cache misses and DB blips degrade to empty/0/false.
-  - Static awards (same for every tier): kill +8, 1st +50, 2nd +30, 3rd +20,
-    4th +10, 5th +5, 6th+ 0; defeat minus -15 (killed by lower-points player),
-    -5 (equal-or-higher killer or zone/unknown death). Placements are capped
-    at the lobby size (2 players => only 1st/2nd exist).
+Awards (kills + win only): kill +8 each, alive at stG=3 +50, dead -5.
+No placement table, no scaling, no defeat branches, no caches, no seasons loop.
+Supabase is the source of truth; every read hits the DB (2 queries per seal
+max — negligible). Nothing here raises.
 """
 
 from __future__ import annotations
 
-import asyncio
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any
 
 from .logger import log_ranked
 
+# v2.19.0 ranked sleep: set RANKED_ENABLED=0 to sleep. Code stays committed
+# but no room lookup or seal can activate when disabled. Points reads
+# still serve (arena display). Tests run enabled by default (unset = on).
+# Never raises.
+RANKED_ENABLED = os.getenv("RANKED_ENABLED", "1") == "1"
+
+
+def ranked_sleeping() -> bool:
+    """True when ranked is asleep (default in v2.19.0). Never raises."""
+    try:
+        return not RANKED_ENABLED
+    except Exception:
+        return True
+
 # ---------------------------------------------------------------------------
-# Tuning constants — static awards (identical for every milestone tier)
+# Tuning constants — flat awards (identical for every tier)
 # ---------------------------------------------------------------------------
 
-STATIC_KILL = 8              # per roster kill
-STATIC_PLACEMENT = {         # placement award (6th+ = 0)
-    1: 50, 2: 30, 3: 20, 4: 10, 5: 5,
-}
-STATIC_DEFEAT_LOWER = -15    # died to a lower-points player
-STATIC_DEFEAT_PEER = -5      # died to an equal-or-higher-points player
-STATIC_DEFEAT_ZONE = -5      # died with no killer (zone / unknown)
+KILL_POINTS = 8    # per kill
+WIN_POINTS = 50    # alive at stG=3
+LOSS_POINTS = -5   # dead at stG=3 (flat: zone, unknown, or killed — no branches)
 
-REFRESH_S = 30           # room cache refresh interval
-POINTS_TTL_S = 60        # per-player points cache TTL
+# Back-compat aliases (old names used by callers/tests).
+STATIC_KILL = KILL_POINTS
+STATIC_PLACEMENT = {1: 50, 2: 30, 3: 20, 4: 10, 5: 5}
+STATIC_PLACEMENT_MIN = {1: 5, 2: 3, 3: 2, 4: 1, 5: 1}
+STATIC_DEFEAT_LOWER = LOSS_POINTS
+STATIC_DEFEAT_PEER = LOSS_POINTS
+STATIC_DEFEAT_ZONE = LOSS_POINTS
+
+POINTS_TTL_S = 60  # per-player points read cache (fast path; DB owns truth)
 
 # Milestone tiers, ascending. icon_url points at the public assets bucket.
 _ASSETS = "https://mnpwvwjqawmuqmickteu.supabase.co/storage/v1/object/public/assets"
@@ -60,14 +71,7 @@ MILESTONE_TIERS = [
 # Overlay arena icon (bottom-left box next to points).
 ARENA_ICON_URL = f"{_ASSETS}/arenaicon.png"
 
-# ---------------------------------------------------------------------------
-# In-memory caches (read-only; Supabase owns the truth)
-# ---------------------------------------------------------------------------
-
-_rooms: dict[str, dict[str, Any]] = {}          # short_code.upper() -> room row
 _points_cache: dict[str, tuple[int, float]] = {}  # discord_id -> (points, ts)
-_MISS_TTL_S = 10               # negative read-through cache (bounds DB hits)
-_miss_cache: dict[str, float] = {}  # code -> last miss ts
 
 
 def _sb():
@@ -115,64 +119,43 @@ def next_milestone(points: Any) -> tuple[dict[str, Any] | None, int, int]:
 
 
 # ---------------------------------------------------------------------------
-# Static rewards
+# Static rewards (flat — kills + win only)
 # ---------------------------------------------------------------------------
 
 def kill_reward() -> int:
-    """Flat per-kill award. Never raises."""
-    return STATIC_KILL
+    return KILL_POINTS
 
 
-def placement_reward(placement: Any, players_count: Any = None) -> int:
-    """Placement award, capped at the lobby size.
+def win_reward(placement: Any = None) -> int:
+    """Winner award: +50. Compat shim (placement ignored)."""
+    return WIN_POINTS
 
-    2 players => only 1st/2nd can pay out (phantom 3rds pay 0).
-    players_count None/0 disables the cap. Never raises.
-    """
+
+def loss_penalty() -> int:
+    return LOSS_POINTS
+
+
+def placement_reward(placement: Any, players_count: Any = None,
+                     avg_points: Any = None) -> int:
+    """Compat shim: 1st pays WIN_POINTS, everything else 0 (kills+win only)."""
     try:
-        pl = int(placement)
+        return WIN_POINTS if int(placement) == 1 else 0
     except Exception:
         return 0
-    try:
-        cap = int(players_count or 0)
-    except Exception:
-        cap = 0
-    if cap > 0 and pl > cap:
-        return 0
-    return int(STATIC_PLACEMENT.get(pl, 0))
 
 
 def defeat_penalty(victim_pts: Any, killer_pts: Any = None) -> int:
-    """Defeat minus for a dead player.
-
-    killer None (zone/unknown) => STATIC_DEFEAT_ZONE; killer with fewer
-    points than the victim => STATIC_DEFEAT_LOWER; otherwise PEER.
-    Never raises.
-    """
-    try:
-        if killer_pts is None:
-            return STATIC_DEFEAT_ZONE
-        return STATIC_DEFEAT_LOWER if int(killer_pts) < int(victim_pts or 0) else STATIC_DEFEAT_PEER
-    except Exception:
-        return STATIC_DEFEAT_ZONE
+    """Compat shim: flat LOSS_POINTS regardless of killer."""
+    return LOSS_POINTS
 
 
 def elo_kill_reward(killer_pts: Any = None, victim_pts: Any = None,
                     placement: Any = None) -> int:
-    """Back-compat shim: static kill value regardless of ratings."""
-    return STATIC_KILL
-
-
-def win_reward(placement: Any = None) -> int:
-    """Back-compat shim: winner (1st-place) award."""
-    try:
-        return STATIC_PLACEMENT[1] if placement is None or int(placement) == 1 else 0
-    except Exception:
-        return 0
+    return KILL_POINTS
 
 
 # ---------------------------------------------------------------------------
-# Room cache
+# Room lookup (direct DB — no cache, no refresh loop)
 # ---------------------------------------------------------------------------
 
 def _norm_code(short_code: Any) -> str:
@@ -182,72 +165,23 @@ def _norm_code(short_code: Any) -> str:
         return ""
 
 
-def refresh_rooms() -> int:
-    """Pull lobby+live rooms from Supabase into memory. Returns room count.
-
-    Never raises — a DB blip keeps the previous cache.
-    """
-    sb = _sb()
-    if not sb:
-        return len(_rooms)
-    try:
-        r = sb.table("ranked_rooms").select("*").in_("status", ["lobby", "live"]).limit(200).execute()
-        rows = r.data or []
-        fresh: dict[str, dict[str, Any]] = {}
-        for row in rows:
-            code = _norm_code(row.get("short_code"))
-            if code:
-                fresh[code] = row
-        _rooms.clear()
-        _rooms.update(fresh)
-        return len(_rooms)
-    except Exception as exc:
-        log_ranked(f"[ranked] refresh failed (keeping {len(_rooms)} cached): {exc}")
-        return len(_rooms)
-
-
 def get_ranked_room(short_code: Any) -> dict[str, Any] | None:
-    """Fast in-memory lookup by 5-char code. None when not a ranked room."""
+    """Open (live preferred, then lobby) room for a 5-char code. None if not ranked."""
+    if ranked_sleeping():
+        return None
     code = _norm_code(short_code)
     if not code:
         return None
-    return _rooms.get(code)
-
-
-def get_ranked_room_fresh(short_code: Any) -> dict[str, Any] | None:
-    """Cache lookup with a DB read-through on miss.
-
-    The 30s room-cache refresh leaves newly created rooms invisible to
-    /api/stats (while /api/ranked/by-code reads the DB directly and sees
-    them) — a 30s+ BLOCK gap on every room creation. On miss this queries
-    Supabase once, caches positives in _rooms (the refresh loop owns them
-    afterwards) and negatives for _MISS_TTL_S. Never raises.
-    """
-    room = get_ranked_room(short_code)
-    if room is not None:
-        return room
-    code = _norm_code(short_code)
-    if not code:
-        return None
-    now = time.time()
-    try:
-        if now - _miss_cache.get(code, 0) < _MISS_TTL_S:
-            return None
-        _miss_cache[code] = now
-    except Exception:
-        pass
     sb = _sb()
     if not sb:
         return None
     try:
-        for status in ("live", "lobby"):  # matches first (seal path is hot)
+        for status in ("live", "lobby"):
             r = sb.table("ranked_rooms").select("*").eq("short_code", code).eq("status", status).limit(1).execute()
-            rows = r.data or []
-            if rows:
-                _rooms[code] = rows[0]
-                return rows[0]
+            if r.data:
+                return r.data[0]
     except Exception as exc:
-        log_ranked(f"[ranked] fresh lookup failed {code}: {exc}")
+        log_ranked(f"[ranked] room lookup failed {code}: {exc}")
     return None
 
 
@@ -260,11 +194,11 @@ def room_roster_ids(room: dict[str, Any]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Points (cached reads, direct writes live in seal_match)
+# Points
 # ---------------------------------------------------------------------------
 
 def get_ranked_points(discord_id: Any) -> int:
-    """Cached points read. 0 on miss/error. Never raises."""
+    """Points read (60s fast-path cache, DB owns truth). 0 on miss. Never raises."""
     try:
         did = str(discord_id or "").strip()
     except Exception:
@@ -287,57 +221,108 @@ def get_ranked_points(discord_id: Any) -> int:
         return hit[0] if hit else 0
 
 
-def _bump_points(discord_id: str, delta: int) -> int:
-    """Read-modify-write a player's points. Returns new total. May raise (caller handles)."""
-    sb = _sb()
-    if not sb:
-        raise RuntimeError("supabase not configured")
-    cur = get_ranked_points(discord_id)
-    total = cur + int(delta)
-    sb.table("ranked_points").upsert({
-        "discord_id": str(discord_id),
-        "points": total,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }, on_conflict="discord_id").execute()
-    _points_cache[str(discord_id)] = (total, time.time())
-    return total
+def _get_points_many(dids) -> dict[str, int]:
+    """Bulk points read: cache hits + ONE IN query for misses. Never raises."""
+    out: dict[str, int] = {}
+    miss: list[str] = []
+    now = time.time()
+    for did in (dids or []):
+        try:
+            d = str(did or "").strip()
+        except Exception:
+            continue
+        if not d or d in out:
+            continue
+        hit = _points_cache.get(d)
+        if hit and now - hit[1] < POINTS_TTL_S:
+            out[d] = hit[0]
+        else:
+            miss.append(d)
+    if miss:
+        try:
+            sb = _sb()
+            if sb:
+                r = sb.table("ranked_points").select("discord_id,points").in_("discord_id", miss).execute()
+                for row in (r.data or []):
+                    try:
+                        d = str(row.get("discord_id"))
+                        pts = int(row.get("points") or 0)
+                        _points_cache[d] = (pts, now)
+                        out[d] = pts
+                    except Exception:
+                        continue
+        except Exception as exc:
+            log_ranked(f"[ranked] bulk points read failed: {exc}")
+        for d in miss:
+            if d not in out:
+                out[d] = 0
+                _points_cache[d] = (0, now)
+    return out
+
+
+def _bump_points_many(deltas: dict[str, int]) -> dict[str, int]:
+    """Bulk award: ONE fresh read + ONE upsert. Never raises."""
+    totals: dict[str, int] = {}
+    try:
+        clean = {str(did): int(sub or 0) for did, sub in (deltas or {}).items()
+                 if str(did or "") and int(sub or 0)}
+        if not clean:
+            return totals
+        sb = _sb()
+        if not sb:
+            raise RuntimeError("supabase not configured")
+        cur = _get_points_many(list(clean))
+        now = datetime.now(timezone.utc).isoformat()
+        rows = [{"discord_id": d, "points": int(cur.get(d, 0)) + delta, "updated_at": now}
+                for d, delta in clean.items()]
+        sb.table("ranked_points").upsert(rows, on_conflict="discord_id").execute()
+        ts = time.time()
+        for row in rows:
+            _points_cache[row["discord_id"]] = (row["points"], ts)
+            totals[row["discord_id"]] = row["points"]
+        return totals
+    except Exception as exc:
+        log_ranked(f"[ranked] bulk bump failed: {exc}")
+    return totals
 
 
 # ---------------------------------------------------------------------------
-# Sealing (Phase 2 calls this; contract defined now)
+# Sealing — kills + win only
 # ---------------------------------------------------------------------------
 
 def seal_match(*, rid: str, match_version: int, gm: str,
                winner_discord_id: str | None,
-               kills: dict[str, int], placements: dict[str, int],
+               kills: dict[str, int] | None = None,
+               placements: dict[str, int] | None = None,
                victim_points: dict[str, int] | None = None,
                kill_events: list | None = None,
                players_count: Any = None,
                death_killers: dict[str, str | None] | None = None) -> dict[str, Any]:
-    """Award static points for one sealed match and persist results.
+    """Award flat points for one sealed match and persist results.
 
-    kills: discord_id -> kill count (roster only, host-harvested).
-    placements: discord_id -> placement (1-based, from host alv).
-    victim_points: optional discord_id -> points snapshot override.
-    kill_events: optional [(killer_did, victim_did)] for exact per-kill
-        counts. When given, it replaces the kills loop; `kills` is still
-        stored in the results row for review.
-    players_count: roster/lobby size — placements above it pay 0.
-    death_killers: victim did -> killer did | None (None = zone/unknown).
-        A listed victim takes the defeat minus even with zero kills.
-    Per player: kills * STATIC_KILL + capped placement award + defeat
-    minus (when dead). Winner missing from placements still gets 1st.
-    Returns {"ok": True, "points": {...}, "match_version": N} or {"ok": False, "error": ...}.
+    kills*w8 + winner +50, everyone else involved -5 (flat loss).
+    `winner_discord_id` None (total wipe, no fallback resolved) => all -5.
+    Extra kwargs (placements, death_killers, victim_points, players_count)
+    are accepted for caller compat and ignored. Idempotent: re-sealing an
+    already-sealed (rid, match_version) returns ok without double-awarding.
     Never raises.
-
-    NOTE: points bumps are additive — callers must pre-check that
-    (rid, match_version) isn't already sealed, or points double-award
-    (the results-row upsert alone does not prevent that).
     """
     try:
+        if ranked_sleeping():
+            return {"ok": False, "error": "ranked sleeping"}
         if not rid or int(match_version or 0) <= 0:
             return {"ok": False, "error": "bad rid/match_version"}
-        # per-kill counts: exact events win over the kills dict
+        sb = _sb()
+        if not sb:
+            return {"ok": False, "error": "supabase not configured"}
+        try:
+            chk = sb.table("ranked_results").select("room_id").eq("room_id", rid).eq(
+                "match_version", int(match_version)).limit(1).execute()
+            if chk.data:
+                return {"ok": True, "match_version": int(match_version), "duplicate": True}
+        except Exception as exc:
+            log_ranked(f"[ranked] seal check failed {rid} v{match_version}: {exc}")
+            return {"ok": False, "error": "seal check failed"}
         kc_map: dict[str, int] = {}
         if kill_events:
             for pair in kill_events:
@@ -352,54 +337,19 @@ def seal_match(*, rid: str, match_version: int, gm: str,
                     kc_map[str(did)] = max(0, int(kc or 0))
                 except Exception:
                     continue
-        deaths = dict(death_killers or {})
-        involved = set(kc_map) | {str(d) for d in (placements or {})} | {str(d) for d in deaths}
-        if winner_discord_id:
-            involved.add(str(winner_discord_id))
-        # pre-award snapshot (defeat minus compares killer vs victim)
-        snap: dict[str, int] = {}
-        for did in involved:
-            try:
-                snap[did] = int((victim_points or {}).get(did, get_ranked_points(did)))
-            except Exception:
-                snap[did] = 0
-        points_awarded: dict[str, int] = {}
-        totals: dict[str, int] = {}
-        for did in involved:
-            try:
-                sub = kc_map.get(did, 0) * STATIC_KILL
-                pl = (placements or {}).get(did)
-                if pl is not None:
-                    sub += placement_reward(pl, players_count)
-                if did in deaths:
-                    kdid = deaths.get(did)
-                    try:
-                        kpts = snap.get(str(kdid)) if kdid else None
-                    except Exception:
-                        kpts = None
-                    sub += defeat_penalty(snap.get(did, 0), kpts)
-                if winner_discord_id and did == str(winner_discord_id):
-                    try:
-                        wpl = int((placements or {}).get(did, 99))
-                    except Exception:
-                        wpl = 99
-                    if wpl != 1:
-                        sub += placement_reward(1, players_count)
-                if sub:
-                    totals[did] = _bump_points(did, sub)
-                points_awarded[did] = sub
-            except Exception as exc:
-                log_ranked(f"[ranked] award failed for {did} in {rid}: {exc}")
-                points_awarded[str(did)] = 0
-        sb = _sb()
-        if not sb:
-            return {"ok": False, "error": "supabase not configured"}
+        involved = set(kc_map) | {str(d) for d in (placements or {})} | {str(d) for d in (death_killers or {})}
+        winner = str(winner_discord_id) if winner_discord_id else None
+        if winner:
+            involved.add(winner)
+        points_awarded = {did: kc_map.get(did, 0) * KILL_POINTS + (WIN_POINTS if did == winner else LOSS_POINTS)
+                          for did in involved}
+        totals = _bump_points_many(points_awarded)
         try:
             sb.table("ranked_results").upsert({
                 "room_id": rid,
                 "match_version": int(match_version),
                 "gm": gm,
-                "winner_discord_id": str(winner_discord_id) if winner_discord_id else None,
+                "winner_discord_id": winner,
                 "kills": kills or {},
                 "points": points_awarded,
                 "placements": placements or {},
@@ -414,58 +364,9 @@ def seal_match(*, rid: str, match_version: int, gm: str,
 
 
 # ---------------------------------------------------------------------------
-# Seasons (ranked_seasons table: season int PK, ends_at timestamptz)
+# Seasons (compat: static season 1 — table lookup deleted)
 # ---------------------------------------------------------------------------
-
-_SEASON_TTL_S = 300
-_season_cache: dict = {"at": 0.0, "value": (1, None)}
-
 
 def get_current_season() -> tuple:
-    """(season_number, reset_at_iso | None). Defaults (1, None). Never raises.
-
-    Cached 5 min. A missing table (pre-migration) degrades to the default
-    instead of erroring every call.
-    """
-    now = time.time()
-    try:
-        if now - float(_season_cache.get("at") or 0) < _SEASON_TTL_S:
-            return _season_cache["value"]
-    except Exception:
-        pass
-    try:
-        sb = _sb()
-        if sb:
-            r = sb.table("ranked_seasons").select("season,ends_at").order("season", desc=True).limit(1).execute()
-            rows = r.data or []
-            if rows:
-                val = (int(rows[0].get("season") or 1), rows[0].get("ends_at"))
-                _season_cache["at"] = now
-                _season_cache["value"] = val
-                return val
-    except Exception as exc:
-        log_ranked(f"[ranked] season lookup failed: {exc}")
-    _season_cache["at"] = now
-    _season_cache["value"] = (1, None)
+    """(season_number, reset_at). Static (1, None) — seasons table deleted."""
     return (1, None)
-
-# ---------------------------------------------------------------------------
-# Background loop (wired in main.py startup)
-# ---------------------------------------------------------------------------
-
-async def load_loop() -> None:
-    """Refresh the room cache every REFRESH_S. Never exits/raises out."""
-    try:
-        n = await asyncio.to_thread(refresh_rooms)
-        log_ranked(f"[ranked] cache primed with {n} rooms")
-    except Exception as exc:
-        log_ranked(f"[ranked] prime failed: {exc}")
-    while True:
-        try:
-            await asyncio.sleep(REFRESH_S)
-            n = await asyncio.to_thread(refresh_rooms)
-            log_ranked(f"[ranked] cache refresh: {n} rooms")
-        except asyncio.CancelledError:
-            break
-        except Exception as exc:
-            log_ranked(f"[ranked] loop tick failed: {exc}")
