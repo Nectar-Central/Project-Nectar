@@ -1,8 +1,8 @@
-discord.py>=2.3
-aiosqlite>=0.20
-fastapi>=0.110
-uvicorn[standard]>=0.29
-pydantic>=2
-supabase>=2.5
-python-dotenv>=1.0
-aiohttp>=3.9
+# Discord bot deps (installed alongside server/requirements.txt in server/Dockerfile).
+# supabase matches the frozen local env (2.31.0) so new-format sb_secret_ /
+# sb_publishable_ keys work everywhere — keep in sync with server/requirements.txt.
+discord.py==2.7.1
+supabase==2.31.0
+python-dotenv==1.0.1
+aiosqlite==0.22.1
+aiohttp==3.14.3
