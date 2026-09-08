@@ -22,7 +22,7 @@ class _FakeDB:
 def _patched(monkeypatch):
     fake = _FakeDB()
     monkeypatch.setattr(proc, "_result_event_exists",
-                        lambda sid, et, rid, ver: fake.exists(sid, et, rid, ver))
+                        lambda sid, et, rid, ver, buf=None: fake.exists(sid, et, rid, ver))
     return fake
 
 

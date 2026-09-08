@@ -198,19 +198,17 @@ def test_stats_ranked_active(fakes, monkeypatch):
     assert rk["points"] == 750 and rk["milestone"] == "Silver"
     assert rk["milestone_icon_url"].endswith("/silver.png")
     assert rk["milestone_color"] == "#C0C0C0"
-    assert rk["arena_icon_url"].endswith("/arenaicon.png")
-    assert rk["points_to_next"] == 250 and rk["next_milestone"] == "Gold"
-    assert rk["next_points_pct"] == 50
-    assert rk["warnings"] == [] and rk["match_id"] == "R-X-3"
+    assert rk["match_id"] == "R-X-3"
     assert rk["match_version"] == 3
+    for gone in ("warnings", "host_game_username", "host_skin", "host_playing",
+                 "points_to_next", "next_milestone", "arena_icon_url",
+                 "min_points", "max_points", "fee", "sealed", "needs_start"):
+        assert gone not in rk
 
 
-def test_stats_ranked_host_and_warnings(fakes, monkeypatch):
-    body = _stats(monkeypatch, session=_live_session(warnings=["Bob"]),
-                  room=dict(_ROOM), points=150)
-    rk = body["ranked"]
-    assert rk["warnings"] == ["Bob"]
-    assert rk["milestone"] == "Unranked"  # 150 < 200
+def test_stats_ranked_tier(fakes, monkeypatch):
+    body = _stats(monkeypatch, session=_live_session(), room=dict(_ROOM), points=150)
+    assert body["ranked"]["milestone"] == "Unranked"  # 150 < 200
 
 
 def test_stats_ranked_is_host_true(fakes, monkeypatch):
@@ -247,8 +245,28 @@ def test_stats_stale_ghost_stays_buried(fakes, monkeypatch):
     assert body["session"]["short_code"] is None
 
 
+def _blip_session_age(age_s):
+    """Blip shape with the old room's last packet age_s seconds ago."""
+    import time as _t
+    return {"current_room_id": "lobby",
+            "rooms": {"lobby": {"room_id": "lobby"},
+                      "r1": {"room_id": "r1", "short_code": "ABCDE",
+                             "match_version": 3, "state": "lobby",
+                             "ranked_warnings": [], "players": {},
+                             "game_mode": "zw_lg", "players_count": 2,
+                             "last_packet_at": _t.time() - age_s}}}
+
+
+def test_stats_left_room_ghost_buried_fast(fakes, monkeypatch):
+    # real leave 60s ago: old room still "fresh" by the 120s session window
+    # but past the 20s blip-rescue window -> no rescue, no ranked BLOCK
+    body = _stats(monkeypatch, session=_blip_session_age(60), room=dict(_ROOM))
+    assert body["ranked"] is None
+    assert body["session"] is None or body["session"].get("short_code") is None
+
+
 # ---------------------------------------------------------------------------
-# get_ranked_room_fresh read-through (new rooms visible before the 30s refresh)
+# direct-DB lookup (no cache: new rooms visible immediately)
 # ---------------------------------------------------------------------------
 
 class _RoomDB:
@@ -286,45 +304,38 @@ class _RoomDB:
 
 @pytest.fixture
 def fresh_env(monkeypatch):
-    ranked_mod._rooms.clear()
-    ranked_mod._miss_cache.clear()
     monkeypatch.setattr(ranked_mod, "_sb", lambda: None)  # default: no DB
     yield
-    ranked_mod._rooms.clear()
-    ranked_mod._miss_cache.clear()
 
 
-def test_fresh_hit_no_db(monkeypatch, fresh_env):
-    ranked_mod._rooms["ABCDE"] = {"id": "R-1"}
+def test_lookup_hit_reads_db(monkeypatch, fresh_env):
+    db = _RoomDB([{"id": "R-1", "short_code": "ABCDE", "status": "live"}])
+    monkeypatch.setattr(ranked_mod, "_sb", lambda: db)
+    assert ranked_mod.get_ranked_room("abcde") == {"id": "R-1", "short_code": "ABCDE", "status": "live"}
+    assert ranked_mod.get_ranked_room("ABCDE")["id"] == "R-1"
+
+
+def test_lookup_miss_returns_none(monkeypatch, fresh_env):
     db = _RoomDB([])
     monkeypatch.setattr(ranked_mod, "_sb", lambda: db)
-    assert ranked_mod.get_ranked_room_fresh("abcde") == {"id": "R-1"}
-    assert db.calls == 0
+    assert ranked_mod.get_ranked_room("ZZZZZ") is None
+    assert ranked_mod.get_ranked_room("") is None
+    assert ranked_mod.get_ranked_room(None) is None
 
 
-def test_fresh_miss_reads_db_and_caches(monkeypatch, fresh_env):
-    db = _RoomDB([{"id": "R-2", "short_code": "FGHIJ", "status": "lobby"}])
-    monkeypatch.setattr(ranked_mod, "_sb", lambda: db)
-    assert ranked_mod.get_ranked_room_fresh("FGHIJ")["id"] == "R-2"
-    assert db.calls == 2  # live miss + lobby hit
-    assert ranked_mod._rooms["FGHIJ"]["id"] == "R-2"  # cached for next poll
-
-
-def test_fresh_negative_cached(monkeypatch, fresh_env):
-    db = _RoomDB([])
-    monkeypatch.setattr(ranked_mod, "_sb", lambda: db)
-    assert ranked_mod.get_ranked_room_fresh("ZZZZZ") is None
-    assert ranked_mod.get_ranked_room_fresh("ZZZZZ") is None
-    assert db.calls == 2  # one live+lobby round; second call served from miss cache
-
-
-def test_fresh_prefers_live(monkeypatch, fresh_env):
+def test_lookup_prefers_live(monkeypatch, fresh_env):
     db = _RoomDB([
         {"id": "R-old", "short_code": "ABCDE", "status": "lobby"},
         {"id": "R-new", "short_code": "ABCDE", "status": "live"},
     ])
     monkeypatch.setattr(ranked_mod, "_sb", lambda: db)
-    assert ranked_mod.get_ranked_room_fresh("ABCDE")["id"] == "R-new"
+    assert ranked_mod.get_ranked_room("ABCDE")["id"] == "R-new"
+
+
+def test_lookup_lobby_when_no_live(monkeypatch, fresh_env):
+    db = _RoomDB([{"id": "R-2", "short_code": "FGHIJ", "status": "lobby"}])
+    monkeypatch.setattr(ranked_mod, "_sb", lambda: db)
+    assert ranked_mod.get_ranked_room("FGHIJ")["id"] == "R-2"
 
 
 def test_stats_no_session_null(fakes, monkeypatch):
@@ -337,49 +348,21 @@ def test_stats_last_result_win(fakes, monkeypatch):
                       "kills": {"D1": 2}, "points": {"D1": 85}, "placements": {"D1": 1}}]
     body = _stats(monkeypatch, session=_live_session(), room=dict(_ROOM))
     assert body["ranked"]["last_result"] == {
-        "match_version": 3, "gained": 85, "won": True, "placement": 1, "kills": 2}
+        "match_version": 3, "gained": 85, "won": True, "kills": 2}
 
 
-def test_stats_last_result_placement(fakes, monkeypatch):
+def test_stats_last_result_loss(fakes, monkeypatch):
     fakes.results = [{"room_id": "R-X", "match_version": 3, "winner_discord_id": "H",
-                      "kills": {"D1": 2}, "points": {"D1": 26}, "placements": {"D1": 2}}]
+                      "kills": {"D1": 2}, "points": {"D1": 11}}]
     body = _stats(monkeypatch, session=_live_session(), room=dict(_ROOM))
     assert body["ranked"]["last_result"] == {
-        "match_version": 3, "gained": 26, "won": False, "placement": 2, "kills": 2}
+        "match_version": 3, "gained": 11, "won": False, "kills": 2}
 
 
 def test_stats_last_result_none_when_unsealed(fakes, monkeypatch):
     fakes.results = []
     body = _stats(monkeypatch, session=_live_session(), room=dict(_ROOM))
     assert body["ranked"]["last_result"] is None
-
-
-def test_stats_host_playing(fakes, monkeypatch):
-    fakes.users.append({"discord_id": "H", "game_username": "True Jew", "skin": "cct_7_gold"})
-    sess = _live_session(players={"1": {"username": "True Jew"},
-                                  "2": {"username": "Player1"}})
-    body = _stats(monkeypatch, session=sess, room=dict(_ROOM))
-    rk = body["ranked"]
-    assert rk["host_game_username"] == "True Jew"
-    assert rk["host_skin"] == "cct_7_gold"
-    assert rk["host_playing"] is True
-
-
-def test_stats_host_not_playing(fakes, monkeypatch):
-    fakes.users.append({"discord_id": "H", "game_username": "True Jew", "skin": "cct_7_gold"})
-    sess = _live_session(players={"2": {"username": "Player1"}})
-    body = _stats(monkeypatch, session=sess, room=dict(_ROOM))
-    rk = body["ranked"]
-    assert rk["host_game_username"] == "True Jew"
-    assert rk["host_playing"] is False
-
-
-def test_stats_host_unknown(fakes, monkeypatch):
-    body = _stats(monkeypatch, session=_live_session(), room=dict(_ROOM))
-    rk = body["ranked"]
-    assert rk["host_game_username"] is None
-    assert rk["host_skin"] is None
-    assert rk["host_playing"] is False
 
 
 def test_stats_is_dev_defaults_false(fakes, monkeypatch):
@@ -532,31 +515,8 @@ def test_leaderboard_normal_untouched(fakes, monkeypatch):
     assert body["results"][0]["discord_id"] == "D1"
 
 
-def test_leaderboard_ranked_season(fakes, monkeypatch):
-    fakes.seasons = [{"season": 3, "ends_at": "2026-10-01T00:00:00+00:00"}]
-    monkeypatch.setattr(ranked_mod, "_sb", lambda: _SeasonAdapter(fakes))
-    monkeypatch.setitem(ranked_mod._season_cache, "at", 0.0)
-    body = _call(disc_mod.leaderboard, {"ranked": "true"})
-    assert body["season"] == 3
-    assert body["reset_at"] == "2026-10-01T00:00:00+00:00"
-
-
-def test_leaderboard_ranked_season_default(fakes, monkeypatch):
-    fakes.seasons = []
-    monkeypatch.setattr(ranked_mod, "_sb", lambda: _SeasonAdapter(fakes))
-    monkeypatch.setitem(ranked_mod._season_cache, "at", 0.0)
+def test_leaderboard_ranked_season_static(fakes, monkeypatch):
+    # seasons table deleted: always season 1, no reset
     body = _call(disc_mod.leaderboard, {"ranked": "true"})
     assert body["season"] == 1
     assert body["reset_at"] is None
-
-
-class _SeasonAdapter:
-    def __init__(self, fake):
-        self._fake = fake
-
-    def table(self, name):
-        return _SeasonQ(self._fake, name)
-
-
-class _SeasonQ(_Q):
-    pass

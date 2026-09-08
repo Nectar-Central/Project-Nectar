@@ -10,7 +10,7 @@ Response: { count, players: [ { username, game_id, skin, discord_username, disco
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from ..lib.supabase_client import supabase, db
+from ..lib.supabase_client import supabase, db, db_io
 from ..lib.redis_client import cache
 from .capture import engine as capture_engine
 
@@ -81,7 +81,7 @@ async def get_players(request: Request):
         try:
             if gids:
                 # supabase in_ filter: .in_("game_id", gids)
-                res = supabase.table("bngc_users").select("discord_id,discord_username,game_username,game_id,skin").in_("game_id", gids).execute()
+                res = await db_io(lambda: supabase.table("bngc_users").select("discord_id,discord_username,game_username,game_id,skin").in_("game_id", gids).execute())
                 for r in (res.data or []):
                     if r.get("game_id"):
                         db_by_gid[str(r["game_id"])] = r
@@ -91,7 +91,7 @@ async def get_players(request: Request):
             if unames:
                 # need to avoid large IN, chunk 20
                 chunk = unames[:30]
-                res2 = supabase.table("bngc_users").select("discord_id,discord_username,game_username,game_id,skin").in_("game_username", chunk).execute()
+                res2 = await db_io(lambda: supabase.table("bngc_users").select("discord_id,discord_username,game_username,game_id,skin").in_("game_username", chunk).execute())
                 for r in (res2.data or []):
                     if r.get("game_username"):
                         db_by_uname[str(r["game_username"])] = r

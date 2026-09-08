@@ -92,6 +92,37 @@ def get_open_room_by_code(code: str):
         return None
 
 
+def get_room_by_thread_id(thread_id: str):
+    """Find a ranked room by its Discord thread ID. Returns the open room or None."""
+    try:
+        tid = str(thread_id or "").strip()
+        if not tid:
+            return None
+        for status in ("live", "lobby"):
+            r = _sb().table("ranked_rooms").select("*").eq("thread_id", tid).eq("status", status).limit(1).execute()
+            if r.data:
+                return r.data[0]
+        return None
+    except Exception:
+        return None
+
+
+def get_user_active_room(discord_id: str):
+    """Find the user's active ranked room (live preferred, then lobby). Returns room dict or None."""
+    try:
+        did = str(discord_id or "").strip()
+        if not did:
+            return None
+        r = _sb().table("ranked_rooms").select("*").in_("status", ["live", "lobby"]).order("created_at", desc=True).limit(50).execute()
+        for status in ("live", "lobby"):
+            for row in (r.data or []):
+                if row.get("status") == status and did in roster_ids(row):
+                    return row
+        return None
+    except Exception:
+        return None
+
+
 def create_room(*, code, host_discord_id, gm, max_players, max_matches,
                 min_points=0, max_points=None, fee=0, starts_at=None,
                 lobby_channel_id=None, lobby_message_id=None):
@@ -113,6 +144,7 @@ def create_room(*, code, host_discord_id, gm, max_players, max_matches,
         "fee": fee or 0,
         "starts_at": starts_at,
         "status": "lobby",
+        "host_status": "is_host_playing",
         "roster": [{"discord_id": str(host_discord_id), "joined_at": _now()}],
         "lobby_channel_id": str(lobby_channel_id) if lobby_channel_id else None,
         "lobby_message_id": str(lobby_message_id) if lobby_message_id else None,
@@ -311,6 +343,11 @@ def lobby_embed(room: dict) -> dict:
         except Exception:
             starts = str(room.get("starts_at"))
     host_line = f"<@{room.get('host_discord_id')}>"
+    hs = (room.get("host_status") or "").strip()
+    if hs == "hosting_only":
+        host_line += " (hosting only)"
+    elif hs == "is_host_playing":
+        host_line += " (playing)"
     return {
         "title": f"Ranked Lobby {room['id']} — {gm_name(room.get('gm'))}",
         "fields": [
@@ -329,8 +366,13 @@ def lobby_embed(room: dict) -> dict:
 def live_embed(room: dict, thread_id=None, host_status: str = "") -> dict:
     """Spec for the flipped-live lobby embed."""
     host_line = f"<@{room.get('host_discord_id')}>"
-    if host_status:
-        host_line += f" ({host_status})"
+    hs = host_status or (room.get("host_status") or "").strip()
+    if hs == "hosting_only":
+        host_line += " (hosting only)"
+    elif hs == "is_host_playing":
+        host_line += " (playing)"
+    elif hs:
+        host_line += f" ({hs})"
     return {
         "title": f"Ranked LIVE {room['id']} — {gm_name(room.get('gm'))}",
         "fields": [
@@ -345,10 +387,16 @@ def live_embed(room: dict, thread_id=None, host_status: str = "") -> dict:
 
 def ended_embed(room: dict, thread_id=None) -> dict:
     """Spec for the ended lobby embed."""
+    host_line = f"<@{room.get('host_discord_id')}>"
+    hs = (room.get("host_status") or "").strip()
+    if hs == "hosting_only":
+        host_line += " (hosting only)"
+    elif hs == "is_host_playing":
+        host_line += " (playing)"
     return {
         "title": f"Ranked ENDED {room['id']} — {gm_name(room.get('gm'))}",
         "fields": [
-            ("Host", f"<@{room.get('host_discord_id')}>", True),
+            ("Host", host_line, True),
             ("Status", "Ended", True),
             ("Players", f"{len(roster_ids(room))}/{room.get('max_players')}", True),
             ("Matches", f"{sealed_count(room['id'])}/{room.get('max_matches')}", True),

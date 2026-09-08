@@ -120,8 +120,18 @@ def _ts_iso() -> str:
 
 
 def log_sys(message: str) -> None:
-    """System/infrastructure log (violet)."""
+    """System/infrastructure chatter (violet). Gated behind BNC_DEBUG=1.
 
+    The console keeps exactly one clean line per meaningful event
+    (log_engine) plus ranked/error/request lines. Set BNC_DEBUG=1 in the
+    environment to see this chatter again for deep diagnostics.
+    """
+
+    try:
+        if _os.getenv("BNC_DEBUG") != "1":
+            return
+    except Exception:
+        return
     print(f"{_timestamp()} {TAG['SYS']} {COL['sys'](message)}")
 
 
@@ -138,8 +148,13 @@ def log_err(message: str) -> None:
 
 
 def log_info(message: str) -> None:
-    """Info log (gray, no tag)."""
+    """Info log (gray). Same gate as log_sys (BNC_DEBUG=1)."""
 
+    try:
+        if _os.getenv("BNC_DEBUG") != "1":
+            return
+    except Exception:
+        return
     print(f"{_timestamp()} {TAG['SYS']} {COL['info'](message)}")
 
 
@@ -276,16 +291,34 @@ _EVENT_TAG = {
     "name_change": TAG["SYS"],
 }
 
+# Per-packet detail events never reach the console (BNC_DEBUG=1 reveals
+# them via log_dbg). The console keeps exactly one clean line per meaningful
+# event: join/leave/killfeed/kill/win/defeat/alv/stg/state/room.
+_ENGINE_DEBUG_EVENTS = {"actor", "debug", "props", "zone", "team_pt", "unknown"}
+
+
 def log_engine(event: str, session: str = "", **fields) -> None:
     """
     Pretty console log with color tag + key=value fields.
-    Also emits JSON line for aggregation.
+    JSON aggregation goes to logs/engine.jsonl only (never the console).
     """
+    if event in _ENGINE_DEBUG_EVENTS:
+        try:
+            field_str = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+            session_part = f" session={session}" if session else ""
+            log_dbg(f"{event}{session_part} {field_str}")
+        except Exception:
+            pass
+        return
     tag = _EVENT_TAG.get(event, TAG["SYS"])
     # Build compact key=value string
     field_str = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
     session_part = f" session={session}" if session else ""
     print(f"{_timestamp()} {tag}{session_part} {field_str}")
-    
-    # Also emit JSON for file/ELK
-    log_engine_json(event, session, **fields)
+
+    # JSON for file aggregation only (no console print)
+    try:
+        payload = {"ts": _ts_iso(), "event": event, "session": session, **fields}
+        _struct_logger.info(json.dumps(payload, separators=(",", ":")))
+    except Exception:
+        pass

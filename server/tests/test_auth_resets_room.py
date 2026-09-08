@@ -1,6 +1,7 @@
 """Regression: a fresh authenticate (reload / disconnect / reconnect) must drop
-the stale current room — otherwise stats keeps serving the previous (possibly
-ranked) room as live and the drawer/UI shows a ghost ranked session.
+the stale current room AND its short_code — otherwise stats keeps serving
+the previous (possibly ranked) room as live and the drawer/UI shows a ghost
+ranked session (lobby-blip rescue re-serves any room that still has a code).
 
 Feeds a minimal real auth op (f302e600 -> opName Authenticate) through the
 engine against a session parked in a ranked room.
@@ -40,10 +41,12 @@ def test_auth_when_already_lobby_is_noop():
     assert eng.get_session("s").current_room_id == "lobby"
 
 
-def test_auth_keeps_ranked_room_record():
-    # Only the pointer moves — the old room (seals/history) is untouched.
+def test_auth_clears_exited_room_code():
+    # The old room record (seals/history) survives, but its code is dropped:
+    # only the pointer moved before, and the rescue path re-served the stale
+    # room by code as a ghost ranked block.
     eng = _seeded()
     eng.feed("s", AUTH_HEX)
     v = eng.get_session("s")
     assert "R-AAA" in v.rooms
-    assert v.rooms["R-AAA"].short_code == "A5337"
+    assert v.rooms["R-AAA"].short_code is None

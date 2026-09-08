@@ -11,7 +11,7 @@ No win/kills math here — caller does it from the returned packets/session.
 from fastapi import APIRouter, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 
-from ..lib.supabase_client import supabase, db
+from ..lib.supabase_client import supabase, db, db_io
 from ..lib.redis_client import cache
 from ..lib.tokens import generate_request_token, validate_request_token, is_session_expired
 from ..lib.logger import log_sys, log_err, log_dbg
@@ -38,6 +38,9 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
     host_mode = bool(body.get("hostMode") or body.get("host_mode"))
     ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "-")
 
+    import time as _t
+    _ct = {"t0": _t.time()}  # per-stage timings (measure-first: find the ack cost)
+
     if not isinstance(records, list):
         return JSONResponse({"error": "records required"}, status_code=400)
     if not auth_session_id and not token:
@@ -47,13 +50,13 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
     new_token = None
     new_counter = None
     if auth_session_id:
-        res = db.get_session_sync(auth_session_id)
+        res = await db_io(db.get_session_sync, auth_session_id)
         sess = res.get("data")
         if not sess:
             return JSONResponse({"error": "Invalid auth session"}, status_code=401)
         if is_session_expired(sess):
             try:
-                db.update_session_sync(auth_session_id, {"is_active": False})
+                await db_io(db.update_session_sync, auth_session_id, {"is_active": False})
             except Exception:
                 pass
             log_sys(f"CAPTURE expired session {auth_session_id[:13]} — client must re-link")
@@ -83,8 +86,9 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
                 base = sess["token_counter"]
             new_counter = base + 1
             new_token = generate_request_token(sess["req_secret"], new_counter)
-            db.update_session_sync(auth_session_id, {"current_token": new_token, "token_counter": new_counter})
+            await db_io(db.update_session_sync, auth_session_id, {"current_token": new_token, "token_counter": new_counter})
             log_sys(f"CAPTURE token ok auth={str(auth_session_id)[:8]} req={req_token} → new {new_token} counter {sess['token_counter']}->{new_counter}")
+    _ct["tok"] = _t.time()
 
     # Serverless: restore engine state from Upstash when this worker has none.
     # Without this, every fresh lambda starts from a blank session (rooms/players/
@@ -105,6 +109,7 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
                     log_sys(f"CAPTURE restored engine state for {auth_session_id[:13]} rooms={len(restored.rooms)}")
         except Exception as e:
             log_err(f"CAPTURE restore failed {auth_session_id[:13]} {e}")
+    _ct["restore"] = _t.time()
 
     # Feed engine per session — no DB writes, just abstract data
     # Build one packet dict PER record (processor needs every packet, not just the last)
@@ -130,6 +135,7 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
         except Exception:
             pass
         packets.append(d)
+    _ct["feed"] = _t.time()
 
     # persist host_mode on SessionView (lifetime of session) — individualist vs host collab
     if auth_session_id and host_mode:
@@ -150,15 +156,6 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
         except Exception:
             pass
 
-    # Persist Engine state to Upstash so any lambda can serve currentmatch (Vercel serverless)
-    if auth_session_id and session_dict:
-        try:
-            _persist_ok = await cache.set_session_state(auth_session_id, session_dict, ttl=3600)
-            if not _persist_ok:
-                log_err(f"CAPTURE persist FAILED for {auth_session_id[:13]} — next lambda starts blank")
-        except Exception:
-            pass
-
     # Run DB writes inline (awaited) — BackgroundTasks are unreliable on serverless
     # (frozen after response) and this keeps local + Vercel behavior identical.
     # Never let DB failures break the 200 response (token already rotated inline).
@@ -173,10 +170,14 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
                 log_err(f"PROCESSOR FAILED session={auth_session_id[:13]} {type(e).__name__}: {e}")
         except Exception as e:
             log_err(f"CAPTURE processor import failed {e} — packets still returned, DB write skipped")
+    _ct["proc"] = _t.time()
 
-    # Re-persist AFTER the processor: it mutates flags/markers/counters/winner that the
-    # pre-processor persist above does not include. Without this the next lambda restores
-    # stale markers and re-records defeats/wins (doubles on Vercel).
+    # Persist Engine state to Upstash ONCE, after the processor (finally
+    # semantics): it mutates flags/markers/counters/winner that must survive
+    # for the next lambda (Vercel serverless) — without this the next lambda
+    # restores stale markers and re-records defeats/wins (doubles). A second
+    # persist before the processor only doubles the biggest cost of this
+    # endpoint (full session serialize + REST) for no durability gain.
     if auth_session_id and view is not None:
         try:
             import time as _t2
@@ -184,9 +185,10 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
             _final["_cached_at"] = _t2.time()
             _final_ok = await cache.set_session_state(auth_session_id, _final, ttl=3600)
             if not _final_ok:
-                log_err(f"CAPTURE final persist FAILED for {auth_session_id[:13]}")
+                log_err(f"CAPTURE persist FAILED for {auth_session_id[:13]} — next lambda starts blank")
         except Exception:
             pass
+    _ct["persist"] = _t.time()
 
     # Also handle username/game_id change via engine's view.me
     # If view.me changed, include in response so userscript can update GM storage
@@ -199,9 +201,53 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
         resp["game_username"] = view.me.username
         resp["game_id"] = view.me.game_id
 
+    # Ranked bind for live UI: which ranked room (if any) this room code
+    # belongs to. The client renders optimistic deltas locally (+8 kill /
+    # +50 win / -5 loss) and corrects from this + /api/stats — it never
+    # polls ranked endpoints. No point rules: both sides hardcode 8/50/-5.
+    if view and discord_id:
+        try:
+            from server.lib import ranked as ranked_mod
+            for room_id_r, room_r in view.rooms.items():
+                code_r = getattr(room_r, "short_code", None)
+                if code_r and room_r.state.value == "match":
+                    room_data = ranked_mod.get_ranked_room(code_r)
+                    if room_data and room_data.get("status") in ("lobby", "live"):
+                        resp["ranked_room"] = {
+                            "code": code_r,
+                            "status": room_data.get("status"),
+                            "match_version": getattr(room_r, "match_version", 0),
+                            "is_host": discord_id == room_data.get("host_discord_id"),
+                        }
+                        break
+        except Exception:
+            pass
+
     resp["packets"] = packets
     if session_dict:
         resp["session"] = session_dict
+
+    # Per-stage timings (measure-first): one line per batch with packets.
+    # t0->tok covers body parse + session/token DB + rotation; the rest is
+    # labeled below. Skipped stages read 0; the next present stage measures
+    # from the last present stamp (carry-forward, no absolute leakage).
+    if packets:
+        try:
+            _parts: dict = {}
+            _last = _ct.get("t0") or 0
+            for _k in ("tok", "restore", "feed", "proc", "persist"):
+                _v = _ct.get(_k)
+                if _v:
+                    _parts[_k] = int((_v - _last) * 1000)
+                    _last = _v
+                else:
+                    _parts[_k] = 0
+            _tend = _t.time()
+            log_sys(f"CAPTURE times n={len(packets)} total={int((_tend - (_ct.get('t0') or _tend)) * 1000)}ms "
+                    f"tok={_parts['tok']} restore={_parts['restore']} feed={_parts['feed']} "
+                    f"proc={_parts['proc']} persist={_parts['persist']} resp={int((_tend - _last) * 1000)}ms")
+        except Exception:
+            pass
 
     # If we have a token, always return 200 with token; else 204
     if new_token:

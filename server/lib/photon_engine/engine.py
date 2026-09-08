@@ -208,7 +208,16 @@ def _resolve_alv_subject(room, player_name, gpb, actor_nr):
 
 def _resolve_actor(room, nr: int | None) -> str | None:
     """Resolve actorNr -> player username via actor_map, room.players key, or player.actor_nr.
-    Actor 0 = room-level properties (curScn/stG/pID), never a player — returns "room"."""
+    Actor 0 = room-level properties (curScn/stG/pID), never a player — returns "room".
+
+    Two self-healing rules keep late joiners resolvable:
+    1. Map repair: a player whose actor_nr matches re-links a pruned map entry
+       (leave-pruning can drop the map while the player stays).
+    2. Single-unknown backfill: players learned from killfeed ("existing"
+       joins arrive without props) carry actor_nr -1. When exactly one such
+       player exists, an unmapped number must be theirs (numbers are unique
+       per room). Ambiguous otherwise — returns None.
+    """
     if nr is None:
         return None
     try:
@@ -217,13 +226,36 @@ def _resolve_actor(room, nr: int | None) -> str | None:
     except Exception:
         pass
     try:
+        nr_int = int(nr)
+    except Exception:
+        nr_int = None
+    try:
         if nr in room.actor_map:
             return str(room.actor_map[nr])
+        if nr_int is not None and nr_int in room.actor_map:
+            return str(room.actor_map[nr_int])
         if nr in room.players:
             return str(room.players[nr].username)
         for p in room.players.values():
-            if p.actor_nr == nr:
-                return str(p.username)
+            try:
+                if nr_int is not None and int(p.actor_nr) == nr_int:
+                    try:
+                        room.actor_map[nr_int] = str(p.username)
+                    except Exception:
+                        pass
+                    return str(p.username)
+            except Exception:
+                continue
+        if nr_int is not None and nr_int > 0:
+            try:
+                unknowns = [p for p in room.players.values() if p.actor_nr in (None, -1)]
+                if len(unknowns) == 1 and unknowns[0].username:
+                    unknowns[0].actor_nr = nr_int
+                    room.actor_map[nr_int] = str(unknowns[0].username)
+                    log_engine("debug", "", msg=f"actor backfill nr={nr_int} -> {unknowns[0].username}")
+                    return str(unknowns[0].username)
+            except Exception:
+                pass
     except Exception:
         pass
     return None
@@ -879,6 +911,14 @@ class Engine:
         try:
             from .fsm import RoomFSM
             did, _old, _new, _via = RoomFSM.transition(room, view, packet, gpb, cur_scn, session_id)
+            # Loud [RANKED] log on lobby↔match transitions for rooms with a ranked code.
+            try:
+                _code = getattr(room, "short_code", None)
+                if _code and _old != _new:
+                    from server.lib.logger import log_ranked
+                    log_ranked(f"[RANKED] scene -> {cur_scn or '-'} room={room.room_id[:8]} code={_code} {_old.value}->{_new.value} via={_via}")
+            except Exception:
+                pass
             # keep room.cur_scn always up to date on scene packets (even when no transition)
             if cur_scn is not None:
                 room.cur_scn = cur_scn
@@ -1160,6 +1200,17 @@ class Engine:
                 _me_lv = (view.me.username if view.me and view.me.username else None) or (room.me.username if room.me and room.me.username else None)
                 if _me_lv and _names_equal(packet.player_name, _me_lv):
                     if view.current_room_id != "lobby":
+                        # The exited room is dead to this session: drop its
+                        # short_code so stats never serves a ghost block for
+                        # it. A rejoin rebinds the code from pID packets.
+                        # (DB row untouched — ranked sessions intentionally
+                        # survive Photon room changes; see version align.)
+                        try:
+                            _exited = view.rooms.get(view.current_room_id) or room
+                            if getattr(_exited, "room_id", None) != "lobby":
+                                _exited.short_code = None
+                        except Exception:
+                            pass
                         _ensure_room("lobby")
                         log_engine("room", session_id[:13], action="left-to-lobby", room=room.room_id[:8])
         except Exception:
@@ -1171,6 +1222,12 @@ class Engine:
         # The following join/create re-points current within the same burst.
         try:
             if packet.packet_type == PacketType.AUTHENTICATE and view.current_room_id != "lobby":
+                try:
+                    _exited = view.rooms.get(view.current_room_id) or room
+                    if getattr(_exited, "room_id", None) != "lobby":
+                        _exited.short_code = None
+                except Exception:
+                    pass
                 _ensure_room("lobby")
                 log_engine("room", session_id[:13], action="auth-to-lobby", room=room.room_id[:8])
         except Exception:
@@ -1255,6 +1312,14 @@ class Engine:
             if target:
                 was_alive = target.is_alive
                 target.is_alive = packet.is_alive
+                # Stamp the resolved subject so to_dict() carries a name to
+                # the client (ALV console lines need it). Fill-only: a set
+                # name (self-report path) is already correct.
+                try:
+                    if target.username and not packet.player_name:
+                        packet.player_name = target.username
+                except Exception:
+                    pass
                 # fill skin/pickaxe/pt from this update (_pt ties to actorNr/TargetActorNr)
                 skid, pid, pfid, pt = _other_props()
                 if skid: target.skin = skid

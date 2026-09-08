@@ -38,6 +38,8 @@ import time
 from collections import deque
 from typing import Any
 
+from .supabase_client import db_io
+
 from .logger import log_sys, log_err
 
 VERIFY_DELAY_S = 2.0       # "2s later it checks" — delay between write and verification
@@ -155,7 +157,7 @@ async def verify_due(max_items: int = 10) -> int:
             due.append(_pending.popleft())
         # Drop overdue-but-uncapped backlog silently? No — keep for next call.
         for item in due:
-            res, reason = _verify_item(item)
+            res, reason = await db_io(_verify_item, item)
             if res is None:
                 _skipped += 1
             else:

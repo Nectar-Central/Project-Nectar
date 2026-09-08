@@ -6,6 +6,7 @@ call sites explicit. Uses service_role key (server-side only).
 """
 
 import os
+import asyncio
 from supabase import create_client, Client
 from dotenv import load_dotenv
 # ---------------------------------------------------------------------------
@@ -183,3 +184,14 @@ class DB:
 
 # Singleton instance
 db = DB()
+
+
+async def db_io(fn, *args, **kwargs):
+    """Run a blocking sync Supabase call in a worker thread.
+
+    The shared client is sync: every .execute() blocks the event loop for
+    its full RTT, serializing ALL concurrent requests on one worker. Awaiting
+    through here keeps ordering (still sequential per request) while letting
+    other requests use the loop. httpx pools are thread-safe for this shape.
+    """
+    return await asyncio.to_thread(fn, *args, **kwargs)
