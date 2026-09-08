@@ -12,6 +12,15 @@ supabase = None
 if USE_SUPABASE:
     try:
         from supabase import create_client
+        try:
+            import importlib.metadata as _md
+            _libv = _md.version("supabase")
+        except Exception:
+            _libv = "unknown"
+        _k = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or ""
+        # Fingerprint only: prefix class + length + dot count. Never the key.
+        _kf = f"{_k[:3]}... (len {len(_k)}, dots {_k.count('.')})"
+        print(f"[db] supabase lib v{_libv}, key {_kf}")
         supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
     except Exception as e:
         print(f"[db] supabase init failed, falling back to sqlite: {e}")
