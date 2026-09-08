@@ -44,7 +44,17 @@ if not _supabase_url:
 supabase: Client | None = None
 
 if _supabase_url and _supabase_key:
-    supabase = create_client(_supabase_url, _supabase_key)
+    try:
+        supabase = create_client(_supabase_url, _supabase_key)
+    except Exception as exc:
+        # Never crash the container on a bad key (e.g. new-format sb_secret_
+        # key with pinned supabase==2.7.0, which only accepts legacy JWTs).
+        # Routes degrade to 500 "Server not configured" instead of exit.
+        try:
+            print(f"[supabase] create_client failed ({exc}); running unconfigured")
+        except Exception:
+            pass
+        supabase = None
 else:
     supabase = None  # Will be None in tests without env
 
