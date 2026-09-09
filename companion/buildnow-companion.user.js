@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Nectar Buildnow Companion
 // @namespace    https://github.com/Nectar-Central
-// @version      2.19.0
-// @description  Nectar Buildnow Companion v2.19.0 — streak rewards, ranked sleeping.
+// @version      2.20.0
+// @description  Nectar Buildnow Companion v2.20.0 — leaderboard panel, insights, friends & chat, play points.
 // @author       Nectar Labs
 // @match        https://buildnow-gg.game-files.crazygames.com/*
 // @match        https://*.crazygames.com/*
@@ -31,7 +31,7 @@
 
 (function () {
   'use strict';
-  const BNC_VERSION = '2.19.0';
+  const BNC_VERSION = '2.20.0';
   const HREF = (() => { try { return location.href; } catch { return ''; } })();
   const IS_GAME_FRAME = HREF.includes('buildnow-gg.game-files.crazygames.com');
   // Loading shell lives inside an intermediate iframe (games.crazygames.com),
@@ -49,10 +49,27 @@
     return;
   }
 
-  // Production API (fixed — no user override).
+  // Production API default. Override order: stored bnc_api_base (user-set,
+  // e.g. http://127.0.0.1:8000 for a local backend) > ?api=local > production.
+  // Without the stored override the drawer talks to production even when a
+  // local backend runs — everything reads Offline there. Never throws.
   const SERVER_API = 'https://project-nectar.onrender.com';
   const LOCAL_API  = 'http://127.0.0.1:8000';
+  function normalizeApiBase(raw){
+    try{
+      let s=String(raw==null?'':raw).trim();
+      if(!s) return null;
+      if(!/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) s='http://'+s;
+      const u=new URL(s);
+      if(u.protocol!=='http:' && u.protocol!=='https:') return null;
+      return u.origin;
+    }catch{ return null; }
+  }
   function resolveApiBase(){
+    try{
+      const stored=normalizeApiBase(GMGet('bnc_api_base', null));
+      if(stored) return stored;
+    }catch{}
     // allow localhost override via ?api=local (dev only, invisible in UI)
     try { if (location.search.includes('api=local')) return LOCAL_API; } catch {}
     return SERVER_API;
@@ -890,6 +907,7 @@
     {id:'pause', label:'Pause feed (dev)', key:'bnc_bind_pause', dev:true, def:{ctrl:false,shift:true,alt:true,meta:false,key:'P'}, run:()=>togglePauseFeed()},
     {id:'drawer', label:'Player info', key:'bnc_drawer_keybind', dev:false, def:{ctrl:false,shift:true,alt:true,meta:false,key:'I'}, run:()=>toggleInfoPanel()},
     {id:'ranked', label:'Ranked panel', key:'bnc_ranked_keybind', dev:false, def:{ctrl:false,shift:false,alt:false,meta:false,key:'F9'}, run:()=>toggleRankedPanel()},
+    {id:'leaderboard', label:'Leaderboard', key:'bnc_lb_keybind', dev:false, def:{ctrl:false,shift:true,alt:true,meta:false,key:'L'}, run:()=>toggleLbPanel()},
   ];
   // Combos the browser takes before the page (per registration order they
   // can't be intercepted no matter the capture phase). Capture warns instead
@@ -1273,9 +1291,12 @@
   }
   function matchBind(e){
     for(const b of BNC_BINDS){
-      // drawer + ranked panel have their own dispatcher below (Esc/panel
-      // handling) — matching them here too would fire twice.
-      if(b.id==='drawer' || b.id==='ranked') continue;
+      // drawer + ranked + leaderboard panels have their own dispatcher below
+      // (Esc/panel handling) — matching them here too would fire twice.
+      if(b.id==='drawer' || b.id==='ranked' || b.id==='leaderboard') continue;
+      // Alt+Shift+L is the leaderboard default: when the press matches the
+      // leaderboard bind, 'Load file' (same factory default) yields to it.
+      try{ if(b.id==='load' && typeof isLbKeybind==='function' && isLbKeybind(e)) continue; }catch{}
       if(b.dev && !isDev()) continue;
       if(matchBindKb(e, getBindKb(b))) return b;
     }
@@ -1432,10 +1453,10 @@
   function fmtGmDrawer(raw, duo){ if(!raw) return '-'; const k=String(raw).trim(); let label = GM_NAMES_DRAWER[k] || GM_NAMES_DRAWER[k.toLowerCase()] || k.replace(/[_-]+/g,' ').replace(/\b\w/g,s=>s.toUpperCase()); if(duo && (k.toLowerCase()==='df' || k.toLowerCase()==='zw_lg') && !/^(solo|duo|\(duo\))/i.test(label)) label = '(Duo) ' + label; return label; }
   function fmtPlaytimeDrawer(s){ if(s==null) return '-'; s=Math.max(0,Math.floor(Number(s)||0)); const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), sec=s%60; if(h) return `${h}h ${m}m`; if(m) return `${m}m ${sec}s`; return `${sec}s`; }
   function skinUrlDrawer(id){ if(!id || id==='-' ) return null; return `https://buildnow-api.netlify.app/skins/${encodeURIComponent(String(id).trim())}.png`; }
-  // team number -> diamond color (1 red, 2 blue, 3 green, 4 orange, 5 purple, 6 yellow, 7 cyan, 8 pink)
+  // team number -> diamond color (1 blue, 2 red, 3 green, 4 orange, 5 purple, 6 yellow, 7 cyan, 8 pink)
   function teamColorDrawer(pt){
     const n=parseInt(String(pt==null?'':pt).trim(), 10);
-    const map={1:'#ef4444',2:'#3b82f6',3:'#22c55e',4:'#f97316',5:'#a855f7',6:'#eab308',7:'#06b6d4',8:'#ec4899'};
+    const map={1:'#3b82f6',2:'#ef4444',3:'#22c55e',4:'#f97316',5:'#a855f7',6:'#eab308',7:'#06b6d4',8:'#ec4899'};
     return map[n]||null;
   }
   // keybind for drawer - customizable via button in drawer
@@ -1713,7 +1734,7 @@
       startStatsPoll();
       startBgLobbyPoll();
       if(drawerTab==='players'){ fetchPlayers(true); startPlayersPoll(); }
-      else { try{ const _pio=getPartyInfo(statsCache&&statsCache.session); if(_pio.isParty&&_pio.code){ fetchPlayers(true); startPlayersPoll(); } }catch{} }
+      else { try{ const _sess=statsCache&&statsCache.session; const _rooms=_sess&&_sess.rooms; const _cid=_sess&&_sess.current_room_id; const _cr=_cid&&_rooms?_rooms[_cid]:null; const _pio=getPartyInfo(_sess); if((_pio.isParty&&_pio.code)||(_cr&&String(_cr.room_id||'')!=='lobby')){ fetchPlayers(true); startPlayersPoll(); } }catch{} }
     } else {
       infoPanel.style.transform='translateX(-100%)';
       drawerBackdrop.style.display='none';
@@ -1830,6 +1851,11 @@
     if(isInParty){
       stateGmLine = hasGm ? `In Party - ${stateLabel} - ${gmLive}` : `In Party - ${stateLabel}`;
     }
+    // No game mode: bare status only ("In Lobby", never "In Lobby - …").
+    if(!hasGm){
+      stateGmLine = isInParty ? `In Party - ${stateLabel}` : stateLabel;
+    }
+    try{ stateGmLine = String(stateGmLine).replace(/\s+-\s*$/, ''); }catch{}
     // ranked overrides party: "In Match - Ranked Match - GM"
     // liveRanked() also requires fresh captures — a ghost block from a dead
     // session (kick/reload) never renders as ranked.
@@ -1879,14 +1905,22 @@
           ${row('Deaths', deaths)}
           ${row('K/D', kd)}
           ${arenaRowsHtml}
+          ${row('Play points', sc && sc.play_points!=null ? fmtPts(sc.play_points) : null)}
           ${row('Wins', wins)}
           ${row('Defeats', defeats)}
           ${row('Playtime', pGlobal!=null? fmtPlaytimeDrawer(pGlobal):null)}
           ${perGmRow}
           ${rankPct!=null? `<div style="font-size:12px;color:#9ca3af;text-align:center;margin-top:2px">Better than <span style="color:#fff;font-weight:800">${rankPct}%</span> of players</div>`:''}`;
-    const isLobbyTab = stateLabel === 'In Lobby';
-    // No player list in party: Players tab only mid-match. In Party status
-    // still shows on the detail line above.
+    const _curRoomId = (sess && sess.current_room_id) || (sess && sess.rooms ? Object.keys(sess.rooms).slice(-1)[0] : null);
+    const _curRoomObj = (_curRoomId && sess && sess.rooms && sess.rooms[_curRoomId]) || _curRoom || null;
+    const _curRoomRid = (_curRoomObj && _curRoomObj.room_id) || (playersCache && playersCache.room_id) || 'lobby';
+    // Players tab visibility follows room lifecycle (Create/Join -> show, Leave -> hide),
+    // not match state: private/random lobbies have a real room before curScn flips to match.
+    // Self-leave prunes the room server-side -> current falls back to the lobby pseudo-room -> hidden.
+    const hasRealRoom = !!_curRoomObj && String(_curRoomRid||'') !== 'lobby';
+    const isLobbyTab = !hasRealRoom;
+    // No player list without a real room: clear stale roster when back to lobby pseudo-room
+    // (fixes not refreshing). Party status still shows on the detail line above.
     if(isLobbyTab){
       // clean up stale player list when back in lobby (fixes not refreshing)
       if(playersCache){ playersCache=null; }
@@ -1897,7 +1931,7 @@
         stopPlayersPoll();
       }
     }
-    // tab bar - Players only mid-match, never for party lobbies
+    // tab bar - Players whenever a real room exists (lobby or match), never for pure lobby pseudo-room
     const tabBtn=(id,label,active)=>`<button id="${id}" style="flex:1;max-width:120px;padding:6px 0;border-radius:999px;border:1px solid ${active?'#fff':'rgba(255,255,255,0.12)'};background:${active?'#fff':'#171717'};color:${active?'#000':'#9ca3af'};font-size:12px;font-weight:700;cursor:pointer">${label}</button>`;
     const tabBar = isLobbyTab
       ? `<div style="display:flex;gap:6px;justify-content:center;width:100%;margin-bottom:4px">${tabBtn('bnc-tab-stats','Stats',drawerTab==='stats')}</div>`
@@ -1957,12 +1991,33 @@
           const discordVal = pl.discord_username!=null ? String(pl.discord_username) : 'NaN';
           const detailLine = `Discord: ${toNaN(discordVal)} · Game ID: ${toNaN(gidFull)}`;
           const detailDiv = `<div style="font-size:11px;color:#9ca3af;word-break:break-word;white-space:normal;line-height:1.35">${detailLine}</div>`;
-          return `<div style="display:flex;gap:10px;align-items:center;width:100%;max-width:300px;padding:8px 10px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px"><div style="flex-shrink:0">${img}</div><div style="flex:1;min-width:0;text-align:left;display:flex;flex-direction:column;gap:2px">${nameLine}${detailDiv}</div></div>`;
+          // Add-friend: in-DB players only, never self. Wired after render.
+          const _meDid = (typeof myDiscordId==='function' ? myDiscordId() : null);
+          const _canAdd = !!(inDb && pl.discord_id && !pl.is_self && _meDid && String(pl.discord_id)!==String(_meDid));
+          const addBtn = _canAdd ? `<button data-addfr="${esc(pl.discord_id)}" title="Send friend request" style="background:#fff;color:#000;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:11px;font-weight:700;flex-shrink:0;white-space:nowrap">Add</button>` : '';
+          return `<div style="display:flex;gap:10px;align-items:center;width:100%;max-width:300px;padding:8px 10px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px"><div style="flex-shrink:0">${img}</div><div style="flex:1;min-width:0;text-align:left;display:flex;flex-direction:column;gap:2px">${nameLine}${detailDiv}</div>${addBtn}</div>`;
         }).join('');
         playersHtml = header + `<div style="display:flex;flex-direction:column;gap:6px;align-items:center;width:100%;max-height:46vh;overflow-y:auto;padding-right:4px">${rows}</div>`;
       }
     }
     body.innerHTML = tabBar + (drawerTab==='stats' ? statsHtml : `<div style="display:flex;flex-direction:column;align-items:center;width:100%;padding:8px 0">${playersHtml}</div>`);
+    // players-tab add-friend buttons (in-DB only; server dedups/409s repeats)
+    try{
+      body.querySelectorAll('button[data-addfr]').forEach(b=>{
+        b.onclick=(e)=>{
+          try{ if(e) e.stopPropagation(); }catch{}
+          const target=String(b.dataset.addfr||'');
+          const me=(typeof myDiscordId==='function' ? myDiscordId() : null);
+          if(!target || !me) return;
+          b.disabled=true; b.textContent='…';
+          apiPostJson('/api/friends/request', {requester_discord_id:me, addressee_discord_id:target}, (j)=>{
+            if(j && (j.ok || (j.status&&j.status!=='pending'))){ b.textContent='Sent'; try{ showToast('Friend request sent', false); }catch{} }
+            else if(j && j.error && /already/i.test(j.error)){ b.textContent='Sent'; }
+            else { b.disabled=false; b.textContent='Add'; try{ showToast('Failed: '+(((j||{}).error)||'server error'), true); }catch{} }
+          });
+        };
+      });
+    }catch{}
     // tab handlers
     const tsBtn=document.getElementById('bnc-tab-stats');
     const tpBtn=document.getElementById('bnc-tab-players');
@@ -2595,6 +2650,514 @@
     });
   }
 
+  // --- LEADERBOARD PANEL: Alt+Shift+L — all players, any time ---
+  // Standalone overlay (same card pattern as the ranked panel): sortable
+  // columns (points/kills/wins/K-D/playtime), paginated, Esc/backdrop closes.
+  // Insights + Friends tabs plug into lbTab/renderLbPanel in later slices.
+  function getLbKeybind(){
+    try{
+      const raw=GMGet('bnc_lb_keybind', null);
+      if(raw && typeof raw==='object' && raw.key) return raw;
+      if(typeof raw==='string' && raw){
+        try{ const j=JSON.parse(raw); if(j && j.key) return j; }catch{}
+        const parts=String(raw).split('+');
+        const kb={ctrl:false,shift:true,alt:true,meta:false,key:'L'};
+        for(const p of parts){ const l=p.trim().toLowerCase(); if(l==='ctrl'||l==='control') kb.ctrl=true; else if(l==='cmd'||l==='meta'||l==='command') kb.meta=true; else if(l==='shift') kb.shift=true; else if(l==='alt') kb.alt=true; else if(p.trim()) kb.key=p.trim().toUpperCase(); }
+        return kb;
+      }
+    }catch{}
+    return {ctrl:false, shift:true, alt:true, meta:false, key:'L'};
+  }
+  function isLbKeybind(e){
+    return bindMatches(e, getLbKeybind());
+  }
+  // Plain JSON POST (no session tokens — friends/party API is discord_id-keyed).
+  function apiPostJson(path, body, cb){
+    let base=''; try{ base=resolveApiBase(); }catch{}
+    if(!base){ try{cb(null);}catch{} return; }
+    const url=base+path;
+    const done=(ok,txt)=>{
+      let j=null;
+      try{ j=(ok && txt) ? JSON.parse(txt) : null; }catch{ j=null; }
+      try{ cb(j); }catch{}
+    };
+    try{
+      const GM=typeof GM_xmlhttpRequest!=='undefined' ? GM_xmlhttpRequest : (typeof unsafeWindow!=='undefined' && unsafeWindow.GM_xmlhttpRequest) || null;
+      if(GM){ GM({method:'POST', url, data:JSON.stringify(body||{}), headers:{'Content-Type':'application/json'}, timeout:10000, onload:r=>done(r.status>=200&&r.status<300, r.responseText), onerror:()=>done(false,''), ontimeout:()=>done(false,'')}); return; }
+    }catch{}
+    fetch(url,{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body||{})}).then(r=>r.text().then(t=>done(r.ok,t)).catch(()=>done(false,''))).catch(()=>done(false,''));
+  }
+  function myDiscordId(){
+    try{ return (statsCache&&statsCache.discord_id)||GMGet('bnc_discord_id',GMGet('bn_discord_id',null))||null; }catch{ return null; }
+  }
+  // Live private-room code I hold right now (invite gating). Mirrors the
+  // stats short_code: current room's pID, never the lobby pseudo-room.
+  function myLiveCode(){
+    try{
+      const sess=statsCache&&statsCache.session;
+      if(!sess||!sess.rooms) return null;
+      const cur=sess.rooms[sess.current_room_id]||null;
+      if(!cur||String(cur.room_id||'')==='lobby') return null;
+      const c=String(cur.short_code||'').trim().toUpperCase();
+      return (c.length===5)?c:null;
+    }catch{ return null; }
+  }
+  function copyText(t, okMsg){
+    const done=()=>{ try{ showToast(okMsg||'Copied', false); }catch{} };
+    try{
+      if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(String(t)).then(done, done); return; }
+    }catch{}
+    try{
+      const ta=document.createElement('textarea');
+      ta.value=String(t); (document.body||document.documentElement).appendChild(ta);
+      ta.select(); document.execCommand('copy'); ta.remove(); done();
+    }catch{ try{ done(); }catch{} }
+  }
+  let lbPanel=null, lbSort='points', lbOrder='desc', lbOffset=0, lbRows=[], lbCount=0, lbLoading=false, _lbFadeT=null;
+  let lbTab='board', lbIns=null, lbInsLoading=false; // 'board' | 'insights' | 'friends'
+  let lbProfile=null, lbProfileIns=null, lbProfileLoading=false; // open player profile (within panel)
+  let lbFriends=null, lbFriendsLoading=false, lbInvites=null, lbSearch=[], lbSearchLoading=false;
+  let lbUnread=null, lbChatWith=null, lbChat=[], lbChatLoading=false, lbChatTimer=null;
+  const LB_LIMIT=20;
+  const LB_SORTS=[['points','Points'],['kills','Kills'],['wins','Wins'],['kd','K/D'],['playtime_global','Playtime']];
+  function createLbPanel(){
+    if(document.getElementById('bnc-lb')){ lbPanel=document.getElementById('bnc-lb'); return; }
+    const ov=document.createElement('div');
+    ov.id='bnc-lb';
+    Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483646', background:'rgba(0,0,0,0.64)', display:'none', opacity:'0', transition:'opacity 180ms ease-out', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif'});
+    ov.innerHTML=`<div id="bnc-lb-card" style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:14px;width:700px;max-width:94vw;height:500px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden"><div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.08)"><div><b style="font-size:16px;color:#fff">Leaderboard</b><div id="bnc-lb-sub" style="font-size:11px;color:#9ca3af;margin-top:2px">All players</div></div><button id="bnc-lb-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px">Close</button></div><div style="display:flex;gap:8px;padding:12px 18px 0 18px"><button id="bnc-lb-tab-board" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Leaderboard</button><button id="bnc-lb-tab-ins" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Insights</button><button id="bnc-lb-tab-fr" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Friends</button></div><div id="bnc-lb-sorts" style="display:flex;gap:8px;padding:12px 18px 0 18px;flex-wrap:wrap"></div><div id="bnc-lb-body" style="flex:1;overflow:auto;padding:16px 18px"></div><div id="bnc-lb-foot" style="display:flex;justify-content:space-between;align-items:center;padding:10px 18px;border-top:1px solid rgba(255,255,255,0.08)"><button id="bnc-lb-prev" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px">‹ Prev</button><span id="bnc-lb-page" style="font-size:11px;color:#9ca3af"></span><button id="bnc-lb-next" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px">Next ›</button></div></div>`;
+    (document.body||document.documentElement).appendChild(ov);
+    // non-passthrough: game must not see clicks/wheel/keys inside the panel
+    const card=ov.querySelector('#bnc-lb-card');
+    ['mousedown','click','keydown'].forEach(ev=> card.addEventListener(ev, e=> e.stopPropagation()));
+    card.addEventListener('wheel', e=> e.stopPropagation(), {passive:false});
+    ov.addEventListener('click', (e)=>{ if(e.target===ov) toggleLbPanel(false); });
+    ov.querySelector('#bnc-lb-close').onclick=()=> toggleLbPanel(false);
+    ov.querySelector('#bnc-lb-tab-board').onclick=()=>{ lbTab='board'; lbProfile=null; try{ stopLbChat(); }catch{} renderLbPanel(); };
+    ov.querySelector('#bnc-lb-tab-ins').onclick=()=>{ lbTab='insights'; try{ stopLbChat(); }catch{} renderLbPanel(); fetchLbIns(); };
+    ov.querySelector('#bnc-lb-tab-fr').onclick=()=>{ lbTab='friends'; renderLbPanel(); fetchLbFriends(); };
+    ov.querySelector('#bnc-lb-prev').onclick=()=>{ if(lbOffset>0){ lbOffset=Math.max(0, lbOffset-LB_LIMIT); fetchLb(); } };
+    ov.querySelector('#bnc-lb-next').onclick=()=>{ lbOffset+=LB_LIMIT; fetchLb(); };
+    lbPanel=ov;
+  }
+  function toggleLbPanel(force){
+    createLbPanel();
+    const isHidden=lbPanel.style.display==='none' || !lbPanel.style.display;
+    const show=typeof force==='boolean' ? force : isHidden;
+    try{ clearTimeout(_lbFadeT); }catch{}
+    if(show){
+      lbPanel.style.display='flex';
+      requestAnimationFrame(()=>{ requestAnimationFrame(()=>{ try{ lbPanel.style.opacity='1'; }catch{} }); });
+      if(lbTab==='insights') fetchLbIns(); else if(lbTab==='friends') fetchLbFriends(); else fetchLb();
+    } else {
+      try{ lbPanel.style.opacity='0'; }catch{}
+      try{ stopLbChat(); }catch{}
+      _lbFadeT=setTimeout(()=>{ try{ lbPanel.style.display='none'; }catch{} }, 180);
+    }
+  }
+  function fetchLb(){
+    if(!lbPanel) return;
+    renderLbPanel();
+    lbLoading=true; renderLbBody();
+    rankedApiGet(`/api/leaderboard?sort=${encodeURIComponent(lbSort)}&order=${encodeURIComponent(lbOrder)}&limit=${LB_LIMIT}&offset=${lbOffset}`, (j)=>{
+      lbLoading=false;
+      if(j && j.results){ lbRows=j.results; lbCount=j.count||j.results.length; }
+      else { lbRows=[]; lbCount=0; }
+      renderLbPanel();
+    });
+  }
+  function renderLbPanel(){
+    if(!lbPanel) return;
+    const tabBtn=(id,active)=>{
+      const el=document.getElementById(id);
+      if(!el) return;
+      el.style.border='1px solid '+(active?'#fff':'rgba(255,255,255,0.12)');
+      el.style.background=active?'#fff':'#171717';
+      el.style.color=active?'#000':'#9ca3af';
+    };
+    tabBtn('bnc-lb-tab-board', lbTab==='board');
+    tabBtn('bnc-lb-tab-ins', lbTab==='insights');
+    tabBtn('bnc-lb-tab-fr', lbTab==='friends');
+    // profile view replaces the board content (sorts + pagination hidden)
+    if(lbTab==='board' && lbProfile){ renderLbProfile(); return; }
+    const sorts=document.getElementById('bnc-lb-sorts');
+    if(sorts) sorts.style.display = lbTab==='board' ? 'flex' : 'none';
+    const foot=document.getElementById('bnc-lb-foot');
+    if(foot) foot.style.display = lbTab==='board' ? 'flex' : 'none';
+    if(lbTab==='insights'){ renderLbIns(); return; }
+    if(lbTab==='friends'){ renderLbFriends(); return; }
+    if(sorts){
+      sorts.innerHTML=LB_SORTS.map(([v,label])=>{
+        const active = lbSort===v;
+        return `<button data-lb-sort="${v}" style="flex:1;min-width:90px;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer;border:1px solid ${active?'#fff':'rgba(255,255,255,0.12)'};background:${active?'#fff':'#171717'};color:${active?'#000':'#9ca3af'}">${label}${active?(lbOrder==='desc'?' ↓':' ↑'):''}</button>`;
+      }).join('');
+      sorts.querySelectorAll('button[data-lb-sort]').forEach(btn=>{
+        btn.onclick=()=>{
+          const v=btn.dataset.lbSort;
+          if(lbSort===v){ lbOrder = lbOrder==='desc' ? 'asc' : 'desc'; }
+          else { lbSort=v; lbOrder='desc'; }
+          lbOffset=0; fetchLb();
+        };
+      });
+    }
+    renderLbBody();
+    const page=document.getElementById('bnc-lb-page');
+    if(page) page.textContent = lbRows.length ? `Showing ${lbOffset+1}–${lbOffset+lbRows.length}` : 'No players yet';
+    const sub=document.getElementById('bnc-lb-sub');
+    if(sub) sub.textContent = `All players · sorted by ${(LB_SORTS.find(s=>s[0]===lbSort)||[,'?'])[1]}`;
+  }
+  function fetchLbIns(){
+    if(!lbPanel || lbTab!=='insights') return;
+    let did=null;
+    try{ did=(statsCache&&statsCache.discord_id)||GMGet('bnc_discord_id',null)||null; }catch{}
+    if(!did){ lbIns=null; lbInsLoading=false; renderLbIns(); return; }
+    lbInsLoading=true; renderLbIns();
+    rankedApiGet(`/api/insights?discord_id=${encodeURIComponent(did)}`, (j)=>{
+      lbInsLoading=false;
+      lbIns=(j && !j.error) ? j : null;
+      if(lbTab==='insights') renderLbIns();
+    });
+  }
+  function renderLbIns(){
+    const body=document.getElementById('bnc-lb-body');
+    if(!body) return;
+    const sub=document.getElementById('bnc-lb-sub');
+    const esc=(v)=> String(v==null?'—':v).replace(/</g,'&lt;');
+    const sess=(m)=>{
+      if(!m) return '—';
+      const res=m.win?'W':(m.defeat?'L':'–');
+      return `${m.kills||0}K/${m.deaths||0}D ${res} (${esc(fmtGmDrawer(m.gm))})`;
+    };
+    if(sub) sub.textContent='Your gameplay insights';
+    if(lbInsLoading){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Loading insights…</div>`; return; }
+    if(!lbIns){
+      let did=null;
+      try{ did=(statsCache&&statsCache.discord_id)||GMGet('bnc_discord_id',null)||null; }catch{}
+      body.innerHTML=!did
+        ? `<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Link your account first — open the player info drawer to link.</div>`
+        : `<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">No insights yet — play a few matches first.</div>`;
+      return;
+    }
+    const card=(label,val)=>`<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 12px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;font-size:12px"><span style="color:#9ca3af">${label}</span><span style="color:#fff;font-weight:700;text-align:right">${val}</span></div>`;
+    const fear=lbIns.biggest_fear, farm=lbIns.biggest_free_kill;
+    const mateI=lbIns.fav_teammate;
+    const mateLine=mateI&&mateI.player?`${esc(mateI.player)} (${mateI.shared||0} shared)`:'Not yet found';
+    const form=(lbIns.recent_form||[]).slice(0,5).map((m,i)=>`<div style="font-size:12px;color:#e5e7eb;padding:5px 12px">${i+1}. ${esc(sess(m))}</div>`).join('') || `<div style="font-size:12px;color:#9ca3af;padding:5px 12px">No recent matches</div>`;
+    const mastery=(lbIns.mode_mastery||[]).slice(0,4).map(m=>`<div style="font-size:12px;color:#e5e7eb;padding:5px 12px;display:flex;justify-content:space-between"><span>${esc(fmtGmDrawer(m.gm))} · ${m.matches} matches</span><span>${esc(m.kd)} K/D · ${Math.round((m.win_rate||0)*100)}% W</span></div>`).join('');
+    const styleTip=(typeof PLAYSTYLE_TIPS!=='undefined' && PLAYSTYLE_TIPS[lbIns.playstyle]) || 'Playstyle from kills/match, K/D and win rate.';
+    body.innerHTML=`<div style="display:flex;flex-direction:column;gap:6px">`
+      + `<div style="font-size:13px;font-weight:800;color:#fff;text-align:center;padding:4px 0">Playstyle: <span title="${esc(styleTip)}" style="text-decoration:underline dotted;cursor:help">${esc(lbIns.playstyle)}</span> <span style="color:#6b7280;font-weight:400">· ${lbIns.matches_analyzed||0} matches</span></div>`
+      + card('🔥 Best session', esc(sess(lbIns.best_session)))
+      + card('🧊 Worst session', esc(sess(lbIns.worst_session)))
+      + card('😱 Biggest fear', fear&&fear.player?`${esc(fear.player)} (${fear.deaths} deaths)`:'—')
+      + card('🎯 Biggest free kill', farm&&farm.player?`${esc(farm.player)} (${farm.kills} kills)`:'—')
+      + card('🎮 Fav mode', esc(fmtGmDrawer(lbIns.fav_game_mode)))
+      + card('🤝 Best teammate', mateLine)
+      + card('🧤 Clutch wins (≤1 kill)', esc(lbIns.clutch_factor))
+      + `<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">RECENT FORM</div>` + form
+      + (mastery?`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">MODE MASTERY</div>`+mastery:'')
+      + `</div>`;
+  }
+  // --- FRIENDS TAB: request / accept / decline / invite-to-party / join ---
+  // Invite is gated on holding a live private pID (myLiveCode); join copies
+  // the code — the game needs manual entry, no auto-join is possible.
+  function fetchLbFriends(){
+    if(!lbPanel || lbTab!=='friends') return;
+    stopLbChat();
+    const did=myDiscordId();
+    if(!did){ lbFriends=null; lbInvites=null; lbUnread=null; lbFriendsLoading=false; renderLbFriends(); return; }
+    lbFriendsLoading=true; renderLbFriends();
+    rankedApiGet(`/api/friends/list?discord_id=${encodeURIComponent(did)}`, (j)=>{
+      lbFriends=(j && !j.error) ? j : null;
+      rankedApiGet(`/api/party/invites?discord_id=${encodeURIComponent(did)}`, (k)=>{
+        lbInvites=(k && !k.error) ? k : null;
+        rankedApiGet(`/api/friends/unread?discord_id=${encodeURIComponent(did)}`, (u)=>{
+          lbFriendsLoading=false;
+          lbUnread=(u && !u.error) ? u : null;
+          if(lbTab==='friends') renderLbFriends();
+        });
+      });
+    });
+  }
+  function stopLbChat(){
+    try{ if(lbChatTimer){ clearInterval(lbChatTimer); lbChatTimer=null; } }catch{}
+    lbChatWith=null;
+  }
+  function fetchLbChat(){
+    if(!lbPanel || lbTab!=='friends' || !lbChatWith) return;
+    const did=myDiscordId();
+    if(!did) return;
+    lbChatLoading=true; renderLbFriends();
+    rankedApiGet(`/api/friends/messages?discord_id=${encodeURIComponent(did)}&with=${encodeURIComponent(lbChatWith)}&limit=50`, (j)=>{
+      lbChatLoading=false;
+      lbChat=(j && !j.error && j.messages) ? j.messages : [];
+      if(lbTab==='friends' && lbChatWith) renderLbFriends();
+      // reading marks them read server-side — refresh the unread badges
+      try{
+        rankedApiGet(`/api/friends/unread?discord_id=${encodeURIComponent(did)}`, (u)=>{
+          lbUnread=(u && !u.error) ? u : lbUnread;
+          if(lbTab==='friends' && lbChatWith) renderLbFriends();
+        });
+      }catch{}
+    });
+  }
+  function startLbChatPoll(){
+    try{ if(lbChatTimer) clearInterval(lbChatTimer); }catch{}
+    lbChatTimer=setInterval(()=>{ try{ if(lbTab==='friends' && lbChatWith && lbPanel && lbPanel.style.display!=='none') fetchLbChat(); }catch{} }, 5000);
+  }
+  function lbFriendAction(path, body, okMsg){
+    apiPostJson(path, body, (j)=>{
+      if(j && (j.ok || !j.error)){ try{ showToast(okMsg||'Done', false); }catch{} }
+      else { try{ showToast('Failed: '+(((j||{}).error)||'server error'), true); }catch{} }
+      fetchLbFriends();
+    });
+  }
+  function renderLbFriends(){
+    const body=document.getElementById('bnc-lb-body');
+    if(!body) return;
+    const sub=document.getElementById('bnc-lb-sub');
+    const esc=(v)=> String(v==null?'—':v).replace(/</g,'&lt;');
+    if(sub) sub.textContent='Friends & party invites';
+    const did=myDiscordId();
+    if(!did){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Link your account first — open the player info drawer to link.</div>`; return; }
+    if(lbFriendsLoading){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Loading friends…</div>`; return; }
+    if(!lbFriends && !lbInvites){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Couldn't load friends — server unreachable?</div>`; return; }
+    // chat view replaces the lists while open
+    if(lbChatWith){ renderLbChatView(body, esc); wireLbChat(body, did, esc); return; }
+    const code=myLiveCode();
+    const unreadBy=(lbUnread&&lbUnread.by_friend)||{};
+    const presDot=(detail)=>({offline:'#4b5563',lobby:'#eab308',match:'#22c55e',scrim:'#a855f7',tourney:'#f59e0b'}[detail]||'#4b5563');
+    const presText=(f)=>{
+      const p=f.presence||{detail:'offline'};
+      if(p.detail==='tourney') return `In Tourney - ${(p.tag&&p.tag.name)||'?'}`;
+      if(p.detail==='scrim') return (p.tag&&p.tag.name) ? `In Scrims - ${p.tag.name}` : `In Scrims - ${fmtGmDrawer(p.gm)}`;
+      if(p.detail==='match') return `In Match - ${fmtGmDrawer(p.gm)}`;
+      if(p.detail==='lobby') return 'In Lobby';
+      return 'Offline';
+    };
+    const btn=(id,label,enabled,title)=>`<button data-fr="${id}" ${enabled?'':'disabled'} title="${esc(title||label)}" style="background:${enabled?'#fff':'#1f2937'};color:${enabled?'#000':'#6b7280'};border:0;border-radius:6px;padding:4px 10px;cursor:${enabled?'pointer':'not-allowed'};font-size:11px;font-weight:700;white-space:nowrap">${label}</button>`;
+    const unreadBadge=(did2)=>{
+      const n=Number(unreadBy[String(did2)]||0);
+      return n>0?`<span style="background:#ef4444;color:#fff;border-radius:999px;font-size:10px;font-weight:800;padding:1px 7px;margin-left:6px">${n}</span>`:'';
+    };
+    const row=(name,sub2,controls)=>`<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 12px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;font-size:12px"><div style="min-width:0"><div style="color:#fff;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(name)}</div>${sub2?`<div style="color:#6b7280;font-size:11px">${esc(sub2)}</div>`:''}</div><div style="display:flex;gap:6px;flex-shrink:0;align-items:center">${controls}</div></div>`;
+    const nm=(e)=> e.discord_username || e.game_username || String(e.discord_id||'').slice(0,6);
+    let html=`<div style="display:flex;flex-direction:column;gap:6px">`;
+    // incoming party invites first (join = copy code)
+    const incoming=(lbInvites&&lbInvites.incoming)||[];
+    if(incoming.length){
+      html+=`<div style="font-size:11px;font-weight:800;color:#f59e0b;letter-spacing:.06em;padding:4px 12px 0">PARTY INVITES — TAP JOIN, THEN ENTER THE CODE IN-GAME</div>`;
+      incoming.forEach((inv,i)=>{
+        const from=inv.from_discord_username || inv.from_game_username || String(inv.from_discord_id||'').slice(0,6);
+        html+=row(`📨 ${from} → room ${inv.code||'?'}`, null, `<button data-join="${i}" style="background:#f59e0b;color:#000;border:0;border-radius:6px;padding:4px 12px;cursor:pointer;font-size:11px;font-weight:800;white-space:nowrap">Join</button>`);
+      });
+    }
+    // friends + presence + invite/chat buttons
+    const friends=(lbFriends&&lbFriends.friends)||[];
+    const unreadTotal=Number((lbUnread&&lbUnread.total)||0);
+    if(sub) sub.textContent='Friends & party invites'+(unreadTotal>0?` · ${unreadTotal} unread`:'');
+    html+=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">FRIENDS (${friends.length})${code?` · YOUR CODE: ${esc(code)}`:' · HOLD A PRIVATE ROOM TO INVITE'}</div>`;
+    html+= friends.length ? friends.map(f=>{
+      const p=f.presence||{detail:'offline'};
+      const dot=`<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${presDot(p.detail)};margin-right:6px" title="${esc(presText(f))}"></span>`;
+      const sub2=[presText(f), (f.game_username&&f.discord_username)?f.game_username:null].filter(Boolean).join(' · ');
+      return row(dot+nm(f)+unreadBadge(f.discord_id), sub2,
+        `<button data-chat="${esc(f.discord_id)}" title="Chat" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:4px 10px;cursor:pointer;font-size:11px;font-weight:700;white-space:nowrap">Chat</button>`
+        +btn('inv:'+f.discord_id, 'Invite', !!code, code?`Invite to room ${code}`:'Hold a private room first (your pID shows here)'));
+    }).join('')
+      : `<div style="font-size:12px;color:#9ca3af;padding:5px 12px">No friends yet — search below to add some.</div>`;
+    // incoming requests
+    const reqs=(lbFriends&&lbFriends.incoming)||[];
+    if(reqs.length){
+      html+=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">REQUESTS (${reqs.length})</div>`;
+      reqs.forEach(f=>{ html+=row(nm(f), null, btn('acc:'+(f.requester_discord_id||f.discord_id),'Accept',true)+btn('dec:'+(f.requester_discord_id||f.discord_id),'Decline',true)); });
+    }
+    // add by search
+    html+=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">ADD FRIEND</div>
+      <div style="display:flex;gap:6px;padding:0 12px"><input id="bnc-fr-q" placeholder="Discord or game name…" value="" style="flex:1;background:#1f2937;border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:7px 10px;color:#e5e7eb;font-size:12px;outline:none;min-width:0"><button id="bnc-fr-go" style="background:#fff;color:#000;border:0;border-radius:8px;padding:7px 14px;cursor:pointer;font-size:12px;font-weight:800">Search</button></div>
+      <div id="bnc-fr-results" style="display:flex;flex-direction:column;gap:6px"></div>`;
+    html+=`</div>`;
+    body.innerHTML=html;
+    // wire search
+    const q=document.getElementById('bnc-fr-q'), go=document.getElementById('bnc-fr-go');
+    const doSearch=()=>{
+      const v=(q&&q.value||'').trim();
+      if(v.length<2){ try{ showToast('Type at least 2 characters', true); }catch{} return; }
+      const box=document.getElementById('bnc-fr-results');
+      if(box) box.innerHTML=`<div style="font-size:12px;color:#9ca3af;padding:4px 12px">Searching…</div>`;
+      rankedApiGet(`/api/search?q=${encodeURIComponent(v)}&limit=10`, (j)=>{
+        lbSearch=(j&&j.results)||[];
+        const bx=document.getElementById('bnc-fr-results');
+        if(!bx) return;
+        bx.innerHTML=lbSearch.length ? lbSearch.map((u,i)=>{
+          const label=u.discord_username || u.game_username || String(u.discord_id||'').slice(0,6);
+          const sub2=u.game_username&&u.discord_username?u.game_username:(u.game_id||null);
+          const mine=String(u.discord_id)===String(did);
+          return row(label, sub2, mine?`<span style="font-size:11px;color:#6b7280">you</span>`:`<button data-req="${i}" style="background:#fff;color:#000;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:11px;font-weight:700;white-space:nowrap">Request</button>`);
+        }).join('') : `<div style="font-size:12px;color:#9ca3af;padding:4px 12px">No players found.</div>`;
+        bx.querySelectorAll('button[data-req]').forEach(b=>{
+          b.onclick=()=>{
+            const u=lbSearch[Number(b.dataset.req)];
+            if(!u) return;
+            lbFriendAction('/api/friends/request', {requester_discord_id:did, addressee_discord_id:u.discord_id}, 'Request sent');
+          };
+        });
+      });
+    };
+    if(go) go.onclick=doSearch;
+    if(q) q.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); e.stopPropagation(); doSearch(); } });
+    // wire row buttons
+    body.querySelectorAll('button[data-fr]').forEach(b=>{
+      b.onclick=()=>{
+        const [act, target]=String(b.dataset.fr).split(/:(.+)/);
+        if(act==='inv'){ if(!code) return; lbFriendAction('/api/party/invite', {from_discord_id:did, to_discord_id:target, code}, 'Invite sent'); }
+        else if(act==='acc'){ lbFriendAction('/api/friends/accept', {discord_id:did, requester_discord_id:target}, 'Friend added'); }
+        else if(act==='dec'){ lbFriendAction('/api/friends/decline', {discord_id:did, requester_discord_id:target}, 'Declined'); }
+      };
+    });
+    body.querySelectorAll('button[data-join]').forEach(b=>{
+      b.onclick=()=>{
+        const inv=incoming[Number(b.dataset.join)];
+        if(!inv||!inv.code) return;
+        copyText(inv.code, `Code ${inv.code} copied — enter it in a private room`);
+      };
+    });
+    body.querySelectorAll('button[data-chat]').forEach(b=>{
+      b.onclick=()=>{
+        lbChatWith=String(b.dataset.chat||'');
+        lbChat=[]; fetchLbChat(); startLbChatPoll();
+      };
+    });
+  }
+  function renderLbChatView(body, esc){
+    const sub=document.getElementById('bnc-lb-sub');
+    const friends=(lbFriends&&lbFriends.friends)||[];
+    const peer=friends.find(f=>String(f.discord_id)===String(lbChatWith))||{discord_id:lbChatWith};
+    const name=peer.discord_username || peer.game_username || String(lbChatWith||'').slice(0,6);
+    if(sub) sub.textContent='Chat — '+name;
+    const did=myDiscordId();
+    const msgs=(lbChat||[]).map(m=>{
+      const mine=String(m.from_discord_id)===String(did);
+      return `<div style="align-self:${mine?'flex-end':'flex-start'};max-width:80%;background:${mine?'#fff':'#1f2937'};color:${mine?'#000':'#e5e7eb'};border-radius:10px;padding:6px 10px;font-size:12px;word-break:break-word">${esc(m.body)}</div>`;
+    }).join('');
+    body.innerHTML=`<div style="display:flex;flex-direction:column;gap:6px;height:100%">`
+      + `<div style="padding:0 12px"><button id="bnc-chat-back" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:4px 12px;cursor:pointer;font-size:11px;font-weight:700">‹ Back</button></div>`
+      + `<div id="bnc-chat-msgs" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;padding:6px 12px;min-height:200px;max-height:46vh">${lbChatLoading?`<div style="color:#9ca3af;font-size:12px;text-align:center">Loading…</div>`:((msgs||`<div style="color:#9ca3af;font-size:12px;text-align:center">No messages yet — say hi.</div>`))}</div>`
+      + `<div style="display:flex;gap:6px;padding:0 12px"><input id="bnc-chat-in" maxlength="500" placeholder="Message ${esc(name)}…" style="flex:1;background:#1f2937;border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:8px 10px;color:#e5e7eb;font-size:12px;outline:none;min-width:0"><button id="bnc-chat-send" style="background:#fff;color:#000;border:0;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:12px;font-weight:800">Send</button></div>`
+      + `</div>`;
+  }
+  function wireLbChat(body, did, esc){
+    const back=document.getElementById('bnc-chat-back');
+    if(back) back.onclick=()=>{ stopLbChat(); fetchLbFriends(); };
+    const inp=document.getElementById('bnc-chat-in'), send=document.getElementById('bnc-chat-send');
+    const box=document.getElementById('bnc-chat-msgs');
+    if(box) box.scrollTop=box.scrollHeight;
+    const doSend=()=>{
+      const v=(inp&&inp.value||'').trim();
+      if(!v || !lbChatWith || !did) return;
+      if(send) send.disabled=true;
+      apiPostJson('/api/friends/message', {from_discord_id:did, to_discord_id:lbChatWith, body:v.slice(0,500)}, (j)=>{
+        if(send) send.disabled=false;
+        if(j && j.ok){ if(inp) inp.value=''; fetchLbChat(); }
+        else { try{ showToast('Failed: '+(((j||{}).error)||'server error'), true); }catch{} }
+      });
+    };
+    if(send) send.onclick=doSend;
+    if(inp) inp.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); e.stopPropagation(); doSend(); } });
+  }
+  function renderLbBody(){
+    const body=document.getElementById('bnc-lb-body');
+    if(!body) return;
+    const esc=(v)=> String(v==null?'—':v).replace(/</g,'&lt;');    if(lbLoading){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Loading…</div>`; return; }
+    if(!lbRows.length){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">No players yet — play a match first.</div>`; return; }
+    const rows=lbRows.map(r=>{
+      const name=r.game_username || r.discord_username || '—';
+      const kd=(r.kd==null)?'—':r.kd;
+      const pt=(r.points==null)?'—':Number(r.points).toLocaleString('en-US');
+      const color=r.milestone_color || '#fff';
+      return `<div style="display:grid;grid-template-columns:34px 1fr 70px 56px 56px 56px 76px;gap:6px;align-items:center;padding:7px 4px;border-bottom:1px solid rgba(255,255,255,0.05);font-size:12px"><span style="color:#6b7280">#${esc(r.rank)}</span><span data-prof="${esc(r.discord_id||'')}" title="Open profile" style="color:#fff;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer;text-decoration:underline;text-decoration-color:rgba(255,255,255,0.25)">${esc(name)}</span><span style="color:${color};font-weight:700;text-align:right">${esc(pt)}</span><span style="color:#e5e7eb;text-align:right">${esc(r.kills)}</span><span style="color:#e5e7eb;text-align:right">${esc(r.wins)}</span><span style="color:#e5e7eb;text-align:right">${esc(kd)}</span><span style="color:#9ca3af;text-align:right">${esc(fmtPlaytimeDrawer(r.playtime_global))}</span></div>`;
+    }).join('');
+    body.innerHTML=`<div style="display:grid;grid-template-columns:34px 1fr 70px 56px 56px 56px 76px;gap:6px;padding:4px;font-size:10px;font-weight:800;color:#6b7280;letter-spacing:.06em"><span>RANK</span><span>PLAYER</span><span style="text-align:right">POINTS</span><span style="text-align:right">KILLS</span><span style="text-align:right">WINS</span><span style="text-align:right">K/D</span><span style="text-align:right">PLAYTIME</span></div>`+rows;
+    try{
+      body.querySelectorAll('[data-prof]').forEach(el=>{
+        el.onclick=(e)=>{
+          try{ if(e) e.stopPropagation(); }catch{}
+          const did=String(el.dataset.prof||'');
+          const row=lbRows.find(r=>String(r.discord_id)===did);
+          if(!row) return;
+          lbProfile=row; lbProfileIns=null; renderLbPanel(); fetchLbProfileIns();
+        };
+      });
+    }catch{}
+  }
+  function fetchLbProfileIns(){
+    if(!lbPanel || !lbProfile) return;
+    const did=lbProfile.discord_id;
+    if(!did) return;
+    lbProfileLoading=true;
+    rankedApiGet(`/api/insights?discord_id=${encodeURIComponent(did)}`, (j)=>{
+      lbProfileLoading=false;
+      lbProfileIns=(j && !j.error) ? j : null;
+      if(lbProfile) renderLbPanel();
+    });
+  }
+  // Profile view: header (back + username), left skin box full height,
+  // right grid of data boxes. Back returns to the leaderboard page.
+  function renderLbProfile(){
+    const sorts=document.getElementById('bnc-lb-sorts');
+    if(sorts) sorts.style.display='none';
+    const foot=document.getElementById('bnc-lb-foot');
+    if(foot) foot.style.display='none';
+    const body=document.getElementById('bnc-lb-body');
+    if(!body || !lbProfile) return;
+    const sub=document.getElementById('bnc-lb-sub');
+    if(sub) sub.textContent='Player profile';
+    const esc=(v)=> String(v==null?'—':v).replace(/</g,'&lt;').replace(/"/g,'&quot;');
+    const r=lbProfile;
+    const name=r.game_username || r.discord_username || '—';
+    const skinId=(r.skin!=null && String(r.skin).trim()!=='' && String(r.skin).toLowerCase()!=='nan') ? r.skin : 'cct_0_default';
+    const skinUrl=skinUrlDrawer(skinId);
+    const ins=lbProfileIns;
+    const box=(label,val,tip)=>`<div title="${esc(tip||label)}" style="background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:10px 12px;min-width:0"><div style="font-size:10px;font-weight:800;color:#6b7280;letter-spacing:.06em">${esc(label)}</div><div style="font-size:15px;font-weight:800;color:#fff;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${val}</div></div>`;
+    const sess=(m)=>{
+      if(!m) return '—';
+      const res=m.win?'W':(m.defeat?'L':'–');
+      return `${m.kills||0}K/${m.deaths||0}D ${res} · ${esc(fmtGmDrawer(m.gm))}`;
+    };
+    const mate=ins&&ins.fav_teammate;
+    const mateVal=!ins?'…':(mate&&mate.player?`${esc(mate.player)} <span style="color:#6b7280;font-weight:400">(${mate.shared} shared)</span>`:'Not yet found');
+    const styleVal=!ins?'…':esc(ins.playstyle||'—');
+    const styleTip=!ins?'':(PLAYSTYLE_TIPS[ins.playstyle]||'Playstyle from kills/match, K/D and win rate.');
+    const boxes=[
+      box('Points', r.points!=null?Number(r.points).toLocaleString('en-US'):'—'),
+      box('Kills', esc(r.kills)),
+      box('Deaths', esc(r.deaths)),
+      box('K/D', esc(r.kd)),
+      box('Wins', esc(r.wins)),
+      box('Win rate', (r.win_rate!=null?Math.round(r.win_rate*100)+'%':'—')),
+      box('Playtime', esc(fmtPlaytimeDrawer(r.playtime_global))),
+      box('Playstyle', styleVal, styleTip),
+      box('Best session', !ins?'…':esc(sess(ins.best_session))),
+      box('Fav mode', !ins?'…':esc(fmtGmDrawer(ins.fav_game_mode))),
+      box('Best teammate', mateVal, 'Most shared team-mode matches. Needs duo/team history.'),
+      box('Biggest fear', !ins?'…':((ins.biggest_fear&&ins.biggest_fear.player)?`${esc(ins.biggest_fear.player)} (${ins.biggest_fear.deaths})`:'—')),
+    ].join('');
+    body.innerHTML=`<div style="display:flex;flex-direction:column;gap:10px;height:100%">`
+      + `<div style="display:flex;align-items:center;gap:10px"><button id="bnc-prof-back" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:5px 12px;cursor:pointer;font-size:12px;font-weight:700">‹ Back</button><b style="font-size:16px;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(name)}</b>${r.rank!=null?`<span style="font-size:11px;color:#6b7280">#${esc(r.rank)}</span>`:''}</div>`
+      + `<div style="flex:1;display:flex;gap:10px;min-height:0;overflow:auto">`
+      + `<div style="width:190px;flex-shrink:0;background:#0a0a0a;border:1px solid rgba(255,255,255,0.08);border-radius:12px;display:flex;align-items:center;justify-content:center;align-self:stretch;padding:12px">${skinUrl?`<img src="${skinUrl}" style="max-width:100%;max-height:100%;object-fit:contain;image-rendering:pixelated" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div style="display:none;font-size:40px">▣</div>`:`<div style="font-size:40px">▣</div>`}</div>`
+      + `<div style="flex:1;display:grid;grid-template-columns:1fr 1fr;gap:8px;align-content:start;min-width:0">${lbProfileLoading?`<div style="grid-column:1/-1;color:#9ca3af;font-size:12px;text-align:center;padding:16px 0">Loading insights…</div>`:boxes}</div>`
+      + `</div></div>`;
+    const back=document.getElementById('bnc-prof-back');
+    if(back) back.onclick=()=>{ lbProfile=null; lbProfileIns=null; renderLbPanel(); };
+  }
+  const PLAYSTYLE_TIPS={
+    Aggressor:'Drops into fights: 3+ kills per match with a strong K/D.',
+    Anchor:'Holds ground: solid K/D and wins half or more of the matches.',
+    Support:'Plays for the team: fewer kills but a steady win rate.',
+    Wildcard:'Unpredictable mix — every lobby is different.',
+  };
+
   // --- KEYBINDS / SETTINGS MENU (Ctrl+Shift+K) ---
   let keybindOverlay=null;
   function createKeybindOverlay(){
@@ -2602,7 +3165,7 @@
     const ov=document.createElement('div');
     ov.id='bnc-keys';
     Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483646', background:'rgba(0,0,0,0.54)', display:'none', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif'});
-    ov.innerHTML = `<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:20px;min-width:360px;max-width:520px;color:#e5e7eb"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><b style="font-size:15px;color:#fff">BuildNow Companion - Shortcuts & Settings</b><button id="bnc-keys-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 8px;cursor:pointer">Close</button></div><div id="bnc-keys-list" style="display:flex;flex-direction:column;gap:6px;font-size:12px"></div><div style="display:flex;gap:8px;margin-top:12px"><button id="bnc-keys-open-drawer" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open player info</button><button id="bnc-keys-open-ranked" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open ranked panel</button></div><div style="margin-top:8px;font-size:11px;color:#9ca3af"><code>Ctrl+Shift+K</code> - This menu (fixed)</div><div style="margin-top:10px;font-size:11px;opacity:0.7">Mac tip: use ⌘ instead of Ctrl — Cmd+Shift+&lt;key&gt; works the same.</div><div id="bnc-dev-row" style="margin-top:14px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);font-size:11px;opacity:0.7">Settings: <label style="cursor:pointer"><input type="checkbox" id="bnc-dev-toggle"> Dev mode (feed)</label></div></div>`;
+    ov.innerHTML = `<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:20px;min-width:360px;max-width:520px;color:#e5e7eb"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><b style="font-size:15px;color:#fff">BuildNow Companion - Shortcuts & Settings</b><button id="bnc-keys-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 8px;cursor:pointer">Close</button></div><div id="bnc-keys-list" style="display:flex;flex-direction:column;gap:6px;font-size:12px"></div><div style="display:flex;gap:8px;margin-top:12px"><button id="bnc-keys-open-drawer" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open player info</button><button id="bnc-keys-open-ranked" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open ranked panel</button><button id="bnc-keys-open-lb" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open leaderboard</button></div><div style="margin-top:8px;font-size:11px;color:#9ca3af"><code>Ctrl+Shift+K</code> - This menu (fixed)</div><div style="margin-top:10px;font-size:11px;opacity:0.7">Mac tip: use ⌘ instead of Ctrl — Cmd+Shift+&lt;key&gt; works the same.</div><div id="bnc-dev-row" style="margin-top:14px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);font-size:11px;opacity:0.7">Settings: <label style="cursor:pointer"><input type="checkbox" id="bnc-dev-toggle"> Dev mode (feed)</label></div></div>`;
     (document.body||document.documentElement).appendChild(ov);
     ov.addEventListener('click', (e)=>{ if(e.target===ov) ov.style.display='none'; });
     ov.querySelector('#bnc-keys-close').onclick=()=> ov.style.display='none';
@@ -2613,6 +3176,8 @@
       if(od) od.onclick=()=>{ try{ toggleInfoPanel(true); }catch{} };
       const or_=ov.querySelector('#bnc-keys-open-ranked');
       if(or_) or_.onclick=()=>{ try{ toggleRankedPanel(true); }catch{} };
+      const ol=ov.querySelector('#bnc-keys-open-lb');
+      if(ol) ol.onclick=()=>{ try{ toggleLbPanel(true); }catch{} };
     }catch{}
     const devT = ov.querySelector('#bnc-dev-toggle');
     devT.checked = !!GMGet('bnc_dev_mode', false);
@@ -2675,9 +3240,11 @@
   document.addEventListener('keydown', (e)=>{
     if(_keybindCapturing) return;
     if (isModalOrInputFocused()) return;
+    if((e.key||'')==='Escape' && typeof lbPanel!=='undefined' && lbPanel && lbPanel.style.display!=='none' && lbPanel.style.display){ e.preventDefault(); toggleLbPanel(false); return; }
     if((e.key||'')==='Escape' && typeof rankedPanel!=='undefined' && rankedPanel && rankedPanel.style.display!=='none' && rankedPanel.style.display){ e.preventDefault(); toggleRankedPanel(false); return; }
     if(isDrawerKeybind(e)){ e.preventDefault(); e.stopPropagation(); toggleInfoPanel(); return; }
     if(isRankedKeybind(e)){ e.preventDefault(); e.stopPropagation(); toggleRankedPanel(); return; }
+    if(isLbKeybind(e)){ e.preventDefault(); e.stopPropagation(); toggleLbPanel(); return; }
     if(modKey(e) && e.shiftKey && (e.key||'').toUpperCase()==='K'){ e.preventDefault(); e.stopPropagation(); toggleKeybinds(); }
   }, true);
 
@@ -2735,6 +3302,12 @@
       }
       if(dot) dot.style.background=color;
       if(apiTxt) apiTxt.textContent=txt;
+      // tooltip shows which backend is active (local vs production)
+      try{
+        const base=resolveApiBase();
+        const wrap=document.getElementById('bnc-drawer-api');
+        if(wrap) wrap.title='API: '+base;
+      }catch{}
     }catch{}
   }
   // v2.19.0 streak toasts + update nudge (dedupe by signature, never spam).

@@ -217,19 +217,52 @@ async def leaderboard(request: Request):
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
-    allowed = {"kills", "deaths", "wins", "defeats", "playtime_global", "kd", "win_rate"}
+    allowed = {"kills", "deaths", "wins", "defeats", "playtime_global", "kd", "win_rate", "points"}
     if sort not in allowed:
         return JSONResponse({"error": f"sort must be one of {', '.join(sorted(allowed))}"}, status_code=400)
 
     if not supabase:
         return JSONResponse({"error": "Server not configured"}, status_code=500)
 
+    def _attach_points(rows: list[dict]) -> None:
+        """Attach play points to leaderboard rows (bngc_users column, no extra
+        query). Ranked milestone fields are left null on the unified board —
+        tiers live on the ?ranked=true path and the arena block."""
+        try:
+            for r in (rows or []):
+                r["points"] = int(r.get("play_points") or 0)
+                r["milestone"] = None
+                r["milestone_icon_url"] = None
+                r["milestone_color"] = None
+        except Exception:
+            for r in (rows or []):
+                r.setdefault("points", 0)
+
     try:
+        if sort == "points":
+            # Unified points sort: play points (bngc_users column, all modes).
+            # The ?ranked=true legacy path above keeps serving the ranked ledger.
+            desc = order == "desc"
+            res = supabase.table("bngc_users").select("discord_id,discord_username,game_username,game_id,skin,kills,deaths,wins,defeats,playtime_global,play_points").order("play_points", desc=desc).range(offset, offset + limit - 1).execute()
+            rows = res.data or []
+            for r in rows:
+                kills = int(r.get("kills") or 0)
+                deaths = int(r.get("deaths") or 0)
+                wins = int(r.get("wins") or 0)
+                defeats = int(r.get("defeats") or 0)
+                total = wins + defeats
+                r["kd"] = round(kills / deaths, 2) if deaths else float(kills)
+                r["win_rate"] = round(wins / total, 3) if total else 0
+            _attach_points(rows)
+            for i, r in enumerate(rows):
+                r["rank"] = offset + i + 1
+            return JSONResponse({"sort": sort, "order": order, "limit": limit, "offset": offset,
+                                 "count": len(rows), "results": rows})
         # For direct columns, let Supabase order; for computed (kd/win_rate), fetch and sort in python
         if sort in ("kills", "deaths", "wins", "defeats", "playtime_global"):
             # supabase order: .order(col, desc=True/False)
             desc = order == "desc"
-            res = supabase.table("bngc_users").select("discord_id,discord_username,game_username,game_id,skin,kills,deaths,wins,defeats,playtime_global").order(sort, desc=desc).range(offset, offset + limit - 1).execute()
+            res = supabase.table("bngc_users").select("discord_id,discord_username,game_username,game_id,skin,kills,deaths,wins,defeats,playtime_global,play_points").order(sort, desc=desc).range(offset, offset + limit - 1).execute()
             rows = res.data or []
             for r in rows:
                 kills = int(r.get("kills") or 0)
@@ -239,6 +272,7 @@ async def leaderboard(request: Request):
                 r["kd"] = round(kills / deaths, 2) if deaths else float(kills)
                 total = wins + defeats
                 r["win_rate"] = round(wins / total, 3) if total else 0
+            _attach_points(rows)
             # add rank
             for i, r in enumerate(rows):
                 r["rank"] = offset + i + 1
@@ -247,7 +281,7 @@ async def leaderboard(request: Request):
             # kd / win_rate — need to compute: fetch top 200 ordered by kills then sort
             # fetch a window larger than limit to get accurate ranking, then slice
             fetch_n = max(limit + offset, 200)
-            res = supabase.table("bngc_users").select("discord_id,discord_username,game_username,game_id,skin,kills,deaths,wins,defeats,playtime_global").limit(fetch_n).execute()
+            res = supabase.table("bngc_users").select("discord_id,discord_username,game_username,game_id,skin,kills,deaths,wins,defeats,playtime_global,play_points").limit(fetch_n).execute()
             rows = res.data or []
             for r in rows:
                 kills = int(r.get("kills") or 0)
@@ -260,6 +294,7 @@ async def leaderboard(request: Request):
             reverse = order == "desc"
             rows.sort(key=lambda x: x.get(sort, 0), reverse=reverse)
             sliced = rows[offset: offset + limit]
+            _attach_points(sliced)
             for i, r in enumerate(sliced):
                 r["rank"] = offset + i + 1
             return JSONResponse({"sort": sort, "order": order, "limit": limit, "offset": offset, "count": len(sliced), "results": sliced})

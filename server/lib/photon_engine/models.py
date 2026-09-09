@@ -347,6 +347,7 @@ class RoomView:
     recent_kills: list[KillInfo] = field(default_factory=list)
     recent_knocks: list[KillInfo] = field(default_factory=list)
     proc_kill_seen: dict[str, float] = field(default_factory=dict)  # processor kill-count dedup: content key -> server ms (retransmit window, survives batches)
+    my_kills_by_version: dict[str, int] = field(default_factory=dict)  # self kills per match_version key "room_id:vN" (best_match_kills source, survives batches)
     match_version: int = 0                           # increments on stG 3→1 for private zw_lg multi-match per room
     match_playtime: Playtime = field(default_factory=lambda: Playtime())  # per-room playtime (ticks per match_version)
     last_win_version: int = -1                       # dedup win per match_version
@@ -421,6 +422,7 @@ class RoomView:
             "recent_kills": [k.to_dict() for k in self.recent_kills[-100:]],
             "recent_knocks": [k.to_dict() for k in self.recent_knocks[-100:]],
             "proc_kill_seen": {str(k): float(v) for k, v in list(self.proc_kill_seen.items())[-500:]},
+            "my_kills_by_version": {str(k): int(v) for k, v in list(self.my_kills_by_version.items())[-50:]},
             "match_version": self.match_version,
             "match_playtime": self.match_playtime.to_dict(),
             "stg_is_phase_end": self.stg_is_phase_end,
@@ -501,6 +503,11 @@ class RoomView:
             try:
                 for k, v in (d.get("proc_kill_seen") or {}).items():
                     r.proc_kill_seen[str(k)] = float(v)
+            except Exception:
+                pass
+            try:
+                for k, v in (d.get("my_kills_by_version") or {}).items():
+                    r.my_kills_by_version[str(k)] = int(v)
             except Exception:
                 pass
             try:

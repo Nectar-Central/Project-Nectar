@@ -31,6 +31,9 @@ from server.lib.photon_engine.engine import _KILL_DUP_WINDOW_MS
 # Precision tracking: each counted write is re-checked ~2s later (see precision.py)
 from server.lib import precision as _precision
 
+# Play-points economy values + hourly helper (all-modes activity ledger)
+from server.lib.ranked import PLAY_KILL, PLAY_KNOCK, PLAY_WIN, hourly_play_points
+
 # TYPE_CHECKING is False at runtime — only imports below when type-checking (mypy/pyright)
 from typing import TYPE_CHECKING
 
@@ -520,6 +523,7 @@ def _write_win(discord_id, session_id, user, gm, room_id, short_code, match_ver,
             room.last_win_version = match_ver  # heal marker so it isn't retried
         return user.get("wins") or 0
     new_wins = _bump_user(user, dirty, "wins")  # Increment (flushed at batch end)
+    _bump_user(user, dirty, "play_points", PLAY_WIN)  # Play points: +per win (defeats pay nothing)
     if buf is None:
         supabase.table("bngc_users").update({"wins": new_wins}).eq("discord_id", discord_id).execute()
     _buf_event(buf, discord_id, session_id, "win",
@@ -634,11 +638,24 @@ def _sync_playtime(view, user, discord_id):
     cur_per["lobby"] = cur_per.get("lobby", 0) + lobby_add  # Add lobby time
     total_add = sum(per_gm_add.values()) + lobby_add  # Total seconds to add
     new_total = (user.get("playtime_global") or 0) + total_add  # New global total
+    # Hourly play points: owed = (full hours now - hours already paid) * rate.
+    # Checkpoint only advances, so replays/splits can never double-pay.
+    hourly_owed, hourly_paid = hourly_play_points(new_total, user.get("play_points_hours_paid"))
+    new_play = (user.get("play_points") or 0) + hourly_owed
     # Write to DB
     supabase.table("bngc_users").update({
         "playtime_global": new_total,           # Updated global playtime
         "playtime_per_gm": json.dumps(cur_per), # Updated per-GM JSON
+        "play_points": new_play,                # Hourly accrual included
+        "play_points_hours_paid": hourly_paid,  # Checkpoint advanced
     }).eq("discord_id", discord_id).execute()   # Where discord_id matches
+    if hourly_owed:
+        log_sys(f"PROCESSOR play_points hourly +{hourly_owed} (hours paid -> {hourly_paid})")
+        try:
+            user["play_points"] = new_play
+            user["play_points_hours_paid"] = hourly_paid
+        except Exception:
+            pass
     log_dbg(f"PROCESSOR playtime per_gm={per_gm_add} lobby={lobby_add} total+{total_add}")
     # Reset room counters to zero (already flushed to DB)
     for r in view.rooms.values():
@@ -655,14 +672,16 @@ def _sync_playtime(view, user, discord_id):
 # v2.19.0 streak rewards — daily / win / kill (batch-end, never raises)
 # ---------------------------------------------------------------------------
 
-def _apply_streaks(user, dirty, ev_rows) -> int:
+def _apply_streaks(user, dirty, ev_rows, view=None) -> int:
     """Update streak counters in-memory + queue for flush. Returns bonus earned.
 
     Daily: first batch per UTC day advances (continue on 1-day gap, reset
     otherwise; same-day re-batch pays nothing). Win: any win event bumps
-    win_streak (defeat resets, best kept). Kill: kills in this batch vs
-    best_match_kills, threshold bonus once per batch. Missing columns
-    (pre-migration rows) default to 0. Never raises.
+    win_streak (defeat resets, best kept). Kill: per-MATCH self-kill total vs
+    best_match_kills (room.my_kills_by_version accumulates across batches;
+    batch count is only a fallback for untracked rooms), threshold bonus once
+    per batch on the batch count. Missing columns (pre-migration rows) default
+    to 0. Never raises.
     """
     bonus = 0
     try:
@@ -724,10 +743,18 @@ def _apply_streaks(user, dirty, ev_rows) -> int:
                 dirty.add("win_streak")
         except Exception:
             pass
-        # kill batch
+        # kill: per-match total (not per-batch — batches split a match across POSTs)
         try:
-            if kills_batch > int(user.get("best_match_kills") or 0):
-                user["best_match_kills"] = kills_batch
+            _match_best = int(kills_batch or 0)
+            try:
+                for _r in (getattr(view, "rooms", None) or {}).values():
+                    for _v in (getattr(_r, "my_kills_by_version", None) or {}).values():
+                        if int(_v or 0) > _match_best:
+                            _match_best = int(_v or 0)
+            except Exception:
+                pass
+            if _match_best > int(user.get("best_match_kills") or 0):
+                user["best_match_kills"] = _match_best
                 dirty.add("best_match_kills")
             bonus += int(_st.kill_bonus(kills_batch) or 0)
         except Exception:
@@ -1123,6 +1150,23 @@ async def process_batch(
                 if not skip_kf and not _me_hosting_only and kf_type == "killed" and me_name and _names_equal(instigator, me_name):  # I am the killer
                     old_kills = user.get("kills", 0)  # Pre-increment value for the log
                     new_kills = _bump_user(user, dirty, "kills")  # Queued for batch-end flush
+                    _bump_user(user, dirty, "play_points", PLAY_KILL)  # Play points: +per kill
+                    # Per-match kill counter for best_match_kills (survives batches via room state).
+                    # Batch-only counting capped the record at ~1 per POST — this accumulates
+                    # across the whole (room_id, match_version).
+                    try:
+                        _mk_room = _kf_room if _kf_room is not None else _get_room(pkt_room_id, view)
+                        if _mk_room is not None:
+                            _mk_key = f"{str(pkt_room_id or _mk_room.room_id or '')[:8]}:v{int(pkt_match_ver if pkt_match_ver is not None else getattr(_mk_room, 'match_version', 0) or 0)}"
+                            _mk_map = getattr(_mk_room, "my_kills_by_version", None)
+                            if not isinstance(_mk_map, dict):
+                                _mk_room.my_kills_by_version = {}
+                                _mk_map = _mk_room.my_kills_by_version
+                            _mk_map[_mk_key] = int(_mk_map.get(_mk_key) or 0) + 1
+                            while len(_mk_map) > 50:
+                                _mk_map.pop(next(iter(_mk_map)))
+                    except Exception:
+                        pass
                     # Queue kill event (separate from killfeed for stat tracking)
                     _buf_event(ev_rows, discord_id, session_id, "kill",
                                {"gm": eff_gm, "victim": instigated, "room_id": pkt_room_id,
@@ -1131,6 +1175,15 @@ async def process_batch(
                     _precision.schedule("kill", session_id=session_id, discord_id=discord_id,
                                         expected=new_kills, match_version=pkt_match_ver,
                                         room_id=pkt_room_id, extra={"victim": instigated})
+
+                # Self-specific knock: play points only (a knock is not an
+                # elimination — the finishing kill pays separately on top).
+                elif not skip_kf and not _me_hosting_only and kf_type == "knocked" and me_name and _names_equal(instigator, me_name):  # I am the knocker
+                    _bump_user(user, dirty, "play_points", PLAY_KNOCK)  # Queued for batch-end flush
+                    _buf_event(ev_rows, discord_id, session_id, "knock",
+                               {"gm": eff_gm, "victim": instigated, "room_id": pkt_room_id,
+                                "code": pkt_short, "match_version": pkt_match_ver})
+                    log_sys(f"PROCESSOR KNOCK victim={instigated} play_points +{PLAY_KNOCK}")
 
                 # Self-specific death: increment deaths + write death event (one per life).
                 # Kills only: being knocked is not death (revive possible) — the
@@ -1686,7 +1739,7 @@ async def process_batch(
         # Queues daily/win/kill counter updates + pays bonus into arena
         # points (ranked_points ledger) best-effort. Never breaks the batch.
         try:
-            _streak_bonus = _apply_streaks(user, dirty, ev_rows)
+            _streak_bonus = _apply_streaks(user, dirty, ev_rows, view)
             if _streak_bonus:
                 try:
                     from server.lib import ranked as _rk_pay
