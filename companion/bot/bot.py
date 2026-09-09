@@ -170,6 +170,92 @@ async def get_session_state(session_id: str):
         print(f"[session] engine fetch failed for {session_id[:8]}: {e}")
     return None
 
+async def get_insights(discord_id: str):
+    """Fetch computed insights via GET /api/insights?discord_id=. None on error."""
+    if not discord_id:
+        return None
+    from urllib.parse import quote
+    url = f"{SERVER_URL}/api/insights?discord_id={quote(str(discord_id))}"
+    try:
+        if aiohttp:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                    if r.status == 200:
+                        return await r.json()
+        else:
+            import urllib.request
+            with urllib.request.urlopen(url, timeout=8) as r:
+                return json.loads(r.read().decode())
+    except Exception as e:
+        print(f"[insights] fetch failed for {str(discord_id)[:6]}: {e}")
+    return None
+
+
+def _fmt_session(m):
+    """One-line summary for a grouped match. Never raises."""
+    try:
+        if not m:
+            return "—"
+        k = m.get("kills", 0)
+        d = m.get("deaths", 0)
+        try:
+            gm = fmt.format_game_mode(m.get("gm"))
+        except Exception:
+            gm = m.get("gm") or "?"
+        res = "W" if m.get("win") else ("L" if m.get("defeat") else "–")
+        return f"{k}K/{d}D {res} ({gm})"
+    except Exception:
+        return "—"
+
+
+async def _api_get(path: str):
+    """GET SERVER_URL + path. Returns parsed JSON or None. Never raises."""
+    url = f"{SERVER_URL}{path}"
+    try:
+        if aiohttp:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                    if r.status == 200:
+                        return await r.json()
+        else:
+            import urllib.request
+            with urllib.request.urlopen(url, timeout=8) as r:
+                return json.loads(r.read().decode())
+    except Exception as e:
+        print(f"[api] GET {path} failed: {e}")
+    return None
+
+
+async def _api_post(path: str, payload: dict):
+    """POST JSON to SERVER_URL + path. Returns (status, parsed body). Never raises."""
+    import json as _json
+    url = f"{SERVER_URL}{path}"
+    try:
+        if aiohttp:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                    try:
+                        body = await r.json()
+                    except Exception:
+                        body = {}
+                    return r.status, body
+        else:
+            import urllib.request
+            import urllib.error as _uerr
+            req = urllib.request.Request(url, data=_json.dumps(payload).encode(),
+                                         headers={"Content-Type": "application/json"}, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    return r.status, _json.loads(r.read().decode() or "{}")
+            except _uerr.HTTPError as he:
+                try:
+                    return he.code, _json.loads(he.read().decode() or "{}")
+                except Exception:
+                    return he.code, {}
+    except Exception as e:
+        print(f"[api] POST {path} failed: {e}")
+    return 0, {}
+
 @bot.event
 async def on_ready():
     await db.init_db()
@@ -1067,6 +1153,249 @@ async def precision_cmd(interaction: discord.Interaction):
     await interaction.followup.send(embed=e)
 
 
+@bot.tree.command(name="insights", description="Show your gameplay insights")
+async def insights_cmd(interaction: discord.Interaction, user: discord.User = None):
+    target = user or interaction.user
+    await interaction.response.defer(ephemeral=False)
+    ins = await get_insights(str(target.id))
+    if not ins:
+        return await interaction.followup.send(f"No insights for {target.mention} yet. Play a few matches first.")
+    e = discord.Embed(title=f"Insights — {(await db.get_by_discord(str(target.id)) or {}).get('discord_username') or target.name}",
+                      color=0x7c3aed,
+                      description=f"Playstyle: **{ins.get('playstyle') or '—'}** · {ins.get('matches_analyzed', 0)} matches")
+    e.add_field(name="🔥 Best session", value=_fmt_session(ins.get("best_session")), inline=True)
+    e.add_field(name="🧊 Worst session", value=_fmt_session(ins.get("worst_session")), inline=True)
+    fear = ins.get("biggest_fear") or {}
+    farm = ins.get("biggest_free_kill") or {}
+    e.add_field(name="😱 Biggest fear", value=f"{fear.get('player', '—')} ({fear.get('deaths', 0)} deaths)" if fear.get("player") else "—", inline=True)
+    e.add_field(name="🎯 Biggest free kill", value=f"{farm.get('player', '—')} ({farm.get('kills', 0)} kills)" if farm.get("player") else "—", inline=True)
+    e.add_field(name="🎮 Fav mode", value=str(ins.get("fav_game_mode") or "—"), inline=True)
+    e.add_field(name="🧤 Clutch wins (≤1 kill)", value=str(ins.get("clutch_factor", 0)), inline=True)
+    await interaction.followup.send(embed=e)
+
+
+@bot.tree.command(name="form", description="Show recent match form (last 5)")
+async def form_cmd(interaction: discord.Interaction, user: discord.User = None):
+    target = user or interaction.user
+    await interaction.response.defer(ephemeral=False)
+    ins = await get_insights(str(target.id))
+    if not ins or not ins.get("recent_form"):
+        return await interaction.followup.send(f"No recent matches for {target.mention}.")
+    lines = [f"{i}. {_fmt_session(m)}" for i, m in enumerate(ins["recent_form"][:5], 1)]
+    e = discord.Embed(title=f"Form — {target.name} (last {len(lines)})", color=0x06b6d4,
+                      description="\n".join(lines)[:4000])
+    await interaction.followup.send(embed=e)
+
+
+@bot.tree.command(name="nemesis", description="Show who kills you the most")
+async def nemesis_cmd(interaction: discord.Interaction, user: discord.User = None):
+    target = user or interaction.user
+    await interaction.response.defer(ephemeral=False)
+    ins = await get_insights(str(target.id))
+    fear = (ins or {}).get("biggest_fear") or {}
+    if not fear.get("player"):
+        return await interaction.followup.send(f"No nemesis for {target.mention} yet.")
+    await interaction.followup.send(f"😱 {target.mention}'s biggest fear: **{fear['player']}** ({fear.get('deaths', 0)} deaths)")
+
+
+@bot.tree.command(name="farm", description="Show who you kill the most")
+async def farm_cmd(interaction: discord.Interaction, user: discord.User = None):
+    target = user or interaction.user
+    await interaction.response.defer(ephemeral=False)
+    ins = await get_insights(str(target.id))
+    farm = (ins or {}).get("biggest_free_kill") or {}
+    if not farm.get("player"):
+        return await interaction.followup.send(f"No free kills for {target.mention} yet.")
+    await interaction.followup.send(f"🎯 {target.mention}'s biggest free kill: **{farm['player']}** ({farm.get('kills', 0)} kills)")
+
+
+@bot.tree.command(name="synergy", description="Show your best teammate (duo/team modes)")
+async def synergy_cmd(interaction: discord.Interaction, user: discord.User = None):
+    target = user or interaction.user
+    await interaction.response.defer(ephemeral=False)
+    ins = await get_insights(str(target.id))
+    mate = (ins or {}).get("fav_teammate") or {}
+    syn = (ins or {}).get("duo_synergy") or {}
+    if not mate.get("player"):
+        return await interaction.followup.send(
+            f"No best teammate for {target.mention} yet — play duo/team modes together first.")
+    wr = syn.get("win_rate")
+    wr_txt = f"{round(wr * 100)}% joint win" if wr is not None else "—"
+    await interaction.followup.send(
+        f"🤝 {target.mention}'s best teammate: **{mate['player']}** "
+        f"({mate.get('shared', 0)} shared, {mate.get('joint_wins', 0)} wins together, {wr_txt})")
+
+
+def _cmp_line(row):
+    """Compact stat line for /compare. Never raises."""
+    try:
+        k = int(row.get("kills") or 0)
+        d = int(row.get("deaths") or 0)
+        w = int(row.get("wins") or 0)
+        l = int(row.get("defeats") or 0)
+        kd = f"{(k / d):.2f}" if d else str(k)
+        wr = f"{(w / (w + l) * 100):.1f}%" if (w + l) else "—"
+        pt = fmt.format_playtime(row.get("playtime_global") or 0)
+        pp = int(row.get("play_points") or 0)
+        return f"{k}K / {d}D ({kd} K/D) · {w}W ({wr}) · {pp} pts · {pt}"
+    except Exception:
+        return "—"
+
+
+@bot.tree.command(name="compare", description="Compare two players side by side")
+async def compare_cmd(interaction: discord.Interaction, a: discord.User, b: discord.User):
+    await interaction.response.defer(ephemeral=False)
+    ra = await db.get_by_discord(str(a.id))
+    rb = await db.get_by_discord(str(b.id))
+    missing = [u.mention for u, r in ((a, ra), (b, rb)) if not r]
+    if missing:
+        return await interaction.followup.send(f"No data for {' '.join(missing)}. They need /register.")
+    e = discord.Embed(title="Compare", color=0x7c3aed)
+    e.add_field(name=(ra.get("discord_username") or a.name)[:256], value=_cmp_line(ra), inline=False)
+    e.add_field(name=(rb.get("discord_username") or b.name)[:256], value=_cmp_line(rb), inline=False)
+    await interaction.followup.send(embed=e)
+
+
+@bot.tree.command(name="friends", description="Show your friends and pending requests")
+async def friends_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    from urllib.parse import quote
+    data = await _api_get(f"/api/friends/list?discord_id={quote(str(interaction.user.id))}")
+    if not data:
+        return await interaction.followup.send("Couldn't load friends (server unreachable or friends not set up yet).")
+    if data.get("error"):
+        return await interaction.followup.send(f"Couldn't load friends: {data['error']}")
+    def _line(entries):
+        out = []
+        for x in (entries or [])[:15]:
+            nm = x.get("discord_username") or x.get("game_username") or x["discord_id"][:6]
+            out.append(f"• **{nm}**")
+        return "\n".join(out) or "—"
+    e = discord.Embed(title=f"Friends — {interaction.user.name}", color=0x7c3aed)
+    e.add_field(name=f"✅ Friends ({data.get('counts', {}).get('friends', 0)})",
+                value=_line(data.get("friends"))[:1024], inline=False)
+    e.add_field(name=f"📥 Incoming ({data.get('counts', {}).get('incoming', 0)})",
+                value=_line(data.get("incoming"))[:1024], inline=False)
+    e.add_field(name=f"📤 Outgoing ({data.get('counts', {}).get('outgoing', 0)})",
+                value=_line(data.get("outgoing"))[:1024], inline=False)
+    await interaction.followup.send(embed=e)
+
+
+@app_commands.describe(friend="Friend to invite", code="Your 5-letter private party code (from the drawer)")
+async def _party_invite_impl(interaction: discord.Interaction, friend: discord.User, code: str):
+    status, body = await _api_post("/api/party/invite", {
+        "from_discord_id": str(interaction.user.id),
+        "to_discord_id": str(friend.id),
+        "code": code,
+    })
+    if status == 200 and body.get("ok"):
+        return await interaction.followup.send(
+            f"📨 Party invite sent to {friend.mention} — code **{body.get('code')}** (expires in 5 min).")
+    err = (body or {}).get("error") or f"HTTP {status}"
+    hint = (" — hold a private room first (the drawer shows your pID)" if "code" in err.lower()
+            else (" — you must be friends first" if "friend" in err.lower() else ""))
+    return await interaction.followup.send(f"Couldn't send invite: {err}{hint}")
+
+
+@bot.tree.command(name="party_invite", description="Invite a friend to your private party (needs your pID code)")
+@app_commands.describe(friend="Friend to invite", code="Your 5-letter private party code (from the drawer)")
+async def party_invite_cmd(interaction: discord.Interaction, friend: discord.User, code: str):
+    await interaction.response.defer(ephemeral=False)
+    await _party_invite_impl(interaction, friend, code)
+
+
+@bot.tree.command(name="dm", description="Send a DM to a friend")
+@app_commands.describe(friend="Friend to message", message="Message (max 500 chars)")
+async def dm_cmd(interaction: discord.Interaction, friend: discord.User, message: str):
+    await interaction.response.defer(ephemeral=True)
+    text = (message or "").strip()
+    if not text:
+        return await interaction.followup.send("Message can't be empty.", ephemeral=True)
+    status, body = await _api_post("/api/friends/message", {
+        "from_discord_id": str(interaction.user.id),
+        "to_discord_id": str(friend.id),
+        "body": text[:500],
+    })
+    if status == 200 and body.get("ok"):
+        return await interaction.followup.send(f"📨 Sent to {friend.mention}.", ephemeral=True)
+    err = (body or {}).get("error") or f"HTTP {status}"
+    hint = " — you must be friends first" if "friend" in err.lower() else ""
+    return await interaction.followup.send(f"Couldn't send: {err}{hint}", ephemeral=True)
+
+
+@bot.tree.command(name="dms", description="Read recent DMs (optionally with one friend)")
+@app_commands.describe(friend="Friend to read conversation with (omit for unread summary)")
+async def dms_cmd(interaction: discord.Interaction, friend: discord.User = None):
+    await interaction.response.defer(ephemeral=True)
+    me = str(interaction.user.id)
+    from urllib.parse import quote
+    if friend is None:
+        data = await _api_get(f"/api/friends/unread?discord_id={quote(me)}")
+        if not data or data.get("error"):
+            return await interaction.followup.send("Couldn't load unread.", ephemeral=True)
+        if not data.get("total"):
+            return await interaction.followup.send("No unread messages.", ephemeral=True)
+        lines = []
+        for did, n in (data.get("by_friend") or {}).items():
+            u = await db.get_by_discord(str(did))
+            nm = (u or {}).get("discord_username") or (u or {}).get("game_username") or str(did)[:6]
+            lines.append(f"• **{nm}** — {n} unread (`/dms @user` to read)")
+        e = discord.Embed(title="Unread DMs", color=0x7c3aed, description="\n".join(lines)[:4000])
+        return await interaction.followup.send(embed=e, ephemeral=True)
+    data = await _api_get(f"/api/friends/messages?discord_id={quote(me)}&with={quote(str(friend.id))}&limit=10")
+    if not data or data.get("error"):
+        return await interaction.followup.send(f"Couldn't load: {(data or {}).get('error') or 'server unreachable'}", ephemeral=True)
+    msgs = data.get("messages") or []
+    if not msgs:
+        return await interaction.followup.send(f"No messages with {friend.mention} yet.", ephemeral=True)
+    me_row = await db.get_by_discord(me)
+    me_name = (me_row or {}).get("discord_username") or interaction.user.name
+    lines = []
+    for m in msgs:
+        who = me_name if str(m.get("from_discord_id")) == me else friend.name
+        lines.append(f"**{who}:** {m.get('body')}")
+    e = discord.Embed(title=f"DMs — {friend.name}", color=0x7c3aed, description="\n".join(lines)[:4000])
+    await interaction.followup.send(embed=e, ephemeral=True)
+
+
+async def _room_tag_impl(interaction: discord.Interaction, kind: str, code: str, name: str | None):
+    if kind == "untag":
+        status, body = await _api_post("/api/room/untag", {"code": code})
+        if status == 200 and body.get("ok"):
+            return await interaction.followup.send(f"🏷️ Tag removed from **{body.get('code')}**.")
+        return await interaction.followup.send(f"Couldn't untag: {(body or {}).get('error') or f'HTTP {status}'}")
+    status, body = await _api_post("/api/room/tag", {
+        "code": code, "kind": kind, "name": (name or "").strip()[:64],
+        "created_by": str(interaction.user.id),
+    })
+    if status == 200 and body.get("ok"):
+        label = "Tourney" if kind == "tourney" else "Scrim"
+        return await interaction.followup.send(
+            f"🏷️ **{body.get('code')}** tagged as {label} — **{body.get('name')}**. Friends now see it in your status.")
+    return await interaction.followup.send(f"Couldn't tag: {(body or {}).get('error') or f'HTTP {status}'}")
+
+
+@bot.tree.command(name="scrim", description="Tag a room code as scrims (friends see 'In Scrims - mode')")
+@app_commands.describe(code="5-letter private room code", name="Scrim label, e.g. Zone scrims")
+async def scrim_cmd(interaction: discord.Interaction, code: str, name: str = "Scrims"):
+    await interaction.response.defer(ephemeral=False)
+    await _room_tag_impl(interaction, "scrim", code, name)
+
+
+@bot.tree.command(name="tourney", description="Tag a room code as a tournament (friends see 'In Tourney - name')")
+@app_commands.describe(code="5-letter private room code", name="Tournament name, e.g. Friday Cup")
+async def tourney_cmd(interaction: discord.Interaction, code: str, name: str):
+    await interaction.response.defer(ephemeral=False)
+    await _room_tag_impl(interaction, "tourney", code, name)
+
+
+@bot.tree.command(name="untag", description="Remove the scrim/tourney tag from a room code")
+@app_commands.describe(code="5-letter private room code")
+async def untag_cmd(interaction: discord.Interaction, code: str):
+    await interaction.response.defer(ephemeral=False)
+    await _room_tag_impl(interaction, "untag", code, None)
+
+
 @bot.tree.command(name="leaderboard", description="Top players by kills or wins")
 @app_commands.describe(stat="Stat to rank by", limit="How many players (1-25)")
 @app_commands.choices(stat=[
@@ -1099,6 +1428,22 @@ async def leaderboard_cmd(interaction: discord.Interaction, stat: str = "kills",
         lines.append(f"{prefix} **{name}** — {val}")
     e.description = "\n".join(lines)[:4000]
     await interaction.followup.send(embed=e)
+
+
+@bot.tree.command(name="streaks", description="Show daily / win streaks and best match")
+async def streaks_cmd(interaction: discord.Interaction, user: discord.User = None):
+    target = user or interaction.user
+    row = await db.get_by_discord(str(target.id))
+    if not row:
+        return await interaction.response.send_message(f"No data for {target.mention}. They need /register.")
+    thumb = fmt.skin_url(row.get("skin"))
+    e = discord.Embed(title=f"Streaks — {row.get('discord_username') or target.name}", color=0xf59e0b)
+    if thumb:
+        e.set_thumbnail(url=thumb)
+    e.add_field(name="🔥 Win streak", value=f"x{row.get('win_streak') or 0} (best {row.get('best_win_streak') or 0})", inline=True)
+    e.add_field(name="📅 Daily streak", value=f"x{row.get('daily_streak') or 0}", inline=True)
+    e.add_field(name="💀 Best match", value=f"{row.get('best_match_kills') or 0} kills", inline=True)
+    await interaction.response.send_message(embed=e)
 
 
 async def _post_patch_channel(embed, view=None):

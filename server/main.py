@@ -19,6 +19,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 
 # ---------------------------------------------------------------------------
@@ -63,6 +64,9 @@ from server.routes.validate_token import router as validate_router
 from server.routes.session_state import router as session_state_router
 from server.routes.stats import router as stats_router
 from server.routes.discovery import router as discovery_router
+from server.routes.insights import router as insights_router
+from server.routes.friends import router as friends_router
+from server.routes.chat import router as chat_router
 from server.routes.players import router as players_router
 from server.routes.health import router as health_router
 
@@ -103,6 +107,9 @@ app.include_router(validate_router)
 app.include_router(session_state_router)
 app.include_router(stats_router)
 app.include_router(discovery_router)
+app.include_router(insights_router)
+app.include_router(friends_router)
+app.include_router(chat_router)
 app.include_router(players_router)
 app.include_router(health_router)
 
@@ -112,6 +119,39 @@ app.include_router(health_router)
 # ---------------------------------------------------------------------------
 # Request logging middleware (like logReq in Node)
 # ---------------------------------------------------------------------------
+
+@app.middleware("http")
+async def head_to_get(request: Request, call_next):
+    """Answer HEAD on any GET route (uptime probes, curl -I, Render/Vercel).
+
+    Starlette matches the method before the handler, so HEAD to a GET-only
+    route 405s. Rewrite to GET for routing, then strip the body and report
+    the GET content-length — same status + headers a GET would return.
+    HEAD to POST-only routes still 405s (correct: no GET exists there).
+    Registered after log_requests so it runs outermost; the logger then
+    sees (and quiets) the rewritten GET like any other poll.
+    """
+
+    if request.method != "HEAD":
+        return await call_next(request)
+
+    request.scope["method"] = "GET"
+    response = await call_next(request)
+
+    body = b""
+    try:
+        async for chunk in response.body_iterator:
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8")
+            body += chunk
+    except Exception:
+        pass
+
+    headers = dict(response.headers)
+    headers.pop("content-length", None)
+    headers["content-length"] = str(len(body))
+    return Response(content=b"", status_code=response.status_code, headers=headers)
+
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):

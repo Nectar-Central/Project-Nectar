@@ -43,6 +43,47 @@ KILL_POINTS = 8    # per kill
 WIN_POINTS = 50    # alive at stG=3
 LOSS_POINTS = -5   # dead at stG=3 (flat: zone, unknown, or killed — no branches)
 
+# ---------------------------------------------------------------------------
+# Play points — activity ledger on bngc_users (all modes, not just ranked).
+# Unlike the ranked ledger above, defeats cost nothing here: play points
+# only ever go up. Hourly pay is derived from the cumulative playtime
+# counter (floor(total/3600) - hours_already_paid), so batch splits and
+# replays can never double-pay. Never raises.
+# ---------------------------------------------------------------------------
+
+PLAY_KILL = 8     # per kill (mirrors ranked kill value)
+PLAY_KNOCK = 2    # per knock (finishing blow pays the kill on top)
+PLAY_WIN = 50     # per win (mirrors ranked win value)
+PLAY_HOUR = 20    # per hour of tracked playtime
+
+
+def hourly_play_points(playtime_global: int, hours_paid: int) -> tuple[int, int]:
+    """Owed hourly pay + new paid checkpoint. Pure, unit-tested.
+
+    Returns (owed_points, new_hours_paid). owed is 0 when no full unpaid
+    hour exists yet. new_hours_paid only advances (never rewound).
+    """
+    try:
+        total_h = int(playtime_global or 0) // 3600
+        paid = int(hours_paid or 0)
+    except Exception:
+        return 0, int(hours_paid or 0)
+    if total_h <= paid:
+        return 0, paid
+    return (total_h - paid) * PLAY_HOUR, total_h
+
+
+def play_points_for(kills: int, wins: int, knocks: int, playtime_s: int) -> int:
+    """Full backfill value for one user. Pure, unit-tested."""
+    try:
+        k = int(kills or 0)
+        w = int(wins or 0)
+        n = int(knocks or 0)
+        h = int(playtime_s or 0) // 3600
+    except Exception:
+        return 0
+    return max(0, k * PLAY_KILL + w * PLAY_WIN + n * PLAY_KNOCK + h * PLAY_HOUR)
+
 # Back-compat aliases (old names used by callers/tests).
 STATIC_KILL = KILL_POINTS
 STATIC_PLACEMENT = {1: 50, 2: 30, 3: 20, 4: 10, 5: 5}

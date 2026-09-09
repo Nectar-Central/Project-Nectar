@@ -430,6 +430,7 @@ async def get_stats(request: Request):
         "deaths": deaths,
         "wins": wins,
         "defeats": defeats,
+        "play_points": int(user.get("play_points") or 0),
         "playtime_global": int(user.get("playtime_global") or 0),
         "playtime_per_gm": ppg or {},
         "kd": kd,
