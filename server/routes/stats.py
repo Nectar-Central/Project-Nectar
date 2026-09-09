@@ -273,6 +273,26 @@ async def get_stats(request: Request):
         except Exception:
             session_out = {"game_mode": live_session.get("game_mode"), "cur_scn": live_session.get("cur_scn")}
 
+    # Room tag (scrim/tourney label for the details line + presence).
+    # Best-effort single lookup by the live short_code; absent without a code.
+    if session_out and session_out.get("short_code"):
+        try:
+            _code = str(session_out.get("short_code") or "").strip().upper()
+            if len(_code) == 5 and _code.isalnum():
+                _tres = supabase.table("bngc_room_tags").select(
+                    "kind,name").eq("code", _code).limit(1).execute()
+                _trows = _tres.data or []
+                session_out["tag"] = ({"kind": str(_trows[0].get("kind") or "").lower(),
+                                       "name": str(_trows[0].get("name") or _code)}
+                                      if _trows else None)
+            else:
+                session_out["tag"] = None
+        except Exception:
+            try:
+                session_out["tag"] = None
+            except Exception:
+                pass
+
     # playtime_per_gm may be json string
     ppg = user.get("playtime_per_gm")
     if isinstance(ppg, str):
@@ -419,6 +439,19 @@ async def get_stats(request: Request):
     except Exception:
         pass
 
+    # Identity diagnostics: kills/skins attach to view.me while playtime is
+    # session-scoped — when me never resolved (null game_username in the DB
+    # with playtime ticking), everything silently misses. Cheap: already in
+    # the live view dict. Null me + ticking session = broken client identity.
+    identity = None
+    try:
+        _lm = (live_session or {}).get("me") if live_session else None
+        if isinstance(_lm, dict):
+            identity = {"username": _lm.get("username"), "game_id": _lm.get("game_id"),
+                        "skin": _lm.get("skin"), "actor_nr": _lm.get("actor_nr")}
+    except Exception:
+        identity = None
+
     return JSONResponse({
         "discord_id": user.get("discord_id"),
         "discord_username": user.get("discord_username"),
@@ -435,6 +468,7 @@ async def get_stats(request: Request):
         "playtime_per_gm": ppg or {},
         "kd": kd,
         "win_rate": win_rate,
+        "identity": identity,
         "rank": rank,
         "is_dev": bool(user.get("is_dev")),
         "arena": arena,

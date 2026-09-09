@@ -693,6 +693,10 @@
       if(_optimisticState.inMatch && !wasInMatch){
         _curScnFlipAt=Date.now();
         try{ _lobbyFlipAt=0; }catch{}
+        // scene entered a match => a real room exists even if the join op
+        // was missed: flip the local room flag so the Players tab appears
+        // on the curScn change, not on the next stats poll.
+        try{ noteLocalRoom(true); }catch{}
       } else {
         _curScnFlipAt=0;
         try{ _lobbyFlipAt=Date.now(); }catch{}
@@ -898,6 +902,11 @@
   // (DevTools, reload, tabs) before page JS ever sees them, so Ctrl+Shift
   // letter defaults silently never fire. Alt+Shift reaches the page.
   // Stored binds win over defaults — existing users keep what they set.
+  // Defaults are single F-keys (one press, no combos): kid-simple on
+  // Windows AND Mac, and they dodge the Alt+Shift layout-switch trap plus
+  // every Ctrl+Shift browser reservation. Stored binds always win, so
+  // changing defaults only affects fresh installs. F1/F3/F5/F11/F12 stay
+  // off-limits (browser takes them — see bindWarning).
   const BNC_BINDS=[
     {id:'collect', label:'Collect toggle', key:'bnc_bind_collect', dev:false, def:{ctrl:false,shift:true,alt:true,meta:false,key:'C'}, run:()=>toggleCollectMode()},
     {id:'save', label:'Save collected', key:'bnc_bind_save', dev:false, def:{ctrl:false,shift:true,alt:true,meta:false,key:'S'}, run:()=>downloadCollected()},
@@ -905,9 +914,9 @@
     {id:'replay', label:'Replay', key:'bnc_bind_replay', dev:false, def:{ctrl:false,shift:true,alt:true,meta:false,key:'R'}, run:()=>replayCollected()},
     {id:'feed', label:'Feed toggle (dev)', key:'bnc_bind_feed', dev:true, def:{ctrl:false,shift:true,alt:true,meta:false,key:'F'}, run:()=>toggleFeed()},
     {id:'pause', label:'Pause feed (dev)', key:'bnc_bind_pause', dev:true, def:{ctrl:false,shift:true,alt:true,meta:false,key:'P'}, run:()=>togglePauseFeed()},
-    {id:'drawer', label:'Player info', key:'bnc_drawer_keybind', dev:false, def:{ctrl:false,shift:true,alt:true,meta:false,key:'I'}, run:()=>toggleInfoPanel()},
+    {id:'drawer', label:'Player info', key:'bnc_drawer_keybind', dev:false, def:{ctrl:false,shift:false,alt:false,meta:false,key:'F2'}, run:()=>toggleInfoPanel()},
     {id:'ranked', label:'Ranked panel', key:'bnc_ranked_keybind', dev:false, def:{ctrl:false,shift:false,alt:false,meta:false,key:'F9'}, run:()=>toggleRankedPanel()},
-    {id:'leaderboard', label:'Leaderboard', key:'bnc_lb_keybind', dev:false, def:{ctrl:false,shift:true,alt:true,meta:false,key:'L'}, run:()=>toggleLbPanel()},
+    {id:'leaderboard', label:'Leaderboard', key:'bnc_lb_keybind', dev:false, def:{ctrl:false,shift:false,alt:false,meta:false,key:'F4'}, run:()=>toggleLbPanel()},
   ];
   // Combos the browser takes before the page (per registration order they
   // can't be intercepted no matter the capture phase). Capture warns instead
@@ -1459,7 +1468,7 @@
     const map={1:'#3b82f6',2:'#ef4444',3:'#22c55e',4:'#f97316',5:'#a855f7',6:'#eab308',7:'#06b6d4',8:'#ec4899'};
     return map[n]||null;
   }
-  // keybind for drawer - customizable via button in drawer
+  // keybind for drawer - customizable via button in drawer (default F2, shared with the shortcuts menu)
   function getDrawerKeybind(){
     try{
       const raw=GMGet('bnc_drawer_keybind', null);
@@ -1468,12 +1477,12 @@
         try{ const j=JSON.parse(raw); if(j && j.key) return j; }catch{}
         // legacy string like "Ctrl+Shift+I" (or "Cmd+Shift+I" on Mac)
         const parts=String(raw).split('+');
-        const kb={ctrl:false,shift:false,alt:false,meta:false,key:'I'};
+        const kb={ctrl:false,shift:false,alt:false,meta:false,key:'F2'};
         for(const p of parts){ const l=p.trim().toLowerCase(); if(l==='ctrl'||l==='control') kb.ctrl=true; else if(l==='cmd'||l==='meta'||l==='command') kb.meta=true; else if(l==='shift') kb.shift=true; else if(l==='alt') kb.alt=true; else if(p.trim()) kb.key=p.trim().toUpperCase(); }
         return kb;
       }
     }catch{}
-    return {ctrl:false, shift:true, alt:true, meta:false, key:'I'};
+    return {ctrl:false, shift:false, alt:false, meta:false, key:'F2'};
   }
   function formatKeybind(kb){ const a=[]; if(kb.meta) a.push('Cmd'); if(kb.ctrl) a.push('Ctrl'); if(kb.shift) a.push('Shift'); if(kb.alt) a.push('Alt'); a.push(String(kb.key||'').toUpperCase()); return a.join('+'); }
   function isDrawerKeybind(e){
@@ -1494,7 +1503,7 @@
   } catch {}
   let drawerTab = GMGet('bnc_drawer_tab','stats'); // 'stats' | 'players'
   if(drawerTab!=='stats'&&drawerTab!=='players') drawerTab='stats';
-  let playersCache=null, playersPollTimer=null, playersLoading=false;
+  let playersCache=null, playersPollTimer=null, playersLoading=false, _playersSeq=0, _statsSeq=0;
   let lobbyAudio=null;
   let bgLobbyPollTimer=null;
   let _audioPlaying=false;
@@ -1759,11 +1768,13 @@
     if(!sessionId){ if(forceRender) renderInfoPanel(); return; }
     if(playersLoading) return;
     playersLoading=true;
+    const mySeq=++_playersSeq;
     const base=resolveApiBase();
     const url=base + '/api/players?session_id=' + encodeURIComponent(sessionId);
     const GM = typeof GM_xmlhttpRequest!=='undefined' ? GM_xmlhttpRequest : (typeof unsafeWindow!=='undefined' && unsafeWindow.GM_xmlhttpRequest) || null;
     const onDone=(ok, txt)=>{
       playersLoading=false;
+      if(mySeq!==_playersSeq) return; // superseded: a newer poll already went out
       if(ok){
         try{
           const j=JSON.parse(txt);
@@ -1863,6 +1874,18 @@
     if(_ranked){
       stateGmLine = hasGm ? `${stateLabel} - Ranked Match - ${gmLive}` : `${stateLabel} - Ranked Match`;
     }
+    // Room tag (host-set via /scrim /tourney): most specific status wins over
+    // party text, but never over a live ranked block. Tourney shows its name,
+    // scrims show the mode (same convention as the friends presence line).
+    try{
+      const _sessTag = sess && sess.tag;
+      if(_sessTag && (_sessTag.kind==='tourney' || _sessTag.kind==='scrim') && stateLabel==='In Match' && !_ranked){
+        const _tn = String(_sessTag.name||'').replace(/</g,'&lt;');
+        stateGmLine = _sessTag.kind==='tourney'
+          ? `In Tourney - ${_tn||'Tournament'}`
+          : `In Scrims - ${hasGm ? gmLive : 'Custom'}`;
+      }
+    }catch{}
     const smallRow = (label,val)=> `<div style="display:flex;justify-content:space-between;align-items:center;width:100%;max-width:240px;font-size:11px"><span style="color:#9ca3af">${label}</span><span style="font-weight:600;color:#fff">${val==null? '-' : val}</span></div>`;
     const perGmRow = hasGm && perGmCurrent!=null ? smallRow('Playtime ('+gmLive+')', fmtPlaytimeDrawer(perGmCurrent)) : '';
     // Empty account (no game username and no stats yet): placeholder instead of blank rows
@@ -1917,7 +1940,10 @@
     // Players tab visibility follows room lifecycle (Create/Join -> show, Leave -> hide),
     // not match state: private/random lobbies have a real room before curScn flips to match.
     // Self-leave prunes the room server-side -> current falls back to the lobby pseudo-room -> hidden.
-    const hasRealRoom = !!_curRoomObj && String(_curRoomRid||'') !== 'lobby';
+    // Plus the instant local flag: server truth lags joins by seconds, so a
+    // just-sent create/join op (or scene flip) shows the tab on the packet.
+    let hasRealRoom = !!_curRoomObj && String(_curRoomRid||'') !== 'lobby';
+    try{ if(!hasRealRoom && localRoomActive()) hasRealRoom=true; }catch{}
     const isLobbyTab = !hasRealRoom;
     // No player list without a real room: clear stale roster when back to lobby pseudo-room
     // (fixes not refreshing). Party status still shows on the detail line above.
@@ -2116,6 +2142,12 @@
   }
   function fetchStats(forceRender){
     if(!sessionId && !discordId) { if(forceRender) renderInfoPanel(); return; }
+    // Sequence guard: overlapping polls (15s timer, bg poll, transition
+    // bursts) must never paint stale data over fresh — a slow older response
+    // arriving last used to flip kills +2 back to +1. Only the newest
+    // response for each transport applies. Never throws.
+    const mySeq=++_statsSeq;
+    const fresh=(s)=> s===_statsSeq; // GM and fetch race each other too
     const base=resolveApiBase();
     const qs = sessionId ? `session_id=${encodeURIComponent(sessionId)}` : `discord_id=${encodeURIComponent(discordId)}`;
     const url = base + '/api/stats?' + qs;
@@ -2124,13 +2156,13 @@
       if(useGM && GM){
         try{
           GM({method:'GET', url, headers:{'Content-Type':'application/json'}, timeout:8000,
-            onload: r=>{ if(r.status>=200&&r.status<300){ try{ const j=JSON.parse(r.responseText); statsCache=j; logInfo(`[AUDIO] stats fetched lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } try{ _reconcileServerState(j.session); }catch{} try{ _reconcileRankedSession(j.session); }catch{} try{ noteRankedBlockPoll(!!(j.ranked&&j.ranked.active)); }catch{} renderInfoPanel(); try{ const _pi=getPartyInfo(j.session); const _inMatch=j.session&&String(j.session.state||'').toLowerCase()==='match'; if((_pi.isParty&&_pi.code)||_inMatch) fetchPlayers(false); }catch{} }catch(e){ logErr(`[AUDIO] stats parse err ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ updateApiDot(); }catch{} },
-            onerror: ()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} },
-            ontimeout: ()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} }});
+            onload: r=>{ if(!fresh(mySeq)) return; if(r.status>=200&&r.status<300){ try{ const j=JSON.parse(r.responseText); statsCache=j; logInfo(`[AUDIO] stats fetched lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } try{ _reconcileServerState(j.session); }catch{} try{ _reconcileRankedSession(j.session); }catch{} try{ noteRankedBlockPoll(!!(j.ranked&&j.ranked.active)); }catch{} renderInfoPanel(); try{ const _pi=getPartyInfo(j.session); const _inMatch=j.session&&String(j.session.state||'').toLowerCase()==='match'; if((_pi.isParty&&_pi.code)||_inMatch) fetchPlayers(false); }catch{} }catch(e){ logErr(`[AUDIO] stats parse err ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ updateApiDot(); }catch{} },
+            onerror: ()=>{ if(!fresh(mySeq)) return; apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} },
+            ontimeout: ()=>{ if(!fresh(mySeq)) return; apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} }});
           return;
         }catch{}
       }
-      fetch(url, {method:'GET'}).then(r=>r.text().then(t=>{ if(r.ok){ try{ const j=JSON.parse(t); statsCache=j; logInfo(`[AUDIO] stats fetched (fetch) lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats-fetch', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} try{ _reconcileServerState(j.session); }catch{} try{ _reconcileRankedSession(j.session); }catch{} try{ noteRankedBlockPoll(!!(j.ranked&&j.ranked.active)); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } renderInfoPanel(); try{ const _pi2=getPartyInfo(j.session); const _inMatch2=j.session&&String(j.session.state||'').toLowerCase()==='match'; if((_pi2.isParty&&_pi2.code)||_inMatch2) fetchPlayers(false); }catch{} }catch(e){ logErr(`[AUDIO] stats parse err (fetch) ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ updateApiDot(); }catch{} }).catch(()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} })).catch(()=>{ apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} });
+      fetch(url, {method:'GET'}).then(r=>r.text().then(t=>{ if(!fresh(mySeq)) return; if(r.ok){ try{ const j=JSON.parse(t); statsCache=j; logInfo(`[AUDIO] stats fetched (fetch) lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats-fetch', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} try{ _reconcileServerState(j.session); }catch{} try{ _reconcileRankedSession(j.session); }catch{} try{ noteRankedBlockPoll(!!(j.ranked&&j.ranked.active)); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } renderInfoPanel(); try{ const _pi2=getPartyInfo(j.session); const _inMatch2=j.session&&String(j.session.state||'').toLowerCase()==='match'; if((_pi2.isParty&&_pi2.code)||_inMatch2) fetchPlayers(false); }catch{} }catch(e){ logErr(`[AUDIO] stats parse err (fetch) ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ updateApiDot(); }catch{} }).catch(()=>{ if(!fresh(mySeq)) return; apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} })).catch(()=>{ if(!fresh(mySeq)) return; apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} });
     };
     doFetch(true);
   }
@@ -2661,15 +2693,35 @@
       if(typeof raw==='string' && raw){
         try{ const j=JSON.parse(raw); if(j && j.key) return j; }catch{}
         const parts=String(raw).split('+');
-        const kb={ctrl:false,shift:true,alt:true,meta:false,key:'L'};
+        const kb={ctrl:false,shift:false,alt:false,meta:false,key:'F4'};
         for(const p of parts){ const l=p.trim().toLowerCase(); if(l==='ctrl'||l==='control') kb.ctrl=true; else if(l==='cmd'||l==='meta'||l==='command') kb.meta=true; else if(l==='shift') kb.shift=true; else if(l==='alt') kb.alt=true; else if(p.trim()) kb.key=p.trim().toUpperCase(); }
         return kb;
       }
     }catch{}
-    return {ctrl:false, shift:true, alt:true, meta:false, key:'L'};
+    return {ctrl:false, shift:false, alt:false, meta:false, key:'F4'};
   }
   function isLbKeybind(e){
     return bindMatches(e, getLbKeybind());
+  }
+  // Text inputs inside game-page overlays: the game swallows keys otherwise
+  // (character insertion dies even though clicks work). Capture-phase trap
+  // on the input itself + explicit focus + no-autocomplete. Never throws.
+  // Applied to every panel text field (friend search, chat). Does NOT affect
+  // the global keybind dispatcher (that one ignores inputs already).
+  function untrapInput(el){
+    if(!el || el.dataset.bncUntrapped) return;
+    try{ el.dataset.bncUntrapped='1'; }catch{}
+    try{ el.setAttribute('autocomplete','off'); }catch{}
+    try{ el.setAttribute('autocapitalize','off'); }catch{}
+    try{ el.setAttribute('spellcheck','false'); }catch{}
+    const trap=(e)=>{ try{ e.stopPropagation(); }catch{} try{ if(e.stopImmediatePropagation) e.stopImmediatePropagation(); }catch{} };
+    ['keydown','keyup','keypress'].forEach(ev=>{
+      try{ el.addEventListener(ev, trap, true); }catch{}
+    });
+    try{
+      el.addEventListener('mousedown', (e)=>{ try{ e.stopPropagation(); }catch{} try{ el.focus(); }catch{} }, true);
+      el.addEventListener('click', (e)=>{ try{ e.stopPropagation(); }catch{} try{ el.focus(); }catch{} }, true);
+    }catch{}
   }
   // Plain JSON POST (no session tokens — friends/party API is discord_id-keyed).
   function apiPostJson(path, body, cb){
@@ -2717,7 +2769,7 @@
   let lbTab='board', lbIns=null, lbInsLoading=false; // 'board' | 'insights' | 'friends'
   let lbProfile=null, lbProfileIns=null, lbProfileLoading=false; // open player profile (within panel)
   let lbFriends=null, lbFriendsLoading=false, lbInvites=null, lbSearch=[], lbSearchLoading=false;
-  let lbUnread=null, lbChatWith=null, lbChat=[], lbChatLoading=false, lbChatTimer=null;
+  let lbUnread=null, lbChatWith=null, lbChat=[], lbChatLoading=false, lbChatTimer=null, _chatRefocus=false;
   const LB_LIMIT=20;
   const LB_SORTS=[['points','Points'],['kills','Kills'],['wins','Wins'],['kd','K/D'],['playtime_global','Playtime']];
   function createLbPanel(){
@@ -2969,8 +3021,14 @@
     // incoming requests
     const reqs=(lbFriends&&lbFriends.incoming)||[];
     if(reqs.length){
-      html+=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">REQUESTS (${reqs.length})</div>`;
+      html+=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">INCOMING REQUESTS (${reqs.length})</div>`;
       reqs.forEach(f=>{ html+=row(nm(f), null, btn('acc:'+(f.requester_discord_id||f.discord_id),'Accept',true)+btn('dec:'+(f.requester_discord_id||f.discord_id),'Decline',true)); });
+    }
+    // outgoing requests (sent by me, awaiting answer) with cancel
+    const outg=(lbFriends&&lbFriends.outgoing)||[];
+    if(outg.length){
+      html+=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">OUTGOING REQUESTS (${outg.length})</div>`;
+      outg.forEach(f=>{ html+=row(nm(f), 'Waiting for answer', btn('can:'+f.discord_id,'Cancel',true,'Withdraw this request')); });
     }
     // add by search
     html+=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">ADD FRIEND</div>
@@ -3005,7 +3063,12 @@
       });
     };
     if(go) go.onclick=doSearch;
-    if(q) q.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); e.stopPropagation(); doSearch(); } });
+    if(q){
+      // capture (not bubble): runs before the generic trap below, so Enter
+      // still searches while every other key dies before the game sees it.
+      q.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); e.stopPropagation(); doSearch(); } }, true);
+      try{ untrapInput(q); }catch{}
+    }
     // wire row buttons
     body.querySelectorAll('button[data-fr]').forEach(b=>{
       b.onclick=()=>{
@@ -3013,6 +3076,7 @@
         if(act==='inv'){ if(!code) return; lbFriendAction('/api/party/invite', {from_discord_id:did, to_discord_id:target, code}, 'Invite sent'); }
         else if(act==='acc'){ lbFriendAction('/api/friends/accept', {discord_id:did, requester_discord_id:target}, 'Friend added'); }
         else if(act==='dec'){ lbFriendAction('/api/friends/decline', {discord_id:did, requester_discord_id:target}, 'Declined'); }
+        else if(act==='can'){ lbFriendAction('/api/friends/remove', {discord_id:did, friend_discord_id:target}, 'Request withdrawn'); }
       };
     });
     body.querySelectorAll('button[data-join]').forEach(b=>{
@@ -3058,12 +3122,18 @@
       if(send) send.disabled=true;
       apiPostJson('/api/friends/message', {from_discord_id:did, to_discord_id:lbChatWith, body:v.slice(0,500)}, (j)=>{
         if(send) send.disabled=false;
-        if(j && j.ok){ if(inp) inp.value=''; fetchLbChat(); }
+        if(j && j.ok){ if(inp) inp.value=''; _chatRefocus=true; fetchLbChat(); }
         else { try{ showToast('Failed: '+(((j||{}).error)||'server error'), true); }catch{} }
       });
     };
     if(send) send.onclick=doSend;
-    if(inp) inp.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); e.stopPropagation(); doSend(); } });
+    if(inp){
+      inp.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); e.stopPropagation(); doSend(); } }, true);
+      try{ untrapInput(inp); }catch{}
+      // refocus only right after OUR send (never on poll refresh — reading
+      // history must not yank focus while the user watches).
+      if(_chatRefocus){ _chatRefocus=false; try{ inp.focus(); }catch{} }
+    }
   }
   function renderLbBody(){
     const body=document.getElementById('bnc-lb-body');
@@ -3115,6 +3185,8 @@
     const esc=(v)=> String(v==null?'—':v).replace(/</g,'&lt;').replace(/"/g,'&quot;');
     const r=lbProfile;
     const name=r.game_username || r.discord_username || '—';
+    const meDid=(typeof myDiscordId==='function' ? myDiscordId() : null);
+    const canAddFriend=!!(r.discord_id && meDid && String(r.discord_id)!==String(meDid));
     const skinId=(r.skin!=null && String(r.skin).trim()!=='' && String(r.skin).toLowerCase()!=='nan') ? r.skin : 'cct_0_default';
     const skinUrl=skinUrlDrawer(skinId);
     const ins=lbProfileIns;
@@ -3143,13 +3215,25 @@
       box('Biggest fear', !ins?'…':((ins.biggest_fear&&ins.biggest_fear.player)?`${esc(ins.biggest_fear.player)} (${ins.biggest_fear.deaths})`:'—')),
     ].join('');
     body.innerHTML=`<div style="display:flex;flex-direction:column;gap:10px;height:100%">`
-      + `<div style="display:flex;align-items:center;gap:10px"><button id="bnc-prof-back" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:5px 12px;cursor:pointer;font-size:12px;font-weight:700">‹ Back</button><b style="font-size:16px;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(name)}</b>${r.rank!=null?`<span style="font-size:11px;color:#6b7280">#${esc(r.rank)}</span>`:''}</div>`
+      + `<div style="display:flex;align-items:center;gap:10px"><button id="bnc-prof-back" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:5px 12px;cursor:pointer;font-size:12px;font-weight:700">‹ Back</button><b style="font-size:16px;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0">${esc(name)}</b>${r.rank!=null?`<span style="font-size:11px;color:#6b7280">#${esc(r.rank)}</span>`:''}${canAddFriend?`<button id="bnc-prof-add" style="background:#fff;color:#000;border:0;border-radius:6px;padding:5px 12px;cursor:pointer;font-size:12px;font-weight:800;flex-shrink:0">Add friend</button>`:''}</div>`
       + `<div style="flex:1;display:flex;gap:10px;min-height:0;overflow:auto">`
       + `<div style="width:190px;flex-shrink:0;background:#0a0a0a;border:1px solid rgba(255,255,255,0.08);border-radius:12px;display:flex;align-items:center;justify-content:center;align-self:stretch;padding:12px">${skinUrl?`<img src="${skinUrl}" style="max-width:100%;max-height:100%;object-fit:contain;image-rendering:pixelated" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div style="display:none;font-size:40px">▣</div>`:`<div style="font-size:40px">▣</div>`}</div>`
       + `<div style="flex:1;display:grid;grid-template-columns:1fr 1fr;gap:8px;align-content:start;min-width:0">${lbProfileLoading?`<div style="grid-column:1/-1;color:#9ca3af;font-size:12px;text-align:center;padding:16px 0">Loading insights…</div>`:boxes}</div>`
       + `</div></div>`;
     const back=document.getElementById('bnc-prof-back');
     if(back) back.onclick=()=>{ lbProfile=null; lbProfileIns=null; renderLbPanel(); };
+    const addBtn=document.getElementById('bnc-prof-add');
+    if(addBtn) addBtn.onclick=()=>{
+      const target=String((lbProfile&&lbProfile.discord_id)||'');
+      const me=(typeof myDiscordId==='function' ? myDiscordId() : null);
+      if(!target || !me) return;
+      addBtn.disabled=true; addBtn.textContent='…';
+      apiPostJson('/api/friends/request', {requester_discord_id:me, addressee_discord_id:target}, (j)=>{
+        if(j && (j.ok || (j.status&&j.status!=='pending'))){ addBtn.textContent='Sent'; try{ showToast('Friend request sent', false); }catch{} }
+        else if(j && j.error && /already/i.test(j.error)){ addBtn.textContent='Sent'; }
+        else { addBtn.disabled=false; addBtn.textContent='Add friend'; try{ showToast('Failed: '+(((j||{}).error)||'server error'), true); }catch{} }
+      });
+    };
   }
   const PLAYSTYLE_TIPS={
     Aggressor:'Drops into fights: 3+ kills per match with a strong K/D.',
@@ -3165,7 +3249,7 @@
     const ov=document.createElement('div');
     ov.id='bnc-keys';
     Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483646', background:'rgba(0,0,0,0.54)', display:'none', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif'});
-    ov.innerHTML = `<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:20px;min-width:360px;max-width:520px;color:#e5e7eb"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><b style="font-size:15px;color:#fff">BuildNow Companion - Shortcuts & Settings</b><button id="bnc-keys-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 8px;cursor:pointer">Close</button></div><div id="bnc-keys-list" style="display:flex;flex-direction:column;gap:6px;font-size:12px"></div><div style="display:flex;gap:8px;margin-top:12px"><button id="bnc-keys-open-drawer" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open player info</button><button id="bnc-keys-open-ranked" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open ranked panel</button><button id="bnc-keys-open-lb" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open leaderboard</button></div><div style="margin-top:8px;font-size:11px;color:#9ca3af"><code>Ctrl+Shift+K</code> - This menu (fixed)</div><div style="margin-top:10px;font-size:11px;opacity:0.7">Mac tip: use ⌘ instead of Ctrl — Cmd+Shift+&lt;key&gt; works the same.</div><div id="bnc-dev-row" style="margin-top:14px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);font-size:11px;opacity:0.7">Settings: <label style="cursor:pointer"><input type="checkbox" id="bnc-dev-toggle"> Dev mode (feed)</label></div></div>`;
+    ov.innerHTML = `<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:20px;min-width:360px;max-width:520px;color:#e5e7eb"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><b style="font-size:15px;color:#fff">BuildNow Companion - Shortcuts & Settings</b><button id="bnc-keys-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 8px;cursor:pointer">Close</button></div><div id="bnc-keys-list" style="display:flex;flex-direction:column;gap:6px;font-size:12px"></div><div style="display:flex;gap:8px;margin-top:12px"><button id="bnc-keys-open-drawer" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open player info</button><button id="bnc-keys-open-ranked" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open ranked panel</button><button id="bnc-keys-open-lb" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open leaderboard</button></div><div style="margin-top:8px;font-size:11px;color:#9ca3af"><code>Ctrl+Shift+K</code> - This menu (fixed)</div><div style="margin-top:10px;font-size:11px;opacity:0.7">Panels open with one key: <b>F2</b> player info · <b>F4</b> leaderboard · <b>F9</b> ranked. Mac: F-keys work as-is (on small MacBooks hold <b>Fn</b>). Combos with Ctrl/⌘ also work via Change.</div><div style="margin-top:10px"><button id="bnc-keys-reset" style="width:100%;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Reset all shortcuts to defaults</button></div><div id="bnc-dev-row" style="margin-top:14px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);font-size:11px;opacity:0.7">Settings: <label style="cursor:pointer"><input type="checkbox" id="bnc-dev-toggle"> Dev mode (feed)</label></div></div>`;
     (document.body||document.documentElement).appendChild(ov);
     ov.addEventListener('click', (e)=>{ if(e.target===ov) ov.style.display='none'; });
     ov.querySelector('#bnc-keys-close').onclick=()=> ov.style.display='none';
@@ -3178,6 +3262,14 @@
       if(or_) or_.onclick=()=>{ try{ toggleRankedPanel(true); }catch{} };
       const ol=ov.querySelector('#bnc-keys-open-lb');
       if(ol) ol.onclick=()=>{ try{ toggleLbPanel(true); }catch{} };
+      const rs=ov.querySelector('#bnc-keys-reset');
+      if(rs) rs.onclick=()=>{
+        try{
+          BNC_BINDS.forEach(b=>{ try{ GMDel(b.key); }catch{} });
+          renderKeybindRows();
+          showToast('Shortcuts reset: F2 player info · F4 leaderboard · F9 ranked', false);
+        }catch{}
+      };
     }catch{}
     const devT = ov.querySelector('#bnc-dev-toggle');
     devT.checked = !!GMGet('bnc_dev_mode', false);
@@ -3326,11 +3418,39 @@
     }catch{}
   }
 
+  // ---- LOCAL ROOM FLAG (instant players-tab visibility) ----
+  // Server truth (stats poll) lags joins by seconds; this flag flips the
+  // moment OUR create/join ops hit the wire, so the Players tab appears on
+  // the packet, not on the next poll. Cleared by auth/leave ops, by fresh
+  // server truth newer than the signal, or by a 3-minute timeout. It can
+  // only ever ADD visibility, never hide a server-confirmed room. Never throws.
+  let _localRoom={active:false, at:0};
+  function noteLocalRoom(active){
+    try{
+      if(active){
+        _localRoom.active=true; _localRoom.at=Date.now();
+        try{ schedulePlayersRefresh('local-join'); }catch{}
+      } else { _localRoom.active=false; _localRoom.at=0; }
+    }catch{}
+  }
+  function localRoomActive(){
+    try{
+      if(!_localRoom.active) return false;
+      if(Date.now()-_localRoom.at>180000) return false;
+      if(_lastStatsAt && _lastStatsAt>_localRoom.at){
+        const s=statsCache&&statsCache.session;
+        const rooms=s&&s.rooms; const cid=s&&s.current_room_id;
+        const cr=cid&&rooms?rooms[cid]:null;
+        if(!cr||String(cr.room_id||'')==='lobby') return false;
+      }
+      return true;
+    }catch{ return false; }
+  }
+
   function enqueue(dir, bytes, url){
     if(isLocked) return;
     if(!bytes||!bytes.length) return;
-    try{ _capSeen++; lastWsSeenAt=Date.now(); }catch{}
-    if(!sessionId || !currentReqToken){
+    try{ _capSeen++; lastWsSeenAt=Date.now(); }catch{}    if(!sessionId || !currentReqToken){
       if(Date.now()-lastCaptureBlockedLog>5000){ lastCaptureBlockedLog=Date.now(); logInfo('capture skipped - no session (login required)'); }
       return;
     }
@@ -3348,10 +3468,11 @@
     // Any Leave event (254 in = someone left queue/match) and any of MY
     // room changes -> prompt player-list refresh (server prunes on Leave).
     try{
-      if((type===2||type===3)&&(code===230||code===231)){ disableRanked('auth'); schedulePlayersRefresh('auth'); }
-      else if((type===2||type===3)&&code===254&&dir==='out'){ _rankedLeaveGuard=true; disableRanked('leave-op'); schedulePlayersRefresh('leave-op'); }
+      if((type===2||type===3)&&(code===230||code===231)){ disableRanked('auth'); schedulePlayersRefresh('auth'); try{ noteLocalRoom(false); }catch{} }
+      else if((type===2||type===3)&&code===254&&dir==='out'){ _rankedLeaveGuard=true; disableRanked('leave-op'); schedulePlayersRefresh('leave-op'); try{ noteLocalRoom(false); }catch{} }
       else if(type===4&&code===254&&dir==='in') schedulePlayersRefresh('leave-ev');
-      else if((type===2||type===3)&&(code===226||code===227)&&dir==='out'){
+      else if((type===2||type===3)&&(code===225||code===226||code===227)&&dir==='out'){
+        try{ noteLocalRoom(true); }catch{}
         const pid=sniffPid(rawHex);
         if(pid) rankedTrack(pid);
         else { disableRanked('public-join'); schedulePlayersRefresh('join-room'); }

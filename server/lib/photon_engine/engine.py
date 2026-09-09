@@ -341,6 +341,7 @@ class EnginePacket:
     room_gm: str | None = None
     actor_nr: int | None = None       # sender actor (params.ActorNr) — original value
     target_actor_nr: int | None = None  # subject actor (params.TargetActorNr) — original value
+    dir: str | None = None            # capture direction: "out" = own client sent it
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {
@@ -370,6 +371,7 @@ class EnginePacket:
             "room_gm": self.room_gm,
             "actor_nr": self.actor_nr,
             "target_actor_nr": self.target_actor_nr,
+            "dir": self.dir,
         }
         if self.is_kill or self.is_knock:
             d["kill"] = {
@@ -394,12 +396,66 @@ class Engine:
         self._pending_pid: dict[str, tuple] = {}  # session_id -> (pID, ts) from JoinRandomRoom without RoomName (private join)
         self._pending_gm: dict[str, GameMode] = {}  # session_id -> gm from JoinRandomRoom without RoomName
 
-    def feed(self, session_id: str, hex_string: str) -> EnginePacket:
+    def _adopt_me_from_echo(self, view, room, killer: str | None,
+                              actor_nr, session_id: str) -> bool:
+        """Adopt session identity from an outbound killfeed echo. Unit-tested.
+
+        An OUTBOUND RaiseEvent carrying killfeed text is, by definition, this
+        client's own traffic — when view.me never resolved (join props arrived
+        without a 255 username), the killer named here is us. Adopts ONLY when
+        me is currently None (never overwrites), leaves usernameChangeCount
+        alone so a later real join still corrects the name via the first-join
+        branch, and registers the player in the room. Returns True on adopt.
+        Never raises.
+        """
+        try:
+            if view is None or room is None:
+                return False
+            if getattr(view, "me", None) is not None:
+                return False
+            name = _clean_username(killer) if killer else ""
+            if not name:
+                return False
+            try:
+                aid = int(actor_nr) if actor_nr is not None else -1
+            except Exception:
+                aid = -1
+            try:
+                late = (room.state == State.MATCH)
+            except Exception:
+                late = False
+            view.me = Player(
+                actor_nr=aid,
+                username=str(name),
+                is_alive=True,
+                is_self=True,
+                late_join=bool(late),
+            )
+            try:
+                key = aid if aid != -1 else hash(str(name)) % 100000
+                while key in room.players:
+                    key = (key + 1) % 100000
+                room.players[key] = view.me
+                if getattr(room, "me", None) is None:
+                    room.me = view.me
+            except Exception:
+                pass
+            log_engine("join", session_id[:13], name=str(name),
+                       source="echo-adopt", room=getattr(room, "room_id", "?")[:8])
+            return True
+        except Exception:
+            return False
+
+    def feed(self, session_id: str, hex_string: str, direction: str | None = None) -> EnginePacket:
         """Feed one hex packet for a session — decrypts, updates SessionView/RoomView, returns EnginePacket.
 
         Rooms are scoped: CreateRoom/JoinRoom/JoinRandomRoom with RoomName creates a new RoomView;
         all subsequent JOIN/LEAVE/ALIVE/KILL/zone/state events are scoped to that room.
         Query: session.rooms[room_id] or session.current_room.
+
+        direction is the capture direction ("out" = this client's own traffic,
+        "in" = server to client). Only used for identity healing (echo-adopt);
+        None keeps every legacy behavior byte-identical.
         """
 
         # Get or create session view for this id
@@ -418,6 +474,10 @@ class Engine:
             gpb = None
 
         packet = self._gpb_to_abstract(hex_string, gpb)
+        try:
+            packet.dir = str(direction) if direction else None
+        except Exception:
+            pass
 
         # Visibility: log packets that classified as UNKNOWN (nothing should be invisible).
         # For evCode 101, include the raw killfeed text so unrecognized verbs/formats
@@ -1368,14 +1428,37 @@ class Engine:
                         tgt.pt = pt
                         _rebuild_teams(room)
                         log_engine("team_pt", session_id[:13], team=pt, target=_tk, player=tgt.username, via="props", room=room.room_id[:8])
-                    if skid and not tgt.skin:
+                    # Refresh (not fill-only): players change skins/picks mid
+                    # session, and first-join often arrives without them — a
+                    # fill-once policy froze them at None forever.
+                    if skid and tgt.skin != skid:
                         tgt.skin = skid
                         log_engine("skin", session_id[:13], name=tgt.username, skin=skid, room=room.room_id[:8])
                         feed_hint = f"skin filled for {tgt.username} via PropertiesChanged"
-                    if pid and not tgt.pickaxe:
+                    if pid and tgt.pickaxe != pid:
                         tgt.pickaxe = pid
-                    if pfid and not tgt.game_id:
+                    if pfid and tgt.game_id != pfid:
                         tgt.game_id = pfid
+                    # Propagate to the session/room self refs when this row is
+                    # me — otherwise view.me keeps the stale first-join copy
+                    # while the roster already knows better.
+                    try:
+                        if view.me and _names_equal(tgt.username, view.me.username):
+                            if skid:
+                                view.me.skin = skid
+                            if pid:
+                                view.me.pickaxe = pid
+                            if pfid:
+                                view.me.game_id = pfid
+                        if room.me and _names_equal(tgt.username, room.me.username):
+                            if skid:
+                                room.me.skin = skid
+                            if pid:
+                                room.me.pickaxe = pid
+                            if pfid:
+                                room.me.game_id = pfid
+                    except Exception:
+                        pass
                     if "ready" in props:
                         tgt.is_ready = bool(props["ready"])
                 elif pt and target_actor_nr:
@@ -1398,6 +1481,14 @@ class Engine:
             if not killer or not victim or "<" in killer or "<" in victim:
                 log_engine("debug", session_id[:13], msg=f"kill dropped empty killer={killer!r} victim={victim!r}", room=room.room_id[:8])
             elif packet.is_echo:
+                # Outbound echo + unknown me => the killer is this client:
+                # heal the null-identity class of bug (playtime counts while
+                # kills/skins attach to nothing). Inbound echoes never adopt.
+                try:
+                    if str(packet.dir or "") == "out":
+                        self._adopt_me_from_echo(view, room, killer, actor_nr, session_id)
+                except Exception:
+                    pass
                 log_engine("debug", session_id[:13], msg=f"kill echo ignored {killer}->{victim} (broadcast counts)", room=room.room_id[:8])
             else:
                 try:
