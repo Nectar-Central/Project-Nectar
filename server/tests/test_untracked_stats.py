@@ -6,7 +6,7 @@ counting (session-scoped) while kills/skins silently missed.
 """
 from server.lib.photon_engine.engine import Engine
 from server.lib.photon_engine.models import Player, RoomView, SessionView
-from server.scripts.processor import _is_self
+from server.scripts.processor import _is_self, _last_seen_due
 
 
 def _room(*players):
@@ -104,3 +104,14 @@ def test_echo_adopt_strips_tags_and_rejects_empty():
     assert eng2._adopt_me_from_echo(v2, r2, None, 1, "s-echo") is False
     assert eng2._adopt_me_from_echo(None, r2, "Bob", 1, "s-echo") is False
     assert v2.me is None
+
+
+def test_last_seen_due():
+    from datetime import datetime
+    ts = datetime.fromisoformat("2026-01-01T00:00:00+00:00").timestamp()
+    assert _last_seen_due(None, ts) is True
+    assert _last_seen_due("", ts) is True
+    assert _last_seen_due("not-a-date", ts) is True
+    assert _last_seen_due("2026-01-01T00:00:00+00:00", ts + 60, 300) is False
+    assert _last_seen_due("2026-01-01T00:00:00+00:00", ts + 301, 300) is True
+    assert _last_seen_due("2026-01-01T00:00:00+00:00", ts - 99999, 300) is False  # clock skew safe

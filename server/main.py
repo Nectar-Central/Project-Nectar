@@ -125,8 +125,11 @@ async def head_to_get(request: Request, call_next):
     """Answer HEAD on any GET route (uptime probes, curl -I, Render/Vercel).
 
     Starlette matches the method before the handler, so HEAD to a GET-only
-    route 405s. Rewrite to GET for routing, then strip the body and report
-    the GET content-length — same status + headers a GET would return.
+    route 405s. Rewrite to GET for routing, then return the same status +
+    headers with an empty body and content-length 0. (A GET-accurate length
+    with an empty body would be ideal, but uvicorn enforces
+    bytes-sent == content-length and 500s the response — so 0 it is.
+    Probes only ever check the status anyway.)
     HEAD to POST-only routes still 405s (correct: no GET exists there).
     Registered after log_requests so it runs outermost; the logger then
     sees (and quiets) the rewritten GET like any other poll.
@@ -138,18 +141,17 @@ async def head_to_get(request: Request, call_next):
     request.scope["method"] = "GET"
     response = await call_next(request)
 
-    body = b""
     try:
-        async for chunk in response.body_iterator:
-            if isinstance(chunk, str):
-                chunk = chunk.encode("utf-8")
-            body += chunk
+        # Drain the body iterator so serverless runtimes don't leak it;
+        # the bytes are discarded — HEAD must not carry a body.
+        async for _ in response.body_iterator:
+            pass
     except Exception:
         pass
 
     headers = dict(response.headers)
     headers.pop("content-length", None)
-    headers["content-length"] = str(len(body))
+    headers["content-length"] = "0"
     return Response(content=b"", status_code=response.status_code, headers=headers)
 
 

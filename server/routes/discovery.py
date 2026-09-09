@@ -243,7 +243,7 @@ async def leaderboard(request: Request):
             # Unified points sort: play points (bngc_users column, all modes).
             # The ?ranked=true legacy path above keeps serving the ranked ledger.
             desc = order == "desc"
-            res = supabase.table("bngc_users").select("discord_id,discord_username,game_username,game_id,skin,kills,deaths,wins,defeats,playtime_global,play_points").order("play_points", desc=desc).range(offset, offset + limit - 1).execute()
+            res = supabase.table("bngc_users").select("discord_id,discord_username,game_username,game_id,skin,kills,deaths,wins,defeats,playtime_global,play_points,last_seen").order("play_points", desc=desc).range(offset, offset + limit - 1).execute()
             rows = res.data or []
             for r in rows:
                 kills = int(r.get("kills") or 0)
@@ -262,7 +262,7 @@ async def leaderboard(request: Request):
         if sort in ("kills", "deaths", "wins", "defeats", "playtime_global"):
             # supabase order: .order(col, desc=True/False)
             desc = order == "desc"
-            res = supabase.table("bngc_users").select("discord_id,discord_username,game_username,game_id,skin,kills,deaths,wins,defeats,playtime_global,play_points").order(sort, desc=desc).range(offset, offset + limit - 1).execute()
+            res = supabase.table("bngc_users").select("discord_id,discord_username,game_username,game_id,skin,kills,deaths,wins,defeats,playtime_global,play_points,last_seen").order(sort, desc=desc).range(offset, offset + limit - 1).execute()
             rows = res.data or []
             for r in rows:
                 kills = int(r.get("kills") or 0)
@@ -281,7 +281,7 @@ async def leaderboard(request: Request):
             # kd / win_rate — need to compute: fetch top 200 ordered by kills then sort
             # fetch a window larger than limit to get accurate ranking, then slice
             fetch_n = max(limit + offset, 200)
-            res = supabase.table("bngc_users").select("discord_id,discord_username,game_username,game_id,skin,kills,deaths,wins,defeats,playtime_global,play_points").limit(fetch_n).execute()
+            res = supabase.table("bngc_users").select("discord_id,discord_username,game_username,game_id,skin,kills,deaths,wins,defeats,playtime_global,play_points,last_seen").limit(fetch_n).execute()
             rows = res.data or []
             for r in rows:
                 kills = int(r.get("kills") or 0)
@@ -408,7 +408,7 @@ async def get_user(request: Request):
         return JSONResponse({"error": "Server not configured"}, status_code=500)
 
     try:
-        cols = "discord_id,discord_username,game_username,game_id,skin,pickaxe,kills,deaths,wins,defeats,playtime_global,playtime_per_gm"
+        cols = "discord_id,discord_username,game_username,game_id,skin,pickaxe,kills,deaths,wins,defeats,playtime_global,playtime_per_gm,last_seen"
         row = None
         for col, val in (("discord_id", discord_id), ("game_username", game_username), ("game_id", game_id)):
             if not val:
@@ -449,6 +449,7 @@ async def get_user(request: Request):
             "win_rate": round(wins / (wins + defeats), 3) if (wins + defeats) else 0,
             "playtime_global": int(row.get("playtime_global") or 0),
             "playtime_per_gm": per_gm or {},
+            "last_seen": row.get("last_seen"),
         })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)

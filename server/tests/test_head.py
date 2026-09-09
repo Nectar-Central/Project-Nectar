@@ -22,7 +22,9 @@ def test_head_health_mirrors_get():
     assert get.status_code == 200
     assert head.status_code == 200
     assert head.content == b""
-    assert head.headers.get("content-length") == str(len(get.content))
+    # Empty body with a matching zero length: uvicorn 500s anything else
+    # (bytes-sent must equal content-length — it can't tell HEAD from GET).
+    assert head.headers.get("content-length") == "0"
 
 
 def test_head_on_param_routes_routes_not_405():
@@ -32,6 +34,9 @@ def test_head_on_param_routes_routes_not_405():
         r = _request("HEAD", path)
         assert r.status_code != 405, path
         assert r.content == b""
+        # uvicorn 500s when body bytes != content-length (httpx doesn't
+        # check — this assertion is the regression net for that).
+        assert int(r.headers.get("content-length", "0")) == len(r.content), path
 
 
 def test_head_on_post_only_routes_stays_405():
