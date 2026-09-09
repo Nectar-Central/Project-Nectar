@@ -118,8 +118,10 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
         hex_str = rec.get("rawHex") or ""
         if not hex_str:
             continue
-        # engine.feed does decrypt + update SessionView for this session_id
-        pkt = engine.feed(auth_session_id or "anon", hex_str)
+        # engine.feed does decrypt + update SessionView for this session_id.
+        # Direction ("out" = own client) powers identity healing: an outbound
+        # killfeed echo adopts view.me when joins never carried a username.
+        pkt = engine.feed(auth_session_id or "anon", hex_str, rec.get("dir"))
         # Attach seq/dir/timestamp from record + full decrypted gpb (same field names as server/logs/*.decrypted.json)
         d = pkt.to_dict() if hasattr(pkt, "to_dict") else {}
         d["seq"] = rec.get("seq")

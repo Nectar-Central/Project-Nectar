@@ -71,6 +71,50 @@ def _names_equal(a, b) -> bool:
     return na and nb and na == nb   # Both non-empty and exact match (case-sensitive)
 
 
+def _is_self(room, view, user, name) -> bool:
+    """Is this killfeed name the session owner? Name match OR stable game-ID.
+
+    Names alone misfire for some players (killfeed casing/tags drift from the
+    join-time username, or view.me never resolved) — while playtime, which is
+    session-scoped, keeps counting. The pfid game_id is stable per account:
+    when the name doesn't match, resolve it through the room roster and
+    compare against the user's game_id. Name match stays first (free, no
+    roster scan). Never raises.
+    """
+    try:
+        if not name:
+            return False
+        me_name = None
+        try:
+            me_name = (view.me.username if view and view.me else None) or (
+                user.get("game_username") if isinstance(user, dict) else None)
+        except Exception:
+            me_name = None
+        if me_name and _names_equal(name, me_name):
+            return True
+        try:
+            ugid = str((user.get("game_id") if isinstance(user, dict) else None) or "").strip()
+        except Exception:
+            ugid = ""
+        if not ugid or room is None:
+            return False
+        try:
+            players = getattr(room, "players", None) or {}
+        except Exception:
+            return False
+        for p in players.values():
+            try:
+                if not getattr(p, "username", None) or not _names_equal(getattr(p, "username"), name):
+                    continue
+                if str(getattr(p, "game_id", "") or "").strip() == ugid:
+                    return True
+            except Exception:
+                continue
+        return False
+    except Exception:
+        return False
+
+
 def _extract_fields(pkt):
     """Extract common fields from packet (dict or Engine object).
     Returns a tuple of 12 fields used throughout the processor.
@@ -1087,6 +1131,53 @@ async def process_batch(
     except Exception as exc:
         log_err(f"processor sync user failed {exc}")
 
+    # Identity fallback: when view.me never resolved (join props arrived
+    # without 255/skid, or under a drifting name), the block above syncs
+    # nothing — skins/pickaxe/game_id freeze while playtime still counts.
+    # Scan room rosters for a self row (name OR stable game_id) carrying
+    # fresher fields and adopt them. Never overwrites with blanks.
+    try:
+        need_skin = not user.get("skin")
+        need_pick = not user.get("pickaxe")
+        need_gid = not user.get("game_id")
+        if need_skin or need_pick or need_gid:
+            me_row = None
+            try:
+                _rooms = list((view.rooms or {}).values())
+            except Exception:
+                _rooms = []
+            for _r in _rooms:
+                try:
+                    _ps = getattr(_r, "players", None) or {}
+                except Exception:
+                    continue
+                for _p in _ps.values():
+                    try:
+                        if _is_self(_r, view, user, getattr(_p, "username", None)):
+                            me_row = _p
+                            break
+                    except Exception:
+                        continue
+                if me_row is not None:
+                    break
+            if me_row is not None:
+                _adopted = {}
+                try:
+                    if need_skin and getattr(me_row, "skin", None) and me_row.skin != user.get("skin"):
+                        _adopted["skin"] = me_row.skin
+                    if need_pick and getattr(me_row, "pickaxe", None) and me_row.pickaxe != user.get("pickaxe"):
+                        _adopted["pickaxe"] = me_row.pickaxe
+                    if need_gid and getattr(me_row, "game_id", None):
+                        _adopted["game_id"] = me_row.game_id
+                except Exception:
+                    pass
+                if _adopted:
+                    pending_user_updates.update(_adopted)
+                    user.update(_adopted)
+                    log_sys(f"PROCESSOR sync user {discord_id[:6]} adopted from roster {sorted(_adopted)}")
+    except Exception as exc:
+        log_err(f"processor roster-adopt failed {exc}")
+
     # -------------------------------------------------------------------
     # Per-packet processing — iterate each packet in the batch
     # -------------------------------------------------------------------
@@ -1147,7 +1238,26 @@ async def process_batch(
                 # Self-specific kill: increment kills + queue kill event.
                 # Kills only (kf_type == killed): a knock is not an elimination —
                 # counting it doubled every knock-then-finish.
-                if not skip_kf and not _me_hosting_only and kf_type == "killed" and me_name and _names_equal(instigator, me_name):  # I am the killer
+                # Identity via _is_self (name OR stable game_id): some clients'
+                # killfeed names drift from the join-time username (casing/tags)
+                # or view.me never resolved — playtime still counted while
+                # kills silently missed. The gid path heals exactly that.
+                _self_kill = (not skip_kf and not _me_hosting_only and kf_type == "killed"
+                              and _is_self(_kf_room, view, user, instigator))
+                # Diagnostic for the null-identity class of bug (game_username
+                # null, view.me None): valid kill, nobody credited. Once per
+                # session so a broken client doesn't spam the log.
+                if (kf_type == "killed" and not skip_kf and not _self_kill
+                        and not _me_hosting_only and instigator and instigated
+                        and view.me is None and not me_name
+                        and not getattr(view, "_no_me_kill_logged", False)):
+                    try:
+                        view._no_me_kill_logged = True
+                    except Exception:
+                        pass
+                    log_sys(f"PROCESSOR no-me kill unattributed killer={instigator} victim={instigated} "
+                            f"gm={eff_gm} room={str(pkt_room_id or '')[:8]} — identity unresolved (check /api/stats identity)")
+                if _self_kill:  # I am the killer
                     old_kills = user.get("kills", 0)  # Pre-increment value for the log
                     new_kills = _bump_user(user, dirty, "kills")  # Queued for batch-end flush
                     _bump_user(user, dirty, "play_points", PLAY_KILL)  # Play points: +per kill
@@ -1178,7 +1288,7 @@ async def process_batch(
 
                 # Self-specific knock: play points only (a knock is not an
                 # elimination — the finishing kill pays separately on top).
-                elif not skip_kf and not _me_hosting_only and kf_type == "knocked" and me_name and _names_equal(instigator, me_name):  # I am the knocker
+                elif not skip_kf and not _me_hosting_only and kf_type == "knocked" and _is_self(_kf_room, view, user, instigator):  # I am the knocker
                     _bump_user(user, dirty, "play_points", PLAY_KNOCK)  # Queued for batch-end flush
                     _buf_event(ev_rows, discord_id, session_id, "knock",
                                {"gm": eff_gm, "victim": instigated, "room_id": pkt_room_id,
@@ -1188,7 +1298,7 @@ async def process_batch(
                 # Self-specific death: increment deaths + write death event (one per life).
                 # Kills only: being knocked is not death (revive possible) — the
                 # finishing "killed" feed or alv=false counts it.
-                elif not skip_kf and not _me_hosting_only and kf_type == "killed" and me_name and _names_equal(instigated, me_name):  # I am the victim
+                elif not skip_kf and not _me_hosting_only and kf_type == "killed" and _is_self(_kf_room, view, user, instigated):  # I am the victim
                     # Dedup key: prevent double-counting from killfeed + alv
                     dedup_key = (discord_id, pkt_match_ver if pkt_match_ver is not None else pkt_room_id)
                     if dedup_key not in death_counted_for_match:  # Not yet counted
@@ -1276,7 +1386,7 @@ async def process_batch(
 
                     # Check if this alv packet indicates death
                     is_dead_alv = (alv_is_alive is False) or bool(alv_is_elim)
-                    if is_dead_alv and not _me_hosting_only and me_name and alv_player and _names_equal(alv_player, me_name):  # I died
+                    if is_dead_alv and not _me_hosting_only and alv_player and _is_self(_get_room(pkt_room_id, view), view, user, alv_player):  # I died
                         dedup_key_alv = (discord_id, pkt_match_ver if pkt_match_ver is not None else pkt_room_id)
                         if dedup_key_alv not in death_counted_for_match:  # Not yet counted
                             room_alv = _get_room(pkt_room_id, view)  # Resolve room
