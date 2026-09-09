@@ -902,12 +902,14 @@
   // (DevTools, reload, tabs) before page JS ever sees them, so Ctrl+Shift
   // letter defaults silently never fire. Alt+Shift reaches the page.
   // Stored binds win over defaults — existing users keep what they set.
-  // Defaults are single F-keys (one press, no combos): kid-simple on
-  // Windows AND Mac, and they dodge the Alt+Shift layout-switch trap plus
+  // Defaults are single keys (one press, no combos): panels on F2/F4/F9,
+  // this menu on Backquote — kid-simple on Windows AND Mac (60% boards have
+  // Backquote but no F-keys), dodging the Alt+Shift layout-switch trap plus
   // every Ctrl+Shift browser reservation. Stored binds always win, so
   // changing defaults only affects fresh installs. F1/F3/F5/F11/F12 stay
   // off-limits (browser takes them — see bindWarning).
   const BNC_BINDS=[
+    {id:'keys', label:'Shortcuts menu', key:'bnc_bind_keys', dev:false, def:{ctrl:false,shift:false,alt:false,meta:false,key:'`'}, run:()=>toggleKeybinds()},
     {id:'collect', label:'Collect toggle', key:'bnc_bind_collect', dev:false, def:{ctrl:false,shift:true,alt:true,meta:false,key:'C'}, run:()=>toggleCollectMode()},
     {id:'save', label:'Save collected', key:'bnc_bind_save', dev:false, def:{ctrl:false,shift:true,alt:true,meta:false,key:'S'}, run:()=>downloadCollected()},
     {id:'load', label:'Load file', key:'bnc_bind_load', dev:false, def:{ctrl:false,shift:true,alt:true,meta:false,key:'L'}, run:()=>{ try{ document.getElementById('bnc-file-input')?.click(); }catch{} }},
@@ -1311,9 +1313,31 @@
     }
     return null;
   }
+  // Typing guard: hotkeys must never fire from a text field (game chat, our
+  // search/chat boxes, token prompt). The login modal has its own check;
+  // this covers everything else, including our own panels.
+  function isTypingKey(){
+    try{
+      const ae=document.activeElement;
+      if(!ae) return false;
+      if(ae.tagName==='INPUT'||ae.tagName==='TEXTAREA'||ae.isContentEditable) return true;
+      if(ae.closest && ae.closest('#bnc-lb-card,#bnc-drawer,#bnc-ranked,#bnc-keys')) return true;
+      return false;
+    }catch{ return false; }
+  }
+  // Watchdog: a stranded capture flag used to kill ALL hotkeys at once.
+  function releaseStuckCapture(){
+    try{
+      if(_keybindCapturing && Date.now()-_keybindCaptureAt>10000){
+        _keybindCapturing=false;
+        try{ logErr('[KEYS] capture stuck >10s, released'); }catch{}
+      }
+    }catch{}
+  }
   document.addEventListener('keydown', (e)=>{
     if(_keybindCapturing) return;
-    if (isModalOrInputFocused()) return;
+    try{ releaseStuckCapture(); }catch{}
+    if (isModalOrInputFocused() || isTypingKey()) return;
     const b=matchBind(e);
     if(b){ e.preventDefault(); e.stopPropagation(); try{ b.run(); }catch(err){ try{ logErr(`[KEYS] bind ${b.id} failed ${err && err.message}`); }catch{} } }
   }, true);
@@ -1500,6 +1524,7 @@
     return bindMatches(e, getDrawerKeybind());
   }
   let _keybindCapturing=false;
+  let _keybindCaptureAt=0; // watchdog timestamp: a stranded capture used to kill every hotkey at once
   let apiOnline=false;
 
   let infoPanel=null, infoUpdateTimer=null, statsCache=null, statsPollTimer=null, drawerBackdrop=null;
@@ -1888,9 +1913,13 @@
     // Room tag (host-set via /scrim /tourney): most specific status wins over
     // party text, but never over a live ranked block. Tourney shows its name,
     // scrims show the mode (same convention as the friends presence line).
+    // Stale stats must not freeze a tag on screen: hide it when the last
+    // successful poll is older than 2 minutes (fail-open when unknown).
     try{
       const _sessTag = sess && sess.tag;
-      if(_sessTag && (_sessTag.kind==='tourney' || _sessTag.kind==='scrim') && stateLabel==='In Match' && !_ranked){
+      let _tagFresh = true;
+      try{ if(_lastStatsAt) _tagFresh = (Date.now()-_lastStatsAt)<=120000; }catch{}
+      if(_tagFresh && _sessTag && (_sessTag.kind==='tourney' || _sessTag.kind==='scrim') && stateLabel==='In Match' && !_ranked){
         const _tn = String(_sessTag.name||'').replace(/</g,'&lt;');
         stateGmLine = _sessTag.kind==='tourney'
           ? `In Tourney - ${_tn||'Tournament'}`
@@ -2098,6 +2127,7 @@
       kbBtn.onclick=()=>{
         if(_keybindCapturing) return;
         _keybindCapturing=true;
+        try{ _keybindCaptureAt=Date.now(); }catch{}
         kbBtn.textContent='Press new keybind…';
         if(kbHint) kbHint.textContent='Press any combo (e.g. Ctrl+Shift+K, or Cmd+Shift+K on Mac). Esc to cancel.';
         const handler=(e)=>{
@@ -2731,11 +2761,46 @@
       try{ e.stopPropagation(); }catch{}
       try{ el.focus(); }catch{}
       try{ setTimeout(()=>{ try{ if(document.activeElement!==el) el.focus(); }catch{} }, 0); }catch{}
+      try{ untrapHold(el); }catch{}
     };
     try{
       el.addEventListener('mousedown', grab, true);
       el.addEventListener('click', grab, true);
     }catch{}
+  }
+  // Focus hold: shooter pages steal focus back to their canvas after every
+  // click (no cursor ever blinks). After an explicit engage, re-assert focus
+  // on a 250ms tick while the panel context is still valid. Releases on:
+  // legit in-panel navigation, Escape, tab switch, panel close, 60s timeout.
+  // One console line per engage for remote diagnosis. Never throws.
+  let _untrapHoldEl=null, _untrapHoldUntil=0, _untrapHoldTimer=null, _untrapHoldLogged=false;
+  function untrapHold(el){
+    try{
+      _untrapHoldEl=el; _untrapHoldUntil=Date.now()+60000; _untrapHoldLogged=false;
+      try{ logInfo(`[INPUT] hold engage id=${el.id||'?'} active=${document.activeElement===el}`); }catch{}
+      if(_untrapHoldTimer) return;
+      _untrapHoldTimer=setInterval(()=>{
+        try{
+          const el2=_untrapHoldEl;
+          if(!el2 || Date.now()>_untrapHoldUntil){ _untrapHoldEl=null; return; }
+          // context still valid? friends tab open with this input in DOM
+          if(!document.contains(el2)){ _untrapHoldEl=null; return; }
+          if(lbTab!=='friends' || !lbPanel || lbPanel.style.display==='none'){ _untrapHoldEl=null; return; }
+          if(document.activeElement===el2) return;
+          // legit navigation inside the panel releases (don't trap the user)
+          const ae=document.activeElement;
+          if(ae && ae!==document.body && lbPanel.contains(ae)){ _untrapHoldEl=null; return; }
+          try{ el2.focus(); }catch{}
+          if(!_untrapHoldLogged){
+            _untrapHoldLogged=true;
+            try{ logInfo(`[INPUT] hold re-assert id=${el2.id||'?'}`); }catch{}
+          }
+        }catch{}
+      }, 250);
+    }catch{}
+  }
+  function untrapRelease(){
+    try{ _untrapHoldEl=null; _untrapHoldUntil=0; }catch{}
   }
   // Plain JSON POST (no session tokens — friends/party API is discord_id-keyed).
   function apiPostJson(path, body, cb){
@@ -2793,14 +2858,23 @@
     Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483646', background:'rgba(0,0,0,0.64)', display:'none', opacity:'0', transition:'opacity 180ms ease-out', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif'});
     ov.innerHTML=`<div id="bnc-lb-card" style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:14px;width:700px;max-width:94vw;height:500px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden"><div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.08)"><div><b style="font-size:16px;color:#fff">Leaderboard</b><div id="bnc-lb-sub" style="font-size:11px;color:#9ca3af;margin-top:2px">All players</div></div><button id="bnc-lb-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px">Close</button></div><div style="display:flex;gap:8px;padding:12px 18px 0 18px"><button id="bnc-lb-tab-board" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Leaderboard</button><button id="bnc-lb-tab-ins" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Insights</button><button id="bnc-lb-tab-fr" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Friends</button></div><div id="bnc-lb-sorts" style="display:flex;gap:8px;padding:12px 18px 0 18px;flex-wrap:wrap"></div><div id="bnc-lb-body" style="flex:1;overflow:auto;padding:16px 18px"></div><div id="bnc-lb-foot" style="display:flex;justify-content:space-between;align-items:center;padding:10px 18px;border-top:1px solid rgba(255,255,255,0.08)"><button id="bnc-lb-prev" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px">‹ Prev</button><span id="bnc-lb-page" style="font-size:11px;color:#9ca3af"></span><button id="bnc-lb-next" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px">Next ›</button></div></div>`;
     (document.body||document.documentElement).appendChild(ov);
+    // visible focus ring on panel text inputs (proves focus landed)
+    try{
+      if(!document.getElementById('bnc-lb-input-style')){
+        const st=document.createElement('style');
+        st.id='bnc-lb-input-style';
+        st.textContent='#bnc-fr-q:focus,#bnc-chat-in:focus{outline:2px solid #fff !important;border-color:#fff !important;}';
+        (document.head||document.documentElement).appendChild(st);
+      }
+    }catch{}
     // non-passthrough: game must not see clicks/wheel/keys inside the panel
     const card=ov.querySelector('#bnc-lb-card');
     ['mousedown','click','keydown'].forEach(ev=> card.addEventListener(ev, e=> e.stopPropagation()));
     card.addEventListener('wheel', e=> e.stopPropagation(), {passive:false});
     ov.addEventListener('click', (e)=>{ if(e.target===ov) toggleLbPanel(false); });
     ov.querySelector('#bnc-lb-close').onclick=()=> toggleLbPanel(false);
-    ov.querySelector('#bnc-lb-tab-board').onclick=()=>{ lbTab='board'; lbProfile=null; try{ stopLbChat(); }catch{} renderLbPanel(); };
-    ov.querySelector('#bnc-lb-tab-ins').onclick=()=>{ lbTab='insights'; try{ stopLbChat(); }catch{} renderLbPanel(); fetchLbIns(); };
+    ov.querySelector('#bnc-lb-tab-board').onclick=()=>{ lbTab='board'; lbProfile=null; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); };
+    ov.querySelector('#bnc-lb-tab-ins').onclick=()=>{ lbTab='insights'; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); fetchLbIns(); };
     ov.querySelector('#bnc-lb-tab-fr').onclick=()=>{ lbTab='friends'; renderLbPanel(); fetchLbFriends(); };
     ov.querySelector('#bnc-lb-prev').onclick=()=>{ if(lbOffset>0){ lbOffset=Math.max(0, lbOffset-LB_LIMIT); fetchLb(); } };
     ov.querySelector('#bnc-lb-next').onclick=()=>{ lbOffset+=LB_LIMIT; fetchLb(); };
@@ -2818,6 +2892,7 @@
     } else {
       try{ lbPanel.style.opacity='0'; }catch{}
       try{ stopLbChat(); }catch{}
+      try{ untrapRelease(); }catch{}
       _lbFadeT=setTimeout(()=>{ try{ lbPanel.style.display='none'; }catch{} }, 180);
     }
   }
@@ -3107,6 +3182,21 @@
       html+=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">OUTGOING REQUESTS (${outg.length})</div>`;
       outg.forEach(f=>{ html+=row(esc(nm(f)), 'Waiting for answer', btn('can:'+f.discord_id,'Cancel',true,'Withdraw this request')); });
     }
+    // nearby: people in the current room, no typing needed (Chat/Add inline).
+    // Built from the already-fetched players cache; states upgrade below.
+    try{
+      const _near=((playersCache&&playersCache.players)||[]).filter(p=>
+        p && p.in_db && p.discord_id && !p.is_self && String(p.discord_id)!==String(did));
+      if(_near.length){
+        html+=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">NEARBY — IN YOUR ROOM (${_near.length})</div>`;
+        _near.slice(0,12).forEach(p=>{
+          const label=p.discord_username || p.username || String(p.discord_id).slice(0,6);
+          html+=row(esc(label), p.game_username&&p.discord_username?p.game_username:null,
+            `<button data-chat="${esc(String(p.discord_id))}" title="Chat" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:4px 10px;cursor:pointer;font-size:11px;font-weight:700;white-space:nowrap">Chat</button>`
+            +`<button data-addfr="${esc(String(p.discord_id))}" data-add-label="Add" style="background:#fff;color:#000;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:11px;font-weight:700;white-space:nowrap">Add</button>`);
+        });
+      }
+    }catch{}
     // add by search
     html+=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">ADD FRIEND</div>
       <div style="display:flex;gap:6px;padding:0 12px"><input id="bnc-fr-q" placeholder="Discord or game name…" value="" style="flex:1;background:#1f2937;border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:7px 10px;color:#e5e7eb;font-size:12px;outline:none;min-width:0"><button id="bnc-fr-go" style="background:#fff;color:#000;border:0;border-radius:8px;padding:7px 14px;cursor:pointer;font-size:12px;font-weight:800">Search</button></div>
@@ -3128,13 +3218,11 @@
           const label=u.discord_username || u.game_username || String(u.discord_id||'').slice(0,6);
           const sub2=u.game_username&&u.discord_username?u.game_username:(u.game_id||null);
           const mine=String(u.discord_id)===String(did);
-          return row(esc(label), sub2, mine?`<span style="font-size:11px;color:#6b7280">you</span>`:`<button data-req="${i}" data-addfr="${esc(String(u.discord_id||''))}" style="background:#fff;color:#000;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:11px;font-weight:700;white-space:nowrap">Request</button>`);
+          return row(esc(label), sub2, mine?`<span style="font-size:11px;color:#6b7280">you</span>`:`<button data-addfr="${esc(String(u.discord_id||''))}" data-add-label="Request" style="background:#fff;color:#000;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:11px;font-weight:700;white-space:nowrap">Request</button>`);
         }).join('') : `<div style="font-size:12px;color:#9ca3af;padding:4px 12px">No players found.</div>`;
-        bx.querySelectorAll('button[data-req]').forEach(b=>{
+        bx.querySelectorAll('button[data-addfr]').forEach(b=>{
           b.onclick=()=>{
-            const u=lbSearch[Number(b.dataset.req)];
-            if(!u) return;
-            sendFriendRequest(did, String(u.discord_id||''), b, 'Request');
+            sendFriendRequest(did, String(b.dataset.addfr||''), b, b.getAttribute('data-add-label')||'Add');
           };
         });
         try{ upgradeFriendButtons(bx); }catch{}
@@ -3170,6 +3258,12 @@
         lbChat=[]; fetchLbChat(); startLbChatPoll();
       };
     });
+    body.querySelectorAll('button[data-addfr]').forEach(b=>{
+      b.onclick=()=>{
+        sendFriendRequest(did, String(b.dataset.addfr||''), b, b.getAttribute('data-add-label')||'Add');
+      };
+    });
+    try{ upgradeFriendButtons(body); }catch{}
   }
   function renderLbChatView(body, esc){
     const sub=document.getElementById('bnc-lb-sub');
@@ -3341,7 +3435,7 @@
     const ov=document.createElement('div');
     ov.id='bnc-keys';
     Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483646', background:'rgba(0,0,0,0.54)', display:'none', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif'});
-    ov.innerHTML = `<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:20px;min-width:360px;max-width:520px;color:#e5e7eb"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><b style="font-size:15px;color:#fff">BuildNow Companion - Shortcuts & Settings</b><button id="bnc-keys-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 8px;cursor:pointer">Close</button></div><div id="bnc-keys-list" style="display:flex;flex-direction:column;gap:6px;font-size:12px"></div><div style="display:flex;gap:8px;margin-top:12px"><button id="bnc-keys-open-drawer" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open player info</button><button id="bnc-keys-open-ranked" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open ranked panel</button><button id="bnc-keys-open-lb" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open leaderboard</button></div><div style="margin-top:8px;font-size:11px;color:#9ca3af"><code>Ctrl+Shift+K</code> - This menu (fixed)</div><div style="margin-top:10px;font-size:11px;opacity:0.7">Panels open with one key: <b>F2</b> player info · <b>F4</b> leaderboard · <b>F9</b> ranked. Mac: F-keys work as-is (on small MacBooks hold <b>Fn</b>). Combos with Ctrl/⌘ also work via Change.</div><div style="margin-top:10px"><button id="bnc-keys-reset" style="width:100%;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Reset all shortcuts to defaults</button></div><div id="bnc-dev-row" style="margin-top:14px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);font-size:11px;opacity:0.7">Settings: <label style="cursor:pointer"><input type="checkbox" id="bnc-dev-toggle"> Dev mode (feed)</label></div></div>`;
+    ov.innerHTML = `<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:20px;min-width:360px;max-width:520px;color:#e5e7eb"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><b style="font-size:15px;color:#fff">BuildNow Companion - Shortcuts & Settings</b><button id="bnc-keys-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 8px;cursor:pointer">Close</button></div><div id="bnc-keys-list" style="display:flex;flex-direction:column;gap:6px;font-size:12px"></div><div style="display:flex;gap:8px;margin-top:12px"><button id="bnc-keys-open-drawer" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open player info</button><button id="bnc-keys-open-ranked" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open ranked panel</button><button id="bnc-keys-open-lb" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open leaderboard</button></div><div style="margin-top:8px;font-size:11px;color:#9ca3af"><code>&#96;</code> - This menu (rebindable like any row; Ctrl+Shift+K still works)</div><div style="margin-top:10px;font-size:11px;opacity:0.7">Panels open with one key: <b>F2</b> player info · <b>F4</b> leaderboard · <b>F9</b> ranked. Mac: F-keys work as-is (on small MacBooks hold <b>Fn</b>). Combos with Ctrl/⌘ also work via Change.</div><div style="margin-top:10px"><button id="bnc-keys-reset" style="width:100%;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Reset all shortcuts to defaults</button></div><div id="bnc-dev-row" style="margin-top:14px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);font-size:11px;opacity:0.7">Settings: <label style="cursor:pointer"><input type="checkbox" id="bnc-dev-toggle"> Dev mode (feed)</label></div></div>`;
     (document.body||document.documentElement).appendChild(ov);
     ov.addEventListener('click', (e)=>{ if(e.target===ov) ov.style.display='none'; });
     ov.querySelector('#bnc-keys-close').onclick=()=> ov.style.display='none';
@@ -3392,6 +3486,7 @@
   function captureBind(b, btn){
     if(_keybindCapturing) return;
     _keybindCapturing=true;
+    try{ _keybindCaptureAt=Date.now(); }catch{}
     const orig=btn.textContent;
     btn.textContent='Press…';
     const hint=document.createElement('span');
@@ -3421,10 +3516,12 @@
   }
   function toggleKeybinds(){ if(!keybindOverlay) createKeybindOverlay(); const isHidden=keybindOverlay.style.display==='none' || !keybindOverlay.style.display; keybindOverlay.style.display = isHidden ? 'flex' : 'none'; if(isHidden){ try{ renderKeybindRows(); }catch{} try{ syncDevUI(); }catch{} } }
   // Hotkeys: drawer (customizable) + Ctrl+Shift+K keybinds (guard modal focus)
+  // + Backquote menu bind (guard typing). Stuck capture flag auto-releases.
   document.addEventListener('keydown', (e)=>{
     if(_keybindCapturing) return;
-    if (isModalOrInputFocused()) return;
-    if((e.key||'')==='Escape' && typeof lbPanel!=='undefined' && lbPanel && lbPanel.style.display!=='none' && lbPanel.style.display){ e.preventDefault(); toggleLbPanel(false); return; }
+    try{ releaseStuckCapture(); }catch{}
+    if (isModalOrInputFocused() || isTypingKey()) return;
+    if((e.key||'')==='Escape' && typeof lbPanel!=='undefined' && lbPanel && lbPanel.style.display!=='none' && lbPanel.style.display){ e.preventDefault(); try{ untrapRelease(); }catch{} toggleLbPanel(false); return; }
     if((e.key||'')==='Escape' && typeof rankedPanel!=='undefined' && rankedPanel && rankedPanel.style.display!=='none' && rankedPanel.style.display){ e.preventDefault(); toggleRankedPanel(false); return; }
     if(isDrawerKeybind(e)){ e.preventDefault(); e.stopPropagation(); toggleInfoPanel(); return; }
     if(isRankedKeybind(e)){ e.preventDefault(); e.stopPropagation(); toggleRankedPanel(); return; }

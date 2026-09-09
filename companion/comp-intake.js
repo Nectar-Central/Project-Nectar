@@ -1,0 +1,398 @@
+'use strict';
+
+/**
+ * Comp intake — host-side match recorder for tourneys/scrims.
+ *
+ * Consumes decoded packets ({rec, msg}, the exact shape updatePresenceFromPacket
+ * in decryptor.js receives) and banks matches into Supabase bngc_comp_* tables:
+ *
+ *   stG == 1  -> open a match (per room)
+ *   stG == 3  -> seal the open match (kills/knocks/alv/leaves included)
+ *   stG == 2  -> respawn time, ignored
+ *
+ * Roster: actorNr -> name from Join ev 255 (255/skid props) + ActorList seeds.
+ * Discord mapping: game_username -> discord_id via bngc_users at seal time;
+ * twin names (2+ actors, same name, unresolvable) stay null — never guess.
+ *
+ * Zero dependencies (global fetch for Supabase REST). Never throws into the
+ * caller: every entry point is wrapped. Pure logic (tracker + mapping +
+ * killfeed parse) is unit-tested via node --test (see comp-intake.test.js).
+ */
+
+const STG_START = 1;    // open match
+const STG_RESPAWN = 2;  // ignored
+const STG_END = 3;      // seal match
+
+const DEFAULT_POINTS = { kill: 1, win: 3, placement: [10, 7, 5, 3, 1] };
+
+function stripTags(s) {
+  try {
+    return String(s == null ? '' : s).replace(/<[^>]*>/g, '').trim();
+  } catch { return ''; }
+}
+
+function normName(n) {
+  const s = stripTags(n);
+  if (/^dc:/i.test(s)) return s.slice(3).trim();
+  return s;
+}
+
+// Minimal killfeed parse (mirrors decryptor.js parseKillfeedText contract):
+// "A killed B" / "A eliminated B" -> kill, "A knocked B" -> knock.
+function parseKillfeed(raw) {
+  const t = stripTags(raw);
+  if (!t) return { type: 'other', killer: null, victim: null };
+  let m = t.match(/^(.+?)\s+(killed|eliminated)\s+(.+)$/i);
+  if (m) return { type: 'kill', killer: m[1].trim(), victim: m[3].trim() };
+  m = t.match(/^(.+?)\s+knocked\s+(.+)$/i);
+  if (m) return { type: 'knock', killer: m[1].trim(), victim: m[2].trim() };
+  return { type: 'other', killer: null, victim: null };
+}
+
+function num(v) {
+  try {
+    const n = Number(v && typeof v === 'object' && 'value' in v ? v.value : v);
+    return Number.isFinite(n) ? n : null;
+  } catch { return null; }
+}
+
+function paramVal(params, key) {
+  try {
+    const p = (params || []).find((x) => x && x.keyName === key);
+    if (!p || !p.value) return undefined;
+    return p.value && typeof p.value === 'object' && 'value' in p.value ? p.value.value : p.value;
+  } catch { return undefined; }
+}
+
+// ---------------------------------------------------------------------------
+// Tracker (pure except sink calls, which are fire-and-forget safe)
+// ---------------------------------------------------------------------------
+
+function createTracker(opts) {
+  opts = opts || {};
+  const sink = opts.sink || null;
+  const log = opts.log || (() => {});
+  const st = {
+    tourneyId: opts.tourneyId != null ? opts.tourneyId : null,
+    room: null,
+    roster: new Map(), // actorNr -> {name}
+    openMatch: null,   // {version, room, openedAt, events[]}
+    nextVersion: 0,
+    sealed: 0,
+    dropped: 0,
+    pending: [],       // sealed matches waiting for a tourney id (cap)
+  };
+
+  function rosterName(nr) {
+    try {
+      const e = st.roster.get(Number(nr));
+      return e ? e.name : null;
+    } catch { return null; }
+  }
+
+  function ensureActor(nr, name) {
+    try {
+      nr = Number(nr);
+      if (!Number.isFinite(nr)) return;
+      const cur = st.roster.get(nr);
+      if (!cur) st.roster.set(nr, { name: name || `Player ${nr}` });
+      else if (name && cur.name.startsWith('Player ')) cur.name = name;
+      else if (name && !cur.name) cur.name = name;
+    } catch {}
+  }
+
+  function setRoom(room) {
+    try {
+      room = room ? String(room) : null;
+      if (room && room !== st.room) {
+        st.room = room;
+        st.roster = new Map();
+        log(`comp room -> ${room.slice(0, 8)}`);
+      }
+    } catch {}
+  }
+
+  function openMatch(manual) {
+    try {
+      if (st.openMatch) return st.openMatch;
+      st.openMatch = {
+        version: st.nextVersion,
+        room: st.room,
+        manual: !!manual,
+        openedAt: new Date().toISOString(),
+        events: [],
+      };
+      log(`comp match v${st.openMatch.version} OPEN${manual ? ' (manual)' : ''} room=${(st.room || '?').slice(0, 8)}`);
+      return st.openMatch;
+    } catch { return null; }
+  }
+
+  function pushEvent(etype, fields) {
+    try {
+      if (!st.openMatch) return;
+      st.openMatch.events.push(Object.assign({ etype, t: new Date().toISOString() }, fields || {}));
+    } catch {}
+  }
+
+  async function sealMatch(manual) {
+    let m = null;
+    try {
+      m = st.openMatch;
+      st.openMatch = null;
+      if (!m) return null;
+      st.nextVersion = Math.max(st.nextVersion, m.version + 1);
+    } catch { return null; }
+    if (st.tourneyId == null) {
+      try {
+        st.pending.push(m);
+        if (st.pending.length > 50) st.pending.shift();
+        log(`comp match v${m.version} sealed, buffered (no tourney set)`);
+      } catch {}
+      return m;
+    }
+    try {
+      if (sink && typeof sink.saveMatch === 'function') {
+        await sink.saveMatch({
+          tourneyId: st.tourneyId,
+          version: m.version,
+          room: m.room,
+          manual: !!manual || !!m.manual,
+          events: m.events,
+        });
+        st.sealed++;
+      } else {
+        st.dropped++;
+      }
+    } catch (e) {
+      try { st.dropped++; log(`comp seal failed v${m.version}: ${e && e.message}`); } catch {}
+    }
+    return m;
+  }
+
+  function onStg(v) {
+    try {
+      const n = num(v);
+      if (n === STG_START) openMatch(false);
+      else if (n === STG_END && st.openMatch) void sealMatch(false);
+      // STG_RESPAWN (2) and everything else: ignored by design
+    } catch {}
+  }
+
+  function handle(rec, msg) {
+    try {
+      if (!msg) return;
+      // room tracking from create/join ops
+      if (msg.req && (msg.req.opName === 'CreateRoom' || msg.req.opName === 'JoinRoom' || msg.req.opName === 'JoinRandomRoom')) {
+        const rn = paramVal(msg.req.params, 'RoomName');
+        const code = rn && typeof rn === 'object' && 'value' in rn ? rn.value : rn;
+        if (code) setRoom(String(code));
+      }
+      if (msg.resp) {
+        const al = paramVal(msg.resp.params, 'ActorList');
+        const arr = al && al.value !== undefined ? al.value : al;
+        if (Array.isArray(arr)) arr.forEach((nr) => ensureActor(nr, null));
+      }
+      if (!msg.ev) return;
+      const code = msg.ev.evCode;
+      if (code === 255) { // Join
+        const actorNr = num(paramVal(msg.ev.params, 'ActorNr'));
+        const props = paramVal(msg.ev.params, 'Properties') || paramVal(msg.ev.params, 'PlayerProperties') || {};
+        const name = props ? stripTags(props['255'] && props['255'].value !== undefined ? props['255'].value : props['255']) : null;
+        if (actorNr != null) ensureActor(actorNr, name || null);
+      } else if (code === 254) { // Leave
+        const actorNr = num(paramVal(msg.ev.params, 'ActorNr'));
+        pushEvent('leave', { actorNr, actorName: actorNr != null ? rosterName(actorNr) : null });
+      } else if (code === 253) { // Properties: stG / alv / curScn...
+        const props = paramVal(msg.ev.params, 'Properties') || {};
+        if (props && typeof props === 'object') {
+          if ('stG' in props) onStg(props.stG && props.stG.value !== undefined ? props.stG.value : props.stG);
+          if ('alv' in props) {
+            const actorNr = num(paramVal(msg.ev.params, 'ActorNr')) ?? num(paramVal(msg.ev.params, 'TargetActorNr'));
+            const alive = props.alv && props.alv.value !== undefined ? !!props.alv.value : !!props.alv;
+            pushEvent('alv', { actorNr, actorName: actorNr != null ? rosterName(actorNr) : null, alive });
+          }
+        }
+      } else if (code === 101) { // Killfeed
+        let text = null;
+        for (const p of (msg.ev.params || [])) {
+          try {
+            const v = p && p.value && typeof p.value === 'object' && 'value' in p.value ? p.value.value : p && p.value;
+            if (typeof v === 'string' && v.trim()) { text = v; break; }
+          } catch {}
+        }
+        if (text) {
+          const kf = parseKillfeed(text);
+          if (kf.type === 'kill' || kf.type === 'knock') {
+            // resolve actor numbers by name for the record (best effort)
+            let actorNr = null;
+            try {
+              for (const [nr, e] of st.roster) {
+                if (normName(e.name) && normName(e.name) === normName(kf.killer)) { actorNr = nr; break; }
+              }
+            } catch {}
+            pushEvent(kf.type === 'kill' ? 'kill' : 'knock',
+              { actorNr, actorName: kf.killer, targetName: kf.victim });
+          }
+        }
+      }
+    } catch {}
+  }
+
+  async function setTourney(id) {
+    try {
+      st.tourneyId = id;
+      st.nextVersion = 0;
+      if (sink && typeof sink.nextVersion === 'function' && id != null) {
+        try { st.nextVersion = await sink.nextVersion(id); } catch {}
+      }
+      // flush buffered matches
+      const pend = st.pending.splice(0, st.pending.length);
+      for (const m of pend) {
+        try {
+          if (sink && typeof sink.saveMatch === 'function') {
+            await sink.saveMatch({ tourneyId: id, version: m.version, room: m.room, manual: !!m.manual, events: m.events });
+            st.sealed++;
+          }
+        } catch {}
+      }
+      return true;
+    } catch { return false; }
+  }
+
+  function status() {
+    try {
+      return {
+        tourneyId: st.tourneyId, room: st.room,
+        open: st.openMatch ? { version: st.openMatch.version, events: st.openMatch.events.length, manual: !!st.openMatch.manual } : null,
+        nextVersion: st.nextVersion, sealed: st.sealed, dropped: st.dropped,
+        buffered: st.pending.length, roster: st.roster.size,
+      };
+    } catch { return {}; }
+  }
+
+  return { handle, status, setTourney, openManual: () => openMatch(true), sealManual: () => sealMatch(true), _state: st };
+}
+
+// ---------------------------------------------------------------------------
+// Discord mapping (pure): game names -> discord_ids, twins fail closed
+// ---------------------------------------------------------------------------
+
+function mapNamesToDiscord(names, usersByGame) {
+  // usersByGame: {game_username: discord_id} (may hold several dids per name
+  // only if the caller passes arrays — duplicate accounts never auto-map).
+  const out = {};
+  try {
+    const seen = {};
+    for (const n of (names || [])) {
+      const k = normName(n);
+      if (!k) continue;
+      seen[k] = (seen[k] || 0) + 1;
+    }
+    for (const n of (names || [])) {
+      const k = normName(n);
+      if (!k || out[n] !== undefined) continue;
+      if ((seen[k] || 0) > 1) { out[n] = null; continue; } // twins: no guess
+      let did = null;
+      try {
+        for (const [g, d] of Object.entries(usersByGame || {})) {
+          if (normName(g) === k) {
+            if (Array.isArray(d)) { did = null; break; } // duplicate accounts
+            did = did === null ? d : (did === d ? d : null);
+            if (did === null && d !== did) break;
+          }
+        }
+      } catch { did = null; }
+      out[n] = did || null;
+    }
+  } catch {}
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Supabase REST sink (fetch only, zero-dep). Reads env lazily so tests and
+// the decryptor never need credentials at import time.
+// ---------------------------------------------------------------------------
+
+function sbEnv() {
+  try {
+    const url = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+    if (!url || !key) return null;
+    return { url, key };
+  } catch { return null; }
+}
+
+async function sbReq(method, path, body) {
+  const env = sbEnv();
+  if (!env) throw new Error('SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY missing');
+  const res = await fetch(`${env.url}/rest/v1${path}`, {
+    method,
+    headers: {
+      apikey: env.key,
+      Authorization: `Bearer ${env.key}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=representation',
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`supabase ${res.status} ${await res.text().catch(() => '')}`.slice(0, 200));
+  const txt = await res.text();
+  return txt ? JSON.parse(txt) : null;
+}
+
+function createSupabaseSink() {
+  return {
+    async nextVersion(tourneyId) {
+      try {
+        const rows = await sbReq('GET', `/bngc_comp_matches?select=version&tourney_id=eq.${encodeURIComponent(tourneyId)}&order=version.desc&limit=1`);
+        const top = rows && rows[0] ? Number(rows[0].version) : -1;
+        return Number.isFinite(top) ? top + 1 : 0;
+      } catch { return 0; }
+    },
+    async resolveNames(names) {
+      // batch game_username lookup (PostgREST in-list)
+      const uniq = [...new Set((names || []).map(normName).filter(Boolean))].slice(0, 100);
+      if (!uniq.length) return {};
+      const list = uniq.map((n) => `"${n.replace(/"/g, '')}"`).join(',');
+      const rows = await sbReq('GET', `/bngc_users?select=discord_id,game_username&game_username=in.(${encodeURIComponent(list)})`);
+      const byGame = {};
+      for (const r of (rows || [])) {
+        if (r && r.game_username && r.discord_id) byGame[r.game_username] = r.discord_id;
+      }
+      return mapNamesToDiscord(names, byGame);
+    },
+    async saveMatch({ tourneyId, version, room, manual, events }) {
+      const names = [];
+      for (const e of (events || [])) {
+        if (e.actorName) names.push(e.actorName);
+        if (e.targetName) names.push(e.targetName);
+      }
+      let mapping = {};
+      try { mapping = await this.resolveNames(names); } catch {}
+      const mrows = await sbReq('POST', '/bngc_comp_matches',
+        { tourney_id: tourneyId, version, room_id: room, status: manual ? 'manual' : 'sealed', sealed_at: new Date().toISOString() });
+      const mid = mrows && mrows[0] && mrows[0].id;
+      if (!mid) throw new Error('match insert returned no id');
+      const erows = (events || []).map((e) => ({
+        match_id: mid,
+        etype: e.etype,
+        actor_nr: e.actorNr != null ? e.actorNr : null,
+        actor_name: e.actorName || null,
+        target_name: e.targetName || null,
+        discord_id: (e.actorName && mapping[e.actorName]) || null,
+        alive: e.alive != null ? !!e.alive : null,
+      }));
+      // chunked insert (100/req)
+      for (let i = 0; i < erows.length; i += 100) {
+        await sbReq('POST', '/bngc_comp_events', erows.slice(i, i + 100));
+      }
+      return mid;
+    },
+  };
+}
+
+module.exports = {
+  STG_START, STG_RESPAWN, STG_END, DEFAULT_POINTS,
+  createTracker, mapNamesToDiscord, parseKillfeed, normName, stripTags,
+  createSupabaseSink, sbEnv,
+};
