@@ -446,6 +446,59 @@ class Engine:
         except Exception:
             return False
 
+    def _heal_ghost_room(self, view, session_id: str, now: float | None = None) -> bool:
+        """Park a silent MATCH room back to lobby. Unit-tested.
+
+        A MATCH exit normally needs auth or leave_self — but leave_self
+        requires resolving to me, so a null-identity session (or a missed
+        leave op) freezes the drawer, presence and room tag on a dead match
+        forever. A live match always has packet traffic well inside 90s
+        (zone timers, alv, killfeed), so a quieter MATCH room is gone:
+        mark it retired (room-less routing skips it from then on), point
+        current at the lobby pseudo-room, keep all history/seals/markers
+        for drains. Fresh packets for the room un-retire it. Returns True
+        when it healed. Never raises.
+        """
+        try:
+            import time as _t
+            now = float(now) if now is not None else _t.time()
+            rooms = getattr(view, "rooms", None) or {}
+            cur_id = getattr(view, "current_room_id", None)
+            cur = rooms.get(cur_id) if cur_id else None
+            if cur is None or getattr(cur, "room_id", "") == "lobby":
+                return False
+            try:
+                st = getattr(getattr(cur, "state", None), "value", getattr(cur, "state", ""))
+                is_match = str(st).lower() == "match"
+            except Exception:
+                is_match = False
+            if not is_match:
+                return False
+            try:
+                lp = float(getattr(cur, "last_packet_at", None) or 0)
+            except Exception:
+                lp = 0.0
+            if not lp or (now - lp) <= 90:
+                return False
+            try:
+                cur.retired = True
+            except Exception:
+                pass
+            try:
+                if "lobby" not in rooms:
+                    from .models import RoomView as _RV
+                    from datetime import datetime, timezone as _tz
+                    rooms["lobby"] = _RV(room_id="lobby", code=None,
+                                         created_at=datetime.now(_tz.utc).isoformat())
+                view.current_room_id = "lobby"
+            except Exception:
+                return False
+            log_engine("room", session_id[:13], action="ghost-healed",
+                       room=str(getattr(cur, "room_id", "?"))[:8], silent=int(now - lp))
+            return True
+        except Exception:
+            return False
+
     def feed(self, session_id: str, hex_string: str, direction: str | None = None) -> EnginePacket:
         """Feed one hex packet for a session — decrypts, updates SessionView/RoomView, returns EnginePacket.
 
@@ -499,7 +552,17 @@ class Engine:
                     view.rooms[room_id] = RoomView(room_id=room_id, code=room_id, created_at=datetime.now(timezone.utc).isoformat())
                     view.current_room_id = room_id
                     log_engine("room", session_id[:13], action="created", room=room_id[:8])
-                elif view.current_room_id != room_id:
+                else:
+                    # Fresh packets un-retire a ghost-healed room (false positive
+                    # heals self-correct the moment the room talks again).
+                    try:
+                        _ex = view.rooms[room_id]
+                        if getattr(_ex, "retired", False):
+                            _ex.retired = False
+                            log_engine("room", session_id[:13], action="unretired", room=room_id[:8])
+                    except Exception:
+                        pass
+                if view.current_room_id != room_id:
                     view.current_room_id = room_id
                     log_engine("room", session_id[:13], action="switched", room=room_id[:8])
                 return view.rooms[room_id]
@@ -509,9 +572,10 @@ class Engine:
             cur = view.rooms.get(view.current_room_id) if view.current_room_id else None
             if cur and cur.state == State.MATCH:
                 return cur
-            # prefer any MATCH room with a game_mode (in case current_room_id is stale lobby)
+            # prefer any MATCH room with a game_mode (in case current_room_id is stale lobby) —
+            # retired (ghost-healed) rooms are skipped until fresh packets un-retire them
             for rv in view.rooms.values():
-                if rv.state == State.MATCH and rv.game_mode:
+                if rv.state == State.MATCH and rv.game_mode and not getattr(rv, "retired", False):
                     view.current_room_id = rv.room_id
                     return rv
             if view.current_room_id and view.current_room_id in view.rooms:
@@ -550,6 +614,13 @@ class Engine:
             room = _ensure_room(room_name)
         else:
             room = _ensure_room(None)
+
+        # Ghost-room healer: silent MATCH rooms (missed self-leave, e.g.
+        # null identity) freeze drawer/presence/tag on a dead match.
+        try:
+            self._heal_ghost_room(view, session_id)
+        except Exception:
+            pass
 
         # Playtime tick — account elapsed since last packet (session + per-room)
         import time as _t

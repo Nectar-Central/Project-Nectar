@@ -361,6 +361,7 @@ class RoomView:
     created_at: str | None = None
     ranked_warnings: list = field(default_factory=list)  # non-roster usernames seen in a ranked room (exposed via /api/stats)
     last_packet_at: float | None = None              # engine feed timestamp (host freshness for ranked sealing)
+    retired: bool = False  # ghost-healed: silent MATCH room parked back to lobby; skipped by room-less routing until fresh packets un-retire it
     # zone bookend for zone modes (zw_lg/wwzw): first zone = start, second zone = win/defeat evaluation
     zone_match_active: bool = False
     last_zone_hex: str | None = None
@@ -435,6 +436,7 @@ class RoomView:
             "created_at": self.created_at,
             "ranked_warnings": list(self.ranked_warnings or []),
             "last_packet_at": self.last_packet_at,
+            "retired": bool(self.retired),
         }
 
     @classmethod
@@ -540,6 +542,10 @@ class RoomView:
                 pass
             try:
                 r.last_packet_at = float(d["last_packet_at"]) if d.get("last_packet_at") is not None else None
+            except Exception:
+                pass
+            try:
+                r.retired = bool(d.get("retired", False))
             except Exception:
                 pass
             return r

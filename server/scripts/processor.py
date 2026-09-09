@@ -100,8 +100,12 @@ def _is_self(room, view, user, name) -> bool:
     join-time username, or view.me never resolved) — while playtime, which is
     session-scoped, keeps counting. The pfid game_id is stable per account:
     when the name doesn't match, resolve it through the room roster and
-    compare against the user's game_id. Name match stays first (free, no
-    roster scan). Never raises.
+    compare against the user's game_id.
+
+    Twins rule (fail-closed): when 2+ roster entries share the normalized
+    name, a normalized-only match credits nobody — it could be either twin.
+    Exact raw matches and game_id-disambiguated matches still credit, so
+    legitimate self-hits are never dropped. Never raises.
     """
     try:
         if not name:
@@ -113,6 +117,17 @@ def _is_self(room, view, user, name) -> bool:
         except Exception:
             me_name = None
         if me_name and _names_equal(name, me_name):
+            try:
+                if str(name or "").strip() == str(me_name or "").strip():
+                    return True  # exact raw match: unambiguous
+            except Exception:
+                pass
+            if _twin_ambiguous(room, user, name):
+                try:
+                    log_dbg(f"PROCESSOR twin skip {name} (shared name, no gid)")
+                except Exception:
+                    pass
+                return False
             return True
         try:
             ugid = str((user.get("game_id") if isinstance(user, dict) else None) or "").strip()
@@ -133,6 +148,26 @@ def _is_self(room, view, user, name) -> bool:
             except Exception:
                 continue
         return False
+    except Exception:
+        return False
+
+
+def _twin_ambiguous(room, user, name) -> bool:
+    """True when 2+ roster entries share this normalized name and the user's
+    game_id doesn't single one out. Pure helper, unit-tested. Never raises."""
+    try:
+        players = getattr(room, "players", None) or {} if room is not None else {}
+        mates = [p for p in players.values()
+                 if getattr(p, "username", None) and _names_equal(getattr(p, "username"), name)]
+        if len(mates) < 2:
+            return False
+        try:
+            ugid = str((user.get("game_id") if isinstance(user, dict) else None) or "").strip()
+        except Exception:
+            ugid = ""
+        if ugid and any(str(getattr(p, "game_id", "") or "").strip() == ugid for p in mates):
+            return False
+        return True
     except Exception:
         return False
 
@@ -619,6 +654,17 @@ def _write_defeat(discord_id, session_id, user, gm, room_id, short_code, match_v
     """
     if room is not None and (room.last_win_version == match_ver or room.last_win_version > match_ver):
         log_sys(f"PROCESSOR DEFEAT skip win already recorded gm={gm}")  # Win stands
+        return user.get("defeats") or 0
+    # Cross-batch/worker: the in-memory marker above is lost on serverless
+    # restore, so a win sealed for this version on another pass would still
+    # let a stale defeat through. A personal win and defeat in one version
+    # are contradictory — the win stands, always. DB-checked (one query per
+    # defeat write at most; defeats are rare).
+    if _result_event_exists(session_id, "win", room_id, match_ver, buf):
+        log_sys(f"PROCESSOR DEFEAT skip sealed win exists gm={gm} room={str(room_id or '')[:8]} ver={match_ver}")
+        if room is not None:
+            room.last_win_version = match_ver  # heal marker so it isn't retried
+            room.had_self_defeat = True
         return user.get("defeats") or 0
     if _result_event_exists(session_id, "defeat", room_id, match_ver, buf):
         log_sys(f"PROCESSOR DEFEAT skip already recorded gm={gm} room={str(room_id or '')[:8]} ver={match_ver}")

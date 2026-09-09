@@ -26,6 +26,28 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
+// Comp intake (host tourneys): guarded require so the decryptor never breaks
+// when comp files are absent. Tracker owns stG match boundaries + event rows;
+// Supabase sink activates only with SUPABASE_URL/SERVICE_ROLE_KEY (+ optional
+// COMP_TOURNEY_ID to record immediately instead of buffering).
+let compTracker = null;
+let compHandle = null;
+try {
+  const comp = require('./comp-intake');
+  const useSink = !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY);
+  compTracker = comp.createTracker({
+    sink: useSink ? comp.createSupabaseSink() : null,
+    tourneyId: process.env.COMP_TOURNEY_ID != null && process.env.COMP_TOURNEY_ID !== ''
+      ? Number(process.env.COMP_TOURNEY_ID) : null,
+    log: (m) => { try { console.log(`[COMP] ${m}`); } catch {} },
+  });
+  compHandle = (rec, msg) => { try { compTracker.handle(rec, msg); } catch {} };
+  if (!useSink) console.log('[COMP] tracker on (no Supabase creds: matches buffer in memory, set COMP_TOURNEY_ID + creds to persist)');
+  else console.log('[COMP] tracker on (Supabase sink active)');
+} catch (e) {
+  console.log(`[COMP] disabled (${e && e.message})`);
+}
+
 // ---------------------------------------------------------------------------
 // ANSI — zero-dep, 24-bit, works in PowerShell + Windows Terminal
 // ---------------------------------------------------------------------------
@@ -955,6 +977,8 @@ function handleBatch(parsed, sock) {
     let msg = null;
     try { msg = parseMessage(hexToBytes(r.rawHex), warnings); } catch {}
     if (msg) updatePresenceFromPacket(r, msg);
+    // comp intake (host tourneys): same decoded feed, own try/catch inside
+    try { if (msg && compHandle) compHandle(r, msg); } catch {}
     logPacket(r);
     // attach decoded essential summary to record for file + for server mirror
     const dec = msg ? (msg.req ? { kind: msg.req.opName, code: msg.req.opCode } : msg.ev ? { kind: msg.ev.evName, code: msg.ev.evCode } : null) : null;
@@ -1032,7 +1056,13 @@ const server = http.createServer((req,res)=>{
     return;
   }
   if (req.method==='GET' && req.url==='/presence'){
-    sendJson(res,200,{ ok:true, presence, stats:{ totalIn, totalOut, totalDecoded, seenOps:Object.fromEntries(seenOps), seenEvs:Object.fromEntries(seenEvs) } });
+    sendJson(res,200,{ ok:true, presence, stats:{ totalIn, totalOut, totalDecoded, seenOps:Object.fromEntries(seenOps), seenEv:Object.fromEntries(seenEvs) } });
+    return;
+  }
+  if (req.method==='GET' && req.url==='/comp/status'){
+    let comp = { enabled: !!compTracker };
+    try { if (compTracker) comp = Object.assign(comp, compTracker.status()); } catch {}
+    sendJson(res,200,{ ok:true, comp });
     return;
   }
   if ((req.method==='POST' || req.method==='GET') && req.url==='/clear'){
