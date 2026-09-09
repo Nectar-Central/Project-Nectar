@@ -1461,6 +1461,17 @@
   const GM_NAMES_DRAWER = {zw_lg:'Late Game Zonewars', zw:'Zone Wars', wwzw:'Duo Wild West', ww:'Solo Wild West', WW:'Solo Wild West', bf:'Boxfights', BF:'Boxfights', bf2v2:'Boxfights 2v2', BF2V2:'Boxfights 2v2', va:'V-Arena', VA:'V-Arena', tdm_bvr:'Red Vs Blue', RVB:'Red Vs Blue', r_1v1:'Realistic 1v1', R_1V1:'Realistic 1v1', df:'Free Mode', DF:'Free Mode', lobby:'Lobby'};
   function fmtGmDrawer(raw, duo){ if(!raw) return '-'; const k=String(raw).trim(); let label = GM_NAMES_DRAWER[k] || GM_NAMES_DRAWER[k.toLowerCase()] || k.replace(/[_-]+/g,' ').replace(/\b\w/g,s=>s.toUpperCase()); if(duo && (k.toLowerCase()==='df' || k.toLowerCase()==='zw_lg') && !/^(solo|duo|\(duo\))/i.test(label)) label = '(Duo) ' + label; return label; }
   function fmtPlaytimeDrawer(s){ if(s==null) return '-'; s=Math.max(0,Math.floor(Number(s)||0)); const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), sec=s%60; if(h) return `${h}h ${m}m`; if(m) return `${m}m ${sec}s`; return `${sec}s`; }
+  function fmtLastSeen(iso){
+    try{
+      if(!iso) return '—';
+      const ms=new Date(String(iso)).getTime()-Date.now();
+      const age=Math.max(0, Math.round(-ms/1000));
+      if(age<300) return 'Online now';
+      if(age<3600) return `${Math.floor(age/60)}m ago`;
+      if(age<86400) return `${Math.floor(age/3600)}h ago`;
+      return `${Math.floor(age/86400)}d ago`;
+    }catch{ return '—'; }
+  }
   function skinUrlDrawer(id){ if(!id || id==='-' ) return null; return `https://buildnow-api.netlify.app/skins/${encodeURIComponent(String(id).trim())}.png`; }
   // team number -> diamond color (1 blue, 2 red, 3 green, 4 orange, 5 purple, 6 yellow, 7 cyan, 8 pink)
   function teamColorDrawer(pt){
@@ -1934,15 +1945,16 @@
           ${row('Playtime', pGlobal!=null? fmtPlaytimeDrawer(pGlobal):null)}
           ${perGmRow}
           ${rankPct!=null? `<div style="font-size:12px;color:#9ca3af;text-align:center;margin-top:2px">Better than <span style="color:#fff;font-weight:800">${rankPct}%</span> of players</div>`:''}`;
-    const _curRoomId = (sess && sess.current_room_id) || (sess && sess.rooms ? Object.keys(sess.rooms).slice(-1)[0] : null);
-    const _curRoomObj = (_curRoomId && sess && sess.rooms && sess.rooms[_curRoomId]) || _curRoom || null;
-    const _curRoomRid = (_curRoomObj && _curRoomObj.room_id) || (playersCache && playersCache.room_id) || 'lobby';
-    // Players tab visibility follows room lifecycle (Create/Join -> show, Leave -> hide),
-    // not match state: private/random lobbies have a real room before curScn flips to match.
-    // Self-leave prunes the room server-side -> current falls back to the lobby pseudo-room -> hidden.
+    // Players tab visibility follows room lifecycle (Create/Join -> show, Leave -> hide).
+    // /api/stats serves a FLAT session (room_id/state, no rooms map): a
+    // non-lobby room_id is a real room, lobby or match. Self-leave prunes
+    // the room server-side -> room_id falls back to lobby -> hidden.
     // Plus the instant local flag: server truth lags joins by seconds, so a
     // just-sent create/join op (or scene flip) shows the tab on the packet.
-    let hasRealRoom = !!_curRoomObj && String(_curRoomRid||'') !== 'lobby';
+    const _sessRoomId = (sess && sess.room_id) || null;
+    const _pcRoomId = (playersCache && playersCache.room_id) || null;
+    let hasRealRoom = (!!_sessRoomId && String(_sessRoomId)!=='lobby')
+      || (!!_pcRoomId && String(_pcRoomId)!=='lobby');
     try{ if(!hasRealRoom && localRoomActive()) hasRealRoom=true; }catch{}
     const isLobbyTab = !hasRealRoom;
     // No player list without a real room: clear stale roster when back to lobby pseudo-room
@@ -2027,22 +2039,17 @@
       }
     }
     body.innerHTML = tabBar + (drawerTab==='stats' ? statsHtml : `<div style="display:flex;flex-direction:column;align-items:center;width:100%;padding:8px 0">${playersHtml}</div>`);
-    // players-tab add-friend buttons (in-DB only; server dedups/409s repeats)
+    // players-tab add-friend buttons (in-DB only; server dedups/409s repeats).
+    // States upgrade after render: already friends -> Remove, pending -> Sent.
     try{
       body.querySelectorAll('button[data-addfr]').forEach(b=>{
         b.onclick=(e)=>{
           try{ if(e) e.stopPropagation(); }catch{}
-          const target=String(b.dataset.addfr||'');
           const me=(typeof myDiscordId==='function' ? myDiscordId() : null);
-          if(!target || !me) return;
-          b.disabled=true; b.textContent='…';
-          apiPostJson('/api/friends/request', {requester_discord_id:me, addressee_discord_id:target}, (j)=>{
-            if(j && (j.ok || (j.status&&j.status!=='pending'))){ b.textContent='Sent'; try{ showToast('Friend request sent', false); }catch{} }
-            else if(j && j.error && /already/i.test(j.error)){ b.textContent='Sent'; }
-            else { b.disabled=false; b.textContent='Add'; try{ showToast('Failed: '+(((j||{}).error)||'server error'), true); }catch{} }
-          });
+          sendFriendRequest(me, String(b.dataset.addfr||''), b, 'Add');
         };
       });
+      try{ upgradeFriendButtons(body); }catch{}
     }catch{}
     // tab handlers
     const tsBtn=document.getElementById('bnc-tab-stats');
@@ -2705,7 +2712,9 @@
   }
   // Text inputs inside game-page overlays: the game swallows keys otherwise
   // (character insertion dies even though clicks work). Capture-phase trap
-  // on the input itself + explicit focus + no-autocomplete. Never throws.
+  // on the input itself + forced focus + no-autocomplete. The focus call is
+  // deferred a tick: shooter games re-focus their canvas inside the same
+  // click, so focusing synchronously loses the race every time. Never throws.
   // Applied to every panel text field (friend search, chat). Does NOT affect
   // the global keybind dispatcher (that one ignores inputs already).
   function untrapInput(el){
@@ -2718,9 +2727,14 @@
     ['keydown','keyup','keypress'].forEach(ev=>{
       try{ el.addEventListener(ev, trap, true); }catch{}
     });
+    const grab=(e)=>{
+      try{ e.stopPropagation(); }catch{}
+      try{ el.focus(); }catch{}
+      try{ setTimeout(()=>{ try{ if(document.activeElement!==el) el.focus(); }catch{} }, 0); }catch{}
+    };
     try{
-      el.addEventListener('mousedown', (e)=>{ try{ e.stopPropagation(); }catch{} try{ el.focus(); }catch{} }, true);
-      el.addEventListener('click', (e)=>{ try{ e.stopPropagation(); }catch{} try{ el.focus(); }catch{} }, true);
+      el.addEventListener('mousedown', grab, true);
+      el.addEventListener('click', grab, true);
     }catch{}
   }
   // Plain JSON POST (no session tokens — friends/party API is discord_id-keyed).
@@ -2921,6 +2935,7 @@
     lbFriendsLoading=true; renderLbFriends();
     rankedApiGet(`/api/friends/list?discord_id=${encodeURIComponent(did)}`, (j)=>{
       lbFriends=(j && !j.error) ? j : null;
+      try{ _lbFriendsAt=Date.now(); }catch{}
       rankedApiGet(`/api/party/invites?discord_id=${encodeURIComponent(did)}`, (k)=>{
         lbInvites=(k && !k.error) ? k : null;
         rankedApiGet(`/api/friends/unread?discord_id=${encodeURIComponent(did)}`, (u)=>{
@@ -2961,7 +2976,67 @@
     apiPostJson(path, body, (j)=>{
       if(j && (j.ok || !j.error)){ try{ showToast(okMsg||'Done', false); }catch{} }
       else { try{ showToast('Failed: '+(((j||{}).error)||'server error'), true); }catch{} }
+      try{ _lbFriendsAt=0; }catch{} // friendship changed: refresh cache below
       fetchLbFriends();
+    });
+  }
+  let _lbFriendsAt=0;
+  // Cached friends list for Add/Remove/Sent button states (60s). Never throws.
+  function ensureLbFriendsCache(cb){
+    const done=(ok)=>{ try{ cb(ok); }catch{} };
+    try{
+      const did=myDiscordId();
+      if(!did){ done(false); return; }
+      if(lbFriends && Date.now()-_lbFriendsAt<60000){ done(true); return; }
+      rankedApiGet(`/api/friends/list?discord_id=${encodeURIComponent(did)}`, (j)=>{
+        if(j && !j.error){ lbFriends=j; _lbFriendsAt=Date.now(); done(true); }
+        else done(false);
+      });
+    }catch{ done(false); }
+  }
+  // Rewrites Add buttons by real relationship: already friends -> Remove,
+  // request pending -> Sent (disabled), else stays Add. Runs on players-tab
+  // rows, search results and the profile panel alike. Never throws.
+  function upgradeFriendButtons(root){
+    try{
+      const btns=(root||document).querySelectorAll
+        ? (root||document).querySelectorAll('button[data-addfr]') : [];
+      if(!btns.length) return;
+      ensureLbFriendsCache((ok)=>{
+        if(!ok || !lbFriends) return;
+        const isF=new Set(((lbFriends.friends)||[]).map(f=>String(f.discord_id)));
+        const isO=new Set(((lbFriends.outgoing)||[]).map(f=>String(f.discord_id)));
+        btns.forEach(b=>{
+          try{
+            if(!document.contains(b)) return;
+            const did=String(b.dataset.addfr||'');
+            if(isF.has(did)){ b.disabled=false; b.textContent='Remove'; b.dataset.friendOp='remove'; }
+            else if(isO.has(did)){ b.disabled=true; b.textContent='Sent'; delete b.dataset.friendOp; }
+          }catch{}
+        });
+      });
+    }catch{}
+  }
+  function sendFriendRequest(did, target, btn, addLabel){
+    if(!did || !target || !btn || btn.disabled) return;
+    if(btn.dataset.friendOp==='remove'){
+      btn.disabled=true;
+      apiPostJson('/api/friends/remove', {discord_id:did, friend_discord_id:target}, (j)=>{
+        btn.disabled=false;
+        if(j && (j.ok || !j.error)){
+          btn.textContent=addLabel||'Add'; delete btn.dataset.friendOp;
+          try{ _lbFriendsAt=0; }catch{}
+          try{ showToast('Friend removed', false); }catch{}
+        } else { try{ showToast('Failed: '+(((j||{}).error)||'server error'), true); }catch{} }
+      });
+      return;
+    }
+    btn.disabled=true; btn.textContent='…';
+    apiPostJson('/api/friends/request', {requester_discord_id:did, addressee_discord_id:target}, (j)=>{
+      if(j && (j.ok || (j.status&&j.status!=='pending'))){ btn.textContent='Sent'; try{ showToast('Friend request sent', false); }catch{} }
+      else if(j && j.error && /already/i.test(j.error)){ btn.textContent='Sent'; }
+      else { btn.disabled=false; btn.textContent=addLabel||'Add'; try{ showToast('Failed: '+(((j||{}).error)||'server error'), true); }catch{} }
+      try{ _lbFriendsAt=0; }catch{}
     });
   }
   function renderLbFriends(){
@@ -2992,7 +3067,9 @@
       const n=Number(unreadBy[String(did2)]||0);
       return n>0?`<span style="background:#ef4444;color:#fff;border-radius:999px;font-size:10px;font-weight:800;padding:1px 7px;margin-left:6px">${n}</span>`:'';
     };
-    const row=(name,sub2,controls)=>`<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 12px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;font-size:12px"><div style="min-width:0"><div style="color:#fff;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(name)}</div>${sub2?`<div style="color:#6b7280;font-size:11px">${esc(sub2)}</div>`:''}</div><div style="display:flex;gap:6px;flex-shrink:0;align-items:center">${controls}</div></div>`;
+    // row() takes pre-built SAFE html for the title (dot/badge markup) —
+    // escape dynamic text BEFORE composing (esc() here would print tags).
+    const row=(titleHtml,sub2,controls)=>`<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 12px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;font-size:12px"><div style="min-width:0"><div style="color:#fff;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${titleHtml}</div>${sub2?`<div style="color:#6b7280;font-size:11px">${esc(sub2)}</div>`:''}</div><div style="display:flex;gap:6px;flex-shrink:0;align-items:center">${controls}</div></div>`;
     const nm=(e)=> e.discord_username || e.game_username || String(e.discord_id||'').slice(0,6);
     let html=`<div style="display:flex;flex-direction:column;gap:6px">`;
     // incoming party invites first (join = copy code)
@@ -3001,7 +3078,7 @@
       html+=`<div style="font-size:11px;font-weight:800;color:#f59e0b;letter-spacing:.06em;padding:4px 12px 0">PARTY INVITES — TAP JOIN, THEN ENTER THE CODE IN-GAME</div>`;
       incoming.forEach((inv,i)=>{
         const from=inv.from_discord_username || inv.from_game_username || String(inv.from_discord_id||'').slice(0,6);
-        html+=row(`📨 ${from} → room ${inv.code||'?'}`, null, `<button data-join="${i}" style="background:#f59e0b;color:#000;border:0;border-radius:6px;padding:4px 12px;cursor:pointer;font-size:11px;font-weight:800;white-space:nowrap">Join</button>`);
+        html+=row(`📨 ${esc(from)} → room ${esc(inv.code||'?')}`, null, `<button data-join="${i}" style="background:#f59e0b;color:#000;border:0;border-radius:6px;padding:4px 12px;cursor:pointer;font-size:11px;font-weight:800;white-space:nowrap">Join</button>`);
       });
     }
     // friends + presence + invite/chat buttons
@@ -3013,7 +3090,7 @@
       const p=f.presence||{detail:'offline'};
       const dot=`<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${presDot(p.detail)};margin-right:6px" title="${esc(presText(f))}"></span>`;
       const sub2=[presText(f), (f.game_username&&f.discord_username)?f.game_username:null].filter(Boolean).join(' · ');
-      return row(dot+nm(f)+unreadBadge(f.discord_id), sub2,
+      return row(dot+esc(nm(f))+unreadBadge(f.discord_id), sub2,
         `<button data-chat="${esc(f.discord_id)}" title="Chat" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:4px 10px;cursor:pointer;font-size:11px;font-weight:700;white-space:nowrap">Chat</button>`
         +btn('inv:'+f.discord_id, 'Invite', !!code, code?`Invite to room ${code}`:'Hold a private room first (your pID shows here)'));
     }).join('')
@@ -3022,13 +3099,13 @@
     const reqs=(lbFriends&&lbFriends.incoming)||[];
     if(reqs.length){
       html+=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">INCOMING REQUESTS (${reqs.length})</div>`;
-      reqs.forEach(f=>{ html+=row(nm(f), null, btn('acc:'+(f.requester_discord_id||f.discord_id),'Accept',true)+btn('dec:'+(f.requester_discord_id||f.discord_id),'Decline',true)); });
+      reqs.forEach(f=>{ html+=row(esc(nm(f)), null, btn('acc:'+(f.requester_discord_id||f.discord_id),'Accept',true)+btn('dec:'+(f.requester_discord_id||f.discord_id),'Decline',true)); });
     }
     // outgoing requests (sent by me, awaiting answer) with cancel
     const outg=(lbFriends&&lbFriends.outgoing)||[];
     if(outg.length){
       html+=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">OUTGOING REQUESTS (${outg.length})</div>`;
-      outg.forEach(f=>{ html+=row(nm(f), 'Waiting for answer', btn('can:'+f.discord_id,'Cancel',true,'Withdraw this request')); });
+      outg.forEach(f=>{ html+=row(esc(nm(f)), 'Waiting for answer', btn('can:'+f.discord_id,'Cancel',true,'Withdraw this request')); });
     }
     // add by search
     html+=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">ADD FRIEND</div>
@@ -3051,15 +3128,16 @@
           const label=u.discord_username || u.game_username || String(u.discord_id||'').slice(0,6);
           const sub2=u.game_username&&u.discord_username?u.game_username:(u.game_id||null);
           const mine=String(u.discord_id)===String(did);
-          return row(label, sub2, mine?`<span style="font-size:11px;color:#6b7280">you</span>`:`<button data-req="${i}" style="background:#fff;color:#000;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:11px;font-weight:700;white-space:nowrap">Request</button>`);
+          return row(esc(label), sub2, mine?`<span style="font-size:11px;color:#6b7280">you</span>`:`<button data-req="${i}" data-addfr="${esc(String(u.discord_id||''))}" style="background:#fff;color:#000;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:11px;font-weight:700;white-space:nowrap">Request</button>`);
         }).join('') : `<div style="font-size:12px;color:#9ca3af;padding:4px 12px">No players found.</div>`;
         bx.querySelectorAll('button[data-req]').forEach(b=>{
           b.onclick=()=>{
             const u=lbSearch[Number(b.dataset.req)];
             if(!u) return;
-            lbFriendAction('/api/friends/request', {requester_discord_id:did, addressee_discord_id:u.discord_id}, 'Request sent');
+            sendFriendRequest(did, String(u.discord_id||''), b, 'Request');
           };
         });
+        try{ upgradeFriendButtons(bx); }catch{}
       });
     };
     if(go) go.onclick=doSearch;
@@ -3100,6 +3178,21 @@
     const name=peer.discord_username || peer.game_username || String(lbChatWith||'').slice(0,6);
     if(sub) sub.textContent='Chat — '+name;
     const did=myDiscordId();
+    // Poll refresh while typing: the input is alive and focused — update ONLY
+    // the message list so the draft and focus survive. Full rebuilds happen
+    // on open/send, where losing focus is correct.
+    const liveIn=document.getElementById('bnc-chat-in');
+    if(liveIn && document.activeElement===liveIn){
+      const box=document.getElementById('bnc-chat-msgs');
+      if(box){
+        box.innerHTML=(lbChat||[]).map(m=>{
+          const mine=String(m.from_discord_id)===String(did);
+          return `<div style="align-self:${mine?'flex-end':'flex-start'};max-width:80%;background:${mine?'#fff':'#1f2937'};color:${mine?'#000':'#e5e7eb'};border-radius:10px;padding:6px 10px;font-size:12px;word-break:break-word">${esc(m.body)}</div>`;
+        }).join('') || `<div style="color:#9ca3af;font-size:12px;text-align:center">No messages yet — say hi.</div>`;
+        box.scrollTop=box.scrollHeight;
+      }
+      return;
+    }
     const msgs=(lbChat||[]).map(m=>{
       const mine=String(m.from_discord_id)===String(did);
       return `<div style="align-self:${mine?'flex-end':'flex-start'};max-width:80%;background:${mine?'#fff':'#1f2937'};color:${mine?'#000':'#e5e7eb'};border-radius:10px;padding:6px 10px;font-size:12px;word-break:break-word">${esc(m.body)}</div>`;
@@ -3208,6 +3301,7 @@
       box('Wins', esc(r.wins)),
       box('Win rate', (r.win_rate!=null?Math.round(r.win_rate*100)+'%':'—')),
       box('Playtime', esc(fmtPlaytimeDrawer(r.playtime_global))),
+      box('Last online', esc(fmtLastSeen(r.last_seen)), r.last_seen ? ('Last seen ' + r.last_seen) : 'No heartbeat yet'),
       box('Playstyle', styleVal, styleTip),
       box('Best session', !ins?'…':esc(sess(ins.best_session))),
       box('Fav mode', !ins?'…':esc(fmtGmDrawer(ins.fav_game_mode))),
@@ -3223,17 +3317,15 @@
     const back=document.getElementById('bnc-prof-back');
     if(back) back.onclick=()=>{ lbProfile=null; lbProfileIns=null; renderLbPanel(); };
     const addBtn=document.getElementById('bnc-prof-add');
-    if(addBtn) addBtn.onclick=()=>{
-      const target=String((lbProfile&&lbProfile.discord_id)||'');
-      const me=(typeof myDiscordId==='function' ? myDiscordId() : null);
-      if(!target || !me) return;
-      addBtn.disabled=true; addBtn.textContent='…';
-      apiPostJson('/api/friends/request', {requester_discord_id:me, addressee_discord_id:target}, (j)=>{
-        if(j && (j.ok || (j.status&&j.status!=='pending'))){ addBtn.textContent='Sent'; try{ showToast('Friend request sent', false); }catch{} }
-        else if(j && j.error && /already/i.test(j.error)){ addBtn.textContent='Sent'; }
-        else { addBtn.disabled=false; addBtn.textContent='Add friend'; try{ showToast('Failed: '+(((j||{}).error)||'server error'), true); }catch{} }
-      });
-    };
+    if(addBtn){
+      addBtn.dataset.addfr=String((lbProfile&&lbProfile.discord_id)||'');
+      try{ upgradeFriendButtons(lbPanel); }catch{}
+      addBtn.onclick=()=>{
+        const target=String((lbProfile&&lbProfile.discord_id)||'');
+        const me=(typeof myDiscordId==='function' ? myDiscordId() : null);
+        sendFriendRequest(me, target, addBtn, 'Add friend');
+      };
+    }
   }
   const PLAYSTYLE_TIPS={
     Aggressor:'Drops into fights: 3+ kills per match with a strong K/D.',

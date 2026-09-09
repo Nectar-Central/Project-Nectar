@@ -60,6 +60,28 @@ def _norm_name(n: str | None) -> str:
     return s                        # Return cleaned name
 
 
+def _last_seen_due(last_seen_raw, now_ts: float | None = None, max_age_s: int = 300) -> bool:
+    """True when the last_seen heartbeat should refresh. Pure, unit-tested.
+
+    Missing/unparseable timestamps always refresh (fail-open: a player with
+    no heartbeat gets one). Otherwise refresh at most every max_age_s so an
+    active session costs one tiny write per 5 minutes, not one per batch.
+    """
+    try:
+        import time as _t
+        now = float(now_ts) if now_ts is not None else _t.time()
+    except Exception:
+        return True
+    try:
+        if not last_seen_raw:
+            return True
+        from datetime import datetime
+        ts = datetime.fromisoformat(str(last_seen_raw).replace("Z", "+00:00")).timestamp()
+        return (now - ts) > int(max_age_s)
+    except Exception:
+        return True
+
+
 def _names_equal(a, b) -> bool:
     """Case-sensitive comparison of two player names after stripping color tags.
     Returns True if both names match exactly after normalization.
@@ -1070,6 +1092,24 @@ async def process_batch(
     # Log current user stats before processing (debug-gated: every batch)
     log_dbg(f"PROCESSOR user={discord_id[:6]} kills={user.get('kills',0)} "
             f"deaths={user.get('deaths',0)} wins={user.get('wins',0)}")
+
+    # Last-seen heartbeat (drives "last online" display): refresh at most
+    # every 5 minutes per player, never let a DB blip break the batch.
+    try:
+        if _last_seen_due(user.get("last_seen")):
+            from datetime import datetime, timezone as _tz
+            _now_iso = datetime.now(_tz.utc).isoformat()
+            try:
+                await db_io(lambda: supabase.table("bngc_users").update(
+                    {"last_seen": _now_iso}).eq("discord_id", discord_id).execute())
+            except Exception as exc:
+                log_err(f"processor last_seen failed {discord_id[:6]} {exc}")
+            try:
+                user["last_seen"] = _now_iso
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     # Settle precision checks due from earlier batches (writes are verified ~2s later)
     try:
