@@ -296,11 +296,16 @@ async def get_stats(request: Request):
     # Live tourney HUD: when the current room carries a tourney tag, attach
     # my points for that tourney (passthrough overlay reads this). Gated on
     # the tag so every other session pays zero extra queries. Never breaks stats.
+    # Fallback: if no room tag, try a direct tourney-by-code lookup so the
+    # HUD still shows even if the tag row is missing.
     comp_tourney = None
     try:
         _tag = (session_out or {}).get("tag") if session_out else None
         _tcode = (session_out or {}).get("short_code") if session_out else None
         if isinstance(_tag, dict) and str(_tag.get("kind") or "") == "tourney" and _tcode:
+            from .comp import code_tourney_points as _ctp
+            comp_tourney = await db_io(_ctp, _tcode, discord_id)
+        elif _tcode and len(str(_tcode)) == 5:
             from .comp import code_tourney_points as _ctp
             comp_tourney = await db_io(_ctp, _tcode, discord_id)
     except Exception:

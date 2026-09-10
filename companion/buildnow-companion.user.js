@@ -2005,6 +2005,15 @@
             stateGmLine = `In Tourney - ${_cn}`;
           }
         }catch{}
+      } else if(!_pub && !_ranked && stateLabel==='In Match'){
+        // stats-poll fallback: comp_tourney from the server even without
+        // a room tag or local _compRoom (tag row missing, pID not sniffed).
+        try{
+          const _ct=statsCache&&statsCache.comp_tourney;
+          if(_ct && _ct.name){
+            stateGmLine = `In Tourney - ${String(_ct.name).replace(/</g,'&lt;')}`;
+          }
+        }catch{}
       }
     }catch{}
     const smallRow = (label,val)=> `<div style="display:flex;justify-content:space-between;align-items:center;width:100%;max-width:240px;font-size:11px"><span style="color:#9ca3af">${label}</span><span style="font-weight:600;color:#fff">${val==null? '-' : val}</span></div>`;

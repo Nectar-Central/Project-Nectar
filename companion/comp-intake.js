@@ -162,7 +162,7 @@ function createTracker(opts) {
         openedAt: new Date().toISOString(),
         events: [],
       };
-      log(`comp match v${st.openMatch.version} OPEN${manual ? ' (manual)' : ''} room=${(st.room || '?').slice(0, 8)}`);
+      log(`match v${st.openMatch.version} OPEN${manual ? ' (manual)' : ''} room=${(st.room || '?').slice(0, 8)}${st.tourneyCode ? ' code=' + st.tourneyCode : ''}`);
       return st.openMatch;
     } catch { return null; }
   }
@@ -193,7 +193,7 @@ function createTracker(opts) {
       try {
         st.pending.push(m);
         if (st.pending.length > 50) st.pending.shift();
-        log(`comp match v${m.version} sealed, buffered (no tourney set)`);
+        log(`match v${m.version} sealed, buffered (no tourney set)${st.tourneyCode ? ' code=' + st.tourneyCode : ''}`);
       } catch {}
       return m;
     }
@@ -207,6 +207,11 @@ function createTracker(opts) {
           events: m.events,
         });
         st.sealed++;
+        // summary log: kills + winner
+        const kills = m.events.filter(e => e.etype === 'kill').length;
+        const alive = m.events.filter(e => e.etype === 'alv' && !e.alive);
+        const winner = alive.length > 0 ? alive[alive.length - 1].actorName : null;
+        log(`match v${m.version} SEALED — kills=${kills} winner=${winner || '?'}`);
       } else {
         st.dropped++;
       }
@@ -316,6 +321,7 @@ function createTracker(opts) {
             } catch {}
             pushEvent(kf.type === 'kill' ? 'kill' : 'knock',
               { actorNr, actorName: kf.killer, targetName: kf.victim });
+            try { log(`kill ${kf.killer} → ${kf.victim}`); } catch {}
           }
         }
       }

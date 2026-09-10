@@ -22,7 +22,7 @@ import urllib.request
 
 TOKEN = os.getenv("DISCORD_TOKEN") or os.getenv("DISCORD_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID") or os.getenv("DISCORD_GUILD_ID") or "1543724907651932282"  # guild sync keeps commands immediate
-SERVER_URL = os.getenv("SERVER_URL", "http://127.0.0.1:8766")
+SERVER_URL = os.getenv("SERVER_URL", "http://127.0.0.1:3000")
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)

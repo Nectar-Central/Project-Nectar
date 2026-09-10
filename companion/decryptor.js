@@ -39,7 +39,7 @@ try {
     sink: useSink ? comp.createSupabaseSink() : null,
     tourneyId: process.env.COMP_TOURNEY_ID != null && process.env.COMP_TOURNEY_ID !== ''
       ? Number(process.env.COMP_TOURNEY_ID) : null,
-    log: (m) => { try { console.log(`[COMP] ${m}`); } catch {} },
+    log: (m) => { try { console.log(`${ts()} ${TAG.COMP} ${COL.info(m)}`); } catch {} },
   });
   compHandle = (rec, msg) => { try { compTracker.handle(rec, msg); } catch {} };
   if (!useSink) console.log('[COMP] tracker on (no Supabase creds: matches buffer in memory, set COMP_TOURNEY_ID + creds to persist)');
@@ -87,6 +87,7 @@ const TAG = {
   ERR: bg(239, 68, 68, c(255, 255, 255, ' ERR ')),
   EVT: bg(109, 40, 217, c(255, 255, 255, ' EVT ')),
   OP: bg(194, 65, 12, c(255, 255, 255, ' OP  ')),
+  COMP: bg(100, 116, 139, c(255, 255, 255, ' COMP ')),
 };
 
 function ts() {
