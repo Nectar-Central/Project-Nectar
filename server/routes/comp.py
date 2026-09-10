@@ -537,7 +537,9 @@ async def comp_tourney_table(request: Request):
     try:
         tid = int(b.get("tourney_id"))
     except Exception:
-        return JSONResponse({"error": "tourney_id required"}, status_code=400)
+        return JSONResponse(
+            {"error": "tourney_id required (pick a tourney in the dashboard list first)"},
+            status_code=400)
     table = _valid_table(b.get("points_table"))
     if table is None:
         return JSONResponse(
@@ -567,7 +569,10 @@ async def comp_calculate(request: Request):
         tids: list[int] = []
         mids: list[int] | None = None
         if b.get("match_id") is not None:
-            mids = [int(b.get("match_id"))]
+            try:
+                mids = [int(b.get("match_id"))]
+            except Exception:
+                return JSONResponse({"error": "match_id must be a number"}, status_code=400)
             mres = supabase.table("bngc_comp_matches").select(
                 "id,tourney_id,version,room_id,status,winner_discord_id,placements").in_("id", mids).execute()
             matches = [m for m in (mres.data or []) if (m or {}).get("status") in ("sealed", "manual")]
@@ -578,7 +583,12 @@ async def comp_calculate(request: Request):
                 "id,points_table").in_("id", list({m["tourney_id"] for m in matches})).execute()
             trous = {t["id"]: t for t in (trows.data or [])}
         else:
-            tid = int(b.get("tourney_id"))
+            try:
+                tid = int(b.get("tourney_id"))
+            except Exception:
+                return JSONResponse(
+                    {"error": "tourney_id required (pick a tourney in the dashboard list first)"},
+                    status_code=400)
             tids = [tid]
             trows = supabase.table("bngc_comp_tourneys").select(
                 "id,points_table").eq("id", tid).limit(1).execute()

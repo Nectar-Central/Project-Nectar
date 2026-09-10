@@ -1338,6 +1338,8 @@
     if(_keybindCapturing) return;
     try{ releaseStuckCapture(); }catch{}
     if (isModalOrInputFocused() || isTypingKey()) return;
+    // composing in our box: hotkeys stay silent (the forwarder owns the keys)
+    try{ if((e.key||'')!=='Escape' && untrapHoldActive()) return; }catch{}
     const b=matchBind(e);
     if(b){ e.preventDefault(); e.stopPropagation(); try{ b.run(); }catch(err){ try{ logErr(`[KEYS] bind ${b.id} failed ${err && err.message}`); }catch{} } }
   }, true);
@@ -2798,10 +2800,79 @@
   // legit in-panel navigation, Escape, tab switch, panel close, 60s timeout.
   // One console line per engage for remote diagnosis. Never throws.
   let _untrapHoldEl=null, _untrapHoldUntil=0, _untrapHoldTimer=null, _untrapHoldLogged=false;
+  let _untrapFwdOn=false, _untrapFwdLogged=false;
+  function untrapHoldActive(){
+    try{
+      return !!(_untrapHoldEl && document.contains(_untrapHoldEl) && Date.now()<=_untrapHoldUntil
+        && lbTab==='friends' && lbPanel && lbPanel.style.display!=='none');
+    }catch{ return false; }
+  }
+  // Key forwarder: while the user is composing in our box, steal printable
+  // keys at document capture, block the game (preventDefault + stop), and
+  // inject them into the input as values. Focus races become irrelevant:
+  // the characters land even when the canvas holds focus. Single-char keys
+  // + Backspace only; shortcuts, Tab, Escape and IME pass through untouched.
+  // Never throws. Registered once.
+  function untrapForward(e){
+    try{
+      if(!untrapHoldActive()) return;
+      const el=_untrapHoldEl;
+      if(e.ctrlKey || e.metaKey || e.altKey) return;
+      if(e.isComposing) return;
+      const k=e.key;
+      const put=(fn)=>{
+        try{ e.preventDefault(); }catch{}
+        try{ e.stopPropagation(); }catch{}
+        try{ if(e.stopImmediatePropagation) e.stopImmediatePropagation(); }catch{}
+        try{ fn(); }catch{}
+        try{
+          if(!_untrapFwdLogged){
+            _untrapFwdLogged=true;
+            try{ logInfo(`[INPUT] forward inject id=${el.id||'?'}`); }catch{}
+          }
+        }catch{}
+      };
+      if(k==='Enter'){
+        put(()=>{ try{ if(typeof el._vkbdAction==='function') el._vkbdAction(); }catch{} });
+        return;
+      }
+      if(k==='Backspace'){
+        put(()=>{
+          const v=el.value||'';
+          let s=(document.activeElement===el && el.selectionStart!=null)?el.selectionStart:v.length;
+          let t=(document.activeElement===el && el.selectionEnd!=null)?el.selectionEnd:v.length;
+          s=Math.max(0,Math.min(s,v.length)); t=Math.max(0,Math.min(t,v.length));
+          if(s===t) s=Math.max(0,s-1);
+          el.value=v.slice(0,s)+v.slice(t);
+          try{ el.focus(); }catch{}
+          try{ el.setSelectionRange(s,s); }catch{}
+          el.dispatchEvent(new Event('input',{bubbles:true}));
+        });
+        return;
+      }
+      if(k && k.length===1){
+        put(()=>{
+          const v=el.value||'';
+          let s=(document.activeElement===el && el.selectionStart!=null)?el.selectionStart:v.length;
+          let t=(document.activeElement===el && el.selectionEnd!=null)?el.selectionEnd:v.length;
+          s=Math.max(0,Math.min(s,v.length)); t=Math.max(0,Math.min(t,v.length));
+          el.value=v.slice(0,s)+k+v.slice(t);
+          try{ el.focus(); }catch{}
+          try{ el.setSelectionRange(s+1,s+1); }catch{}
+          el.dispatchEvent(new Event('input',{bubbles:true}));
+        });
+        return;
+      }
+    }catch{}
+  }
   function untrapHold(el){
     try{
       _untrapHoldEl=el; _untrapHoldUntil=Date.now()+60000; _untrapHoldLogged=false;
       try{ logInfo(`[INPUT] hold engage id=${el.id||'?'} active=${document.activeElement===el}`); }catch{}
+      if(!_untrapFwdOn){
+        _untrapFwdOn=true;
+        try{ document.addEventListener('keydown', untrapForward, true); }catch{}
+      }
       if(_untrapHoldTimer) return;
       _untrapHoldTimer=setInterval(()=>{
         try{
@@ -2951,7 +3022,7 @@
     if(document.getElementById('bnc-tourney-hud')){ tourneyHud=document.getElementById('bnc-tourney-hud'); return tourneyHud; }
     const el=document.createElement('div');
     el.id='bnc-tourney-hud';
-    Object.assign(el.style,{position:'fixed', top:'14px', right:'14px', zIndex:'2147483639', display:'none', flexDirection:'column', alignItems:'flex-end', gap:'2px', background:'rgba(0,0,0,0.72)', border:'1px solid rgba(255,255,255,0.12)', borderRadius:'10px', padding:'8px 14px', fontFamily:'Inter, system-ui, sans-serif', pointerEvents:'none', textAlign:'right', whiteSpace:'nowrap'});
+    Object.assign(el.style,{position:'fixed', left:'40%', bottom:'14px', zIndex:'2147483639', display:'none', flexDirection:'column', alignItems:'flex-start', gap:'2px', background:'rgba(0,0,0,0.72)', border:'1px solid rgba(255,255,255,0.12)', borderRadius:'10px', padding:'8px 14px', fontFamily:'Inter, system-ui, sans-serif', pointerEvents:'none', textAlign:'left', whiteSpace:'nowrap'});
     (document.body||document.documentElement).appendChild(el);
     tourneyHud=el;
     return el;
@@ -3451,6 +3522,7 @@
       // capture (not bubble): runs before the generic trap below, so Enter
       // still searches while every other key dies before the game sees it.
       q.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); e.stopPropagation(); doSearch(); } }, true);
+      try{ q._vkbdAction=doSearch; }catch{}
       try{ untrapInput(q); }catch{}
       try{ attachVkbd(q, doSearch); }catch{}
     }
@@ -3539,6 +3611,7 @@
     if(send) send.onclick=doSend;
     if(inp){
       inp.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); e.stopPropagation(); doSend(); } }, true);
+      try{ inp._vkbdAction=doSend; }catch{}
       try{ untrapInput(inp); }catch{}
       try{ attachVkbd(inp, doSend); }catch{}
       // refocus only right after OUR send (never on poll refresh — reading
@@ -3840,9 +3913,11 @@
   function toggleKeybinds(){ if(!keybindOverlay) createKeybindOverlay(); const isHidden=keybindOverlay.style.display==='none' || !keybindOverlay.style.display; keybindOverlay.style.display = isHidden ? 'flex' : 'none'; if(isHidden){ try{ renderKeybindRows(); }catch{} try{ syncDevUI(); }catch{} } }
   // Hotkeys: drawer (customizable) + Ctrl+Shift+K keybinds (guard modal focus)
   // + Backquote menu bind (guard typing). Stuck capture flag auto-releases.
+  // Composing in our box silences hotkeys too (Escape still releases first).
   document.addEventListener('keydown', (e)=>{
     if(_keybindCapturing) return;
     try{ releaseStuckCapture(); }catch{}
+    if((e.key||'')!=='Escape'){ try{ if(untrapHoldActive()) return; }catch{} }
     if (isModalOrInputFocused() || isTypingKey()) return;
     if((e.key||'')==='Escape' && typeof lbPanel!=='undefined' && lbPanel && lbPanel.style.display!=='none' && lbPanel.style.display){ e.preventDefault(); try{ untrapRelease(); }catch{} toggleLbPanel(false); return; }
     if((e.key||'')==='Escape' && typeof rankedPanel!=='undefined' && rankedPanel && rankedPanel.style.display!=='none' && rankedPanel.style.display){ e.preventDefault(); toggleRankedPanel(false); return; }

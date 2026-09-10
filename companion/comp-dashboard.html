@@ -82,6 +82,10 @@ const $ = (id) => document.getElementById(id);
 const esc = (v) => String(v == null ? '—' : v).replace(/</g, '&lt;');
 let SRV = localStorage.getItem('comp_server') || 'http://127.0.0.1:8000';
 let selTid = null;
+try {
+  const saved = Number(localStorage.getItem('comp_sel_tid'));
+  if (Number.isFinite(saved)) selTid = saved;
+} catch {}
 let editMatchId = null;
 function log(m, err) {
   const el = $('log');
@@ -157,11 +161,28 @@ async function refreshList() {
       `<span class="pill ${cls[t.status] || 'end'}">${esc(t.status)}</span> ` +
       `<span class="dim">${t.sealed || 0}/${t.series_len || '∞'} · ${t.players || 0} players</span></div>`
     ).join('') || '<span class="dim">None yet — create one with /tourney-create.</span>';
+    // auto-select: keep the saved tourney if still listed, else pick the
+    // newest non-ended one so Save/Calculate never fire with no selection.
+    try {
+      const ids = ((j && j.tourneys) || []).map((t) => Number(t.id)).filter(Number.isFinite);
+      if (!ids.includes(Number(selTid))) {
+        const open = ((j && j.tourneys) || []).find((t) => t.status !== 'ended');
+        selTid = open ? Number(open.id) : (ids.length ? ids[0] : null);
+        try {
+          if (selTid == null) localStorage.removeItem('comp_sel_tid');
+          else localStorage.setItem('comp_sel_tid', String(selTid));
+        } catch {}
+        editMatchId = null;
+        if (selTid != null) refreshDetail();
+      }
+    } catch {}
     $('tlist').querySelectorAll('[data-t]').forEach((el) => {
       const go = () => {
         const _id = Number(el.dataset.t);
         if (!Number.isFinite(_id)) { log('bad tourney id', true); return; }
-        selTid = _id; editMatchId = null; refreshList(); refreshDetail();
+        selTid = _id; editMatchId = null;
+        try { localStorage.setItem('comp_sel_tid', String(selTid)); } catch {}
+        refreshList(); refreshDetail();
       };
       el.onclick = go;
       el.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } };
