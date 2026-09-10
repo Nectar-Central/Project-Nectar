@@ -114,8 +114,8 @@ async function local(path, body) {
   if (!r.ok) throw new Error((j && (j.error || JSON.stringify(j))) || ('HTTP ' + r.status));
   return j;
 }
-function post(path, body) {
-  return { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
+function post(body) {
+  return { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body == null ? {} : body) };
 }
 function showTab(which) {
   ['status', 'tourneys', 'log'].forEach((k) => {
