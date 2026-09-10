@@ -254,9 +254,12 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
         except Exception:
             pass
 
-    # If we have a token, always return 200 with token; else 204
+    # If we have a token, always return 200 with token; else 200 with an
+    # empty object — never 204: the {} body is still serialized while the
+    # status forbids one, and uvicorn 500s ("Response content longer than
+    # Content-Length"). Heartbeats land here every 5s, so this must not 500.
     if new_token:
         return JSONResponse(resp)
     if packets:
         return JSONResponse(resp)
-    return JSONResponse({}, status_code=204)
+    return JSONResponse({"ok": True})
