@@ -1990,7 +1990,8 @@
       let _tagFresh = true;
       try{ if(_lastStatsAt) _tagFresh = (Date.now()-_lastStatsAt)<=120000; }catch{}
       let _pub=false; try{ _pub=!!_publicRoom; }catch{}
-      if(!_pub && _tagFresh && _sessTag && (_sessTag.kind==='tourney' || _sessTag.kind==='scrim') && stateLabel==='In Match' && !_ranked){
+      let _hasComp=false; try{ _hasComp=!!_compRoom; }catch{}
+      if(!_pub && _hasComp && _tagFresh && _sessTag && (_sessTag.kind==='tourney' || _sessTag.kind==='scrim') && stateLabel==='In Match' && !_ranked){
         const _tn = String(_sessTag.name||'').replace(/</g,'&lt;');
         stateGmLine = _sessTag.kind==='tourney'
           ? `In Tourney - ${_tn||'Tournament'}`
@@ -3099,8 +3100,10 @@
   function updateTourneyHud(){
     const el=ensureTourneyHud();
     if(!el) return;
-    // public rooms never show comp UI, even with stale tourney state
-    if(_publicRoom){ el.style.display='none'; return; }
+    // hidden by default: only show when a pID join detected a tourney room.
+    // Public rooms, stale state after leave/auth, or any room without a
+    // confirmed comp room all keep the HUD off.
+    if(_publicRoom || !_compRoom){ el.style.display='none'; return; }
     let d=null;
     try{ d=(statsCache&&statsCache.comp_tourney)||null; }catch{}
     // hide the moment we're no longer holding that room: fresh stats with

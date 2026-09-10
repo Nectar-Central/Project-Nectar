@@ -52,16 +52,25 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
     if auth_session_id:
         res = await db_io(db.get_session_sync, auth_session_id)
         sess = res.get("data")
-        if not sess:
+        db_err = res.get("error")
+        # DB connection blip ("Server disconnected"): the session probably
+        # still exists — skip rotation but DON'T 401. The client retries
+        # with the same token on the next batch; if the session was truly
+        # deleted the next call will see data=None without an error and
+        # return 401 then.
+        if db_err and not sess:
+            log_err(f"CAPTURE session lookup DB error ({db_err[:40]}) — passing through")
+            sess = None  # fall through to the token-free path below
+        elif not sess:
             return JSONResponse({"error": "Invalid auth session"}, status_code=401)
-        if is_session_expired(sess):
+        if sess and is_session_expired(sess):
             try:
                 await db_io(db.update_session_sync, auth_session_id, {"is_active": False})
             except Exception:
                 pass
             log_sys(f"CAPTURE expired session {auth_session_id[:13]} — client must re-link")
             return JSONResponse({"error": "Session expired - please re-link"}, status_code=401)
-        if sess.get("is_locked"):
+        if sess and sess.get("is_locked"):
             scope = str(sess.get("lock_scope") or ("admin" if sess.get("is_admin_locked") else "default")).lower()
             is_admin = scope == "admin" or bool(sess.get("is_admin_locked"))
             try:
@@ -71,7 +80,7 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
                 pass
             msg = "Account admin-locked" if is_admin else "Account locked"
             return JSONResponse({"error": msg, "lock_scope": scope, "is_admin_locked": is_admin}, status_code=403)
-        if req_token:
+        if sess and req_token:
             if sess.get("discord_id") != discord_id:
                 return JSONResponse({"error": "Session mismatch"}, status_code=403)
             v = validate_request_token(sess["req_secret"], req_token, sess["token_counter"])
