@@ -239,6 +239,7 @@ async function refreshDetail() {
     if (_shellTid !== selTid) {
       box.innerHTML =
         `<div id="thead"></div>` +
+        `<fieldset style="margin-top:8px"><legend>Hosts</legend><div id="hosts">…</div></fieldset>` +
         `<fieldset style="margin-top:8px"><legend>Placement points</legend><div>` +
         ['1st', '2nd', '3rd', '4th', '5th'].map((lbl, i) =>
           `<label style="margin-right:8px">${lbl}<input size="3" id="tbP${i + 1}" inputmode="numeric" value="${place[i] != null ? place[i] : ''}" style="margin-left:3px"></label>`).join('') +
@@ -260,6 +261,7 @@ async function refreshDetail() {
     renderBoard(j);
     wireMatchList(matches);
     await refreshMatch();
+    await renderHosts(j);
     await refreshUnmapped(j);
     await refreshRegs(j);
   } catch (e) { box.innerHTML = '<span class="bad">Failed: ' + esc(e.message) + '</span>'; _shellTid = null; }
@@ -278,6 +280,78 @@ function renderBoard(j) {
     `<tr><td>${i + 1}</td><td>${esc(r.name)}</td><td>${r.points}</td><td>${r.kills}</td><td>${r.wins}</td></tr>`).join('');
   el.innerHTML = bd ? `<table class="grid"><tr><th>#</th><th>Player</th><th>Pts</th><th>K</th><th>W</th></tr>${bd}</table>` : '<span class="dim">No sealed matches.</span>';
 }
+// Hosts panel: host-playing toggle + add/remove, optimistic with lite
+// rollback on failure. The creator always hosts (even if unlisted).
+async function renderHosts(j) {
+  const box = $('hosts');
+  if (!box || selTid == null) return;
+  try {
+    const t = ((j || detailCache || {}).tourney) || {};
+    const hp = t.host_playing !== false;
+    const rawHosts = [...new Set([...((t.hosts) || []), ...(t.created_by ? [String(t.created_by)] : [])].map((x) => String(x)))].filter(Boolean);
+    const pmap = {};
+    (((j || detailCache || {}).players) || []).forEach((p) => { if (p.name) pmap[String(p.discord_id)] = p.name; });
+    const missing = rawHosts.filter((d) => !pmap[d]);
+    if (missing.length) {
+      const nm = await api('/api/comp/names?ids=' + encodeURIComponent(missing.slice(0, 100).join(','))).catch(() => ({ names: {} }));
+      Object.assign(pmap, (nm && nm.names) || {});
+    }
+    box.innerHTML =
+      `<div class="gap">Host: <b>${hp ? 'Playing' : 'Hosting only'}</b> ` +
+      `<button id="hpGo">${hp ? 'Switch to Hosting Only' : 'Switch to Playing'}</button></div>` +
+      `<div class="muted" style="margin:4px 0 2px">HOSTS (${rawHosts.length})</div>` +
+      (rawHosts.map((d) =>
+        `<div><b>${esc(pmap[d] || String(d).slice(0, 6))}</b> <span class="dim">${esc(d)}</span> ` +
+        `<button data-unhost="${esc(d)}">Remove</button></div>`).join('') || '<span class="dim">None listed.</span>') +
+      `<div class="gap"><input size="14" id="hostAdd" placeholder="discord id"> <button id="hostAddGo">Add host</button></div>` +
+      `<div class="dim">The creator always hosts, even if unlisted.</div>`;
+    const flip = $('hpGo');
+    if (flip) flip.onclick = async () => {
+      flip.disabled = true;
+      try {
+        if (detailCache && detailCache.tourney) detailCache.tourney.host_playing = !hp;
+        renderHosts(detailCache);
+        await api('/api/comp/tourney/host-playing', post({ tourney_id: selTid, host_playing: !hp }));
+        log('host status: ' + (!hp ? 'playing' : 'hosting only'));
+      } catch (e) { log('host status: ' + e.message, true); refreshTourneyLite(); }
+    };
+    const addGo = $('hostAddGo');
+    if (addGo) addGo.onclick = async () => {
+      const inp = $('hostAdd');
+      const did = (inp && inp.value.trim()) || '';
+      if (!did) { log('add host: enter a discord id', true); return; }
+      addGo.disabled = true;
+      try {
+        if (detailCache && detailCache.tourney) {
+          const hs = new Set((((detailCache.tourney.hosts) || []).map(String)));
+          hs.add(did);
+          detailCache.tourney.hosts = [...hs];
+        }
+        renderHosts(detailCache);
+        const r = await api('/api/comp/tourney/hosts', post({ tourney_id: selTid, add: did }));
+        if (detailCache && detailCache.tourney) detailCache.tourney.hosts = r.hosts || detailCache.tourney.hosts;
+        renderHosts(detailCache);
+        log('host added ' + did.slice(0, 6));
+      } catch (e) { log('add host: ' + e.message, true); refreshTourneyLite(); }
+    };
+    box.querySelectorAll('[data-unhost]').forEach((b) => {
+      b.onclick = async () => {
+        b.disabled = true;
+        const did = b.dataset.unhost;
+        try {
+          if (detailCache && detailCache.tourney) {
+            detailCache.tourney.hosts = (((detailCache.tourney.hosts) || []).map(String)).filter((h) => h !== did);
+          }
+          renderHosts(detailCache);
+          const r = await api('/api/comp/tourney/hosts', post({ tourney_id: selTid, remove: did }));
+          if (detailCache && detailCache.tourney) detailCache.tourney.hosts = r.hosts || [];
+          renderHosts(detailCache);
+          log('host removed ' + did.slice(0, 6));
+        } catch (e) { log('remove host: ' + e.message, true); refreshTourneyLite(); }
+      };
+    });
+  } catch (e) { box.innerHTML = '<span class="bad">Failed: ' + esc(e.message) + '</span>'; }
+}
 // narrow tourney refresh for table/calculate/open-match: header, standings
 // and match list only. Inputs, match panel, regs and unmapped are untouched
 // (no lost edits, no scroll jumps).
@@ -291,6 +365,7 @@ async function refreshTourneyLite() {
     renderHead(j);
     renderBoard(j);
     wireMatchList(j.matches || []);
+    renderHosts(j);
   } catch (e) { log('refresh: ' + e.message, true); }
 }
 function needTid() {

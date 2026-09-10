@@ -1481,6 +1481,50 @@ def _comp_is_host(member) -> bool:
     return False
 
 
+def _comp_tourney_hosts(sb, tourney_id) -> list:
+    """Per-tourney host discord IDs (hosts column + created_by fallback).
+    Missing column (pre-v233 DB) reads as no extra hosts. Never raises."""
+    try:
+        r = sb.table("bngc_comp_tourneys").select("hosts,created_by").eq(
+            "id", int(tourney_id)).limit(1).execute()
+        row = (r.data or [{}])[0] or {}
+        hs = [str(x) for x in (row.get("hosts") or []) if str(x or "").strip()]
+        cb = str(row.get("created_by") or "").strip()
+        if cb and cb not in hs:
+            hs.append(cb)
+        return hs
+    except Exception:
+        return []
+
+
+async def _comp_require_manager(interaction, tourney_id):
+    """Gate for per-tourney management: global host (admin/role) OR a host
+    listed on the tourney. Returns (sb, me); sends the refusal and returns
+    (None, None) otherwise. Never raises."""
+    try:
+        me = await _comp_member(interaction, interaction.user.id)
+        sb = _comp_sb()
+        if sb is None:
+            await interaction.followup.send("Supabase not configured.", ephemeral=True)
+            return None, None
+        if _comp_is_host(me):
+            return sb, me
+        try:
+            hosts = _comp_tourney_hosts(sb, tourney_id)
+        except Exception:
+            hosts = []
+        if str(interaction.user.id) in [str(h) for h in hosts]:
+            return sb, me
+        await interaction.followup.send("Host only.", ephemeral=True)
+        return None, None
+    except Exception:
+        try:
+            await interaction.followup.send("Host only.", ephemeral=True)
+        except Exception:
+            pass
+        return None, None
+
+
 async def _comp_member(interaction, user_id) -> object | None:
     """Fetch guild member for role checks/grants. None on failure."""
     try:
@@ -1631,12 +1675,9 @@ async def tourney_create_cmd(interaction: discord.Interaction, name: str,
 @app_commands.describe(tourney_id="Numeric tourney ID (from 0)")
 async def tourney_stop_cmd(interaction: discord.Interaction, tourney_id: int):
     await interaction.response.defer(ephemeral=True)
-    me = await _comp_member(interaction, interaction.user.id)
-    if not _comp_is_host(me):
-        return await interaction.followup.send("Host only.", ephemeral=True)
-    sb = _comp_sb()
+    sb, me = await _comp_require_manager(interaction, tourney_id)
     if sb is None:
-        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+        return
     try:
         from datetime import datetime, timezone
         old = sb.table("bngc_comp_tourneys").select("code").eq("id", int(tourney_id)).limit(1).execute()
@@ -1662,11 +1703,9 @@ async def tourney_stop_cmd(interaction: discord.Interaction, tourney_id: int):
                        code="New 5-letter private room code")
 async def tourney_code_cmd(interaction: discord.Interaction, tourney_id: int, code: str):
     await interaction.response.defer(ephemeral=True)
-    me = await _comp_member(interaction, interaction.user.id)
-    if not _comp_is_host(me):
-        return await interaction.followup.send("Host only.", ephemeral=True)
-    if _comp_sb() is None:
-        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+    sb, me = await _comp_require_manager(interaction, tourney_id)
+    if sb is None:
+        return
     ok, msg = await _tourney_set_code(int(tourney_id), code, str(interaction.user.id))
     return await interaction.followup.send(msg, ephemeral=True)
 
@@ -1676,11 +1715,9 @@ async def tourney_code_cmd(interaction: discord.Interaction, tourney_id: int, co
                        code="5-letter private room code")
 async def tourney_set_code_cmd(interaction: discord.Interaction, tourney_id: int, code: str):
     await interaction.response.defer(ephemeral=True)
-    me = await _comp_member(interaction, interaction.user.id)
-    if not _comp_is_host(me):
-        return await interaction.followup.send("Host only.", ephemeral=True)
-    if _comp_sb() is None:
-        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+    sb, me = await _comp_require_manager(interaction, tourney_id)
+    if sb is None:
+        return
     ok, msg = await _tourney_set_code(int(tourney_id), code, str(interaction.user.id))
     return await interaction.followup.send(msg, ephemeral=True)
 
@@ -1775,9 +1812,9 @@ async def _comp_set_banned(tourney_id: int, user_id: str, banned: bool, guild=No
 @app_commands.describe(tourney_id="Numeric tourney ID (from 0)", user="Player to ban")
 async def tourney_ban_cmd(interaction: discord.Interaction, tourney_id: int, user: discord.User):
     await interaction.response.defer(ephemeral=True)
-    me = await _comp_member(interaction, interaction.user.id)
-    if not _comp_is_host(me):
-        return await interaction.followup.send("Host only.", ephemeral=True)
+    sb, me = await _comp_require_manager(interaction, tourney_id)
+    if sb is None:
+        return
     ok, msg = await _comp_set_banned(int(tourney_id), str(user.id), True, interaction.guild)
     return await interaction.followup.send(msg, ephemeral=True)
 
@@ -1786,11 +1823,73 @@ async def tourney_ban_cmd(interaction: discord.Interaction, tourney_id: int, use
 @app_commands.describe(tourney_id="Numeric tourney ID (from 0)", user="Player to unban")
 async def tourney_unban_cmd(interaction: discord.Interaction, tourney_id: int, user: discord.User):
     await interaction.response.defer(ephemeral=True)
-    me = await _comp_member(interaction, interaction.user.id)
-    if not _comp_is_host(me):
-        return await interaction.followup.send("Host only.", ephemeral=True)
+    sb, me = await _comp_require_manager(interaction, tourney_id)
+    if sb is None:
+        return
     ok, msg = await _comp_set_banned(int(tourney_id), str(user.id), False, interaction.guild)
     return await interaction.followup.send(msg, ephemeral=True)
+
+
+@bot.tree.command(name="tourney-host-status", description="Set whether the host plays too (host)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)",
+                       status="Playing = host kills count, Hosting only = spectate")
+@app_commands.choices(status=[app_commands.Choice(name="Playing", value="playing"),
+                              app_commands.Choice(name="Hosting only", value="hosting_only")])
+async def tourney_host_status_cmd(interaction: discord.Interaction, tourney_id: int, status: str):
+    await interaction.response.defer(ephemeral=True)
+    sb, me = await _comp_require_manager(interaction, tourney_id)
+    if sb is None:
+        return
+    hp = str(status or "").lower() != "hosting_only"
+    try:
+        res = sb.table("bngc_comp_tourneys").update({"host_playing": hp}).eq("id", int(tourney_id)).execute()
+        if not res.data:
+            return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
+        label = "Playing — your kills count" if hp else "Hosting only — your kills don't count"
+        return await interaction.followup.send(f"Tourney **#{tourney_id}** host status: **{label}**.", ephemeral=True)
+    except Exception as e:
+        return await interaction.followup.send(f"Couldn't update: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="tourney-add-host", description="Add a co-host to a tourney (host)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)", user="Co-host to add")
+async def tourney_add_host_cmd(interaction: discord.Interaction, tourney_id: int, user: discord.User):
+    await interaction.response.defer(ephemeral=True)
+    sb, me = await _comp_require_manager(interaction, tourney_id)
+    if sb is None:
+        return
+    try:
+        chk = sb.table("bngc_comp_tourneys").select("id").eq("id", int(tourney_id)).limit(1).execute()
+        if not chk.data:
+            return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
+        hosts = _comp_tourney_hosts(sb, tourney_id)
+        did = str(user.id)
+        if did not in hosts:
+            hosts.append(did)
+            sb.table("bngc_comp_tourneys").update({"hosts": hosts}).eq("id", int(tourney_id)).execute()
+        return await interaction.followup.send(f"{user.mention} is now a host of tourney **#{tourney_id}**.", ephemeral=True)
+    except Exception as e:
+        return await interaction.followup.send(f"Couldn't add host: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="tourney-remove-host", description="Remove a co-host from a tourney (host)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)", user="Co-host to remove")
+async def tourney_remove_host_cmd(interaction: discord.Interaction, tourney_id: int, user: discord.User):
+    await interaction.response.defer(ephemeral=True)
+    sb, me = await _comp_require_manager(interaction, tourney_id)
+    if sb is None:
+        return
+    try:
+        chk = sb.table("bngc_comp_tourneys").select("id").eq("id", int(tourney_id)).limit(1).execute()
+        if not chk.data:
+            return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
+        hosts = _comp_tourney_hosts(sb, tourney_id)
+        did = str(user.id)
+        hosts = [h for h in hosts if h != did]
+        sb.table("bngc_comp_tourneys").update({"hosts": hosts}).eq("id", int(tourney_id)).execute()
+        return await interaction.followup.send(f"{user.mention} is no longer a host of tourney **#{tourney_id}**.", ephemeral=True)
+    except Exception as e:
+        return await interaction.followup.send(f"Couldn't remove host: {e}", ephemeral=True)
 
 
 def _comp_announce_text(t: dict):
@@ -1842,12 +1941,9 @@ async def tourney_post_cmd(interaction: discord.Interaction, tourney_id: int,
                            ping_role: discord.Role | None = None,
                            signups_channel: discord.TextChannel | None = None):
     await interaction.response.defer(ephemeral=True)
-    me = await _comp_member(interaction, interaction.user.id)
-    if not _comp_is_host(me):
-        return await interaction.followup.send("Host only.", ephemeral=True)
-    sb = _comp_sb()
+    sb, me = await _comp_require_manager(interaction, tourney_id)
     if sb is None:
-        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+        return
     try:
         tres = sb.table("bngc_comp_tourneys").select("*").eq("id", int(tourney_id)).limit(1).execute()
         if not tres.data:
@@ -1907,12 +2003,9 @@ async def tourney_post_cmd(interaction: discord.Interaction, tourney_id: int,
                        when="UTC start, exactly: YYYY-MM-DD HH:MM")
 async def tourney_schedule_cmd(interaction: discord.Interaction, tourney_id: int, when: str):
     await interaction.response.defer(ephemeral=True)
-    me = await _comp_member(interaction, interaction.user.id)
-    if not _comp_is_host(me):
-        return await interaction.followup.send("Host only.", ephemeral=True)
-    sb = _comp_sb()
+    sb, me = await _comp_require_manager(interaction, tourney_id)
     if sb is None:
-        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+        return
     try:
         from datetime import datetime, timezone
         dt = datetime.strptime(str(when or "").strip(), "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
@@ -2190,12 +2283,9 @@ async def _comp_autoclose(tourney_id: int, guild=None, channel=None):
 async def tourney_start_cmd(interaction: discord.Interaction, tourney_id: int,
                             role_to_give: discord.Role | None = None):
     await interaction.response.defer(ephemeral=True)
-    me = await _comp_member(interaction, interaction.user.id)
-    if not _comp_is_host(me):
-        return await interaction.followup.send("Host only.", ephemeral=True)
-    sb = _comp_sb()
+    sb, me = await _comp_require_manager(interaction, tourney_id)
     if sb is None:
-        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+        return
     try:
         from datetime import datetime, timezone
         tres = sb.table("bngc_comp_tourneys").select(

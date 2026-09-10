@@ -638,6 +638,78 @@ async def comp_tourney_table(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@router.post("/api/comp/tourney/host-playing")
+async def comp_tourney_host_playing(request: Request):
+    """Flip whether the host plays (dashboard toggle + bot host-status).
+
+    When false the bridge ignores the host's own kills/alv rows."""
+    err = _need()
+    if err:
+        return err
+    b = await _json(request)
+    try:
+        tid = int(b.get("tourney_id"))
+    except Exception:
+        return JSONResponse(
+            {"error": "tourney_id required (pick a tourney in the dashboard list first)"},
+            status_code=400)
+    if b.get("host_playing") is None:
+        return JSONResponse({"error": "host_playing required (true/false)"}, status_code=400)
+    hp = bool(b.get("host_playing"))
+    try:
+        res = supabase.table("bngc_comp_tourneys").update(
+            {"host_playing": hp}).eq("id", tid).execute()
+        if not res.data:
+            return JSONResponse({"error": "tourney not found"}, status_code=404)
+        return JSONResponse({"ok": True, "tourney_id": tid, "host_playing": hp})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@router.post("/api/comp/tourney/hosts")
+async def comp_tourney_hosts(request: Request):
+    """Add/remove a per-tourney host (dashboard hosts UI + bot).
+
+    Body: {tourney_id, add: discord_id} or {tourney_id, remove: discord_id}
+    (exactly one). Returns the resulting hosts list."""
+    err = _need()
+    if err:
+        return err
+    b = await _json(request)
+    try:
+        tid = int(b.get("tourney_id"))
+    except Exception:
+        return JSONResponse(
+            {"error": "tourney_id required (pick a tourney in the dashboard list first)"},
+            status_code=400)
+    add = b.get("add")
+    remove = b.get("remove")
+    add = str(add).strip() if add is not None else ""
+    remove = str(remove).strip() if remove is not None else ""
+    if bool(add) == bool(remove):
+        return JSONResponse(
+            {"error": "pass exactly one of add/remove (discord id)"}, status_code=400)
+    try:
+        rres = supabase.table("bngc_comp_tourneys").select("hosts").eq(
+            "id", tid).limit(1).execute()
+        if not rres.data:
+            return JSONResponse({"error": "tourney not found"}, status_code=404)
+        hosts = [str(x) for x in ((rres.data[0] or {}).get("hosts") or [])
+                 if str(x or "").strip()]
+        if add:
+            if add not in hosts:
+                hosts.append(add)
+        else:
+            hosts = [h for h in hosts if h != remove]
+        ures = supabase.table("bngc_comp_tourneys").update(
+            {"hosts": hosts}).eq("id", tid).execute()
+        if not ures.data:
+            return JSONResponse({"error": "tourney not found"}, status_code=404)
+        return JSONResponse({"ok": True, "tourney_id": tid, "hosts": hosts})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @router.post("/api/comp/calculate")
 async def comp_calculate(request: Request):
     """Compute standings with the shared math and snapshot per-match rows
