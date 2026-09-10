@@ -39,8 +39,15 @@
   #log { font-family: Consolas, monospace; font-size: 11px; max-height: 150px; overflow: auto; background: #fff; }
   #log div { margin: 1px 0; border-bottom: 1px dotted #d4dbe4; padding: 1px 0; }
   .tlink { color: #2456a6; text-decoration: underline; cursor: pointer; }
+  .mlink { color: #2456a6; text-decoration: underline; cursor: pointer; }
+  .mlink.sel { font-weight: bold; text-decoration: none; color: #16386b; background: #dbe7f5; border-radius: 3px; padding: 0 4px; }
+  .cols { display: flex; gap: 12px; align-items: flex-start; }
+  .cols > fieldset { flex: 1; min-width: 260px; }
+  .feed { font-family: Consolas, monospace; font-size: 11px; max-height: 420px; overflow: auto; background: #f7fafc; border: 1px solid #d4dbe4; border-radius: 3px; padding: 6px 8px; }
+  .feed div { margin: 2px 0; border-bottom: 1px dotted #d4dbe4; padding: 1px 0; }
+  .feed .tm { color: #5b6770; }
   .placebtn { padding: 3px 7px; font-size: 11px; margin-right: 3px; }
-  @media (max-width: 700px) { #wrap { padding: 8px; } fieldset { padding: 8px; } }
+  @media (max-width: 700px) { #wrap { padding: 8px; } fieldset { padding: 8px; } .cols { flex-direction: column; } }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 </style>
 </head>
@@ -87,6 +94,17 @@ try {
   if (Number.isFinite(saved)) selTid = saved;
 } catch {}
 let editMatchId = null;
+let _matchLive = false;
+try {
+  const savedM = Number(localStorage.getItem('comp_sel_match'));
+  if (Number.isFinite(savedM)) editMatchId = savedM;
+} catch {}
+function persistMatch() {
+  try {
+    if (editMatchId == null) localStorage.removeItem('comp_sel_match');
+    else localStorage.setItem('comp_sel_match', String(editMatchId));
+  } catch {}
+}
 function log(m, err) {
   const el = $('log');
   if (!el) return;
@@ -172,7 +190,8 @@ async function refreshList() {
           if (selTid == null) localStorage.removeItem('comp_sel_tid');
           else localStorage.setItem('comp_sel_tid', String(selTid));
         } catch {}
-        editMatchId = null;
+        editMatchId = null; _matchLive = false;
+        persistMatch();
         if (selTid != null) refreshDetail();
       }
     } catch {}
@@ -180,7 +199,8 @@ async function refreshList() {
       const go = () => {
         const _id = Number(el.dataset.t);
         if (!Number.isFinite(_id)) { log('bad tourney id', true); return; }
-        selTid = _id; editMatchId = null;
+        selTid = _id; editMatchId = null; _matchLive = false;
+        persistMatch();
         try { localStorage.setItem('comp_sel_tid', String(selTid)); } catch {}
         refreshList(); refreshDetail();
       };
@@ -213,13 +233,14 @@ async function refreshDetail() {
       `<label>win <input id="tbW" size="3" inputmode="numeric" value="${table.win != null ? table.win : 3}"></label> ` +
       `<button id="tbSave">Save table</button> <button id="calc" class="primary">Calculate</button> <button id="dmOpen">Open blank match</button></div></fieldset>` +
       `<fieldset style="margin-top:8px"><legend>Standings</legend><div id="board">…</div></fieldset>` +
-      `<fieldset style="margin-top:8px"><legend>Matches</legend><div id="matches">…</div></fieldset>` +
+      `<fieldset style="margin-top:8px"><legend>Matches — pick one</legend><div id="matchlist">…</div></fieldset>` +
+      `<div class="cols" style="margin-top:8px">` +
+      `<fieldset><legend id="mLeftLeg">Match</legend><div id="matchLeft"><span class="dim">Pick a match above.</span></div></fieldset>` +
+      `<fieldset><legend>Killfeed</legend><div id="matchFeed" class="feed"><span class="dim">Pick a match above.</span></div></fieldset>` +
+      `</div>` +
       `<fieldset style="margin-top:8px"><legend>Unmapped names — link to players</legend><div id="unmapped">…</div></fieldset>` +
-      `<fieldset style="margin-top:8px"><legend>Players — editing match <select id="editMatch"></select></legend><div id="players">…</div></fieldset>` +
       `<fieldset style="margin-top:8px"><legend>Players &amp; banned</legend><div id="regs">…</div></fieldset>`;
-    const sel = $('editMatch');
-    sel.innerHTML = matches.map((m) => `<option value="${m.id}"${m.id === editMatchId ? ' selected' : ''}>v${m.version} (${esc(m.status)})</option>`).join('') || '<option value="">—</option>';
-    sel.onchange = () => { editMatchId = Number(sel.value) || null; refreshDetail(); };
+    wireMatchList(matches);
     const needTid = () => {
       if (selTid == null || !Number.isFinite(Number(selTid))) {
         log('pick a tourney first', true);
@@ -256,32 +277,7 @@ async function refreshDetail() {
     const bd = (j.standings || []).map((r, i) =>
       `<tr><td>${i + 1}</td><td>${esc(r.name)}</td><td>${r.points}</td><td>${r.kills}</td><td>${r.wins}</td></tr>`).join('');
     $('board').innerHTML = bd ? `<table class="grid"><tr><th>#</th><th>Player</th><th>Pts</th><th>K</th><th>W</th></tr>${bd}</table>` : '<span class="dim">No sealed matches.</span>';
-    $('matches').innerHTML = (matches.map((m) =>
-      `<div>v${m.version} <span class="dim">${esc(m.status)} · winner ${esc(m.winner || '—')}</span> ` +
-      `<input size="10" placeholder="winner did" id="w-${m.id}" value=""> ` +
-      `<button data-win="${m.id}">Set winner</button> ` +
-      ((m.status === 'open' || m.status === 'manual') ? `<button data-seal="${m.id}">Seal</button>` : '') + `</div>`).join('') || '<span class="dim">None.</span>');
-    // NOTE: 'kp' prefix keeps the winner input findable without id collision; value read below via data-win id lookup.
-    $('matches').querySelectorAll('[data-win]').forEach((b) => {
-      b.onclick = async () => {
-        b.disabled = true;
-        const inp = document.querySelector(`[id="w-${b.dataset.win}"]`);
-        try {
-          await api('/api/comp/match/winner', post({ match_id: Number(b.dataset.win), winner_discord_id: (inp && inp.value.trim()) || null }));
-          log('winner set match ' + b.dataset.win); refreshDetail();
-        } catch (e) { log('winner: ' + e.message, true); b.disabled = false; }
-      };
-    });
-    $('matches').querySelectorAll('[data-seal]').forEach((b) => {
-      b.onclick = async () => {
-        b.disabled = true;
-        try {
-          await api('/api/comp/match/seal', post({ match_id: Number(b.dataset.seal) }));
-          log('sealed match ' + b.dataset.seal); refreshDetail();
-        } catch (e) { log('seal: ' + e.message, true); b.disabled = false; }
-      };
-    });
-    await refreshPlayers();
+    await refreshMatch();
     await refreshUnmapped(j);
     const rq = await api('/api/comp/regs?tourney_id=' + encodeURIComponent(selTid) + '&status=accepted').catch(() => ({ regs: [] }));
     const bq = await api('/api/comp/regs?tourney_id=' + encodeURIComponent(selTid) + '&status=banned').catch(() => ({ regs: [] }));
@@ -338,62 +334,115 @@ async function refreshDetail() {
     $('regs').querySelectorAll('[data-unban]').forEach((b) => { b.onclick = () => setBan(b.dataset.unban, false, b); });
   } catch (e) { box.innerHTML = '<span class="bad">Failed: ' + esc(e.message) + '</span>'; }
 }
-async function refreshPlayers() {
-  const box = $('players');
-  if (!box || selTid == null || editMatchId == null) {
-    if (box) box.innerHTML = '<span class="dim">Pick a match above.</span>';
+async function refreshMatch() {
+  const left = $('matchLeft');
+  const feed = $('matchFeed');
+  const leg = $('mLeftLeg');
+  if (!left || !feed || selTid == null || editMatchId == null) {
+    if (left) left.innerHTML = '<span class="dim">Pick a match above.</span>';
+    if (feed) feed.innerHTML = '<span class="dim">Pick a match above.</span>';
     return;
   }
   try {
-    const t = await api('/api/comp/tourney?id=' + encodeURIComponent(selTid));
+    const d = await api('/api/comp/match?id=' + encodeURIComponent(editMatchId));
+    const m = d.match || {};
+    const board = d.board || [];
+    const kills = d.killfeed || [];
+    _matchLive = (m.status === 'open' || m.status === 'manual');
+    const sc = feed ? feed.scrollTop : 0;
+    if (leg) leg.textContent = `Match v${m.version} (${m.status || '?'})${m.room_id ? ' · ' + String(m.room_id).slice(0, 8) : ''}`;
+    // LEFT: leaderboard + buttons
+    const rows = board.map((r, i) =>
+      `<tr><td>${i + 1}</td><td>${esc(r.name)}${r.won ? ' 👑' : ''}</td>` +
+      `<td>${r.kills || 0}</td><td>${r.placement != null ? 'P' + r.placement : '—'}</td><td><b>${r.points}</b></td></tr>`).join('');
     const acc = await api('/api/comp/regs?tourney_id=' + encodeURIComponent(selTid) + '&status=accepted').catch(() => ({ regs: [] }));
-    const dids = [...new Set(((acc && acc.regs) || []).flatMap((r) => r.member_ids || []))];
-    if (!dids.length) { box.innerHTML = '<span class="dim">No accepted players.</span>'; return; }
-    try {
-      const boards = (t.match_boards || []).find((b) => {
-        const m = (t.matches || []).find((x) => x.id === editMatchId);
-        return m && b.version === m.version;
-      });
-      const kmap = {};
-      ((boards && boards.rows) || []).forEach((r) => { kmap[String(r.discord_id)] = r; });
-      box.innerHTML = dids.map((did) => {
-        const row = kmap[String(did)] || {};
-        const nm = esc(row.name || String(did).slice(0, 6));
-        return `<div style="margin:4px 0"><b>${nm}</b> <span class="dim">${row.kills || 0}K${row.placement ? ' · P' + row.placement : ''}</span><br>` +
-          `<button data-k="${did}">+ kill</button> ` +
-          `<button data-w="${did}">+ win</button> ` +
-          [1, 2, 3, 4, 5].map((p) => `<button class="placebtn" data-p="${did}:${p}">${p}</button>`).join(' ') + `</div>`;
-      }).join('');
-    } catch (e) { box.innerHTML = '<span class="bad">Failed: ' + esc(e.message) + '</span>'; return; }
-    box.querySelectorAll('[data-k]').forEach((b) => {
-      b.onclick = async () => {
-        b.disabled = true;
-        try {
-          await api('/api/comp/match/kills', post({ match_id: editMatchId, discord_id: b.dataset.k, delta: 1 }));
-          log('+kill ' + b.dataset.k); refreshDetail();
-        } catch (e) { log('kill: ' + e.message, true); b.disabled = false; }
+    const roster = [...new Set(((acc && acc.regs) || []).flatMap((r) => r.member_ids || []))];
+    const bmap = {};
+    board.forEach((r) => { bmap[String(r.discord_id)] = r; });
+    roster.forEach((x) => { if (!bmap[String(x)]) bmap[String(x)] = { discord_id: String(x), name: String(x).slice(0, 6), kills: 0 }; });
+    const plist = Object.values(bmap).map((p) => {
+      const did = String(p.discord_id);
+      const nm = esc(p.name || did.slice(0, 6));
+      return `<div style="margin:4px 0"><b>${nm}</b> <span class="dim">${p.kills || 0}K${p.placement ? ' · P' + p.placement : ''}</span><br>` +
+        `<button data-k="${esc(did)}">+ kill</button> ` +
+        `<button data-w="${esc(did)}">+ win</button> ` +
+        [1, 2, 3, 4, 5].map((n) => `<button class="placebtn" data-p="${esc(did)}:${n}">${n}</button>`).join(' ') + `</div>`;
+    }).join('') || '<span class="dim">No players.</span>';
+    const canSeal = (m.status === 'open' || m.status === 'manual');
+    left.innerHTML =
+      (rows ? `<table class="grid"><tr><th>#</th><th>Player</th><th>K</th><th>Pl</th><th>Pts</th></tr>${rows}</table>`
+        : '<span class="dim">No scoring events yet.</span>') +
+      `<div class="gap"><input size="12" placeholder="winner did" id="mWinner" value="${esc(m.winner_discord_id || '')}"> ` +
+      `<button id="mWinGo">Set winner</button> ` +
+      (canSeal ? `<button id="mSealGo" class="primary">Seal match</button>` : '') + `</div>` +
+      `<div class="muted" style="margin:6px 0 2px">SCORE</div>` + plist;
+    const upd = async (btn, fn, what) => {
+      btn.disabled = true;
+      try { await fn(); log(what); refreshDetail(); }
+      catch (e) { log(what.split(' ')[0] + ': ' + e.message, true); btn.disabled = false; }
+    };
+    const wgo = $('mWinGo');
+    if (wgo) wgo.onclick = () => {
+      const inp = $('mWinner');
+      upd(wgo, () => api('/api/comp/match/winner', post({ match_id: editMatchId, winner_discord_id: (inp && inp.value.trim()) || null })), 'winner set match ' + editMatchId);
+    };
+    const sgo = $('mSealGo');
+    if (sgo) sgo.onclick = () => upd(sgo, () => api('/api/comp/match/seal', post({ match_id: editMatchId })), 'sealed match ' + editMatchId);
+    left.querySelectorAll('[data-k]').forEach((b) => {
+      b.onclick = () => upd(b, () => api('/api/comp/match/kills', post({ match_id: editMatchId, discord_id: b.dataset.k, delta: 1 })), '+kill ' + b.dataset.k);
+    });
+    left.querySelectorAll('[data-w]').forEach((b) => {
+      b.onclick = () => upd(b, () => api('/api/comp/match/winner', post({ match_id: editMatchId, winner_discord_id: b.dataset.w })), '+win ' + b.dataset.w);
+    });
+    left.querySelectorAll('[data-p]').forEach((b) => {
+      b.onclick = () => {
+        const [did, pl] = String(b.dataset.p).split(':');
+        upd(b, () => api('/api/comp/match/place', post({ match_id: editMatchId, discord_id: did, place: Number(pl) })), 'P' + pl + ' ' + did.slice(0, 6));
       };
     });
-    box.querySelectorAll('[data-w]').forEach((b) => {
-      b.onclick = async () => {
-        b.disabled = true;
-        try {
-          await api('/api/comp/match/winner', post({ match_id: editMatchId, winner_discord_id: b.dataset.w }));
-          log('+win ' + b.dataset.w); refreshDetail();
-        } catch (e) { log('win: ' + e.message, true); b.disabled = false; }
-      };
-    });
-    box.querySelectorAll('[data-p]').forEach((b) => {
-      b.onclick = async () => {
-        b.disabled = true;
-        try {
-          const [did, pl] = String(b.dataset.p).split(':');
-          await api('/api/comp/match/place', post({ match_id: editMatchId, discord_id: did, place: Number(pl) }));
-          log('P' + pl + ' ' + did.slice(0, 6)); refreshDetail();
-        } catch (e) { log('place: ' + e.message, true); b.disabled = false; }
-      };
-    });
-  } catch (e) { box.innerHTML = '<span class="bad">Failed: ' + esc(e.message) + '</span>'; }
+    // RIGHT: killfeed
+    const line = (e) => {
+      const t = e.created_at ? `<span class="tm">${esc(new Date(e.created_at).toLocaleTimeString())}</span> ` : '';
+      const a = `<b>${esc(e.actor_name || '?')}</b>`;
+      const v = `<b>${esc(e.target_name || '?')}</b>`;
+      if (e.etype === 'kill') return `<div>${t}🔪 ${a} killed ${v}</div>`;
+      if (e.etype === 'knock') return `<div>${t}💥 ${a} knocked ${v}</div>`;
+      if (e.etype === 'alv' && e.alive === false) return `<div>${t}💀 ${a} eliminated</div>`;
+      if (e.etype === 'leave') return `<div>${t}🚪 ${a} left</div>`;
+      return '';
+    };
+    feed.innerHTML = kills.map(line).join('') || '<span class="dim">No events yet.</span>';
+    try { feed.scrollTop = sc; } catch {}
+  } catch (e) {
+    if (left) left.innerHTML = '<span class="bad">Failed: ' + esc(e.message) + '</span>';
+    if (feed) feed.innerHTML = '';
+  }
+}
+function wireMatchList(matches) {
+  const box = $('matchlist');
+  if (!box) return;
+  const list = matches || [];
+  if (!list.length) { box.innerHTML = '<span class="dim">None yet — play a match or open a blank one.</span>'; return; }
+  // keep selection if still listed; else the live (open/manual) match, else latest
+  if (!list.some((m) => m.id === editMatchId)) {
+    const live = list.find((m) => m.status === 'open' || m.status === 'manual');
+    editMatchId = (live || list[list.length - 1]).id;
+    persistMatch();
+  }
+  box.innerHTML = list.map((m) => {
+    const sel = m.id === editMatchId ? ' sel' : '';
+    const dot = (m.status === 'open' || m.status === 'manual') ? ' 🟢' : '';
+    return `<div style="margin:3px 0"><span class="mlink${sel}" data-m="${m.id}">v${m.version}${dot}</span> ` +
+      `<span class="dim">${esc(m.status)}${m.room_id ? ' · ' + esc(m.room_id) : ''} · winner ${esc(m.winner || '—')}</span></div>`;
+  }).join('');
+  box.querySelectorAll('[data-m]').forEach((el) => {
+    el.onclick = () => {
+      editMatchId = Number(el.dataset.m);
+      persistMatch();
+      wireMatchList(list);
+      refreshMatch();
+    };
+  });
 }
 $('srv').value = SRV;
 $('srvSave').onclick = () => { SRV = $('srv').value.trim() || SRV; localStorage.setItem('comp_server', SRV); log('server -> ' + SRV); refreshAll(); };
@@ -462,6 +511,8 @@ async function refreshUnmapped(t) {
 }
 async function refreshAll() { await refreshTracker(); await refreshList(); await refreshDetail(); }
 setInterval(refreshTracker, 4000);
+// live match view: re-pull board + killfeed while the picked match is open
+setInterval(() => { try { if (_matchLive && selTid != null && editMatchId != null) refreshMatch(); } catch {} }, 4000);
 refreshAll();
 </script>
 </body>

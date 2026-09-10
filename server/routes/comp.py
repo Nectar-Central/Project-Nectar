@@ -386,6 +386,17 @@ async def tourney_detail(request: Request):
             per_match, board = standings_for_matches(t, sealed, by_mid)
         except Exception:
             per_match, board = [], []
+        # winner names for the match list (sealed only; open matches resolve
+        # live in the match endpoint below).
+        winners: dict = {}
+        try:
+            for i, m in enumerate(sealed):
+                rows = per_match[i] if i < len(per_match) else []
+                w = next((rw.get("name") for rw in rows if rw.get("won")), None)
+                if w:
+                    winners[m.get("id")] = w
+        except Exception:
+            pass
         try:
             rres = supabase.table("bngc_comp_registrations").select(
                 "team_label,member_ids,captain_id,status"
@@ -413,10 +424,9 @@ async def tourney_detail(request: Request):
             "players": [{"discord_id": str(x), "name": names.get(str(x), str(x)[:6])}
                         for r in regs for x in (r.get("member_ids") or []) if x],
             "matches": [{"id": m.get("id"), "version": m.get("version"), "status": m.get("status"),
-                         "room_id": (str(m.get("room_id") or "")[:8] or None),
-                         "winner": next((rw.get("name") for rw in (per_match[i] if i < len(per_match) else [])
-                                         if rw.get("won")), None)}
-                        for i, m in enumerate(sealed)],
+                          "room_id": (str(m.get("room_id") or "")[:8] or None),
+                          "winner": winners.get(m.get("id"))}
+                         for m in matches],
             "match_boards": [{"version": m.get("version"),
                               "rows": (per_match[i] if i < len(per_match) else [])[:10]}
                              for i, m in enumerate(sealed)],
@@ -432,6 +442,77 @@ async def _json(request: Request) -> dict:
         return b if isinstance(b, dict) else {}
     except Exception:
         return {}
+
+
+@router.get("/api/comp/match")
+async def comp_match_detail(request: Request):
+    """One match for the dashboard match view: live board + killfeed.
+
+    Works for open matches too (board computed from events so far).
+    Returns {match, tourney, board, killfeed}. Never raises."""
+    err = _need()
+    if err:
+        return err
+    try:
+        mid = int(request.query_params.get("id"))
+    except Exception:
+        return JSONResponse({"error": "id required (match id)"}, status_code=400)
+    try:
+        mres = supabase.table("bngc_comp_matches").select(
+            "id,tourney_id,version,room_id,status,winner_discord_id,placements,started_at,sealed_at"
+        ).eq("id", mid).limit(1).execute()
+        mrows = mres.data or []
+        if not mrows:
+            return JSONResponse({"error": "match not found"}, status_code=404)
+        m = mrows[0]
+        try:
+            tres = supabase.table("bngc_comp_tourneys").select(
+                "id,name,code,status,points_table").eq(
+                "id", m.get("tourney_id")).limit(1).execute()
+            t = (tres.data or [{}])[0]
+        except Exception:
+            t = {}
+        table = _table_of(t)
+        try:
+            eres = supabase.table("bngc_comp_events").select(
+                "id,match_id,etype,actor_nr,actor_name,target_name,discord_id,alive,created_at"
+            ).eq("match_id", mid).order("id").limit(1000).execute()
+            events = eres.data or []
+        except Exception:
+            events = []
+        board = compute_match_points(events, table, m.get("winner_discord_id"), m.get("placements"))
+        # display names: registered game_username wins over raw actor names.
+        try:
+            dids = sorted({str(r.get("discord_id")) for r in board if r.get("discord_id")})[:200]
+            if dids:
+                ures = supabase.table("bngc_users").select(
+                    "discord_id,game_username,discord_username").in_("discord_id", dids).execute()
+                nmap = {str(u.get("discord_id")): str(
+                    u.get("game_username") or u.get("discord_username") or u.get("discord_id"))
+                    for u in (ures.data or []) if u.get("discord_id")}
+                for r in board:
+                    if nmap.get(str(r.get("discord_id"))):
+                        r["name"] = nmap[str(r.get("discord_id"))]
+        except Exception:
+            pass
+        feed = [{"id": e.get("id"), "etype": e.get("etype"), "actor_nr": e.get("actor_nr"),
+                 "actor_name": e.get("actor_name"), "target_name": e.get("target_name"),
+                 "discord_id": e.get("discord_id"), "alive": e.get("alive"),
+                 "created_at": e.get("created_at")} for e in events]
+        return JSONResponse({
+            "match": {"id": m.get("id"), "tourney_id": m.get("tourney_id"),
+                      "version": m.get("version"), "status": m.get("status"),
+                      "room_id": m.get("room_id"),
+                      "winner_discord_id": m.get("winner_discord_id"),
+                      "placements": m.get("placements") or {},
+                      "started_at": m.get("started_at"), "sealed_at": m.get("sealed_at")},
+            "tourney": {"id": t.get("id"), "name": t.get("name"), "code": t.get("code"),
+                        "status": t.get("status"), "points_table": table},
+            "board": board,
+            "killfeed": feed,
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 def _next_version(tourney_id: int) -> int:
