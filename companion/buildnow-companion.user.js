@@ -227,18 +227,26 @@
   let apiBusy = false;
   function apiPost(path, body, cb){
     const clean={...body}; delete clean._retried;
-    apiQueue.push({path, body: clean, cb, retried: !!body._retried});
+    const quiet=!!clean._quiet; delete clean._quiet;
+    const noLive=!!clean._noLiveness; delete clean._noLiveness;
+    const noTok=!!clean._noToken; delete clean._noToken;
+    apiQueue.push({path, body: clean, cb, retried: !!body._retried, quiet, noLive, noTok});
     processApiQueue();
   }
   function processApiQueue(){
     if(apiBusy || !apiQueue.length) return;
     apiBusy = true;
-    const {path, body: origBody, cb, retried} = apiQueue.shift();
+    const {path, body: origBody, cb, retried, quiet, noLive, noTok} = apiQueue.shift();
     let body = {...origBody};
-    if(path!=='/api/validate-token' && sessionId && currentReqToken){
+    if(path!=='/api/validate-token' && sessionId && (currentReqToken || noTok)){
       if(path==='/api/capture'){
-        body = { ...body, authSessionId: sessionId, discord_id: discordId, req_token: currentReqToken };
-        try{ lastCaptureSentAt=Date.now(); }catch{}
+        body = { ...body, authSessionId: sessionId, discord_id: discordId };
+        // _noToken (heartbeat): touch the session without rotating/burning
+        // a single-use req_token. Server proceeds, skips rotation, 204s.
+        if(!noTok && currentReqToken) body.req_token = currentReqToken;
+        // heartbeats opt out: they warm the server session but must never
+        // stamp client liveness (that would resurrect ghost blocks / dot).
+        if(!noLive){ try{ lastCaptureSentAt=Date.now(); }catch{} }
       } else {
         body = { ...body, session_id: sessionId, discord_id: discordId, req_token: currentReqToken };
       }
@@ -277,12 +285,12 @@
               else if(j.new_req_token) storeSession(j);
               if(!retried){
                 logInfo(`replay detected for ${path} - retry`);
-                apiQueue.unshift({path, body: {...origBody, _retried:true}, cb, retried:true});
+                apiQueue.unshift({path, body: {...origBody, _retried:true}, cb, retried:true, quiet, noLive, noTok});
                 apiBusy = false; setTimeout(processApiQueue, 30); return;
               }
             }
             if(j.error && String(j.error).toLowerCase().includes('invalid')){
-              if(j.current){ currentReqToken=j.current; GMSet('bnc_req_token', currentReqToken); logInfo(`mismatch sync token → ${String(currentReqToken).slice(0,4)}…`); if(!retried){ logInfo(`mismatch retry ${path}`); apiQueue.unshift({path, body: {...origBody, _retried:true}, cb, retried:true}); apiBusy=false; setTimeout(processApiQueue,30); return; } }
+              if(j.current){ currentReqToken=j.current; GMSet('bnc_req_token', currentReqToken); logInfo(`mismatch sync token → ${String(currentReqToken).slice(0,4)}…`); if(!retried){ logInfo(`mismatch retry ${path}`); apiQueue.unshift({path, body: {...origBody, _retried:true}, cb, retried:true, quiet, noLive, noTok}); apiBusy=false; setTimeout(processApiQueue,30); return; } }
               else { logErr(`req_token rejected - clearing session`); cleanTokenStorage(); }
             }
           }catch{}
@@ -299,14 +307,14 @@
           // on, doubling its load (the timed-out work still completes).
           const postTimeout = String(u).includes('/api/capture') ? 30000 : 15000;
           GM({ method:'POST', url:u, headers:{'Content-Type':'application/json'}, data: JSON.stringify(body), timeout:postTimeout,
-            onload: r=> { const ok=r.status>=200&&r.status<300; const txt=r.responseText||''; const isZone=txt.includes('"zone"'); (ok?logOk:logErr)(`API ${ok?'OK':'ERR'} ${u} → ${r.status} ${String(txt).slice(0, isZone?1200:600)}`); if(isZone){ try{ const j=JSON.parse(txt); const zps=(j.packets||[]).filter(p=> (p.packet||p.packet_type)==='zone'); if(zps.length){ logGroup(`API zone batch ${zps.length} packets`, ()=>{ zps.forEach(zp=> console.log('zone packet', zp, 'decrypted', zp.decrypted_hex||zp.raw)); }); } }catch{} } wrapOk(ok, r.responseText); },
+            onload: r=> { const ok=r.status>=200&&r.status<300; const txt=r.responseText||''; const isZone=txt.includes('"zone"'); if(!quiet||!ok){ (ok?logOk:logErr)(`API ${ok?'OK':'ERR'} ${u} → ${r.status} ${String(txt).slice(0, isZone?1200:600)}`); } if(isZone){ try{ const j=JSON.parse(txt); const zps=(j.packets||[]).filter(p=> (p.packet||p.packet_type)==='zone'); if(zps.length){ logGroup(`API zone batch ${zps.length} packets`, ()=>{ zps.forEach(zp=> console.log('zone packet', zp, 'decrypted', zp.decrypted_hex||zp.raw)); }); } }catch{} } wrapOk(ok, r.responseText); },
             onerror: (e)=>{ wrapFail(`API GM_xhr error → ${u} ${e&&e.error||''}`); },
             ontimeout: ()=>{ wrapFail(`API timeout (${postTimeout/1000}s) → ${u}`); }});
           return true;
         }catch(e){ wrapFail(`API GM throw ${e.message}`); return false; }
       }
       try{
-        fetch(u,{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r=>r.text().then(t=>{ const ok=r.ok; const isZone=t.includes('"zone"'); (ok?logOk:logErr)(`API fetch ${ok?'OK':'ERR'} ${u} → ${r.status} ${t.slice(0, isZone?1200:600)}`); if(isZone){ try{ const j=JSON.parse(t); const zps=(j.packets||[]).filter(p=> (p.packet||p.packet_type)==='zone'); if(zps.length){ logGroup(`API zone batch ${zps.length} packets`, ()=>{ zps.forEach(zp=> console.log('zone packet', zp, 'decrypted', zp.decrypted_hex||zp.raw)); }); } }catch{} } wrapOk(ok,t); }).catch(()=>wrapFail(`fetch catch ${u}`))).catch((e)=>{ wrapFail(`API fetch fail ${u} ${e.message}`); });
+        fetch(u,{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r=>r.text().then(t=>{ const ok=r.ok; const isZone=t.includes('"zone"'); if(!quiet||!ok){ (ok?logOk:logErr)(`API fetch ${ok?'OK':'ERR'} ${u} → ${r.status} ${t.slice(0, isZone?1200:600)}`); } if(isZone){ try{ const j=JSON.parse(t); const zps=(j.packets||[]).filter(p=> (p.packet||p.packet_type)==='zone'); if(zps.length){ logGroup(`API zone batch ${zps.length} packets`, ()=>{ zps.forEach(zp=> console.log('zone packet', zp, 'decrypted', zp.decrypted_hex||zp.raw)); }); } }catch{} } wrapOk(ok,t); }).catch(()=>wrapFail(`fetch catch ${u}`))).catch((e)=>{ wrapFail(`API fetch fail ${u} ${e.message}`); });
         return true;
       }catch(e){ wrapFail(`API fetch throw ${e.message}`); return false; }
     };
@@ -2228,13 +2236,13 @@
   }
   function stopStatsPoll(){ if(statsPollTimer){ clearInterval(statsPollTimer); statsPollTimer=null; } }
   // auto-create drawer shell immediately so handle is visible + hidden audio tag that auto plays
-  setTimeout(()=>{ ensureLobbyAudio(); createInfoPanel(); renderInfoPanel(); if(drawerOpen){ startStatsPoll(); if(drawerTab==='players') startPlayersPoll(); } if(sessionId) startBgLobbyPoll(); try{ logInfo(`[RANKED] companion v${BNC_VERSION} boot`); }catch{} }, 700);
+  setTimeout(()=>{ ensureLobbyAudio(); createInfoPanel(); renderInfoPanel(); if(drawerOpen){ startStatsPoll(); if(drawerTab==='players') startPlayersPoll(); } if(sessionId){ startBgLobbyPoll(); try{ startHeartbeat(); }catch{} } try{ logInfo(`[RANKED] companion v${BNC_VERSION} boot`); }catch{} }, 700);
   // refresh when session established after login
   const _origStoreSession = storeSession;
   // wrap storeSession to trigger render
   // monkey-patch via interval check on sessionId change
   let _lastSid = sessionId;
-  setInterval(()=>{ if(sessionId!==_lastSid){ _lastSid=sessionId; renderInfoPanel(); if(drawerOpen){ fetchStats(false); if(drawerTab==='players') fetchPlayers(false); } else if(sessionId){ startBgLobbyPoll(); fetchStats(false); } } }, 1000);
+  setInterval(()=>{ if(sessionId!==_lastSid){ _lastSid=sessionId; renderInfoPanel(); if(drawerOpen){ fetchStats(false); if(drawerTab==='players') fetchPlayers(false); } else if(sessionId){ startBgLobbyPoll(); try{ startHeartbeat(); }catch{} fetchStats(false); } } }, 1000);
 
   // --- RANKED OVERLAY (Phase 5): bottom-left box, points text only ---
   // Game frame only, pointer-transparent, driven by the stats poll. Shows in
@@ -3059,13 +3067,14 @@
     }
     const escS=(v)=> String(v==null?'—':v).replace(/</g,'&lt;');
     const pts=d.points!=null?Number(d.points).toLocaleString('en-US'):'—';
+    // counter shows points only: no tourney name, and zero kill/win parts
+    // are dropped (a bare counter never reads "0K · 0W").
     const sub=[];
     if(d.rank!=null) sub.push('#'+d.rank+(d.players?' of '+d.players:''));
-    sub.push(`${d.kills||0}K`);
-    sub.push(`${d.wins||0}W`);
-    el.innerHTML=`<div style="font-size:11px;font-weight:800;color:#f59e0b;letter-spacing:.06em">${escS(d.name||'TOURNEY')}</div>`
-      + `<div style="font-size:23px;font-weight:800;color:#fff">${escS(pts)}<span style="font-size:11px;font-weight:600;color:#9ca3af"> pts</span></div>`
-      + `<div style="font-size:11px;color:#9ca3af">${escS(sub.join(' · '))}</div>`;
+    if(Number(d.kills||0)>0) sub.push(`${d.kills}K`);
+    if(Number(d.wins||0)>0) sub.push(`${d.wins}W`);
+    el.innerHTML=`<div style="font-size:23px;font-weight:800;color:#fff">${escS(pts)}<span style="font-size:11px;font-weight:600;color:#9ca3af"> pts</span></div>`
+      + (sub.length?`<div style="font-size:11px;color:#9ca3af">${escS(sub.join(' · '))}</div>`:'');
     el.style.display='flex';
   }
   // Party-invite gate: pID required, plus tourney rooms and mid-match both
@@ -4249,6 +4258,31 @@
   }
   function ensureHex(rec){ if(rec.rawHex) return rec.rawHex; try{ rec.rawHex=hexOf(rec._bytes); delete rec._bytes; }catch{ rec.rawHex=''; } return rec.rawHex; }
   function scheduleFlush(){ if(flushTimer) return; if(queue.length>=BATCH_MAX) flush(); else flushTimer=setTimeout(flush, FLUSH_MS); }
+  // Heartbeat: every 5s send an empty test-cap batch so the server session
+  // stays warm (_cached_at slides, stats/presence stay fresh) through quiet
+  // stretches (idle lobby, mobile players). Records carry NO rawHex, so the
+  // server skips them before engine.feed AND the processor — zero effect on
+  // kills/wins/versions/seals — and NO req_token, so no rotation is burned.
+  // Client liveness is deliberately untouched (_noLiveness): a heartbeat
+  // must never resurrect ghost blocks or green the API dot. Never throws.
+  let _lastRealFlushAt=0, _hbTimer=null, _hbLoggedOk=false;
+  function sendHeartbeat(){
+    try{
+      if(isLocked) return;
+      if(!sessionId) return;
+      if(lastWsSeenAt<=0) return; // game traffic never seen on this page
+      const now=Date.now();
+      if(now-_lastRealFlushAt<5000) return; // real traffic already fresh
+      if(flushInFlight) return;
+      apiPost('/api/capture', { sessionId: captureSessionId, records: [{hb:1, t:now}], _quiet:true, _noLiveness:true, _noToken:true }, (ok)=>{
+        try{
+          if(ok){ if(!_hbLoggedOk){ _hbLoggedOk=true; try{ logInfo('[CAPTURE] heartbeat ok (session warm)'); }catch{} } }
+          else _hbLoggedOk=false;
+        }catch{}
+      });
+    }catch{}
+  }
+  function startHeartbeat(){ try{ if(_hbTimer) return; _hbTimer=setInterval(sendHeartbeat, 5000); }catch{} }
   function flush(){
     if(isLocked) { flushTimer=null; queue=[]; return; }
     if(!queue.length){ flushTimer=null; return; }
@@ -4270,6 +4304,7 @@
     const batch=queue.splice(0,BATCH_MAX);
     for(const r of batch) ensureHex(r);
     const payload={ sessionId: captureSessionId, records: batch };
+    try{ _lastRealFlushAt=Date.now(); }catch{}
     flushInFlight=true;
     try{ _flushStartAt=Date.now(); }catch{}
     feedLog('flush', {count:batch.length, queued:queue.length});

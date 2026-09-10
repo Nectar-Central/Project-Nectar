@@ -117,6 +117,9 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
     for rec in records:
         hex_str = rec.get("rawHex") or ""
         if not hex_str:
+            # heartbeat / empty slot ({hb:1}): keeps the session warm
+            # (_cached_at slides, stats/presence stay fresh) but never
+            # reaches engine.feed or the processor - zero gameplay effect.
             continue
         # engine.feed does decrypt + update SessionView for this session_id.
         # Direction ("out" = own client) powers identity healing: an outbound

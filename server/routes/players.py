@@ -16,6 +16,60 @@ from .capture import engine as capture_engine
 
 router = APIRouter()
 
+_BLANK = ("", "nan", "null", "none", "undefined")
+
+
+def _ident_key(p: dict, idx: int):
+    """Identity key for dedup: game_id, then discord_id, then username.
+
+    Rows with no identity at all get a unique per-row key so they are
+    never collapsed into each other."""
+    for kind, val in (("gid", p.get("game_id")), ("did", p.get("discord_id"))):
+        s = str(val or "").strip()
+        if s and s.lower() not in _BLANK:
+            return (kind, s.lower() if kind == "did" else s)
+    un = str(p.get("username") or "").strip().lower()
+    if un and un not in _BLANK:
+        return ("un", un)
+    return ("row", idx)
+
+
+def _keep_rank(p: dict):
+    return (bool(p.get("is_self")), bool(p.get("is_alive")), bool(p.get("in_db")))
+
+
+def dedup_players(enriched: list) -> list:
+    """Collapse duplicate rows for the same person (multi-device joins,
+    ghost actors): one row per game_id/discord_id/username. The winner is
+    self > alive > in_db (stable: first-seen on ties); missing discord /
+    skin / game fields merge from the loser. Pure — unit-tested."""
+    groups: dict = {}
+    order: list = []
+    for i, p in enumerate(enriched or []):
+        try:
+            k = _ident_key(p, i)
+        except Exception:
+            k = ("row", i)
+        if k not in groups:
+            groups[k] = dict(p)
+            order.append(k)
+            continue
+        cur = groups[k]
+        win, lose = (p, cur) if _keep_rank(p) > _keep_rank(cur) else (cur, p)
+        win = dict(win)
+        for f in ("discord_username", "discord_id", "game_id", "skin"):
+            try:
+                if not win.get(f) and lose.get(f):
+                    win[f] = lose[f]
+            except Exception:
+                pass
+        for f in ("is_self", "is_alive", "late_join"):
+            win[f] = bool(win.get(f) or lose.get(f))
+        if lose.get("in_db") and not win.get("in_db"):
+            win["in_db"] = True
+        groups[k] = win
+    return [groups[k] for k in order]
+
 @router.get("/api/players")
 async def get_players(request: Request):
     qp = request.query_params
@@ -131,6 +185,13 @@ async def get_players(request: Request):
     else:
         for p in raw_players:
             enriched.append({**p, "discord_username": None, "discord_id": None, "in_db": False})
+
+    # Dedup: same person under two actor numbers (mobile + desktop,
+    # ghost actors) shares game_id/discord_id — show once.
+    try:
+        enriched = dedup_players(enriched)
+    except Exception:
+        pass
 
     # Sort: self first, then alive first, then name
     enriched.sort(key=lambda x: (not x.get("is_self"), not x.get("is_alive"), (x.get("username") or "").lower()))
