@@ -101,6 +101,7 @@ let _matchLive = false;
 let detailCache = null;
 let matchCache = null;
 let rosterCache = [];
+let namesCache = {};
 let _shellTid = null;
 try {
   const savedM = Number(localStorage.getItem('comp_sel_match'));
@@ -407,6 +408,23 @@ async function refreshMatch() {
       const acc = await api('/api/comp/regs?tourney_id=' + encodeURIComponent(selTid) + '&status=accepted').catch(() => ({ regs: [] }));
       rosterCache = [...new Set(((acc && acc.regs) || []).flatMap((r) => r.member_ids || []))];
     } catch { rosterCache = []; }
+    // names for roster-only rows (never just did prefixes): real names from
+    // board + tourney players first, then one bulk lookup for the rest.
+    // A name that is just the id again counts as unknown — keep looking.
+    try {
+      const known = {};
+      const good = (nm, k) => nm && String(nm) !== k && !/^\d+$/.test(String(nm));
+      ((d.board || [])).forEach((r) => { if (good(r.name, String(r.discord_id))) known[String(r.discord_id)] = r.name; });
+      (((detailCache || {}).players) || []).forEach((p) => { if (good(p.name, String(p.discord_id))) known[String(p.discord_id)] = p.name; });
+      const missing = [...new Set([...(rosterCache || []).map(String),
+        ...((d.board || []).map((r) => String(r.discord_id)))])]
+        .filter((x) => x && !known[x] && !namesCache[x]);
+      namesCache = {};
+      if (missing.length) {
+        const nm = await api('/api/comp/names?ids=' + encodeURIComponent(missing.slice(0, 100).join(','))).catch(() => ({ names: {} }));
+        namesCache = (nm && nm.names) || {};
+      }
+    } catch { namesCache = {}; }
     renderMatchPanel();
   } catch (e) {
     if (left) left.innerHTML = '<span class="bad">Failed: ' + esc(e.message) + '</span>';
@@ -414,12 +432,47 @@ async function refreshMatch() {
   }
 }
 function nameOfDid(did) {
+  const k = String(did);
+  // a "name" that is just the id again (or all digits) counts as unknown —
+  // keep looking through the other sources before falling back.
+  const rawlike = (v) => !v || v === k || /^\d+$/.test(String(v));
   try {
+    const b = ((matchCache || {}).board || []).find((r) => String(r.discord_id) === k);
+    if (b && b.name && !rawlike(b.name)) return b.name;
     const ps = ((detailCache || {}).players || []);
-    const hit = ps.find((p) => String(p.discord_id) === String(did));
+    const hit = ps.find((p) => String(p.discord_id) === k);
+    if (hit && hit.name && !rawlike(hit.name)) return hit.name;
+    if (namesCache[k]) return namesCache[k];
+    if (b && b.name) return b.name;
     if (hit && hit.name) return hit.name;
   } catch {}
-  return String(did).slice(0, 6);
+  return k.slice(0, 6);
+}
+// typed winner / name or raw did -> discord_id (or null when unknown).
+// Candidates: board + roster + tourney players, matched by name
+// (case-insensitive) or exact did.
+function resolveDid(v) {
+  const s = String(v || '').trim();
+  if (!s) return null;
+  const pool = {};
+  try {
+    ((matchCache.board || [])).forEach((r) => { pool[String(r.discord_id)] = r.name || String(r.discord_id); });
+    (rosterCache || []).forEach((x) => { const k = String(x); if (!pool[k]) pool[k] = nameOfDid(k); });
+    (((detailCache || {}).players) || []).forEach((p) => { const k = String(p.discord_id); if (!pool[k] && p.name) pool[k] = p.name; });
+  } catch {}
+  if (pool[s]) return s;
+  const low = s.toLowerCase();
+  for (const [did, nm] of Object.entries(pool)) {
+    if (String(nm).toLowerCase() === low) return did;
+  }
+  return null;
+}
+function ord(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return '—';
+  const s = ['th', 'st', 'nd', 'rd'];
+  const v = x % 100;
+  return x + (s[(v - 20) % 10] || s[v] || s[0]);
 }
 // optimistic board patches: instant local feedback, server reconciles.
 // kill/win math mirrors the server table (from the match payload); any
@@ -477,6 +530,18 @@ function optPlace(did, p) {
 function optSeal() {
   try { (matchCache.match || {}).status = 'sealed'; _matchLive = false; } catch {}
 }
+function optSub(did, dk, kp) {
+  // optimistic points removal mirrors the server (manual kill rows);
+  // reconcile corrects when tracked kills cap the removal.
+  try {
+    const b = matchCache.board || [];
+    const r = b.find((x) => String(x.discord_id) === String(did));
+    if (!r) return;
+    r.kills = Math.max(0, (Number(r.kills) || 0) - dk);
+    r.points = Math.max(0, (Number(r.points) || 0) - dk * kp);
+    _sortBoard();
+  } catch {}
+}
 function winnerNameOf(did) {
   if (!did) return null;
   try {
@@ -520,37 +585,52 @@ function renderMatchPanel() {
   _matchLive = (m.status === 'open' || m.status === 'manual');
   const sc = feed ? feed.scrollTop : 0;
   if (leg) leg.textContent = `Match v${m.version} (${m.status || '?'})${m.room_id ? ' · ' + String(m.room_id).slice(0, 8) : ''}`;
-  // keep a typed-but-unset winner while other buttons re-render the panel
-  let wv = m.winner_discord_id || '';
-  try { const w0 = $('mWinner'); if (w0 && document.activeElement === w0 && w0.value !== wv) wv = w0.value; } catch {}
-  // LEFT: leaderboard + buttons
-    const rows = board.map((r, i) =>
-      `<tr><td>${i + 1}</td><td>${esc(r.name)}${r.won ? ' 👑' : ''}</td>` +
-      `<td>${r.kills || 0}</td><td>${r.placement != null ? 'P' + r.placement : '—'}</td><td><b>${r.points}</b></td></tr>`).join('');
-    const roster = (rosterCache && rosterCache.length) ? rosterCache.slice() : [...new Set(board.map((r) => String(r.discord_id)))];
-    const bmap = {};
-    board.forEach((r) => { bmap[String(r.discord_id)] = r; });
-    roster.forEach((x) => { if (!bmap[String(x)]) bmap[String(x)] = { discord_id: String(x), name: String(x).slice(0, 6), kills: 0 }; });
-    const plist = Object.values(bmap).map((p) => {
-      const did = String(p.discord_id);
-      const nm = esc(p.name || did.slice(0, 6));
-      return `<div style="margin:4px 0"><b>${nm}</b> <span class="dim">${p.kills || 0}K${p.placement ? ' · P' + p.placement : ''}</span><br>` +
-        `<button data-k="${esc(did)}">+ kill</button> ` +
-        `<button data-w="${esc(did)}">+ win</button> ` +
-        [1, 2, 3, 4, 5].map((n) => `<button class="placebtn" data-p="${esc(did)}:${n}">${n}</button>`).join(' ') + `</div>`;
-    }).join('') || '<span class="dim">No players.</span>';
-    const canSeal = (m.status === 'open' || m.status === 'manual');
-    left.innerHTML =
-      (rows ? `<table class="grid"><tr><th>#</th><th>Player</th><th>K</th><th>Pl</th><th>Pts</th></tr>${rows}</table>`
-        : '<span class="dim">No scoring events yet.</span>') +
-      `<div class="gap"><input size="12" placeholder="winner did" id="mWinner" value="${esc(wv)}"> ` +
-      `<button id="mWinGo">Set winner</button> ` +
-      (canSeal ? `<button id="mSealGo" class="primary">Seal match</button>` : '') + `</div>` +
-      `<div class="muted" style="margin:6px 0 2px">SCORE</div>` + plist;
+  // preserve whatever the host is typing while live polls re-render
+  let _fId = null, _fVal = '';
+  try {
+    const a = document.activeElement;
+    if (a && a.id && left.contains(a)) { _fId = a.id; _fVal = a.value; }
+  } catch {}
+  // LEFT: leaderboard + buttons (placements as 1st/2nd/…, never P1/digits)
+  const rows = board.map((r, i) =>
+    `<tr><td>${i + 1}</td><td>${esc(r.name)}${r.won ? ' 👑' : ''}</td>` +
+    `<td>${r.kills || 0}</td><td>${r.placement != null ? ord(r.placement) : '—'}</td><td><b>${r.points}</b></td></tr>`).join('');
+  const roster = (rosterCache && rosterCache.length) ? rosterCache.slice() : [...new Set(board.map((r) => String(r.discord_id)))];
+  const bmap = {};
+  board.forEach((r) => { bmap[String(r.discord_id)] = r; });
+  roster.forEach((x) => { if (!bmap[String(x)]) bmap[String(x)] = { discord_id: String(x), name: nameOfDid(String(x)), kills: 0 }; });
+  const plist = Object.values(bmap).map((p) => {
+    const did = String(p.discord_id);
+    const nm = esc(nameOfDid(did));
+    return `<div style="margin:4px 0"><b>${nm}</b> <span class="dim">${p.kills || 0}K${p.placement ? ' · ' + ord(p.placement) : ''}</span><br>` +
+      `<button data-k="${esc(did)}">+ kill</button> ` +
+      `<button data-w="${esc(did)}">+ win</button> ` +
+      `<input size="3" id="sub-${esc(did)}" placeholder="pts" inputmode="numeric" title="Points to remove"> <button data-sub="${esc(did)}" title="Remove points (tracked kills are kept)">−pts</button><br>` +
+      `<span class="dim">Place:</span> ` +
+      [1, 2, 3, 4, 5].map((n) => `<button class="placebtn" data-p="${esc(did)}:${n}">${ord(n)}</button>`).join(' ') + `</div>`;
+  }).join('') || '<span class="dim">No players.</span>';
+  const canSeal = (m.status === 'open' || m.status === 'manual');
+  // winner dropdown options: names with dids as labels
+  const cand = {};
+  board.forEach((r) => { cand[String(r.discord_id)] = r.name || String(r.discord_id); });
+  roster.forEach((x) => { const k = String(x); if (!cand[k]) cand[k] = nameOfDid(k); });
+  const dlOpts = Object.entries(cand).map(([did, nm]) => `<option value="${esc(nm)}">${esc(did)}</option>`).join('');
+  const wv = winnerNameOf(m.winner_discord_id) || '';
+  left.innerHTML =
+    (rows ? `<table class="grid"><tr><th>#</th><th>Player</th><th>K</th><th>Pl</th><th>Pts</th></tr>${rows}</table>`
+      : '<span class="dim">No scoring events yet.</span>') +
+    `<div class="gap"><input size="14" list="mWinnerList" placeholder="winner name or id" id="mWinner" value="${esc(wv)}"> ` +
+    `<datalist id="mWinnerList">${dlOpts}</datalist>` +
+    `<button id="mWinGo">Set winner</button> ` +
+    (canSeal ? `<button id="mSealGo" class="primary">Seal match</button>` : '') + `</div>` +
+    `<div class="muted" style="margin:6px 0 2px">SCORE</div>` + plist;
+  try { if (_fId) { const n = document.getElementById(_fId); if (n && 'value' in n) n.value = _fVal; } } catch {}
     const wgo = $('mWinGo');
     if (wgo) wgo.onclick = () => {
       const inp = $('mWinner');
-      const who = (inp && inp.value.trim()) || null;
+      const raw = (inp && inp.value.trim()) || '';
+      if (raw && !resolveDid(raw)) { log('winner: unknown player — pick from the list or paste a discord id', true); return; }
+      const who = raw ? resolveDid(raw) : null;
       mutMatch(wgo, () => optWinner(who),
         () => api('/api/comp/match/winner', post({ match_id: editMatchId, winner_discord_id: who })),
         'winner set match ' + editMatchId);
@@ -570,7 +650,26 @@ function renderMatchPanel() {
       b.onclick = () => {
         const [did, pl] = String(b.dataset.p).split(':');
         mutMatch(b, () => optPlace(did, Number(pl)),
-          () => api('/api/comp/match/place', post({ match_id: editMatchId, discord_id: did, place: Number(pl) })), 'P' + pl + ' ' + did.slice(0, 6));
+          () => api('/api/comp/match/place', post({ match_id: editMatchId, discord_id: did, place: Number(pl) })), ord(pl) + ' ' + nameOfDid(did));
+      };
+    });
+    left.querySelectorAll('[data-sub]').forEach((b) => {
+      b.onclick = () => {
+        const did = b.dataset.sub;
+        let inp = null;
+        try { inp = left.querySelector(`[id="sub-${did}"]`); } catch {}
+        if (!inp) { try { inp = document.getElementById('sub-' + did); } catch {} }
+        const pts = Number(inp && inp.value);
+        const kp = _killPts();
+        if (!Number.isFinite(pts) || pts <= 0) { log('subtract: enter points > 0 first', true); return; }
+        let dk = Math.round(pts / kp);
+        if (dk < 1) dk = 1;
+        if (dk > 50) { log('subtract: capped at ' + (50 * kp) + 'pts', true); return; }
+        // server removes manual kill rows only (tracked kills are kept);
+        // the reconcile fetch below shows what actually came off.
+        mutMatch(b, () => optSub(did, dk, kp),
+          () => api('/api/comp/match/kills', post({ match_id: editMatchId, discord_id: did, delta: -dk })),
+          '−' + (dk * kp) + 'pts ' + nameOfDid(did));
       };
     });
     // RIGHT: killfeed
