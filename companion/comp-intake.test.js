@@ -288,3 +288,48 @@ test('codeless tourney scores any room', async () => {
   t.handle(null, stg(1));
   assert.ok(t.status().open);
 });
+
+test('public room suppresses auto open and seal', async () => {
+  const sink = codedSink('ABCDE');
+  const t = comp.createTracker({ sink, log: () => {} });
+  await t.setTourney(4);
+  t.handle({ dir: 'out' }, joinRandomRoomNoPid());
+  assert.equal(t.status().public, true);
+  t.handle(null, stg(1));
+  assert.equal(t.status().open, null);
+  t.handle(null, stg(3));
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(sink.saved.length, 0);
+  // manual still works in public rooms (explicit host action)
+  t.openManual();
+  assert.ok(t.status().open);
+  await t.sealManual();
+  assert.equal(sink.saved.length, 1);
+});
+
+test('public seal drops a stale open match', async () => {
+  const sink = codedSink('ABCDE');
+  const t = comp.createTracker({ sink, log: () => {} });
+  await t.setTourney(4);
+  t.handle({ dir: 'out' }, joinRoomPid('ABCDE'));
+  t.handle(null, stg(1));
+  assert.ok(t.status().open);
+  // left for public matchmaking without a clean end
+  t.handle({ dir: 'out' }, joinRandomRoomNoPid());
+  t.handle(null, stg(3));
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(sink.saved.length, 0);
+  assert.equal(t.status().open, null);
+});
+
+test('coded join clears public state', async () => {
+  const sink = codedSink('ABCDE');
+  const t = comp.createTracker({ sink, log: () => {} });
+  await t.setTourney(4);
+  t.handle({ dir: 'out' }, joinRandomRoomNoPid());
+  assert.equal(t.status().public, true);
+  t.handle({ dir: 'out' }, joinRoomPid('ABCDE'));
+  assert.equal(t.status().public, false);
+  t.handle(null, stg(1));
+  assert.ok(t.status().open);
+});

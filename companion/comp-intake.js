@@ -76,6 +76,7 @@ function createTracker(opts) {
     tourneyId: opts.tourneyId != null ? opts.tourneyId : null,
     tourneyCode: null, // 5-char room code of the tracked tourney (null = codeless/manual: no room gate)
     room: null,
+    publicRoom: false, // pid-less JoinRandomRoom: public matchmaking, comp checks off until the next real join
     roster: new Map(), // actorNr -> {name}
     selfName: null,    // local player (first outbound PlayerProperties 255)
     hostPlaying: true, // refreshed from the tourney row on setTourney
@@ -115,6 +116,7 @@ function createTracker(opts) {
       room = room ? String(room) : null;
       if (room && room !== st.room) {
         st.room = room;
+        st.publicRoom = false; // a real join ends public state
         st.roster = new Map();
         log(`comp room -> ${room.slice(0, 8)}`);
         // auto-tourney: an open tourney tagged with this room code takes
@@ -145,6 +147,10 @@ function createTracker(opts) {
       // therefore never seal — into the tracked tourney. Codeless tourneys
       // and explicit manual opens bypass the gate. Unknown room fails open
       // (missed join packet must not eat a real match).
+      if (!manual && st.publicRoom) {
+        log('comp match suppressed: public room');
+        return null;
+      }
       if (!manual && st.tourneyCode && st.room && String(st.room).toUpperCase() !== st.tourneyCode) {
         log(`comp match suppressed: room ${st.room} != tourney room ${st.tourneyCode}`);
         return null;
@@ -176,6 +182,13 @@ function createTracker(opts) {
       if (!m) return null;
       st.nextVersion = Math.max(st.nextVersion, m.version + 1);
     } catch { return null; }
+    // public room: drop the stale open match instead of sealing it with
+    // public-match events (left the tourney room without a clean stG 3).
+    // Manual seals bypass.
+    if (!manual && st.publicRoom) {
+      try { log(`comp seal suppressed: public room (dropping stale v${m.version})`); } catch {}
+      return null;
+    }
     if (st.tourneyId == null) {
       try {
         st.pending.push(m);
@@ -231,10 +244,15 @@ function createTracker(opts) {
         } catch {}
         if (pid) setRoom(pid);
         // JoinRandomRoom without a pID is public matchmaking: ignore it
-        // completely (no RoomName fallback). A random uuid would flip the
-        // tracker out of the tourney room and wipe the roster for a room
-        // that can never score.
-        else if (!isRandom && code) setRoom(String(code));
+        // completely (no RoomName fallback) AND mark the public state so
+        // auto open/seal stay off until the next real join. A random uuid
+        // would flip the tracker out of the tourney room and wipe the
+        // roster for a room that can never score.
+        else if (isRandom) {
+          st.publicRoom = true;
+          log('comp public room - comp checks off');
+        }
+        else if (code) setRoom(String(code));
         // self identity: the FIRST outbound PlayerProperties 255 is this box.
         // (Host-skip for non-playing hosts keys off this name.)
         if (rec && rec.dir === 'out' && !st.selfName) {
@@ -340,6 +358,7 @@ function createTracker(opts) {
     try {
       return {
         tourneyId: st.tourneyId, tourneyCode: st.tourneyCode, room: st.room,
+        public: st.publicRoom,
         open: st.openMatch ? { version: st.openMatch.version, events: st.openMatch.events.length, manual: !!st.openMatch.manual } : null,
         nextVersion: st.nextVersion, sealed: st.sealed, dropped: st.dropped,
         buffered: st.pending.length, roster: st.roster.size,

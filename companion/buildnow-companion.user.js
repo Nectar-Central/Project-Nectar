@@ -1984,16 +1984,18 @@
     // scrims show the mode (same convention as the friends presence line).
     // Stale stats must not freeze a tag on screen: hide it when the last
     // successful poll is older than 2 minutes (fail-open when unknown).
+    // Public rooms never show comp lines, even with a trailing server tag.
     try{
       const _sessTag = sess && sess.tag;
       let _tagFresh = true;
       try{ if(_lastStatsAt) _tagFresh = (Date.now()-_lastStatsAt)<=120000; }catch{}
-      if(_tagFresh && _sessTag && (_sessTag.kind==='tourney' || _sessTag.kind==='scrim') && stateLabel==='In Match' && !_ranked){
+      let _pub=false; try{ _pub=!!_publicRoom; }catch{}
+      if(!_pub && _tagFresh && _sessTag && (_sessTag.kind==='tourney' || _sessTag.kind==='scrim') && stateLabel==='In Match' && !_ranked){
         const _tn = String(_sessTag.name||'').replace(/</g,'&lt;');
         stateGmLine = _sessTag.kind==='tourney'
           ? `In Tourney - ${_tn||'Tournament'}`
           : `In Scrims - ${hasGm ? gmLive : 'Custom'}`;
-      } else if(!_ranked && stateLabel==='In Match' && _compRoom){
+      } else if(!_pub && !_ranked && stateLabel==='In Match' && _compRoom){
         // local fallback: join-detected comp room whose tag hasn't landed
         // in stats yet (host started but tag row lagging). Same line shape.
         try{
@@ -3043,9 +3045,10 @@
   // Local comp-room detection (join-time, faster than the stats poll): the
   // room pID is checked against open comp tourneys once per join, like the
   // ranked tracker. Cleared on auth/leave with the room flag.
-  let _compRoom=null, _compHudData=null;
+  let _compRoom=null, _compHudData=null, _publicRoom=false;
   function fetchCompRoom(code){
     try{
+      if(_publicRoom) return; // public matchmaking: never resolve
       code=String(code||'').trim().toUpperCase();
       if(!code || !/^[A-Z0-9]{5}$/.test(code)) return;
       if(_compRoom && _compRoom.code===code && Date.now()-_compRoom.at<600000) return; // fresh
@@ -3096,6 +3099,8 @@
   function updateTourneyHud(){
     const el=ensureTourneyHud();
     if(!el) return;
+    // public rooms never show comp UI, even with stale tourney state
+    if(_publicRoom){ el.style.display='none'; return; }
     let d=null;
     try{ d=(statsCache&&statsCache.comp_tourney)||null; }catch{}
     // hide the moment we're no longer holding that room: fresh stats with
@@ -4116,13 +4121,19 @@
     // Any Leave event (254 in = someone left queue/match) and any of MY
     // room changes -> prompt player-list refresh (server prunes on Leave).
     try{
-      if((type===2||type===3)&&(code===230||code===231)){ disableRanked('auth'); schedulePlayersRefresh('auth'); try{ noteLocalRoom(false); }catch{} try{ _compRoom=null; _compHudData=null; updateTourneyHud(); }catch{} }
-      else if((type===2||type===3)&&code===254&&dir==='out'){ _rankedLeaveGuard=true; disableRanked('leave-op'); schedulePlayersRefresh('leave-op'); try{ noteLocalRoom(false); }catch{} try{ _compRoom=null; _compHudData=null; updateTourneyHud(); }catch{} }
+      if((type===2||type===3)&&(code===230||code===231)){ disableRanked('auth'); schedulePlayersRefresh('auth'); try{ noteLocalRoom(false); }catch{} try{ _publicRoom=false; _compRoom=null; _compHudData=null; updateTourneyHud(); }catch{} }
+      else if((type===2||type===3)&&code===254&&dir==='out'){ _rankedLeaveGuard=true; disableRanked('leave-op'); schedulePlayersRefresh('leave-op'); try{ noteLocalRoom(false); }catch{} try{ _publicRoom=false; _compRoom=null; _compHudData=null; updateTourneyHud(); }catch{} }
       else if(type===4&&code===254&&dir==='in') schedulePlayersRefresh('leave-ev');
       else if((type===2||type===3)&&(code===225||code===226||code===227)&&dir==='out'){
         try{ noteLocalRoom(true); }catch{}
-        // comp-room check on the join pID (ranked-style instant detect)
-        try{ const _cpid=sniffPid(rawHex); if(_cpid) fetchCompRoom(_cpid); }catch{}
+        // comp-room check on the join pID (ranked-style instant detect).
+        // Pid-less joins are public matchmaking: never resolve, drop any
+        // stale tourney state and hide comp UI for the whole room.
+        try{
+          const _cpid=sniffPid(rawHex);
+          if(_cpid){ _publicRoom=false; fetchCompRoom(_cpid); }
+          else { _publicRoom=true; _compRoom=null; _compHudData=null; updateTourneyHud(); }
+        }catch{}
         const pid=sniffPid(rawHex);
         if(pid) rankedTrack(pid);
         else { disableRanked('public-join'); schedulePlayersRefresh('join-room'); }
