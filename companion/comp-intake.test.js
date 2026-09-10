@@ -193,3 +193,32 @@ test('ambiguous or missing code never auto-tracks', async () => {
   assert.equal(t.status().tourneyId, null);
   assert.equal(t.status().room, 'ZZZ99');
 });
+
+test('tourneyByCode matches any non-ended status (v232 lifecycle)', async () => {
+  // regression: the filter was status=eq.open, but 'open' no longer exists
+  // (created/scheduled/started/ended) so auto-track never fired.
+  const calls = [];
+  const realFetch = globalThis.fetch;
+  const oldUrl = process.env.SUPABASE_URL;
+  const oldKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  process.env.SUPABASE_URL = 'https://example.supabase.co';
+  process.env.SUPABASE_SERVICE_ROLE_KEY = 'dummy';
+  globalThis.fetch = async (url) => {
+    calls.push(String(url));
+    return { ok: true, text: async () => JSON.stringify([{ id: 7 }]) };
+  };
+  try {
+    const sink = comp.createSupabaseSink();
+    assert.equal(await sink.tourneyByCode('GZ8GU'), 7);
+    assert.equal(calls.length, 1);
+    assert.match(calls[0], /status=neq\.ended/);
+    assert.doesNotMatch(calls[0], /status=eq\.open/);
+    // ambiguous: two rows -> null, never guess
+    globalThis.fetch = async () => ({ ok: true, text: async () => JSON.stringify([{ id: 7 }, { id: 8 }]) });
+    assert.equal(await sink.tourneyByCode('GZ8GU'), null);
+  } finally {
+    globalThis.fetch = realFetch;
+    if (oldUrl === undefined) delete process.env.SUPABASE_URL; else process.env.SUPABASE_URL = oldUrl;
+    if (oldKey === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY; else process.env.SUPABASE_SERVICE_ROLE_KEY = oldKey;
+  }
+});

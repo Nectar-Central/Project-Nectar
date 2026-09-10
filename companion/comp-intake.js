@@ -407,10 +407,12 @@ function createSupabaseSink() {
       } catch { return null; }
     },
     async tourneyByCode(code) {
-      // exactly one OPEN tourney carrying this room code -> its id, else null
+      // exactly one NON-ENDED tourney carrying this room code -> its id, else null
       // (ambiguous or absent: caller keeps current tracking, never guesses).
+      // NOTE: statuses are created/scheduled/started/ended since v232 —
+      // 'open' no longer exists, so filter neq ended, not eq open.
       try {
-        const rows = await sbReq('GET', `/bngc_comp_tourneys?select=id&code=eq.${encodeURIComponent(String(code || '').toUpperCase())}&status=eq.open&limit=2`);
+        const rows = await sbReq('GET', `/bngc_comp_tourneys?select=id&code=eq.${encodeURIComponent(String(code || '').toUpperCase())}&status=neq.ended&limit=2`);
         if (rows && rows.length === 1 && rows[0].id != null) return Number(rows[0].id);
         return null;
       } catch { return null; }

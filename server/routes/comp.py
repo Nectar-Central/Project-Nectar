@@ -207,10 +207,12 @@ def code_tourney_points(code: str | None, discord_id: str | None) -> dict | None
         if not code or not did or not supabase:
             return None
         tres = supabase.table("bngc_comp_tourneys").select(
-            "id,name,points_table").eq("code", code).eq("status", "open").limit(1).execute()
-        if not tres.data:
+            "id,name,points_table").eq("code", code).neq(
+            "status", "ended").limit(2).execute()
+        rows = tres.data or []
+        if len(rows) != 1:
             return None
-        t = tres.data[0]
+        t = rows[0]
         mres = supabase.table("bngc_comp_matches").select(
             "id,winner_discord_id,placements").eq("tourney_id", t["id"]).in_(
             "status", ["sealed", "manual"]).order("version").limit(200).execute()
