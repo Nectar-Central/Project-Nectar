@@ -209,17 +209,32 @@
   if(sessionId && currentReqToken){
     logInfoEarly(`session restored ${String(sessionId).slice(0,8)}… counter=${reqCounter}`);
   } else if(loginToken){
-    setTimeout(()=> apiPost('/api/validate-token', {token: loginToken}, (ok, txt)=>{
-      if(!ok){
+    // boot re-validation: an explicit rejection means the login token is
+    // dead (wipe + prompt is correct), but a timeout/500/empty at boot is
+    // transient — wiping on it logs the user out for a blip. Retry twice.
+    let _valTries=0;
+    const tryValidate=()=>{
+      apiPost('/api/validate-token', {token: loginToken, _quiet:true}, (ok, txt)=>{
+        if(ok){
+          try{ const j=JSON.parse(txt); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.session_id) storeSession(j); }catch{}
+          return;
+        }
         let reason=''; let scope='default'; try{ const _p=JSON.parse(txt||'{}'); reason=_p.error||''; scope=_p.lock_scope||(_p.is_admin_locked?'admin':'default'); }catch{}
         if(String(reason).toLowerCase().includes('locked')){
           showLockedPanel(reason || 'Account locked', scope);
           return;
         }
+        const rl=String(reason).toLowerCase();
+        const deadToken=rl.includes('invalid')||rl.includes('expired')||rl.includes('not found')||rl.includes('no account');
+        if(!deadToken && ++_valTries<=2){
+          try{ logInfo(`[AUTH] validate failed (${reason||'network'}) - retry ${_valTries}/2`); }catch{}
+          setTimeout(tryValidate, _valTries===1?3000:8000);
+          return;
+        }
         cleanTokenStorage(); hasWelcomed=false; setTimeout(()=>{ showTokenPrompt(); showToast('Session expired - enter new token', true); }, 800);
-      }
-      else { try{ const j=JSON.parse(txt); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.session_id) storeSession(j); }catch{} }
-    }), 600);
+      });
+    };
+    setTimeout(tryValidate, 600);
   }
 
   // queue: one at a time to avoid req_token reuse
@@ -230,13 +245,14 @@
     const quiet=!!clean._quiet; delete clean._quiet;
     const noLive=!!clean._noLiveness; delete clean._noLiveness;
     const noTok=!!clean._noToken; delete clean._noToken;
-    apiQueue.push({path, body: clean, cb, retried: !!body._retried, quiet, noLive, noTok});
+    const noWipe=!!clean._noWipe; delete clean._noWipe;
+    apiQueue.push({path, body: clean, cb, retried: !!body._retried, quiet, noLive, noTok, noWipe});
     processApiQueue();
   }
   function processApiQueue(){
     if(apiBusy || !apiQueue.length) return;
     apiBusy = true;
-    const {path, body: origBody, cb, retried, quiet, noLive, noTok} = apiQueue.shift();
+    const {path, body: origBody, cb, retried, quiet, noLive, noTok, noWipe} = apiQueue.shift();
     let body = {...origBody};
     if(path!=='/api/validate-token' && sessionId && (currentReqToken || noTok)){
       if(path==='/api/capture'){
@@ -285,13 +301,20 @@
               else if(j.new_req_token) storeSession(j);
               if(!retried){
                 logInfo(`replay detected for ${path} - retry`);
-                apiQueue.unshift({path, body: {...origBody, _retried:true}, cb, retried:true, quiet, noLive, noTok});
+                apiQueue.unshift({path, body: {...origBody, _retried:true}, cb, retried:true, quiet, noLive, noTok, noWipe});
                 apiBusy = false; setTimeout(processApiQueue, 30); return;
               }
             }
             if(j.error && String(j.error).toLowerCase().includes('invalid')){
-              if(j.current){ currentReqToken=j.current; GMSet('bnc_req_token', currentReqToken); logInfo(`mismatch sync token → ${String(currentReqToken).slice(0,4)}…`); if(!retried){ logInfo(`mismatch retry ${path}`); apiQueue.unshift({path, body: {...origBody, _retried:true}, cb, retried:true, quiet, noLive, noTok}); apiBusy=false; setTimeout(processApiQueue,30); return; } }
-              else { logErr(`req_token rejected - clearing session`); cleanTokenStorage(); }
+              if(j.current){ currentReqToken=j.current; GMSet('bnc_req_token', currentReqToken); logInfo(`mismatch sync token → ${String(currentReqToken).slice(0,4)}…`); if(!retried){ logInfo(`mismatch retry ${path}`); apiQueue.unshift({path, body: {...origBody, _retried:true}, cb, retried:true, quiet, noLive, noTok, noWipe}); apiBusy=false; setTimeout(processApiQueue,30); return; } }
+              // rejected with no resync token: historically wiped the session
+              // on first sight — but that fires on transient DB read misses
+              // ("Invalid auth session") too, logging the user out for a
+              // blip. Retry once, wipe only on the second consecutive
+              // failure. _noWipe requests (heartbeat) never wipe at all.
+              else if(noWipe){ try{ logErr(`auth rejected (${path}) - no-wipe request, session kept`); }catch{} }
+              else if(!retried){ try{ logInfo(`auth rejected (${path}) - retry once before wiping`); }catch{} apiQueue.unshift({path, body: {...origBody, _retried:true}, cb, retried:true, quiet, noLive, noTok, noWipe}); apiBusy=false; setTimeout(processApiQueue,1500); return; }
+              else { logErr(`req_token rejected twice - clearing session`); cleanTokenStorage(); }
             }
           }catch{}
         }
@@ -2995,7 +3018,6 @@
           const t=j&&j.tourney;
           if(t && t.id!=null){
             _compRoom={code, id:t.id, name:t.name||'Tourney', at:Date.now()};
-            try{ showToast(`Comp room: ${t.name||''} (#${t.id})`, false); }catch{}
             try{ logInfo(`[COMP] room ${code} -> tourney #${t.id}`); }catch{}
             fetchCompHud();
           } else if(_compRoom && _compRoom.code===code){
@@ -4265,7 +4287,7 @@
   // kills/wins/versions/seals — and NO req_token, so no rotation is burned.
   // Client liveness is deliberately untouched (_noLiveness): a heartbeat
   // must never resurrect ghost blocks or green the API dot. Never throws.
-  let _lastRealFlushAt=0, _hbTimer=null, _hbLoggedOk=false;
+  let _lastRealFlushAt=0, _hbTimer=null, _hbLoggedOk=false, _hbFails=0;
   function sendHeartbeat(){
     try{
       if(isLocked) return;
@@ -4274,10 +4296,16 @@
       const now=Date.now();
       if(now-_lastRealFlushAt<5000) return; // real traffic already fresh
       if(flushInFlight) return;
-      apiPost('/api/capture', { sessionId: captureSessionId, records: [{hb:1, t:now}], _quiet:true, _noLiveness:true, _noToken:true }, (ok)=>{
+      apiPost('/api/capture', { sessionId: captureSessionId, records: [{hb:1, t:now}], _quiet:true, _noLiveness:true, _noToken:true, _noWipe:true }, (ok)=>{
         try{
-          if(ok){ if(!_hbLoggedOk){ _hbLoggedOk=true; try{ logInfo('[CAPTURE] heartbeat ok (session warm)'); }catch{} } }
-          else _hbLoggedOk=false;
+          if(ok){ _hbFails=0; if(!_hbLoggedOk){ _hbLoggedOk=true; try{ logInfo('[CAPTURE] heartbeat ok (session warm)'); }catch{} } }
+          else{
+            _hbLoggedOk=false; _hbFails++;
+            // persistent failure (dead session, long outage): stop instead
+            // of erroring every 5s forever. Restarts on next login (the
+            // session watcher calls startHeartbeat on session change).
+            if(_hbFails>=12){ try{ logErr('[CAPTURE] heartbeat failing 60s+ - stopping (re-login resumes it)'); }catch{} try{ if(_hbTimer){ clearInterval(_hbTimer); _hbTimer=null; } }catch{} }
+          }
         }catch{}
       });
     }catch{}
