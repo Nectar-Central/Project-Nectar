@@ -499,6 +499,60 @@ class Engine:
         except Exception:
             return False
 
+    def _phase_end_bump(self, room, session_id: str, stg) -> bool:
+        """stG=3 phase-end: arm the win path + bump the match version.
+        Unit-tested. The bump is identity-free on purpose: the version
+        numbers the MATCH, and gating it on view.me stranded null-identity
+        sessions at version 0 where the processor win drain can never fire.
+        Returns True when the version bumped. Never raises.
+        """
+        try:
+            if _stg_bumps_version(stg, room.last_stg, getattr(room, "stg3_armed", True)):
+                # one-shot: a 3->2->3 flap must not bump twice (second
+                # bump seals an empty version -> missed toasts/awards)
+                try:
+                    room.stg3_armed = False
+                except Exception:
+                    pass
+                room.stg_is_phase_end = True  # arm win path (repeats/timers leave it)
+                # Bump unconditionally on a real phase end in a live
+                # room: the version numbers the MATCH, not the player.
+                # Gating it on identity (old code required view.me)
+                # stranded null-identity sessions at version 0, where
+                # the processor win drain (`match_version > 0`) can
+                # never fire — wins silently lost while killfeed and
+                # defeats recorded fine. Winner attribution still
+                # needs identity downstream; numbering must not.
+                if room.state == State.MATCH:
+                    # bump version for next match — Processor checks stG==3 to calculate win/defeat
+                    # (per-life flags are left untouched: the ended match's
+                    # drain still needs them; they reset on next stG=1)
+                    room.match_version += 1
+                    room.zone_match_active = False
+                    if len(room.recent_kills) > 20:
+                        room.recent_kills = room.recent_kills[-10:]
+                    room.recent_knocks = []
+                    log_engine("match", session_id[:13], action="new_version", version=room.match_version, room=room.room_id[:8], via="stG 3")
+                    try:
+                        code = getattr(room, "short_code", None)
+                        if code:
+                            log_ranked(f"[ranked] stg=3 bump code={code} v={room.match_version} room={room.room_id[:8]}")
+                    except Exception:
+                        pass
+                return True
+            elif stg == 3 and room.last_stg != 3 and (room.last_stg is None or room.last_stg <= 2) \
+                    and getattr(room, "stg3_armed", True) is False:
+                # one-shot consumed: 3->2->3 flap blocked (no double bump)
+                try:
+                    log_ranked(f"[ranked] stg=3 flap blocked code={getattr(room, 'short_code', None)} room={room.room_id[:8]}")
+                except Exception:
+                    pass
+                return False
+            # else: timer ticking down through 3 — leave flag untouched
+            return False
+        except Exception:
+            return False
+
     def feed(self, session_id: str, hex_string: str, direction: str | None = None) -> EnginePacket:
         """Feed one hex packet for a session — decrypts, updates SessionView/RoomView, returns EnginePacket.
 
@@ -1119,39 +1173,10 @@ class Engine:
                         pass
                 # stG=3: match end marker — Processor handles win/defeat calculation
                 if stg == 3 and room.last_stg != 3 and room.game_mode and room.game_mode in _STG_PHASE_MODES:
-                    if _stg_bumps_version(stg, room.last_stg, getattr(room, "stg3_armed", True)):
-                        # one-shot: a 3->2->3 flap must not bump twice (second
-                        # bump seals an empty version -> missed toasts/awards)
-                        try:
-                            room.stg3_armed = False
-                        except Exception:
-                            pass
-                        room.stg_is_phase_end = True  # arm win path (repeats/timers leave it)
-                        me_name = (view.me.username if view.me else None) or (room.me.username if room.me else None)
-                        if me_name and room.state == State.MATCH:
-                            # bump version for next match — Processor checks stG==3 to calculate win/defeat
-                            # (per-life flags are left untouched: the ended match's
-                            # drain still needs them; they reset on next stG=1)
-                            room.match_version += 1
-                            room.zone_match_active = False
-                            if len(room.recent_kills) > 20:
-                                room.recent_kills = room.recent_kills[-10:]
-                            room.recent_knocks = []
-                            log_engine("match", session_id[:13], action="new_version", version=room.match_version, room=room.room_id[:8], via="stG 3")
-                            try:
-                                code = getattr(room, "short_code", None)
-                                if code:
-                                    log_ranked(f"[ranked] stg=3 bump code={code} v={room.match_version} room={room.room_id[:8]}")
-                            except Exception:
-                                pass
-                    elif stg == 3 and room.last_stg != 3 and (room.last_stg is None or room.last_stg <= 2) \
-                            and getattr(room, "stg3_armed", True) is False:
-                        # one-shot consumed: 3->2->3 flap blocked (no double bump)
-                        try:
-                            log_ranked(f"[ranked] stg=3 flap blocked code={getattr(room, 'short_code', None)} room={room.room_id[:8]}")
-                        except Exception:
-                            pass
-                    # else: timer ticking down through 3 — leave flag untouched
+                    try:
+                        self._phase_end_bump(room, session_id, stg)
+                    except Exception:
+                        pass
                 room.last_stg = stg
             except Exception:
                 pass

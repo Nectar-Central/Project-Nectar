@@ -76,6 +76,8 @@ function createTracker(opts) {
     tourneyId: opts.tourneyId != null ? opts.tourneyId : null,
     room: null,
     roster: new Map(), // actorNr -> {name}
+    selfName: null,    // local player (first outbound PlayerProperties 255)
+    hostPlaying: true, // refreshed from the tourney row on setTourney
     openMatch: null,   // {version, room, openedAt, events[]}
     nextVersion: 0,
     sealed: 0,
@@ -88,6 +90,12 @@ function createTracker(opts) {
       const e = st.roster.get(Number(nr));
       return e ? e.name : null;
     } catch { return null; }
+  }
+
+  function isHost(name) {
+    try {
+      return !!(st.selfName && name && normName(name) === st.selfName);
+    } catch { return false; }
   }
 
   function ensureActor(nr, name) {
@@ -108,6 +116,22 @@ function createTracker(opts) {
         st.room = room;
         st.roster = new Map();
         log(`comp room -> ${room.slice(0, 8)}`);
+        // auto-tourney: an open tourney tagged with this room code takes
+        // over tracking — no COMP_TOURNEY_ID needed per night. Only when the
+        // code maps to exactly one open tourney; manual Track always wins
+        // (it runs after and overwrites).
+        if (/^[A-Z0-9]{5}$/i.test(room) && sink && typeof sink.tourneyByCode === 'function') {
+          const code = room.toUpperCase();
+          Promise.resolve()
+            .then(() => sink.tourneyByCode(code))
+            .then((tid) => {
+              if (tid == null) return;
+              if (st.tourneyId !== null && String(st.tourneyId) === String(tid)) return;
+              log(`comp room ${code} belongs to tourney #${tid} — auto-tracking`);
+              return setTourney(Number(tid));
+            })
+            .catch(() => {});
+        }
       }
     } catch {}
   }
@@ -185,7 +209,29 @@ function createTracker(opts) {
       if (msg.req && (msg.req.opName === 'CreateRoom' || msg.req.opName === 'JoinRoom' || msg.req.opName === 'JoinRandomRoom')) {
         const rn = paramVal(msg.req.params, 'RoomName');
         const code = rn && typeof rn === 'object' && 'value' in rn ? rn.value : rn;
-        if (code) setRoom(String(code));
+        // Prefer the 5-char pID (private rooms): it matches tourney codes
+        // and server short_codes. Falls back to RoomName.
+        let pid = null;
+        try {
+          const gp = paramVal(msg.req.params, 'GameProperties') || {};
+          const raw = gp && gp.pID !== undefined ? gp.pID : null;
+          const v = raw && typeof raw === 'object' && 'value' in raw ? raw.value : raw;
+          if (typeof v === 'string' && /^[A-Z0-9]{5}$/i.test(v.trim())) pid = v.trim().toUpperCase();
+        } catch {}
+        if (pid) setRoom(pid);
+        else if (code) setRoom(String(code));
+        // self identity: the FIRST outbound PlayerProperties 255 is this box.
+        // (Host-skip for non-playing hosts keys off this name.)
+        if (rec && rec.dir === 'out' && !st.selfName) {
+          try {
+            const pp = paramVal(msg.req.params, 'PlayerProperties');
+            const nm = pp && pp['255'] && pp['255'].value !== undefined ? stripTags(pp['255'].value) : null;
+            if (nm) {
+              st.selfName = normName(nm) || nm;
+              log(`comp self = ${st.selfName}`);
+            }
+          } catch {}
+        }
       }
       if (msg.resp) {
         const al = paramVal(msg.resp.params, 'ActorList');
@@ -208,8 +254,10 @@ function createTracker(opts) {
           if ('stG' in props) onStg(props.stG && props.stG.value !== undefined ? props.stG.value : props.stG);
           if ('alv' in props) {
             const actorNr = num(paramVal(msg.ev.params, 'ActorNr')) ?? num(paramVal(msg.ev.params, 'TargetActorNr'));
+            const nm = actorNr != null ? rosterName(actorNr) : null;
+            if (!st.hostPlaying && isHost(nm)) return; // spectating host: no alv rows
             const alive = props.alv && props.alv.value !== undefined ? !!props.alv.value : !!props.alv;
-            pushEvent('alv', { actorNr, actorName: actorNr != null ? rosterName(actorNr) : null, alive });
+            pushEvent('alv', { actorNr, actorName: nm, alive });
           }
         }
       } else if (code === 101) { // Killfeed
@@ -223,6 +271,9 @@ function createTracker(opts) {
         if (text) {
           const kf = parseKillfeed(text);
           if (kf.type === 'kill' || kf.type === 'knock') {
+            // non-playing host spectates: their own kills/knocks are admin
+            // noise, never scoreboard rows (tourney.host_playing == false).
+            if (!st.hostPlaying && isHost(kf.killer)) return;
             // resolve actor numbers by name for the record (best effort)
             let actorNr = null;
             try {
@@ -242,8 +293,15 @@ function createTracker(opts) {
     try {
       st.tourneyId = id;
       st.nextVersion = 0;
+      st.hostPlaying = true;
       if (sink && typeof sink.nextVersion === 'function' && id != null) {
         try { st.nextVersion = await sink.nextVersion(id); } catch {}
+      }
+      if (sink && typeof sink.getTourney === 'function' && id != null) {
+        try {
+          const t = await sink.getTourney(id);
+          if (t && t.host_playing === false) st.hostPlaying = false;
+        } catch {}
       }
       // flush buffered matches
       const pend = st.pending.splice(0, st.pending.length);
@@ -342,6 +400,21 @@ async function sbReq(method, path, body) {
 
 function createSupabaseSink() {
   return {
+    async getTourney(tourneyId) {
+      try {
+        const rows = await sbReq('GET', `/bngc_comp_tourneys?select=id,host_playing&id=eq.${encodeURIComponent(tourneyId)}&limit=1`);
+        return (rows && rows[0]) || null;
+      } catch { return null; }
+    },
+    async tourneyByCode(code) {
+      // exactly one OPEN tourney carrying this room code -> its id, else null
+      // (ambiguous or absent: caller keeps current tracking, never guesses).
+      try {
+        const rows = await sbReq('GET', `/bngc_comp_tourneys?select=id&code=eq.${encodeURIComponent(String(code || '').toUpperCase())}&status=eq.open&limit=2`);
+        if (rows && rows.length === 1 && rows[0].id != null) return Number(rows[0].id);
+        return null;
+      } catch { return null; }
+    },
     async nextVersion(tourneyId) {
       try {
         const rows = await sbReq('GET', `/bngc_comp_matches?select=version&tourney_id=eq.${encodeURIComponent(tourneyId)}&order=version.desc&limit=1`);

@@ -1065,6 +1065,47 @@ const server = http.createServer((req,res)=>{
     sendJson(res,200,{ ok:true, comp });
     return;
   }
+  if (req.method==='GET' && (req.url==='/comp/' || req.url==='/comp/dashboard')){
+    // Host console (loopback-only by listen address): matches, manual
+    // controls, table editor, calculate, registrations.
+    try {
+      const html = fs.readFileSync(path.join(__dirname, 'comp-dashboard.html'), 'utf8');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+    } catch (e) {
+      sendJson(res, 500, { error: 'dashboard file missing' });
+    }
+    return;
+  }
+  if (req.method==='POST' && req.url==='/comp/manual/open'){
+    readBody(req, () => {
+      try {
+        if (compTracker) compTracker.openManual();
+        sendJson(res, 200, { ok: true });
+      } catch (e) { sendJson(res, 500, { error: String((e && e.message) || e) }); }
+    });
+    return;
+  }
+  if (req.method==='POST' && req.url==='/comp/manual/seal'){
+    readBody(req, () => {
+      Promise.resolve()
+        .then(() => (compTracker ? compTracker.sealManual() : null))
+        .then((m) => sendJson(res, 200, { ok: true, version: m ? m.version : null }))
+        .catch((e) => sendJson(res, 500, { error: String((e && e.message) || e) }));
+    });
+    return;
+  }
+  if (req.method==='POST' && req.url==='/comp/tourney'){
+    readBody(req, (body) => {
+      let id = null;
+      try { id = body ? JSON.parse(body.toString()).id : null; } catch {}
+      if (id == null || !compTracker) { sendJson(res, 400, { error: 'id required' }); return; }
+      Promise.resolve(compTracker.setTourney(Number(id)))
+        .then(() => sendJson(res, 200, { ok: true, tourneyId: Number(id) }))
+        .catch((e) => sendJson(res, 500, { error: String((e && e.message) || e) }));
+    });
+    return;
+  }
   if ((req.method==='POST' || req.method==='GET') && req.url==='/clear'){
     presence.status='idle'; presence.players=[]; presence.playersCount=0; presence.gameMode=null; presence.scene.curScn=null; presence.updatedAt=new Date().toISOString();
     lastPacketAt = 0;

@@ -132,3 +132,64 @@ test('never throws on garbage', () => {
   t.handle(null, { ev: { evCode: 101, params: [{ keyName: 'Data', value: {} }] } });
   assert.equal(t.status().sealed, 0);
 });
+
+function joinReq(name) {
+  return { req: { opName: 'JoinRoom', opCode: 226, params: [
+    { keyName: 'PlayerProperties', value: { value: { 255: { value: name } } } },
+  ] } };
+}
+
+test('non-playing host kills and alv skipped', async () => {
+  const sink = memSink();
+  const t = comp.createTracker({ sink, tourneyId: 0, log: () => {} });
+  t.handle({ dir: 'out' }, joinReq('HostGuy'));
+  // flip to spectating (as setTourney would from the tourney row)
+  t._state.hostPlaying = false;
+  t.handle(null, stg(1));
+  t.handle(null, kfEv('HostGuy killed Alice'));
+  t.handle(null, kfEv('Alice killed Bob'));
+  t.handle(null, stg(3));
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(sink.saved.length, 1);
+  const kinds = sink.saved[0].events.map((e) => (e.actorName || '') + ':' + e.etype);
+  assert.deepEqual(kinds, ['Alice:kill']);
+});
+
+test('playing host (default) keeps everything', async () => {
+  const sink = memSink();
+  const t = comp.createTracker({ sink, tourneyId: 0, log: () => {} });
+  t.handle({ dir: 'out' }, joinReq('HostGuy'));
+  t.handle(null, stg(1));
+  t.handle(null, kfEv('HostGuy killed Alice'));
+  t.handle(null, stg(3));
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(sink.saved[0].events.length, 1);
+});
+
+function joinRoomPid(pid) {
+  return { req: { opName: 'JoinRoom', opCode: 226, params: [
+    { keyName: 'RoomName', value: { value: 'uuid-room-1' } },
+    { keyName: 'GameProperties', value: { value: { pID: { value: pid } } } },
+  ] } };
+}
+
+test('pID room auto-tracks the open tourney with that code', async () => {
+  let tracked = null;
+  const sink = memSink();
+  sink.tourneyByCode = async (code) => (code === 'ABCDE' ? 4 : null);
+  const t = comp.createTracker({ sink, log: () => {} });
+  t.handle({ dir: 'out' }, joinRoomPid('ABCDE'));
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(t.status().tourneyId, 4);
+  assert.equal(t.status().room, 'ABCDE');
+});
+
+test('ambiguous or missing code never auto-tracks', async () => {
+  const sink = memSink();
+  sink.tourneyByCode = async () => null;
+  const t = comp.createTracker({ sink, log: () => {} });
+  t.handle({ dir: 'out' }, joinRoomPid('ZZZ99'));
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(t.status().tourneyId, null);
+  assert.equal(t.status().room, 'ZZZ99');
+});

@@ -1924,6 +1924,16 @@
         stateGmLine = _sessTag.kind==='tourney'
           ? `In Tourney - ${_tn||'Tournament'}`
           : `In Scrims - ${hasGm ? gmLive : 'Custom'}`;
+      } else if(!_ranked && stateLabel==='In Match' && _compRoom){
+        // local fallback: join-detected comp room whose tag hasn't landed
+        // in stats yet (host started but tag row lagging). Same line shape.
+        try{
+          const _cc=(sess&&sess.short_code)||null;
+          if(_cc && String(_cc).toUpperCase()===String(_compRoom.code||'').toUpperCase()){
+            const _cn=String((_compRoom&&_compRoom.name)||'Tourney').replace(/</g,'&lt;');
+            stateGmLine = `In Tourney - ${_cn}`;
+          }
+        }catch{}
       }
     }catch{}
     const smallRow = (label,val)=> `<div style="display:flex;justify-content:space-between;align-items:center;width:100%;max-width:240px;font-size:11px"><span style="color:#9ca3af">${label}</span><span style="font-weight:600;color:#fff">${val==null? '-' : val}</span></div>`;
@@ -1969,6 +1979,7 @@
           ${row('K/D', kd)}
           ${arenaRowsHtml}
           ${row('Play points', sc && sc.play_points!=null ? fmtPts(sc.play_points) : null)}
+          ${sc && sc.comp && sc.comp.length ? sc.comp.map(c=>row('🏆 '+String(c.tourney_name!=null?c.tourney_name:('Event #'+c.tourney_id)).replace(/</g,'&lt;'), fmtPts(c.points)+` (${c.wins||0}W)`)).join('') : ''}
           ${row('Wins', wins)}
           ${row('Defeats', defeats)}
           ${row('Playtime', pGlobal!=null? fmtPlaytimeDrawer(pGlobal):null)}
@@ -2110,6 +2121,8 @@
     }
     // ranked overlay follows every stats render (drawer open or not)
     try{ updateRankedOverlay(); }catch{}
+    // tourney HUD follows every stats render too (passthrough, drawer-independent)
+    try{ updateTourneyHud(); }catch{}
     // ranked lobby card follows every stats render
     try{ updateRankedLobby(); }catch{}
     // ranked match UI (lobby/match switch, fee toast, host panel)
@@ -2753,7 +2766,18 @@
     try{ el.setAttribute('autocomplete','off'); }catch{}
     try{ el.setAttribute('autocapitalize','off'); }catch{}
     try{ el.setAttribute('spellcheck','false'); }catch{}
-    const trap=(e)=>{ try{ e.stopPropagation(); }catch{} try{ if(e.stopImmediatePropagation) e.stopImmediatePropagation(); }catch{} };
+    const trap=(e)=>{
+      try{
+        // one-line remote diagnosis: if the game preventDefaults at
+        // window/document capture, defaultPrevented is already true here and
+        // NO element-level trick can restore typing (hence the keyboard below).
+        if(e && e.type==='keydown' && !el.dataset.bncVkDiag){
+          try{ el.dataset.bncVkDiag='1'; }catch{}
+          try{ logInfo(`[INPUT] first key id=${el.id||'?'} key=${e.key} defaultPrevented=${!!e.defaultPrevented}`); }catch{}
+        }
+      }catch{}
+      try{ e.stopPropagation(); }catch{} try{ if(e.stopImmediatePropagation) e.stopImmediatePropagation(); }catch{}
+    };
     ['keydown','keyup','keypress'].forEach(ev=>{
       try{ el.addEventListener(ev, trap, true); }catch{}
     });
@@ -2802,6 +2826,195 @@
   function untrapRelease(){
     try{ _untrapHoldEl=null; _untrapHoldUntil=0; }catch{}
   }
+  // On-screen keyboard for panel text fields (search, chat): clicks always
+  // reach the panel, so typing via taps works even when the game eats every
+  // physical keystroke (defaultPrevented at window capture — see diagnosis
+  // above, which no element-level handler can undo). One ⌨ toggle per input,
+  // grid sits below its row, Enter triggers the input's own action. Never throws.
+  function attachVkbd(input, onEnter){
+    try{
+      if(!input || input.dataset.bncVkbd) return;
+      input.dataset.bncVkbd='1';
+      const toggle=document.createElement('button');
+      toggle.textContent='⌨';
+      toggle.title='On-screen keyboard';
+      toggle.style.cssText='background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:7px 10px;cursor:pointer;font-size:13px;flex-shrink:0';
+      const grid=document.createElement('div');
+      grid.style.cssText='display:none;flex-direction:column;gap:4px;width:100%;padding:6px 0 2px';
+      const rows=['qwertyuiop','asdfghjkl','zxcvbnm','1234567890'];
+      const press=(ch)=>{
+        try{ input.focus(); }catch{}
+        try{
+          const s=input.selectionStart==null?input.value.length:input.selectionStart;
+          const e2=input.selectionEnd==null?input.value.length:input.selectionEnd;
+          const v=input.value||'';
+          if(ch==='\b'){ input.value=v.slice(0,Math.max(0,s-1))+v.slice(e2); }
+          else { input.value=v.slice(0,s)+ch+v.slice(e2); }
+          const pos=ch==='\b'?Math.max(0,s-1):s+ch.length;
+          try{ input.setSelectionRange(pos,pos); }catch{}
+          input.dispatchEvent(new Event('input',{bubbles:true}));
+        }catch{}
+      };
+      rows.forEach((rk)=>{
+        const r=document.createElement('div');
+        r.style.cssText='display:flex;gap:3px;justify-content:center';
+        [...rk].forEach((ch)=>{
+          const b=document.createElement('button');
+          b.textContent=ch;
+          b.style.cssText='flex:1;max-width:30px;background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:6px 0;cursor:pointer;font-size:12px';
+          b.onclick=(ev)=>{ try{ if(ev) ev.stopPropagation(); }catch{} press(ch); };
+          r.appendChild(b);
+        });
+        grid.appendChild(r);
+      });
+      const last=document.createElement('div');
+      last.style.cssText='display:flex;gap:3px;justify-content:center';
+      [['space',' ',4],['⌫','\b',2],['Enter','\n',2],['Hide','',2]].forEach(([label,ch,flex])=>{
+        const b=document.createElement('button');
+        b.textContent=label;
+        b.style.cssText=`flex:${flex};background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:6px 0;cursor:pointer;font-size:12px`;
+        b.onclick=(ev)=>{
+          try{ if(ev) ev.stopPropagation(); }catch{}
+          if(label==='Hide'){ grid.style.display='none'; return; }
+          if(label==='Enter'){ try{ onEnter&&onEnter(); }catch{} return; }
+          press(ch);
+        };
+        last.appendChild(b);
+      });
+      grid.appendChild(last);
+      toggle.onclick=(ev)=>{
+        try{ if(ev) ev.stopPropagation(); }catch{}
+        grid.style.display=(grid.style.display==='none'||!grid.style.display)?'flex':'none';
+        try{ input.focus(); }catch{}
+      };
+      const row=input.parentElement;
+      if(row){ row.appendChild(toggle); row.parentElement.insertBefore(grid, row.nextSibling); }
+      ['mousedown','click'].forEach((ev)=>{
+        try{
+          grid.addEventListener(ev, (e)=>{ try{ e.stopPropagation(); }catch{} }, true);
+          toggle.addEventListener(ev, (e)=>{ try{ e.stopPropagation(); }catch{} }, true);
+        }catch{}
+      });
+    }catch{}
+  }
+  // --- TOURNEY HUD: passthrough point counter, visible only while holding
+  // a pID-tagged tourney room. Data rides the stats poll (comp_tourney);
+  // the overlay itself never captures clicks/keys (pointer-events none),
+  // so the game stays fully playable underneath it.
+  let tourneyHud=null;
+  // Local comp-room detection (join-time, faster than the stats poll): the
+  // room pID is checked against open comp tourneys once per join, like the
+  // ranked tracker. Cleared on auth/leave with the room flag.
+  let _compRoom=null, _compHudData=null;
+  function fetchCompRoom(code){
+    try{
+      code=String(code||'').trim().toUpperCase();
+      if(!code || !/^[A-Z0-9]{5}$/.test(code)) return;
+      if(_compRoom && _compRoom.code===code && Date.now()-_compRoom.at<600000) return; // fresh
+      rankedApiGet(`/api/comp/tourney/by-code?code=${encodeURIComponent(code)}`, (j)=>{
+        try{
+          const t=j&&j.tourney;
+          if(t && t.id!=null){
+            _compRoom={code, id:t.id, name:t.name||'Tourney', at:Date.now()};
+            try{ showToast(`Comp room: ${t.name||''} (#${t.id})`, false); }catch{}
+            try{ logInfo(`[COMP] room ${code} -> tourney #${t.id}`); }catch{}
+            fetchCompHud();
+          } else if(_compRoom && _compRoom.code===code){
+            _compRoom=null; _compHudData=null;
+          }
+          updateTourneyHud();
+        }catch{}
+      });
+    }catch{}
+  }
+  function fetchCompHud(){
+    try{
+      const cr=_compRoom;
+      if(!cr) return;
+      let did=null;
+      try{ did=myDiscordId(); }catch{}
+      rankedApiGet(`/api/comp/tourney?id=${encodeURIComponent(cr.id)}`, (j)=>{
+        try{
+          const b=(j&&j.standings)||[];
+          const me=b.findIndex(r=>did && String(r.discord_id)===String(did));
+          const row=me>=0?b[me]:null;
+          _compHudData=row?{name:cr.name, points:row.points||0, kills:row.kills||0, wins:row.wins||0,
+            rank:me+1, players:b.length}:{name:cr.name, points:0, kills:0, wins:0, rank:null, players:b.length};
+          updateTourneyHud();
+        }catch{}
+      });
+    }catch{}
+  }
+  function ensureTourneyHud(){
+    if(!IS_GAME_FRAME) return null;
+    if(tourneyHud) return tourneyHud;
+    if(document.getElementById('bnc-tourney-hud')){ tourneyHud=document.getElementById('bnc-tourney-hud'); return tourneyHud; }
+    const el=document.createElement('div');
+    el.id='bnc-tourney-hud';
+    Object.assign(el.style,{position:'fixed', top:'14px', right:'14px', zIndex:'2147483639', display:'none', flexDirection:'column', alignItems:'flex-end', gap:'2px', background:'rgba(0,0,0,0.72)', border:'1px solid rgba(255,255,255,0.12)', borderRadius:'10px', padding:'8px 14px', fontFamily:'Inter, system-ui, sans-serif', pointerEvents:'none', textAlign:'right', whiteSpace:'nowrap'});
+    (document.body||document.documentElement).appendChild(el);
+    tourneyHud=el;
+    return el;
+  }
+  function updateTourneyHud(){
+    const el=ensureTourneyHud();
+    if(!el) return;
+    let d=null;
+    try{ d=(statsCache&&statsCache.comp_tourney)||null; }catch{}
+    // hide the moment we're no longer holding that room: fresh stats with
+    // no block, or a different/no code, both mean left.
+    let sameRoom=false;
+    try{
+      const cur=(statsCache&&statsCache.session&&statsCache.session.short_code)||null;
+      sameRoom=!!(d&&cur);
+    }catch{}
+    if((!d || !sameRoom) && _compRoom){
+      // local fallback: join-detected comp room, stats tag not there yet
+      // (or tag missing) — show what we know until stats confirm or deny.
+      try{
+        const cur2=(statsCache&&statsCache.session&&statsCache.session.short_code)||null;
+        const fresh=Date.now()-_compRoom.at<600000;
+        if(fresh && cur2 && String(cur2).toUpperCase()===String(_compRoom.code).toUpperCase()){
+          d=_compHudData||{name:_compRoom.name, points:0, kills:0, wins:0, rank:null, players:0};
+          sameRoom=true;
+        } else if(!fresh || (cur2 && String(cur2).toUpperCase()!==String(_compRoom.code).toUpperCase())){
+          _compRoom=null; _compHudData=null;
+        }
+      }catch{}
+    }
+    if(!d || !sameRoom){
+      el.style.display='none';
+      return;
+    }
+    const escS=(v)=> String(v==null?'—':v).replace(/</g,'&lt;');
+    const pts=d.points!=null?Number(d.points).toLocaleString('en-US'):'—';
+    const sub=[];
+    if(d.rank!=null) sub.push('#'+d.rank+(d.players?' of '+d.players:''));
+    sub.push(`${d.kills||0}K`);
+    sub.push(`${d.wins||0}W`);
+    el.innerHTML=`<div style="font-size:11px;font-weight:800;color:#f59e0b;letter-spacing:.06em">${escS(d.name||'TOURNEY')}</div>`
+      + `<div style="font-size:23px;font-weight:800;color:#fff">${escS(pts)}<span style="font-size:11px;font-weight:600;color:#9ca3af"> pts</span></div>`
+      + `<div style="font-size:11px;color:#9ca3af">${escS(sub.join(' · '))}</div>`;
+    el.style.display='flex';
+  }
+  // Party-invite gate: pID required, plus tourney rooms and mid-match both
+  // block invites (locked by comp rules). Single choke point for every
+  // Invite button in drawer + panel.
+  function canPartyInvite(){
+    try{
+      const sess=statsCache&&statsCache.session;
+      const code=sess&&sess.short_code;
+      if(!code) return {ok:false, code:null, why:'Join a private room first (your pID shows here)'};
+      const tag=sess&&sess.tag;
+      if(tag && String(tag.kind||'')==='tourney') return {ok:false, code:null, why:'Invites off in tourney rooms'};
+      const st=sess&&String(sess.state||'').toLowerCase();
+      let inMatch=false;
+      try{ inMatch=!!_optimisticState.inMatch; }catch{}
+      if(!inMatch) inMatch=(st==='match');
+      if(inMatch) return {ok:false, code:null, why:'Invites off mid-match'};
+      return {ok:true, code:String(code).toUpperCase(), why:''};
+    }catch{ return {ok:false, code:null, why:'Unavailable'}; }
+  }
   // Plain JSON POST (no session tokens — friends/party API is discord_id-keyed).
   function apiPostJson(path, body, cb){
     let base=''; try{ base=resolveApiBase(); }catch{}
@@ -2845,18 +3058,19 @@
     }catch{ try{ done(); }catch{} }
   }
   let lbPanel=null, lbSort='points', lbOrder='desc', lbOffset=0, lbRows=[], lbCount=0, lbLoading=false, _lbFadeT=null;
-  let lbTab='board', lbIns=null, lbInsLoading=false; // 'board' | 'insights' | 'friends'
+  let lbTab='board', lbIns=null, lbInsLoading=false; // 'board' | 'insights' | 'friends' | 'events'
+  let lbEvents=null, lbEventsLoading=false, lbEventFilter='all', lbEventDetail=null, lbEventLoading=false;
   let lbProfile=null, lbProfileIns=null, lbProfileLoading=false; // open player profile (within panel)
   let lbFriends=null, lbFriendsLoading=false, lbInvites=null, lbSearch=[], lbSearchLoading=false;
   let lbUnread=null, lbChatWith=null, lbChat=[], lbChatLoading=false, lbChatTimer=null, _chatRefocus=false;
   const LB_LIMIT=20;
-  const LB_SORTS=[['points','Points'],['kills','Kills'],['wins','Wins'],['kd','K/D'],['playtime_global','Playtime']];
+  const LB_SORTS=[['points','Points'],['kills','Kills'],['wins','Wins'],['kd','K/D'],['playtime_global','Playtime'],['comp','Comp']];
   function createLbPanel(){
     if(document.getElementById('bnc-lb')){ lbPanel=document.getElementById('bnc-lb'); return; }
     const ov=document.createElement('div');
     ov.id='bnc-lb';
     Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483646', background:'rgba(0,0,0,0.64)', display:'none', opacity:'0', transition:'opacity 180ms ease-out', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif'});
-    ov.innerHTML=`<div id="bnc-lb-card" style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:14px;width:700px;max-width:94vw;height:500px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden"><div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.08)"><div><b style="font-size:16px;color:#fff">Leaderboard</b><div id="bnc-lb-sub" style="font-size:11px;color:#9ca3af;margin-top:2px">All players</div></div><button id="bnc-lb-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px">Close</button></div><div style="display:flex;gap:8px;padding:12px 18px 0 18px"><button id="bnc-lb-tab-board" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Leaderboard</button><button id="bnc-lb-tab-ins" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Insights</button><button id="bnc-lb-tab-fr" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Friends</button></div><div id="bnc-lb-sorts" style="display:flex;gap:8px;padding:12px 18px 0 18px;flex-wrap:wrap"></div><div id="bnc-lb-body" style="flex:1;overflow:auto;padding:16px 18px"></div><div id="bnc-lb-foot" style="display:flex;justify-content:space-between;align-items:center;padding:10px 18px;border-top:1px solid rgba(255,255,255,0.08)"><button id="bnc-lb-prev" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px">‹ Prev</button><span id="bnc-lb-page" style="font-size:11px;color:#9ca3af"></span><button id="bnc-lb-next" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px">Next ›</button></div></div>`;
+    ov.innerHTML=`<div id="bnc-lb-card" style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:14px;width:700px;max-width:94vw;height:500px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden"><div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.08)"><div><b style="font-size:16px;color:#fff">Leaderboard</b><div id="bnc-lb-sub" style="font-size:11px;color:#9ca3af;margin-top:2px">All players</div></div><button id="bnc-lb-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px">Close</button></div><div style="display:flex;gap:8px;padding:12px 18px 0 18px"><button id="bnc-lb-tab-board" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Leaderboard</button><button id="bnc-lb-tab-ins" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Insights</button><button id="bnc-lb-tab-fr" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Friends</button><button id="bnc-lb-tab-ev" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Events</button></div><div id="bnc-lb-sorts" style="display:flex;gap:8px;padding:12px 18px 0 18px;flex-wrap:wrap"></div><div id="bnc-lb-body" style="flex:1;overflow:auto;padding:16px 18px"></div><div id="bnc-lb-foot" style="display:flex;justify-content:space-between;align-items:center;padding:10px 18px;border-top:1px solid rgba(255,255,255,0.08)"><button id="bnc-lb-prev" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px">‹ Prev</button><span id="bnc-lb-page" style="font-size:11px;color:#9ca3af"></span><button id="bnc-lb-next" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px">Next ›</button></div></div>`;
     (document.body||document.documentElement).appendChild(ov);
     // visible focus ring on panel text inputs (proves focus landed)
     try{
@@ -2876,6 +3090,7 @@
     ov.querySelector('#bnc-lb-tab-board').onclick=()=>{ lbTab='board'; lbProfile=null; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); };
     ov.querySelector('#bnc-lb-tab-ins').onclick=()=>{ lbTab='insights'; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); fetchLbIns(); };
     ov.querySelector('#bnc-lb-tab-fr').onclick=()=>{ lbTab='friends'; renderLbPanel(); fetchLbFriends(); };
+    ov.querySelector('#bnc-lb-tab-ev').onclick=()=>{ lbTab='events'; lbEventDetail=null; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); fetchLbEvents(); };
     ov.querySelector('#bnc-lb-prev').onclick=()=>{ if(lbOffset>0){ lbOffset=Math.max(0, lbOffset-LB_LIMIT); fetchLb(); } };
     ov.querySelector('#bnc-lb-next').onclick=()=>{ lbOffset+=LB_LIMIT; fetchLb(); };
     lbPanel=ov;
@@ -2888,7 +3103,7 @@
     if(show){
       lbPanel.style.display='flex';
       requestAnimationFrame(()=>{ requestAnimationFrame(()=>{ try{ lbPanel.style.opacity='1'; }catch{} }); });
-      if(lbTab==='insights') fetchLbIns(); else if(lbTab==='friends') fetchLbFriends(); else fetchLb();
+      if(lbTab==='insights') fetchLbIns(); else if(lbTab==='friends') fetchLbFriends(); else if(lbTab==='events') fetchLbEvents(); else fetchLb();
     } else {
       try{ lbPanel.style.opacity='0'; }catch{}
       try{ stopLbChat(); }catch{}
@@ -2919,6 +3134,7 @@
     tabBtn('bnc-lb-tab-board', lbTab==='board');
     tabBtn('bnc-lb-tab-ins', lbTab==='insights');
     tabBtn('bnc-lb-tab-fr', lbTab==='friends');
+    tabBtn('bnc-lb-tab-ev', lbTab==='events');
     // profile view replaces the board content (sorts + pagination hidden)
     if(lbTab==='board' && lbProfile){ renderLbProfile(); return; }
     const sorts=document.getElementById('bnc-lb-sorts');
@@ -2927,6 +3143,7 @@
     if(foot) foot.style.display = lbTab==='board' ? 'flex' : 'none';
     if(lbTab==='insights'){ renderLbIns(); return; }
     if(lbTab==='friends'){ renderLbFriends(); return; }
+    if(lbTab==='events'){ renderLbEvents(); return; }
     if(sorts){
       sorts.innerHTML=LB_SORTS.map(([v,label])=>{
         const active = lbSort===v;
@@ -3165,9 +3382,10 @@
       const p=f.presence||{detail:'offline'};
       const dot=`<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${presDot(p.detail)};margin-right:6px" title="${esc(presText(f))}"></span>`;
       const sub2=[presText(f), (f.game_username&&f.discord_username)?f.game_username:null].filter(Boolean).join(' · ');
+      const gate=canPartyInvite();
       return row(dot+esc(nm(f))+unreadBadge(f.discord_id), sub2,
         `<button data-chat="${esc(f.discord_id)}" title="Chat" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:4px 10px;cursor:pointer;font-size:11px;font-weight:700;white-space:nowrap">Chat</button>`
-        +btn('inv:'+f.discord_id, 'Invite', !!code, code?`Invite to room ${code}`:'Hold a private room first (your pID shows here)'));
+        +btn('inv:'+f.discord_id, 'Invite', gate.ok, gate.ok?`Invite to room ${gate.code}`:gate.why));
     }).join('')
       : `<div style="font-size:12px;color:#9ca3af;padding:5px 12px">No friends yet — search below to add some.</div>`;
     // incoming requests
@@ -3234,12 +3452,17 @@
       // still searches while every other key dies before the game sees it.
       q.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); e.stopPropagation(); doSearch(); } }, true);
       try{ untrapInput(q); }catch{}
+      try{ attachVkbd(q, doSearch); }catch{}
     }
     // wire row buttons
     body.querySelectorAll('button[data-fr]').forEach(b=>{
       b.onclick=()=>{
         const [act, target]=String(b.dataset.fr).split(/:(.+)/);
-        if(act==='inv'){ if(!code) return; lbFriendAction('/api/party/invite', {from_discord_id:did, to_discord_id:target, code}, 'Invite sent'); }
+        if(act==='inv'){
+          const g2=canPartyInvite();
+          if(!g2.ok){ try{ showToast(g2.why, true); }catch{} return; }
+          lbFriendAction('/api/party/invite', {from_discord_id:did, to_discord_id:target, code:g2.code}, 'Invite sent');
+        }
         else if(act==='acc'){ lbFriendAction('/api/friends/accept', {discord_id:did, requester_discord_id:target}, 'Friend added'); }
         else if(act==='dec'){ lbFriendAction('/api/friends/decline', {discord_id:did, requester_discord_id:target}, 'Declined'); }
         else if(act==='can'){ lbFriendAction('/api/friends/remove', {discord_id:did, friend_discord_id:target}, 'Request withdrawn'); }
@@ -3317,10 +3540,110 @@
     if(inp){
       inp.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); e.stopPropagation(); doSend(); } }, true);
       try{ untrapInput(inp); }catch{}
+      try{ attachVkbd(inp, doSend); }catch{}
       // refocus only right after OUR send (never on poll refresh — reading
       // history must not yank focus while the user watches).
       if(_chatRefocus){ _chatRefocus=false; try{ inp.focus(); }catch{} }
     }
+  }
+  // --- EVENTS TAB: scheduled / running / ended tourneys + detail ---
+  // List from GET /api/comp/tourneys (client-side status chips), detail from
+  // GET /api/comp/tourney?id= (info, players, per-match boards, standings).
+  function fetchLbEvents(){
+    if(!lbPanel || lbTab!=='events') return;
+    lbEventsLoading=true; renderLbEvents();
+    rankedApiGet('/api/comp/tourneys', (j)=>{
+      lbEventsLoading=false;
+      lbEvents=(j && !j.error && j.tourneys) ? j.tourneys : [];
+      if(lbTab==='events' && !lbEventDetail) renderLbEvents();
+    });
+  }
+  function fetchLbEventDetail(id){
+    if(!lbPanel) return;
+    lbEventLoading=true; renderLbEvents();
+    rankedApiGet(`/api/comp/tourney?id=${encodeURIComponent(id)}`, (j)=>{
+      lbEventLoading=false;
+      lbEventDetail=(j && !j.error) ? j : null;
+      if(lbTab==='events') renderLbEvents();
+    });
+  }
+  function evStatusMeta(st){
+    st=String(st||'').toLowerCase();
+    if(st==='running') return {label:'Running', color:'#22c55e'};
+    if(st==='ended') return {label:'Ended', color:'#4b5563'};
+    return {label:'Scheduled', color:'#eab308'};
+  }
+  function renderLbEvents(){
+    const body=document.getElementById('bnc-lb-body');
+    if(!body) return;
+    const sub=document.getElementById('bnc-lb-sub');
+    const esc=(v)=> String(v==null?'—':v).replace(/</g,'&lt;');
+    if(lbEventDetail || lbEventLoading){ renderLbEventDetail(body, esc, sub); return; }
+    if(sub) sub.textContent='Tournament events';
+    if(lbEventsLoading){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Loading events…</div>`; return; }
+    const list=lbEvents||[];
+    const chips=[['all','All'],['scheduled','Scheduled'],['running','Running'],['ended','Ended']];
+    const rows=list.filter(t=>lbEventFilter==='all' || String(t.status||'').toLowerCase()===lbEventFilter);
+    const chipHtml=chips.map(([v,label])=>{
+      const active=lbEventFilter===v;
+      return `<button data-ev-filter="${v}" style="flex:1;min-width:70px;padding:6px 0;border-radius:999px;font-size:11px;font-weight:700;cursor:pointer;border:1px solid ${active?'#fff':'rgba(255,255,255,0.12)'};background:${active?'#fff':'#171717'};color:${active?'#000':'#9ca3af'}">${label}</button>`;
+    }).join('');
+    let html=`<div style="display:flex;gap:6px;margin-bottom:10px">${chipHtml}</div>`;
+    if(!rows.length){
+      const hint=lbEventFilter==='running' ? 'No running events — check scheduled.' : lbEventFilter==='ended' ? 'No ended events yet.' : 'No events yet — hosts create them with /tourney-create.';
+      html+=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">${hint}</div>`;
+    } else {
+      html+=rows.map(t=>{
+        const m=evStatusMeta(t.status);
+        const prog=(t.series_len||0)>0 ? `${t.sealed||0}/${t.series_len}` : `${t.sealed||0} played`;
+        return `<div data-ev-open="${t.id}" title="Open event" style="display:flex;gap:10px;align-items:center;padding:9px 12px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;font-size:12px;cursor:pointer;margin-bottom:6px"><span style="width:9px;height:9px;border-radius:50%;background:${m.color};flex-shrink:0" title="${m.label}"></span><div style="flex:1;min-width:0"><div style="color:#fff;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">#${t.id} ${esc(t.name)}</div><div style="color:#6b7280;font-size:11px">${m.label} · ${prog} matches · ${t.players||0} players</div></div><span style="color:#6b7280;font-size:14px">›</span></div>`;
+      }).join('');
+    }
+    body.innerHTML=html;
+    body.querySelectorAll('button[data-ev-filter]').forEach(b=>{
+      b.onclick=()=>{ lbEventFilter=b.dataset.evFilter||'all'; renderLbEvents(); };
+    });
+    body.querySelectorAll('[data-ev-open]').forEach(el=>{
+      el.onclick=()=>{ lbEventDetail=null; fetchLbEventDetail(el.dataset.evOpen); };
+    });
+  }
+  function renderLbEventDetail(body, esc, sub){
+    if(lbEventLoading){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Loading event…</div>`; return; }
+    if(!lbEventDetail){
+      body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Couldn't load this event.</div>
+        <div style="text-align:center"><button id="bnc-ev-back" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px;font-weight:700">‹ Back</button></div>`;
+      const bb=document.getElementById('bnc-ev-back');
+      if(bb) bb.onclick=()=>{ lbEventDetail=null; renderLbEvents(); };
+      return;
+    }
+    const t=lbEventDetail.tourney||{};
+    const m=evStatusMeta(t.status);
+    if(sub) sub.textContent=`Event #${t.id}`;
+    const card=(label,val)=>`<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 12px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;font-size:12px"><span style="color:#9ca3af">${label}</span><span style="color:#fff;font-weight:700;text-align:right">${val}</span></div>`;
+    const players=lbEventDetail.players||[];
+    const standings=lbEventDetail.standings||[];
+    const matches=lbEventDetail.matches||[];
+    const boards=lbEventDetail.match_boards||[];
+    const boardFor=(v)=>{ const b=boards.find(x=>x&&(x.version===v)); return (b&&b.rows)||[]; };
+    let html=`<div style="display:flex;flex-direction:column;gap:6px">`
+      + `<div style="display:flex;align-items:center;gap:10px"><button id="bnc-ev-back" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:5px 12px;cursor:pointer;font-size:12px;font-weight:700;flex-shrink:0">‹ Back</button><b style="font-size:15px;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0">#${t.id} ${esc(t.name)}</b><span style="font-size:10px;font-weight:800;color:${m.color}">${m.label.toUpperCase()}</span></div>`
+      + card('Series', `${t.sealed||0}/${t.series_len||'∞'} matches`)
+      + (t.code?card('Room code', `<span style="font-family:monospace">${esc(t.code)}</span>`):'')
+      + `<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">LEADERBOARD (${standings.length})</div>`
+      + (standings.length ? standings.slice(0,15).map((r,i)=>`<div style="font-size:12px;color:#e5e7eb;padding:5px 12px;display:flex;justify-content:space-between"><span>${i+1}. ${esc(r.name||'?')}</span><span><b>${r.points||0}</b> pts · ${r.kills||0}K · ${r.wins||0}W</span></div>`).join('') : `<div style="font-size:12px;color:#9ca3af;padding:5px 12px">No sealed matches yet.</div>`)
+      + `<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">MATCHES (${matches.length})</div>`
+      + (matches.length ? matches.map(mm=>{
+          const rows=boardFor(mm.version);
+          return `<div style="background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:8px 12px"><div style="font-size:12px;color:#fff;font-weight:700">Match v${mm.version} <span style="color:#6b7280;font-weight:400">· winner ${esc(mm.winner||'—')}</span></div>`
+            + (rows.length?rows.slice(0,5).map((r,i)=>`<div style="font-size:11px;color:#9ca3af;display:flex;justify-content:space-between;padding:2px 0"><span>${i+1}. ${esc(r.name||'?')}</span><span>${r.points||0} pts</span></div>`).join(''):'')
+            + `</div>`;
+        }).join('') : `<div style="font-size:12px;color:#9ca3af;padding:5px 12px">No matches sealed.</div>`)
+      + `<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">PLAYERS (${players.length})</div>`
+      + `<div style="font-size:12px;color:#e5e7eb;padding:5px 12px;line-height:1.7">${players.length?players.slice(0,40).map(p=>esc(p.name||'?')).join(' · '):'No registrations yet.'}</div>`
+      + `</div>`;
+    body.innerHTML=html;
+    const back=document.getElementById('bnc-ev-back');
+    if(back) back.onclick=()=>{ lbEventDetail=null; renderLbEvents(); };
   }
   function renderLbBody(){
     const body=document.getElementById('bnc-lb-body');
@@ -3657,11 +3980,13 @@
     // Any Leave event (254 in = someone left queue/match) and any of MY
     // room changes -> prompt player-list refresh (server prunes on Leave).
     try{
-      if((type===2||type===3)&&(code===230||code===231)){ disableRanked('auth'); schedulePlayersRefresh('auth'); try{ noteLocalRoom(false); }catch{} }
-      else if((type===2||type===3)&&code===254&&dir==='out'){ _rankedLeaveGuard=true; disableRanked('leave-op'); schedulePlayersRefresh('leave-op'); try{ noteLocalRoom(false); }catch{} }
+      if((type===2||type===3)&&(code===230||code===231)){ disableRanked('auth'); schedulePlayersRefresh('auth'); try{ noteLocalRoom(false); }catch{} try{ _compRoom=null; _compHudData=null; updateTourneyHud(); }catch{} }
+      else if((type===2||type===3)&&code===254&&dir==='out'){ _rankedLeaveGuard=true; disableRanked('leave-op'); schedulePlayersRefresh('leave-op'); try{ noteLocalRoom(false); }catch{} try{ _compRoom=null; _compHudData=null; updateTourneyHud(); }catch{} }
       else if(type===4&&code===254&&dir==='in') schedulePlayersRefresh('leave-ev');
       else if((type===2||type===3)&&(code===225||code===226||code===227)&&dir==='out'){
         try{ noteLocalRoom(true); }catch{}
+        // comp-room check on the join pID (ranked-style instant detect)
+        try{ const _cpid=sniffPid(rawHex); if(_cpid) fetchCompRoom(_cpid); }catch{}
         const pid=sniffPid(rawHex);
         if(pid) rankedTrack(pid);
         else { disableRanked('public-join'); schedulePlayersRefresh('join-room'); }

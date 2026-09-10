@@ -217,7 +217,7 @@ async def leaderboard(request: Request):
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
-    allowed = {"kills", "deaths", "wins", "defeats", "playtime_global", "kd", "win_rate", "points"}
+    allowed = {"kills", "deaths", "wins", "defeats", "playtime_global", "kd", "win_rate", "points", "comp"}
     if sort not in allowed:
         return JSONResponse({"error": f"sort must be one of {', '.join(sorted(allowed))}"}, status_code=400)
 
@@ -278,8 +278,10 @@ async def leaderboard(request: Request):
                 r["rank"] = offset + i + 1
             return JSONResponse({"sort": sort, "order": order, "limit": limit, "offset": offset, "count": len(rows), "results": rows})
         else:
-            # kd / win_rate — need to compute: fetch top 200 ordered by kills then sort
-            # fetch a window larger than limit to get accurate ranking, then slice
+            # kd / win_rate / comp — computed in python over a candidate window.
+            # comp: open-tourney totals per user (best tourney each); the Points
+            # column carries the comp total under this sort (milestones are the
+            # play-points ladder and don't apply here).
             fetch_n = max(limit + offset, 200)
             res = supabase.table("bngc_users").select("discord_id,discord_username,game_username,game_id,skin,kills,deaths,wins,defeats,playtime_global,play_points,last_seen").limit(fetch_n).execute()
             rows = res.data or []
@@ -291,8 +293,21 @@ async def leaderboard(request: Request):
                 r["kd"] = round(kills / deaths, 2) if deaths else float(kills)
                 total = wins + defeats
                 r["win_rate"] = round(wins / total, 3) if total else 0
+            if sort == "comp":
+                try:
+                    from .comp import open_tourney_points as _otp
+                    _pmap = _otp([str(r.get("discord_id")) for r in rows]) or {}
+                except Exception:
+                    _pmap = {}
+                for r in rows:
+                    _cp = (_pmap.get(str(r.get("discord_id"))) or {})
+                    r["points"] = int(_cp.get("points") or 0)
+                    r["comp_tourney"] = _cp.get("tourney_name")
+                    r["milestone"] = None
+                    r["milestone_icon_url"] = None
+                    r["milestone_color"] = None
             reverse = order == "desc"
-            rows.sort(key=lambda x: x.get(sort, 0), reverse=reverse)
+            rows.sort(key=lambda x: x.get(sort if sort != "comp" else "points", 0), reverse=reverse)
             sliced = rows[offset: offset + limit]
             _attach_points(sliced)
             for i, r in enumerate(sliced):

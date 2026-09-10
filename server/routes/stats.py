@@ -293,6 +293,19 @@ async def get_stats(request: Request):
             except Exception:
                 pass
 
+    # Live tourney HUD: when the current room carries a tourney tag, attach
+    # my points for that tourney (passthrough overlay reads this). Gated on
+    # the tag so every other session pays zero extra queries. Never breaks stats.
+    comp_tourney = None
+    try:
+        _tag = (session_out or {}).get("tag") if session_out else None
+        _tcode = (session_out or {}).get("short_code") if session_out else None
+        if isinstance(_tag, dict) and str(_tag.get("kind") or "") == "tourney" and _tcode:
+            from .comp import code_tourney_points as _ctp
+            comp_tourney = await db_io(_ctp, _tcode, discord_id)
+    except Exception:
+        comp_tourney = None
+
     # playtime_per_gm may be json string
     ppg = user.get("playtime_per_gm")
     if isinstance(ppg, str):
@@ -452,6 +465,21 @@ async def get_stats(request: Request):
     except Exception:
         identity = None
 
+    # Comp points across open tourneys (drawer line + leaderboard sort read
+    # this). Bounded single lookup; empty without open tourneys. Never breaks
+    # stats: any failure degrades to no comp block, exactly like arena=None.
+    comp = []
+    try:
+        from .comp import open_tourney_points as _otp
+        _cp = await db_io(_otp, [discord_id])
+        _mine = (_cp or {}).get(str(discord_id)) if isinstance(_cp, dict) else None
+        if _mine:
+            comp = [{"tourney_id": _mine.get("tourney_id"), "tourney_name": _mine.get("tourney_name"),
+                     "points": int(_mine.get("points") or 0), "kills": int(_mine.get("kills") or 0),
+                     "wins": int(_mine.get("wins") or 0)}]
+    except Exception:
+        comp = []
+
     return JSONResponse({
         "discord_id": user.get("discord_id"),
         "discord_username": user.get("discord_username"),
@@ -469,6 +497,8 @@ async def get_stats(request: Request):
         "kd": kd,
         "win_rate": win_rate,
         "identity": identity,
+        "comp": comp,
+        "comp_tourney": comp_tourney,
         "rank": rank,
         "is_dev": bool(user.get("is_dev")),
         "arena": arena,

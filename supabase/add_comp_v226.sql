@@ -11,6 +11,7 @@ create table if not exists public.bngc_comp_tourneys (
   code text, -- 5-char room pID when played in a tagged room (nullable: manual tourneys)
   name text not null,
   status text not null default 'open', -- 'open' | 'closed'
+  mode text not null default 'solo', -- 'solo' | 'duo' (team size validation)
   series_len integer not null default 0, -- expected match count (0 = open-ended)
   points_table jsonb not null default '{"kill":1,"win":3,"placement":[10,7,5,3,1]}'::jsonb,
   reg_channel_id text,
@@ -19,7 +20,8 @@ create table if not exists public.bngc_comp_tourneys (
   reg_open boolean not null default false,
   created_by text,
   created_at timestamptz not null default now(),
-  constraint bngc_comp_tourneys_status check (status in ('open', 'closed'))
+  constraint bngc_comp_tourneys_status check (status in ('open', 'closed')),
+  constraint bngc_comp_tourneys_mode check (mode in ('solo', 'duo'))
 );
 
 create table if not exists public.bngc_comp_matches (

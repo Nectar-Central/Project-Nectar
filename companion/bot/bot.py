@@ -95,6 +95,28 @@ def save_announced(data: dict):
         print(f"[announce] save failed: {e}")
 
 
+async def _seed_game_username(discord_id: str, handle: str) -> bool:
+    """Seed bngc_users.game_username from the /register handle when empty.
+
+    Gives every linked account an identity baseline so kills attribute even
+    when join packets never resolve view.me (the null-identity class).
+    Never overwrites a tracked name. Never raises (returns bool).
+    """
+    try:
+        clean = str(handle or "").strip()[:32]
+        if not clean or not db.USE_SUPABASE or not db.supabase:
+            return False
+        row = await db.get_by_discord(str(discord_id))
+        if row and (row.get("game_username") or "").strip():
+            return False
+        db.supabase.table("bngc_users").update(
+            {"game_username": clean}).eq("discord_id", str(discord_id)).execute()
+        return True
+    except Exception as e:
+        print(f"[register] game_username seed failed: {e}")
+        return False
+
+
 def save_registered_player(discord_id: int, username: str, display_name: str, game_handle: str, avatar_url: str):
     if not db.USE_SUPABASE or not db.supabase:
         raise RuntimeError("Supabase is not configured")
@@ -271,6 +293,11 @@ async def on_ready():
     except Exception as exc:
         print(f"Command sync failed: {exc}")
     print(f"Bot ready as {bot.user} — {len(bot.tree.get_commands())} commands loaded")
+    # persistent comp players button (restart-safe, fixed custom_id)
+    try:
+        bot.add_view(_CompPlayersView())
+    except Exception as e:
+        print(f"[comp] persistent view failed: {e}")
     # start alert DM loop (login / locked / cheat / warning / blacklist)
     try:
         bot.loop.create_task(alert_mod.alert_loop(bot))
@@ -300,6 +327,7 @@ async def register_cmd(interaction: discord.Interaction, game_handle: app_comman
             last_sid_short = sessions[0].get("session_id","")[:8] if sessions else "—"
             # Still handle dashboard game_handle update even when already registered
             profile_error = None
+            seeded_handle = False
             if game_handle:
                 clean_handle = str(game_handle).strip()
                 try:
@@ -308,12 +336,18 @@ async def register_cmd(interaction: discord.Interaction, game_handle: app_comman
                 except Exception as exc:
                     profile_error = exc
                     print(f"Player profile save failed for {interaction.user.id}: {exc}")
+                try:
+                    seeded_handle = await _seed_game_username(str(interaction.user.id), clean_handle)
+                except Exception:
+                    seeded_handle = False
             msg = f"You are already registered. Use **/refresh-token** to get a new login token.\n"
             msg += f"**{total_sessions} sessions · {total_matches} matches · last played {last_played} ({last_sid_short})**"
             if game_handle and profile_error is None:
                 msg += f"\nDashboard profile updated for **{game_handle}**."
             elif game_handle:
                 msg += "\nI could not save the dashboard profile yet; run the Supabase schema and try again."
+            if seeded_handle:
+                msg += "\nGame name saved for stat tracking."
             try:
                 await _grant_registered_role(interaction.guild, interaction.user.id)
             except: pass
@@ -336,6 +370,7 @@ async def register_cmd(interaction: discord.Interaction, game_handle: app_comman
         return await interaction.followup.send("Registration is temporarily unavailable. Check the bot's Supabase configuration.", ephemeral=True)
 
     profile_error = None
+    seeded_handle = False
     if game_handle:
         clean_handle = str(game_handle).strip()
         try:
@@ -344,6 +379,10 @@ async def register_cmd(interaction: discord.Interaction, game_handle: app_comman
         except Exception as exc:
             profile_error = exc
             print(f"Player profile save failed for {interaction.user.id}: {exc}")
+        try:
+            seeded_handle = await _seed_game_username(str(interaction.user.id), clean_handle)
+        except Exception:
+            seeded_handle = False
 
     try:
         await interaction.user.send(f"Your BuildNow login token is **{token}**\nEnter it in the userscript prompt (once, 5 min expiry). Keep it secret!\nPlay a match to get your stats saved.")
@@ -359,6 +398,8 @@ async def register_cmd(interaction: discord.Interaction, game_handle: app_comman
         message += f"\nDashboard profile saved for **{game_handle}**."
     elif game_handle:
         message += "\nI could not save the dashboard profile yet; run the Supabase schema and try again."
+    if seeded_handle:
+        message += "\nGame name saved for stat tracking."
     await interaction.followup.send(message, ephemeral=True)
 
 
@@ -1389,11 +1430,1128 @@ async def tourney_cmd(interaction: discord.Interaction, code: str, name: str):
     await _room_tag_impl(interaction, "tourney", code, name)
 
 
+async def _comp_reg_rows(tourney_id):
+    """All registration rows for a tourney (id, members, status). Never raises."""
+    try:
+        sb = _comp_sb()
+        if sb is None:
+            return []
+        res = sb.table("bngc_comp_registrations").select(
+            "id,member_ids,status").eq("tourney_id", int(tourney_id)).limit(1000).execute()
+        return res.data or []
+    except Exception:
+        return []
+
+
 @bot.tree.command(name="untag", description="Remove the scrim/tourney tag from a room code")
-@app_commands.describe(code="5-letter private room code")
+@app_commands.describe(code="5-letter private party code")
 async def untag_cmd(interaction: discord.Interaction, code: str):
     await interaction.response.defer(ephemeral=False)
     await _room_tag_impl(interaction, "untag", code, None)
+
+
+# ---------------------------------------------------------------------------
+# Comp tourneys (objects with numeric IDs from 0 — NOT the /tourney room tag
+# above, which stays untouched). Host-gated at runtime (administrator or
+# COMP_HOST_ROLE_ID) so non-admin hosts work. Channels/role per tourney with
+# env fallbacks (COMP_REG_CHANNEL_ID, COMP_BOARD_CHANNEL_ID,
+# COMP_PLAYER_ROLE_ID).
+# ---------------------------------------------------------------------------
+
+COMP_HOST_ROLE_ID = os.getenv("COMP_HOST_ROLE_ID", "") or ""
+COMP_PLAYER_ROLE_ID = os.getenv("COMP_PLAYER_ROLE_ID", "") or ""
+COMP_REG_CHANNEL_ID = os.getenv("COMP_REG_CHANNEL_ID", "") or ""
+COMP_BOARD_CHANNEL_ID = os.getenv("COMP_BOARD_CHANNEL_ID", "") or ""
+
+_comp_reg_cache = {"at": 0.0, "rows": []}
+
+
+def _comp_is_host(member) -> bool:
+    """Administrator or holder of COMP_HOST_ROLE_ID. Never raises."""
+    try:
+        perms = getattr(member, "guild_permissions", None)
+        if perms and getattr(perms, "administrator", False):
+            return True
+        rid = str(COMP_HOST_ROLE_ID or "").strip()
+        roles = getattr(member, "roles", None) or []
+        if rid:
+            return any(str(getattr(r, "id", "")) == rid for r in roles)
+    except Exception:
+        pass
+    return False
+
+
+async def _comp_member(interaction, user_id) -> object | None:
+    """Fetch guild member for role checks/grants. None on failure."""
+    try:
+        guild = interaction.guild
+        if guild is None:
+            return None
+        try:
+            m = guild.get_member(int(user_id))
+            if m is not None:
+                return m
+        except Exception:
+            pass
+        return await guild.fetch_member(int(user_id))
+    except Exception:
+        return None
+
+
+async def _comp_grant_role(guild, user_id, role_id) -> bool:
+    """Best-effort role grant. Never raises (returns bool)."""
+    try:
+        if guild is None or not role_id:
+            return False
+        role = guild.get_role(int(role_id))
+        if role is None:
+            return False
+        try:
+            member = guild.get_member(int(user_id))
+        except Exception:
+            member = None
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(user_id))
+            except Exception:
+                return False
+        if member is None:
+            return False
+        await member.add_roles(role, reason="Comp tourney registration")
+        return True
+    except Exception as e:
+        print(f"[comp] role grant failed: {e}")
+        return False
+
+
+def _comp_team_members(user_ids: list, mode: str):
+    """Validate mention list for the mode. Pure: ([ids], None) or ([], error).
+
+    Solo wants exactly 1, duo exactly 2 (any separator — separators never
+    reach us, only the mention list does). Bots and dupes rejected.
+    """
+    try:
+        ids = [str(x) for x in (user_ids or []) if str(x or "").strip()]
+    except Exception:
+        return [], "unreadable mentions"
+    try:
+        if len(ids) != len(set(ids)):
+            return [], "duplicate mentions"
+        want = 2 if str(mode or "").lower() == "duo" else 1
+        if len(ids) != want:
+            return [], (f"{mode} needs exactly {want} real mention(s), got {len(ids)} — "
+                        f"type @ and pick from the popup, typed-out names don't count")
+        return ids, None
+    except Exception:
+        return [], "invalid mentions"
+
+
+def _comp_sb():
+    if not db.USE_SUPABASE or not db.supabase:
+        return None
+    return db.supabase
+
+
+@bot.tree.command(name="tourney-create", description="Create a comp tourney (host). Returns its numeric ID.")
+@app_commands.describe(code="5-letter private room code (optional)",
+                       name="Tourney name", series_len="Match count, 0 = open-ended",
+                       mode="Solo or duo teams", game_mode="Game code, e.g. zw_lg",
+                       region="Region, e.g. EU", rules_channel="Rules channel",
+                       shoot_timer="Shoot timer, e.g. 4:30",
+                       ping_role="Role pinged on open/close",
+                       max_players="Auto-close intake at N accepted players (0 = unlimited)",
+                       host_playing="Host plays too (their kills count)")
+@app_commands.choices(mode=[app_commands.Choice(name="Solo", value="solo"),
+                            app_commands.Choice(name="Duo", value="duo")])
+@app_commands.choices(game_mode=[
+    app_commands.Choice(name="Late Game Zonewars", value="zw_lg"),
+    app_commands.Choice(name="Zone Wars", value="zw"),
+    app_commands.Choice(name="Duo Wild West", value="wwzw"),
+    app_commands.Choice(name="Solo Wild West", value="ww"),
+    app_commands.Choice(name="Boxfights", value="bf"),
+    app_commands.Choice(name="Boxfights 2v2", value="BF2V2"),
+    app_commands.Choice(name="V-Arena", value="VA"),
+    app_commands.Choice(name="Red Vs Blue", value="tdm_bvr"),
+    app_commands.Choice(name="Realistic 1v1", value="r_1v1"),
+    app_commands.Choice(name="Free Mode", value="df"),
+])
+async def tourney_create_cmd(interaction: discord.Interaction, name: str,
+                             code: str | None = None, series_len: int = 0,
+                             mode: str = "solo", game_mode: str | None = None,
+                             region: str | None = None,
+                             rules_channel: discord.TextChannel | None = None,
+                             shoot_timer: str | None = None,
+                             ping_role: discord.Role | None = None,
+                             max_players: int = 0, host_playing: bool = True):
+    await interaction.response.defer(ephemeral=True)
+    me = await _comp_member(interaction, interaction.user.id)
+    if not _comp_is_host(me):
+        return await interaction.followup.send("Host only.", ephemeral=True)
+    sb = _comp_sb()
+    if sb is None:
+        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+    code_c = (code or "").strip().upper() or None
+    if code_c and (len(code_c) != 5 or not code_c.isalnum()):
+        return await interaction.followup.send("Code must be 5 letters/digits.", ephemeral=True)
+    mode_c = "duo" if str(mode or "").lower() == "duo" else "solo"
+    try:
+        series = max(0, int(series_len or 0))
+    except Exception:
+        series = 0
+    try:
+        maxp = max(0, int(max_players or 0))
+    except Exception:
+        maxp = 0
+    try:
+        res = sb.table("bngc_comp_tourneys").insert({
+            "code": code_c, "name": str(name or "").strip()[:64] or "Tourney",
+            "status": "created", "mode": mode_c, "series_len": series,
+            "game_mode": (game_mode or "").strip() or None,
+            "region": (region or "").strip()[:16] or "EU",
+            "rules_channel_id": str(rules_channel.id) if rules_channel else None,
+            "shoot_timer": (shoot_timer or "").strip()[:16] or "4:30",
+            "ping_role_id": str(ping_role.id) if ping_role else None,
+            "max_players": maxp,
+            "host_playing": bool(host_playing),
+            "reg_channel_id": COMP_REG_CHANNEL_ID or None,
+            "board_channel_id": COMP_BOARD_CHANNEL_ID or None,
+            "player_role_id": COMP_PLAYER_ROLE_ID or None,
+            "created_by": str(interaction.user.id),
+        }).execute()
+        row = (res.data or [{}])[0]
+        return await interaction.followup.send(
+            f"🏆 Tourney **#{row.get('id')} {row.get('name')}** created ({mode_c}, "
+            f"{series or '∞'} matches). Post it: `/tourney-post {row.get('id')}`. "
+            f"Registrations: `/listen-registrations`.", ephemeral=True)
+    except Exception as e:
+        return await interaction.followup.send(f"Couldn't create: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="tourney-stop", description="Close a comp tourney (host)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)")
+async def tourney_stop_cmd(interaction: discord.Interaction, tourney_id: int):
+    await interaction.response.defer(ephemeral=True)
+    me = await _comp_member(interaction, interaction.user.id)
+    if not _comp_is_host(me):
+        return await interaction.followup.send("Host only.", ephemeral=True)
+    sb = _comp_sb()
+    if sb is None:
+        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+    try:
+        from datetime import datetime, timezone
+        old = sb.table("bngc_comp_tourneys").select("code").eq("id", int(tourney_id)).limit(1).execute()
+        old_code = ((old.data or [{}])[0] or {}).get("code")
+        res = sb.table("bngc_comp_tourneys").update(
+            {"status": "ended", "reg_open": False, "ended_at": datetime.now(timezone.utc).isoformat()}
+        ).eq("id", int(tourney_id)).execute()
+        if not res.data:
+            return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
+        # drop the room tag so presence stops showing the ended tourney
+        if old_code:
+            try:
+                sb.table("bngc_room_tags").delete().eq("code", str(old_code).upper()).execute()
+            except Exception as e:
+                print(f"[comp] stop untag failed: {e}")
+        return await interaction.followup.send(f"🏁 Tourney **#{tourney_id}** closed.", ephemeral=True)
+    except Exception as e:
+        return await interaction.followup.send(f"Couldn't stop: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="tourney-change-code", description="Change a tourney's room code (host)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)",
+                       code="New 5-letter private room code")
+async def tourney_code_cmd(interaction: discord.Interaction, tourney_id: int, code: str):
+    await interaction.response.defer(ephemeral=True)
+    me = await _comp_member(interaction, interaction.user.id)
+    if not _comp_is_host(me):
+        return await interaction.followup.send("Host only.", ephemeral=True)
+    if _comp_sb() is None:
+        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+    ok, msg = await _tourney_set_code(int(tourney_id), code, str(interaction.user.id))
+    return await interaction.followup.send(msg, ephemeral=True)
+
+
+@bot.tree.command(name="tourney-set-code", description="Set a tourney's room code (host, works when empty)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)",
+                       code="5-letter private room code")
+async def tourney_set_code_cmd(interaction: discord.Interaction, tourney_id: int, code: str):
+    await interaction.response.defer(ephemeral=True)
+    me = await _comp_member(interaction, interaction.user.id)
+    if not _comp_is_host(me):
+        return await interaction.followup.send("Host only.", ephemeral=True)
+    if _comp_sb() is None:
+        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+    ok, msg = await _tourney_set_code(int(tourney_id), code, str(interaction.user.id))
+    return await interaction.followup.send(msg, ephemeral=True)
+
+
+async def _tourney_set_code(tourney_id: int, code: str, actor_id: str):
+    """Shared set/change-code impl. Returns (ok, message). Never raises."""
+    try:
+        code_c = (code or "").strip().upper()
+        if len(code_c) != 5 or not code_c.isalnum():
+            return False, "Code must be 5 letters/digits."
+        sb = _comp_sb()
+        if sb is None:
+            return False, "Supabase not configured."
+        old = sb.table("bngc_comp_tourneys").select("id,code,name,status").eq(
+            "id", int(tourney_id)).limit(1).execute()
+        if not old.data:
+            return False, "No tourney with that ID."
+        t = old.data[0]
+        old_code = (t.get("code") or "").upper() or None
+        sb.table("bngc_comp_tourneys").update({"code": code_c}).eq("id", int(tourney_id)).execute()
+        # move the room tag so presence follows the new code (started only)
+        extra = ""
+        try:
+            if old_code and old_code != code_c:
+                sb.table("bngc_room_tags").delete().eq("code", old_code).execute()
+            if str(t.get("status") or "") == "started":
+                sb.table("bngc_room_tags").upsert({
+                    "code": code_c, "kind": "tourney",
+                    "name": str(t.get("name") or "Tourney"),
+                    "created_by": str(actor_id),
+                }, on_conflict="code").execute()
+                extra = " (room tag moved)"
+        except Exception as e:
+            print(f"[comp] set-code retag failed: {e}")
+        verb = "changed" if old_code else "set"
+        return True, f"🔁 Tourney **#{tourney_id}** code {verb}: `{old_code or '—'}` → `{code_c}`{extra}."
+    except Exception as e:
+        return False, f"Couldn't set code: {e}"
+
+
+async def _comp_set_banned(tourney_id: int, user_id: str, banned: bool, guild=None):
+    """Ban (or unban -> accepted) one player. Returns (ok, message). Never raises."""
+    try:
+        sb = _comp_sb()
+        if sb is None:
+            return False, "Supabase not configured."
+        did = str(user_id)
+        if banned:
+            try:
+                sb.table("bngc_comp_registrations").insert({
+                    "tourney_id": int(tourney_id), "team_label": f"<@{did}>",
+                    "member_ids": [did], "captain_id": did,
+                    "source_message_id": None, "status": "banned",
+                }).execute()
+            except Exception as e:
+                return False, f"Couldn't ban: {e}"
+            # strip the player role if we can resolve it
+            try:
+                tres = sb.table("bngc_comp_tourneys").select("player_role_id").eq(
+                    "id", int(tourney_id)).limit(1).execute()
+                rid = ((tres.data or [{}])[0] or {}).get("player_role_id") or COMP_PLAYER_ROLE_ID
+                if guild is not None and rid:
+                    try:
+                        m = guild.get_member(int(did))
+                        if m is None:
+                            m = await guild.fetch_member(int(did))
+                        role = guild.get_role(int(rid))
+                        if m is not None and role is not None:
+                            await m.remove_roles(role, reason="Comp tourney ban")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return True, f"⛔ <@{did}> banned from tourney **#{tourney_id}**."
+        rows = await _comp_reg_rows(int(tourney_id))
+        mine = [r for r in rows if (r or {}).get("status") == "banned"
+                and did in ((r or {}).get("member_ids") or [])]
+        if not mine:
+            return False, "No ban row for that user in this tourney."
+        for r in mine:
+            try:
+                sb.table("bngc_comp_registrations").update(
+                    {"status": "accepted"}).eq("id", r["id"]).execute()
+            except Exception:
+                pass
+        return True, f"✅ <@{did}> unbanned (accepted) in tourney **#{tourney_id}**."
+    except Exception as e:
+        return False, f"Couldn't update ban: {e}"
+
+
+@bot.tree.command(name="tourney-ban", description="Ban a player from a tourney (host)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)", user="Player to ban")
+async def tourney_ban_cmd(interaction: discord.Interaction, tourney_id: int, user: discord.User):
+    await interaction.response.defer(ephemeral=True)
+    me = await _comp_member(interaction, interaction.user.id)
+    if not _comp_is_host(me):
+        return await interaction.followup.send("Host only.", ephemeral=True)
+    ok, msg = await _comp_set_banned(int(tourney_id), str(user.id), True, interaction.guild)
+    return await interaction.followup.send(msg, ephemeral=True)
+
+
+@bot.tree.command(name="tourney-unban", description="Unban a player (re-accepts them) (host)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)", user="Player to unban")
+async def tourney_unban_cmd(interaction: discord.Interaction, tourney_id: int, user: discord.User):
+    await interaction.response.defer(ephemeral=True)
+    me = await _comp_member(interaction, interaction.user.id)
+    if not _comp_is_host(me):
+        return await interaction.followup.send("Host only.", ephemeral=True)
+    ok, msg = await _comp_set_banned(int(tourney_id), str(user.id), False, interaction.guild)
+    return await interaction.followup.send(msg, ephemeral=True)
+
+
+def _comp_announce_text(t: dict):
+    """Announcement message matching the host template exactly. Pure-ish."""
+    try:
+        mode = str(t.get("mode") or "solo").upper()
+        name = str(t.get("name") or "Tourney")
+        try:
+            gm = fmt.format_game_mode(t.get("game_mode")) if t.get("game_mode") else "—"
+        except Exception:
+            gm = str(t.get("game_mode") or "—")
+        gm = str(gm).upper() if str(gm) != "—" else "—"
+        code = (t.get("code") or "").strip() or ""
+        region = str(t.get("region") or "EU")
+        timer = str(t.get("shoot_timer") or "4:30")
+        rules = f"<#{t.get('rules_channel_id')}>" if t.get("rules_channel_id") else "—"
+        signups = f"<#{t.get('reg_channel_id')}>" if t.get("reg_channel_id") else "—"
+        ping = (t.get("ping_role_id") or t.get("player_role_id")
+                or COMP_PLAYER_ROLE_ID or "")
+        ping = str(ping).strip()
+        ping_line = f"<@&{ping}>" if ping else "@role"
+        lines = [
+            f"## {mode} {name}",
+            f"**GAME MODE**: {gm}",
+            f"**REGION**: {region}",
+            f"**CODE**: {code if code else 'Wait For Match'}",
+            f"**RULES**: {rules}",
+            f"**SIGNUPS**: {signups}",
+            f"**SHOOT TIMER**: {timer}",
+            "",
+            "**WINNER IS HAVING TOURNAMENT MVP UNTIL THE NEXT TOURNEY**",
+            "",
+            "✅  IF YOU ARE GONNA JOIN",
+            "",
+            ping_line,
+        ]
+        return "\n".join(lines)
+    except Exception:
+        return str((t or {}).get("name") or "Tourney")
+
+
+@bot.tree.command(name="tourney-post", description="Post the tourney announcement (host). Re-post edits it.")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)",
+                       channel="Channel to post in (default: board channel)",
+                       ping_role="Role to ping (default: stored)",
+                       signups_channel="Signups channel override (stored)")
+async def tourney_post_cmd(interaction: discord.Interaction, tourney_id: int,
+                           channel: discord.TextChannel | None = None,
+                           ping_role: discord.Role | None = None,
+                           signups_channel: discord.TextChannel | None = None):
+    await interaction.response.defer(ephemeral=True)
+    me = await _comp_member(interaction, interaction.user.id)
+    if not _comp_is_host(me):
+        return await interaction.followup.send("Host only.", ephemeral=True)
+    sb = _comp_sb()
+    if sb is None:
+        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+    try:
+        tres = sb.table("bngc_comp_tourneys").select("*").eq("id", int(tourney_id)).limit(1).execute()
+        if not tres.data:
+            return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
+        t = tres.data[0]
+        # field overrides from this post (persisted so re-posts keep them)
+        try:
+            _ov = {}
+            if ping_role is not None:
+                _ov["ping_role_id"] = str(ping_role.id)
+            if signups_channel is not None:
+                _ov["reg_channel_id"] = str(signups_channel.id)
+            if _ov:
+                sb.table("bngc_comp_tourneys").update(_ov).eq("id", int(tourney_id)).execute()
+                t.update(_ov)
+        except Exception as e:
+            print(f"[comp] post field persist failed: {e}")
+        target = channel or (interaction.guild.get_channel(int(t.get("board_channel_id")))
+                             if interaction.guild and t.get("board_channel_id") else None)
+        if target is None:
+            target = interaction.channel
+        embed = None
+        text = _comp_announce_text(t)
+        mid, cid = t.get("announce_message_id"), t.get("announce_channel_id")
+        posted = None
+        if mid and cid:
+            # re-post = edit (code filled in later without spam)
+            try:
+                old_ch = interaction.guild.get_channel(int(cid)) if interaction.guild else None
+                if old_ch is not None:
+                    posted = await (await old_ch.fetch_message(int(mid))).edit(content=text)
+            except Exception:
+                posted = None
+        if posted is None:
+            try:
+                posted = await target.send(content=text)
+            except Exception as e:
+                return await interaction.followup.send(f"Couldn't post: {e}", ephemeral=True)
+            try:
+                await posted.add_reaction("✅")
+            except Exception:
+                pass
+            try:
+                sb.table("bngc_comp_tourneys").update(
+                    {"announce_channel_id": str(target.id),
+                     "announce_message_id": str(posted.id)}).eq("id", int(tourney_id)).execute()
+            except Exception:
+                pass
+        return await interaction.followup.send(
+            f"📢 Announcement for **#{tourney_id}** is live in {target.mention}.", ephemeral=True)
+    except Exception as e:
+        return await interaction.followup.send(f"Couldn't post: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="tourney-schedule", description="Schedule a tourney (host). Shows it in Events.")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)",
+                       when="UTC start, exactly: YYYY-MM-DD HH:MM")
+async def tourney_schedule_cmd(interaction: discord.Interaction, tourney_id: int, when: str):
+    await interaction.response.defer(ephemeral=True)
+    me = await _comp_member(interaction, interaction.user.id)
+    if not _comp_is_host(me):
+        return await interaction.followup.send("Host only.", ephemeral=True)
+    sb = _comp_sb()
+    if sb is None:
+        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.strptime(str(when or "").strip(), "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+    except Exception:
+        return await interaction.followup.send(
+            "Bad datetime. Use exactly `YYYY-MM-DD HH:MM` in UTC (e.g. `2026-09-12 18:30`).", ephemeral=True)
+    try:
+        from datetime import datetime, timezone
+        if dt <= datetime.now(timezone.utc):
+            return await interaction.followup.send("That time is in the past.", ephemeral=True)
+        res = sb.table("bngc_comp_tourneys").update(
+            {"scheduled_at": dt.isoformat(), "status": "scheduled"}
+        ).eq("id", int(tourney_id)).execute()
+        if not res.data:
+            return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
+        return await interaction.followup.send(
+            f"📅 Tourney **#{tourney_id}** scheduled for <t:{int(dt.timestamp())}:F> — visible under Scheduled in Events.", ephemeral=True)
+    except Exception as e:
+        return await interaction.followup.send(f"Couldn't schedule: {e}", ephemeral=True)
+
+
+async def _comp_tourney(tourney_id) -> dict | None:
+    """Fetch GET /api/comp/tourney?id=. None on error. Never raises."""
+    from urllib.parse import quote
+    try:
+        return await _api_get(f"/api/comp/tourney?id={quote(str(tourney_id))}")
+    except Exception:
+        return None
+
+
+def _comp_board_lines(board, limit=15):
+    """Render aggregate standings lines. Pure."""
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    try:
+        for i, r in enumerate((board or [])[:limit], 1):
+            name = (r or {}).get("name") or "?"
+            pts = (r or {}).get("points", 0)
+            kills = (r or {}).get("kills", 0)
+            wins = (r or {}).get("wins", 0)
+            prefix = medals[i - 1] if i <= 3 else f"{i}."
+            lines.append(f"{prefix} **{name}** — {pts} pts ({kills}K, {wins}W)")
+    except Exception:
+        pass
+    return lines
+
+
+@bot.tree.command(name="tourney-board", description="Aggregate leaderboard for a comp tourney")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)")
+async def tourney_board_cmd(interaction: discord.Interaction, tourney_id: int):
+    await interaction.response.defer(ephemeral=False)
+    data = await _comp_tourney(tourney_id)
+    if not data or data.get("error"):
+        return await interaction.followup.send(f"Couldn't load tourney #{tourney_id}: {(data or {}).get('error') or 'server unreachable'}.")
+    t = data.get("tourney") or {}
+    board = data.get("standings") or []
+    if not board:
+        return await interaction.followup.send(f"No sealed matches in **{t.get('name')}** yet.")
+    e = discord.Embed(title=f"🏆 {t.get('name')} — #{t.get('id')} ({t.get('status')})", color=0xFFD700,
+                      description="\n".join(_comp_board_lines(board))[:4000])
+    e.set_footer(text=f"{len(board)} players · {t.get('sealed', 0)}/{t.get('series_len') or '∞'} matches")
+    await interaction.followup.send(embed=e)
+
+
+@bot.tree.command(name="tourney-match", description="Per-match board for a comp tourney match")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)", version="Match version (0, 1, 2, ...)")
+async def tourney_match_cmd(interaction: discord.Interaction, tourney_id: int, version: int):
+    await interaction.response.defer(ephemeral=False)
+    data = await _comp_tourney(tourney_id)
+    if not data or data.get("error"):
+        return await interaction.followup.send(f"Couldn't load tourney #{tourney_id}: {(data or {}).get('error') or 'server unreachable'}.")
+    t = data.get("tourney") or {}
+    matches = data.get("matches") or []
+    m = next((x for x in matches if (x or {}).get("version") == int(version)), None)
+    if m is None:
+        return await interaction.followup.send(f"No sealed match v{version} in **{t.get('name')}**.")
+    w = m.get("winner")
+    boards = data.get("match_boards") or []
+    b = next((x for x in boards if (x or {}).get("version") == int(version)), None)
+    rows = (b or {}).get("rows") or []
+    lines = []
+    for i, r in enumerate(rows, 1):
+        nm = (r or {}).get("name") or "?"
+        pts = (r or {}).get("points", 0)
+        k = (r or {}).get("kills", 0)
+        p = (r or {}).get("placement")
+        lines.append(f"{i}. **{nm}** — {pts} pts ({k}K{', P' + str(p) if p else ''})")
+    e = discord.Embed(title=f"{t.get('name')} — match v{version}", color=0x7c3aed,
+                      description=(f"Winner: **{w or '—'}**\n" + ("\n".join(lines) if lines else "No rows."))[:4000])
+    await interaction.followup.send(embed=e)
+
+
+@bot.tree.command(name="tourney-list", description="List comp tourneys (id, status, matches)")
+async def tourney_list_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    sb = _comp_sb()
+    if sb is None:
+        return await interaction.followup.send("Supabase not configured.")
+    try:
+        res = sb.table("bngc_comp_tourneys").select(
+            "id,code,name,status,mode,series_len").order("id").limit(25).execute()
+        rows = res.data or []
+        if not rows:
+            return await interaction.followup.send("No tourneys yet. Hosts: `/tourney-create`.")
+        lines = [f"**#{r.get('id')}** {r.get('name')} — {r.get('status')} ({r.get('mode')}, "
+                 f"{r.get('series_len') or '∞'} matches)" + (f" `{r.get('code')}`" if r.get("code") else "")
+                 for r in rows]
+        e = discord.Embed(title="Comp tourneys", color=0x7c3aed, description="\n".join(lines)[:4000])
+        return await interaction.followup.send(embed=e)
+    except Exception as e:
+        return await interaction.followup.send(f"Couldn't list: {e}")
+
+
+@bot.tree.command(name="listen-registrations", description="Open signups in a channel (host)")
+@app_commands.describe(channel="Signups channel", tourney_id="Numeric tourney ID",
+                       ping_role="Role to ping (default: tourney player role)")
+async def listen_reg_cmd(interaction: discord.Interaction, channel: discord.TextChannel,
+                         tourney_id: int, ping_role: discord.Role | None = None):
+    await interaction.response.defer(ephemeral=True)
+    me = await _comp_member(interaction, interaction.user.id)
+    if not _comp_is_host(me):
+        return await interaction.followup.send("Host only.", ephemeral=True)
+    sb = _comp_sb()
+    if sb is None:
+        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+    try:
+        tres = sb.table("bngc_comp_tourneys").select(
+            "id,name,mode,player_role_id,ping_role_id").eq(
+            "id", int(tourney_id)).in_("status", ["created", "scheduled", "started"]).limit(1).execute()
+        if not tres.data:
+            return await interaction.followup.send(
+                "No registrable tourney with that ID (created/scheduled/started).", ephemeral=True)
+        t = tres.data[0]
+        print(t)
+        ping = str(ping_role.id) if ping_role else (t.get("ping_role_id") or t.get("player_role_id") or COMP_PLAYER_ROLE_ID or "")
+        sb.table("bngc_comp_tourneys").update(
+            {"reg_open": True, "reg_channel_id": str(channel.id),
+             "ping_role_id": ping or None}).eq("id", int(tourney_id)).execute()
+        try:
+            _comp_reg_cache["at"] = 0.0
+        except Exception:
+            pass
+        # unlock typing so players can post their mentions
+        try:
+            await channel.set_permissions(interaction.guild.default_role, send_messages=True,
+                                          reason="Comp signups open")
+        except Exception as e:
+            print(f"[comp] unlock typing failed: {e}")
+        mode = (t or {}).get("mode") or "solo"
+        try:
+            posted = await channel.send(_comp_open_text(mode, ping, t.get("name")), view=_CompPlayersView())
+        except Exception as e:
+            return await interaction.followup.send(
+                f"Listening, but the open message failed: {e}", ephemeral=True)
+        return await interaction.followup.send(
+            f"👂 Listening {channel.mention} for tourney **#{tourney_id}** ({mode}). "
+            f"Typing unlocked, open message posted.", ephemeral=True)
+    except Exception as e:
+        return await interaction.followup.send(f"Couldn't listen: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="stop-registration", description="Close signups: lock typing + post counts (host)")
+@app_commands.describe(tourney_id="Numeric tourney ID")
+async def stop_reg_cmd(interaction: discord.Interaction, tourney_id: int):
+    await interaction.response.defer(ephemeral=True)
+    me = await _comp_member(interaction, interaction.user.id)
+    if not _comp_is_host(me):
+        return await interaction.followup.send("Host only.", ephemeral=True)
+    sb = _comp_sb()
+    if sb is None:
+        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+    try:
+        res = sb.table("bngc_comp_tourneys").select(
+            "id,name,mode,reg_channel_id,ping_role_id,player_role_id").eq(
+            "id", int(tourney_id)).limit(1).execute()
+        if not res.data:
+            return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
+        t = res.data[0]
+        sb.table("bngc_comp_tourneys").update({"reg_open": False}).eq("id", int(tourney_id)).execute()
+        try:
+            _comp_reg_cache["at"] = 0.0
+        except Exception:
+            pass
+        players, teams = await _comp_accepted_counts(int(tourney_id))
+        # lock typing + closed message in the signups channel
+        try:
+            ch = interaction.guild.get_channel(int(t.get("reg_channel_id"))) if interaction.guild and t.get("reg_channel_id") else None
+            if ch is not None:
+                try:
+                    await ch.set_permissions(interaction.guild.default_role, send_messages=False,
+                                             reason="Comp signups closed")
+                except Exception as e:
+                    print(f"[comp] lock typing failed: {e}")
+                try:
+                    await ch.send(_comp_closed_text(t.get("mode"), players, teams, t.get("name")))
+                except Exception as e:
+                    print(f"[comp] closed message failed: {e}")
+        except Exception:
+            pass
+        return await interaction.followup.send(
+            f"🔇 Registration closed for tourney **#{tourney_id}** ({players} players / {teams} teams).",
+            ephemeral=True)
+    except Exception as e:
+        return await interaction.followup.send(f"Couldn't stop: {e}", ephemeral=True)
+
+
+async def _comp_accepted_counts(tourney_id: int):
+    """(accepted players, accepted teams). Never raises."""
+    try:
+        sb = _comp_sb()
+        if sb is None:
+            return 0, 0
+        res = sb.table("bngc_comp_registrations").select("member_ids").eq(
+            "tourney_id", int(tourney_id)).eq("status", "accepted").limit(1000).execute()
+        teams = len(res.data or [])
+        players = sum(len((r or {}).get("member_ids") or []) for r in (res.data or []))
+        return players, teams
+    except Exception:
+        return 0, 0
+
+
+async def _comp_autoclose(tourney_id: int, guild=None, channel=None):
+    """Close intake when max_players accepted is reached. Posts the closed
+    message like /stop-registration. Returns True when it closed. Never raises."""
+    try:
+        sb = _comp_sb()
+        if sb is None:
+            return False
+        tres = sb.table("bngc_comp_tourneys").select(
+            "id,name,mode,reg_open,reg_channel_id,max_players").eq(
+            "id", int(tourney_id)).limit(1).execute()
+        if not tres.data:
+            return False
+        t = tres.data[0]
+        try:
+            maxp = int(t.get("max_players") or 0)
+        except Exception:
+            maxp = 0
+        if maxp <= 0 or not t.get("reg_open"):
+            return False
+        players, teams = await _comp_accepted_counts(int(tourney_id))
+        if players < maxp:
+            return False
+        sb.table("bngc_comp_tourneys").update({"reg_open": False}).eq("id", int(tourney_id)).execute()
+        try:
+            _comp_reg_cache["at"] = 0.0
+        except Exception:
+            pass
+        ch = channel
+        try:
+            if ch is None and guild is not None and t.get("reg_channel_id"):
+                ch = guild.get_channel(int(t["reg_channel_id"]))
+        except Exception:
+            ch = None
+        if ch is not None:
+            try:
+                await ch.set_permissions(guild.default_role, send_messages=False,
+                                         reason="Comp full: max players reached")
+            except Exception:
+                pass
+            try:
+                await ch.send(_comp_closed_text(t.get("mode"), players, teams, t.get("name")) + " (full)")
+            except Exception:
+                pass
+        print(f"[comp] tourney #{tourney_id} auto-closed at {players} players")
+        return True
+    except Exception as e:
+        print(f"[comp] autoclose failed: {e}")
+        return False
+
+
+@bot.tree.command(name="tourney-start", description="Start a tourney: role to accepted players (host)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)",
+                       role_to_give="Player role (default: stored)")
+async def tourney_start_cmd(interaction: discord.Interaction, tourney_id: int,
+                            role_to_give: discord.Role | None = None):
+    await interaction.response.defer(ephemeral=True)
+    me = await _comp_member(interaction, interaction.user.id)
+    if not _comp_is_host(me):
+        return await interaction.followup.send("Host only.", ephemeral=True)
+    sb = _comp_sb()
+    if sb is None:
+        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+    try:
+        from datetime import datetime, timezone
+        tres = sb.table("bngc_comp_tourneys").select(
+            "id,code,name,status,player_role_id").eq("id", int(tourney_id)).limit(1).execute()
+        if not tres.data:
+            return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
+        t = tres.data[0]
+        role_id = (str(role_to_give.id) if role_to_give else None) or t.get("player_role_id") or COMP_PLAYER_ROLE_ID
+        if role_to_give is not None:
+            try:
+                sb.table("bngc_comp_tourneys").update(
+                    {"player_role_id": str(role_to_give.id)}).eq("id", int(tourney_id)).execute()
+            except Exception:
+                pass
+        rres = sb.table("bngc_comp_registrations").select("member_ids").eq(
+            "tourney_id", int(tourney_id)).eq("status", "accepted").limit(1000).execute()
+        dids = sorted({str(x) for r in (rres.data or []) for x in ((r or {}).get("member_ids") or []) if x})
+        if not role_id:
+            try:
+                sb.table("bngc_comp_tourneys").update(
+                    {"started_at": datetime.now(timezone.utc).isoformat(),
+                     "status": "started"}).eq("id", int(tourney_id)).execute()
+            except Exception:
+                pass
+            return await interaction.followup.send(
+                f"🚀 Tourney **#{tourney_id}** started ({len(dids)} players) — "
+                f"no player role configured, nobody to give it to. Pass `role_to_give`.",
+                ephemeral=True)
+        ok = 0
+        for did in dids:
+            if await _comp_grant_role(interaction.guild, did, role_id):
+                ok += 1
+        try:
+            sb.table("bngc_comp_tourneys").update(
+                {"started_at": datetime.now(timezone.utc).isoformat(),
+                 "status": "started"}).eq("id", int(tourney_id)).execute()
+        except Exception:
+            pass
+        # auto-tag the room code so presence + drawer show the tourney state
+        if t.get("code"):
+            try:
+                sb.table("bngc_room_tags").upsert({
+                    "code": str(t["code"]).upper(), "kind": "tourney",
+                    "name": str(t.get("name") or "Tourney"),
+                    "created_by": str(interaction.user.id),
+                }, on_conflict="code").execute()
+            except Exception as e:
+                print(f"[comp] start tag failed: {e}")
+        extra = "" if ok == len(dids) else f" ({len(dids) - ok} failed — check role order/perms)"
+        return await interaction.followup.send(
+            f"🚀 Tourney **#{tourney_id}** started — role to {ok}/{len(dids)} players.{extra}",
+            ephemeral=True)
+    except Exception as e:
+        return await interaction.followup.send(f"Couldn't start: {e}", ephemeral=True)
+
+
+TEAM_COLORS = ["🔵", "🔴", "🟠", "🟡", "🟢", "🟣"]
+
+
+def _comp_team_color(index: int) -> str:
+    """Team color by intake order (cycles 6). Pure."""
+    try:
+        return TEAM_COLORS[int(index or 0) % len(TEAM_COLORS)]
+    except Exception:
+        return TEAM_COLORS[0]
+
+
+def _comp_open_text(mode: str, ping_role_id: str | None = None, name: str = "Tourney") -> str:
+    """Registration-open announcement. Pure. Ping role mention prepended."""
+    try:
+        head = (f"## {str(name).upper()} SIGNUPS REGISTRATIONS OPEN:\n\n"
+                f"*@yourself to register (type @ and pick your name from the popup — "
+                f"typed-out names don't count).*")
+        ping = str(ping_role_id or "").strip()
+        return (f"<@&{ping}>\n" if ping else "") + head
+    except Exception:
+        return "SIGNUPS OPEN"
+
+
+def _comp_closed_text(mode: str, players: int, teams: int, name: str) -> str:
+    """Registration-closed announcement. Pure."""
+    try:
+        return (f"## {str(name).upper()} SIGNUPS CLOSED:\n\n"
+                f"{int(players or 0)} Players/ {int(teams or 0)} Teams")
+    except Exception:
+        return "SIGNUPS CLOSED"
+
+
+class _CompPlayersView(discord.ui.View):
+    """Persistent 'see players' button (survives restarts via fixed custom_id).
+
+    Tourney resolved at click time: the open registration in this channel.
+    """
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="See players", style=discord.ButtonStyle.primary,
+                       custom_id="comp:players")
+    async def show_players(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+        try:
+            regs = await _comp_open_regs()
+            mine = [r for r in (regs or [])
+                    if str((r or {}).get("reg_channel_id") or "") == str(getattr(interaction.channel, "id", ""))]
+            if not mine:
+                return await interaction.followup.send("No open registration here.", ephemeral=True)
+            t = mine[0]
+            rows = await _comp_reg_rows(t["id"])
+            acc = [r for r in rows if (r or {}).get("status") == "accepted"]
+            if not acc:
+                return await interaction.followup.send("No accepted players yet.", ephemeral=True)
+            names = []
+            try:
+                sb = _comp_sb()
+                dids = sorted({str(x) for r in acc for x in ((r or {}).get("member_ids") or []) if x})[:100]
+                umap = {}
+                if sb is not None and dids:
+                    ures = sb.table("bngc_users").select(
+                        "discord_id,game_username,discord_username").in_("discord_id", dids).execute()
+                    umap = {str(u.get("discord_id")): (u.get("game_username") or u.get("discord_username")) for u in (ures.data or [])}
+                # misses (no bngc_users row) resolve live via Discord itself
+                missing = [d for d in dids if not umap.get(d)][:25]
+                if missing and interaction.guild is not None:
+                    for d in missing:
+                        try:
+                            m = interaction.guild.get_member(int(d))
+                            if m is None:
+                                m = await interaction.guild.fetch_member(int(d))
+                            if m is not None:
+                                umap[d] = m.display_name
+                        except Exception:
+                            continue
+                for r in acc:
+                    ms = [umap.get(str(x), str(x)[:6]) for x in ((r or {}).get("member_ids") or [])]
+                    tag = (r or {}).get("team_color") or ""
+                    names.append(f"{tag + ' ' if tag else ''}{' / '.join(ms)}")
+            except Exception:
+                names = [", ".join((r or {}).get("member_ids") or []) for r in acc]
+            e = discord.Embed(title=f"Players — tourney #{t['id']}", color=0x7c3aed,
+                              description="\n".join(names[:50])[:4000])
+            return await interaction.followup.send(embed=e, ephemeral=True)
+        except Exception as e:
+            try:
+                return await interaction.followup.send(f"Couldn't load: {e}", ephemeral=True)
+            except Exception:
+                pass
+
+
+async def _comp_open_regs():
+    """Tourney rows currently listening (cached 30s). Never raises."""
+    try:
+        import time as _t
+        if _t.time() - float(_comp_reg_cache.get("at") or 0) < 30 and _comp_reg_cache.get("rows") is not None:
+            return _comp_reg_cache["rows"]
+    except Exception:
+        pass
+    rows = []
+    try:
+        sb = _comp_sb()
+        if sb is not None:
+            res = sb.table("bngc_comp_tourneys").select(
+                "id,mode,reg_channel_id,player_role_id").eq("reg_open", True).neq(
+                "status", "ended").execute()
+            rows = res.data or []
+    except Exception:
+        rows = []
+    try:
+        import time as _t2
+        _comp_reg_cache["at"] = _t2.time()
+        _comp_reg_cache["rows"] = rows
+    except Exception:
+        pass
+    return rows
+
+
+@bot.event
+async def on_message(message):
+    # Registration intake: solo = 1 mention, duo = 2 mentions (separators
+    # never reach us, only the mention list does). Duplicates, wrong counts
+    # and banned members are refused with an auto-deleted hint.
+    try:
+        if message.author is None or getattr(message.author, "bot", False):
+            return
+        if message.guild is None:
+            return
+        regs = await _comp_open_regs()
+        mine = [r for r in (regs or [])
+                if str((r or {}).get("reg_channel_id") or "") == str(getattr(message.channel, "id", ""))]
+        if not mine:
+            return
+        t = mine[0]
+        ids = [str(u.id) for u in (message.mentions or []) if not getattr(u, "bot", False)]
+        # dedupe preserving order
+        seen, clean = set(), []
+        for i in ids:
+            if i not in seen:
+                seen.add(i)
+                clean.append(i)
+        members, err = _comp_team_members(clean, (t or {}).get("mode") or "solo")
+        sb = _comp_sb()
+
+        async def _refuse(text):
+            try:
+                await message.add_reaction("❌")
+            except Exception:
+                pass
+            try:
+                hint = await message.reply(text)
+                await hint.delete(delay=60)
+            except Exception:
+                pass
+
+        # self-registration only: solo = your own mention; duo = your mention
+        # first, then your teammate. Registering strangers is refused.
+        try:
+            author_id = str(getattr(message.author, "id", ""))
+        except Exception:
+            author_id = ""
+        if err is None and author_id not in (members or []):
+            err = "mention yourself to register (solo: @you, duo: @you @teammate first)"
+        elif err is None and str((t or {}).get("mode") or "solo").lower() == "duo" and members[0] != author_id:
+            err = "duos: your own mention must come first (@you @teammate)"
+
+        if err or sb is None:
+            await _refuse(err or "Registration unavailable, try later.")
+            return
+        # banned member anywhere on the team -> refuse (python-side overlap;
+        # postgrest array ops vary by version, so never trust them blindly)
+        try:
+            banned = any(
+                (r or {}).get("status") == "banned"
+                and any(m in members for m in ((r or {}).get("member_ids") or []))
+                for r in await _comp_reg_rows(t["id"]))
+            if banned:
+                await _refuse("❌ A member of this team is banned from this tourney.")
+                return
+        except Exception:
+            pass
+        # already in (any status but banned) -> dup
+        try:
+            dup = any(
+                (r or {}).get("status") != "banned"
+                and any(m in members for m in ((r or {}).get("member_ids") or []))
+                for r in await _comp_reg_rows(t["id"]))
+            if dup:
+                await _refuse("Already registered for this tourney.")
+                return
+        except Exception:
+            pass
+        try:
+            existing = await _comp_reg_rows(t["id"])
+            team_idx = sum(1 for r in existing if (r or {}).get("status") != "banned")
+            color = _comp_team_color(team_idx) if str((t or {}).get("mode") or "solo") == "duo" else None
+            sb.table("bngc_comp_registrations").insert({
+                "tourney_id": t["id"],
+                "team_label": " / ".join(f"<@{i}>" for i in members),
+                "member_ids": members,
+                "captain_id": members[0],
+                "source_message_id": str(message.id),
+                "status": "accepted",
+                "team_color": color,
+            }).execute()
+        except Exception as e:
+            # unique violation = same message processed twice (retry)
+            print(f"[comp] reg insert failed: {e}")
+            return
+        # auto-accept: grant the player role immediately (no pending state;
+        # bans are the only gate and were checked above).
+        try:
+            _rid = (t or {}).get("player_role_id") or COMP_PLAYER_ROLE_ID
+            for _did in members:
+                await _comp_grant_role(message.guild, _did, _rid)
+        except Exception as e:
+            print(f"[comp] intake role grant failed: {e}")
+        # intake verdict right on the message: team color (duo) / ✅ solo,
+        # ❌ only on failure paths above. Host ✅/❌ moderation still works:
+        # hosts are different users, so their reactions are distinct.
+        try:
+            await message.add_reaction(color or "✅")
+        except Exception as e:
+            print(f"[comp] intake reaction failed: {e}")
+    except Exception as e:
+        print(f"[comp] on_message failed: {e}")
+    try:
+        await bot.process_commands(message)
+    except Exception:
+        pass
+
+
+@bot.event
+async def on_raw_reaction_add(payload):
+    # Host moderation: ✅ accepts (grants player role), ❌ bans. Only host
+    # role members count; only pending rows on reg-listened messages move.
+    try:
+        if payload.guild_id is None:
+            return
+        if str(payload.emoji.name) not in ("✅", "❌"):
+            return
+        if payload.user_id == (bot.user.id if bot.user else 0):
+            return
+        sb = _comp_sb()
+        if sb is None:
+            return
+        guild = bot.get_guild(payload.guild_id)
+        if guild is None:
+            return
+        try:
+            reactor = await guild.fetch_member(payload.user_id)
+        except Exception:
+            return
+        if reactor is None or getattr(reactor, "bot", False):
+            return
+        if not _comp_is_host(reactor):
+            return
+        try:
+            rres = sb.table("bngc_comp_registrations").select(
+                "id,tourney_id,member_ids,status").eq(
+                "source_message_id", str(payload.message_id)).limit(5).execute()
+        except Exception:
+            return
+        rows = [r for r in (rres.data or []) if (r or {}).get("status") == "pending"]
+        if not rows:
+            return
+        row = rows[0]
+        if str(payload.emoji.name) == "✅":
+            try:
+                sb.table("bngc_comp_registrations").update({"status": "accepted"}).eq("id", row["id"]).execute()
+            except Exception:
+                return
+            # player role: tourney override, else env
+            role_id = ""
+            try:
+                tres = sb.table("bngc_comp_tourneys").select("player_role_id").eq("id", row["tourney_id"]).limit(1).execute()
+                role_id = ((tres.data or [{}])[0] or {}).get("player_role_id") or ""
+            except Exception:
+                pass
+            role_id = role_id or COMP_PLAYER_ROLE_ID
+            for did in (row.get("member_ids") or []):
+                await _comp_grant_role(guild, did, role_id)
+            # max-players auto-close (posts the closed message like /stop-registration)
+            try:
+                ch = guild.get_channel(payload.channel_id) if payload.channel_id else None
+                await _comp_autoclose(row["tourney_id"], guild, ch)
+            except Exception:
+                pass
+        else:
+            try:
+                sb.table("bngc_comp_registrations").update({"status": "banned"}).eq("id", row["id"]).execute()
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[comp] reaction failed: {e}")
 
 
 @bot.tree.command(name="leaderboard", description="Top players by kills or wins")
