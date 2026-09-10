@@ -224,15 +224,20 @@ function createTracker(opts) {
   function onStg(v) {
     try {
       const n = num(v);
+      log(`stG raw=${JSON.stringify(v)} parsed=${n}`);
       if (n === STG_START) openMatch(false);
       else if (n === STG_END && st.openMatch) void sealMatch(false);
       // STG_RESPAWN (2) and everything else: ignored by design
-    } catch {}
+    } catch (e) { log(`stG error: ${e && e.message}`); }
   }
 
   function handle(rec, msg) {
     try {
       if (!msg) return;
+      try {
+        const kind = msg.req ? `req:${msg.req.opName}` : msg.ev ? `ev:${msg.ev.evCode}` : '?';
+        log(`handle ${kind} dir=${rec && rec.dir}`);
+      } catch {}
       // room tracking from create/join ops
       if (msg.req && (msg.req.opName === 'CreateRoom' || msg.req.opName === 'JoinRoom' || msg.req.opName === 'JoinRandomRoom')) {
         const isRandom = msg.req.opName === 'JoinRandomRoom';
@@ -288,6 +293,7 @@ function createTracker(opts) {
         pushEvent('leave', { actorNr, actorName: actorNr != null ? rosterName(actorNr) : null });
       } else if (code === 253) { // Properties: stG / alv / curScn...
         const props = paramVal(msg.ev.params, 'Properties') || {};
+        try { log(`253 props keys=${props && typeof props === 'object' ? Object.keys(props).join(',') : typeof props}`); } catch {}
         if (props && typeof props === 'object') {
           if ('stG' in props) onStg(props.stG && props.stG.value !== undefined ? props.stG.value : props.stG);
           if ('alv' in props) {
