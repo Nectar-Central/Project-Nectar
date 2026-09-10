@@ -204,17 +204,17 @@ except (OSError, PermissionError):
 
 
 def log_ranked(message: str) -> None:
-    """Ranked stream: console line + append to logs/ranked.log.
-
-    All [ranked] call sites go through here so one file tells the whole
-    story of a session (seals, placements, awards, bumps, verdicts).
-    Never raises.
-    """
+    """Ranked stream: append to logs/ranked.log (always). Console line
+    gated behind BNC_RANKED_LOG=1 to keep the terminal clean."""
     try:
         line = f"{datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3]} {message}"
-        print(f"{_timestamp()} {TAG['RANKED']} {message}")
         try:
             _ranked_logger.info(line)
+        except Exception:
+            pass
+        try:
+            if _os.getenv("BNC_RANKED_LOG") == "1":
+                print(f"{_timestamp()} {TAG['RANKED']} {message}")
         except Exception:
             pass
     except Exception:
