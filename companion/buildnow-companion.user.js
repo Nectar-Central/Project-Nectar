@@ -78,6 +78,7 @@
     ['bnc_token','bn_token','bnc_guest','bn_guest','bnc_discord_username','bn_discord_username','bnc_discord_id','bn_discord_id','bnc_first_seen','bn_first_seen','bnc_game_username','bn_game_username','bnc_game_id','bn_game_id','bnc_welcomed','bn_welcomed','bnc_session_gm','bn_session_gm','bnc_session_id','bn_session_id','bnc_req_secret','bn_req_secret','bnc_req_token','bn_req_token','bnc_req_counter','bn_req_counter'].forEach(GMDel);
     loginToken=null; discordUsername=null; hasWelcomed=false;
     sessionId=null; currentReqToken=null; reqCounter=0; discordId=null;
+    try{ if(typeof stopRevalidate==='function') stopRevalidate(); }catch{}
     try{ localStorage.removeItem('bnc_token'); localStorage.removeItem('bn_token'); sessionStorage.removeItem('bnc_token'); sessionStorage.removeItem('bn_token'); }catch{}
   }
   let loginToken = GMGet('bnc_token', GMGet('bn_token', null));
@@ -99,8 +100,64 @@
     else if(j.new_req_token){ currentReqToken=j.new_req_token; GMSet('bnc_req_token', currentReqToken); reqCounter=Number(j.new_counter??reqCounter+1); GMSet('bnc_req_counter', reqCounter); }
     else if(j.new_counter!=null){ reqCounter=j.new_counter; GMSet('bnc_req_counter', reqCounter); }
     if(j.discord_id){ discordId=j.discord_id; GMSet('bnc_discord_id', discordId); }
-    if(j.session_id) { loginToken=null; GMDel('bnc_token'); GMDel('bn_token'); GMDel('bnc_guest'); GMDel('bn_guest'); }
+    // NOTE: the login token is deliberately KEPT (never deleted here): the
+    // server's used-token path returns the still-active session, so a lost
+    // session can re-validate silently after restarts instead of asking the
+    // player to link again. A truly dead token is wiped on explicit reject.
+    if(j.session_id) { try{ stopRevalidate(); }catch{} }
     GMDel('bnc_req_secret'); GMDel('bn_req_secret');
+  }
+  // Session-only clear: drops the session, keeps login token + identity so
+  // silentRevalidate can restore without the player. Never prompts by itself.
+  function clearSessionOnly(){
+    sessionId=null; currentReqToken=null; reqCounter=0;
+    try{ GMDel('bnc_session_id'); GMDel('bn_session_id'); GMDel('bnc_req_token'); GMDel('bn_req_token'); GMDel('bnc_req_counter'); GMDel('bn_req_counter'); }catch{}
+  }
+  // Silent re-validation with the kept login token. Explicit rejection =
+  // token truly dead (full wipe + prompt). Anything else (timeout, 500,
+  // 503) = transient: keep retrying quietly every 60s, never wipe.
+  let _revalTimer=null;
+  function stopRevalidate(){ try{ if(_revalTimer){ clearInterval(_revalTimer); _revalTimer=null; } }catch{} }
+  function scheduleRevalidate(){
+    try{
+      if(_revalTimer || !loginToken) return;
+      _revalTimer=setInterval(()=>{ try{ silentRevalidate('periodic'); }catch{} }, 60000);
+    }catch{}
+  }
+  function silentRevalidate(why){
+    try{
+      if(!loginToken) return;
+      if(sessionId) { try{ stopRevalidate(); }catch{} return; } // already restored
+      apiPost('/api/validate-token', {token: loginToken, _quiet:true}, (ok, txt)=>{
+        try{
+          if(ok){
+            const j=JSON.parse(txt);
+            if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); }
+            if(j.game_username) GMSet('bnc_game_username', j.game_username);
+            if(j.game_id) GMSet('bnc_game_id', j.game_id);
+            if(j.session_id){ storeSession(j); try{ logInfo(`[AUTH] session restored (${why})`); }catch{} try{ showToast('Session restored', false); }catch{} }
+            return;
+          }
+          let reason=''; try{ reason=(JSON.parse(txt||'{}').error)||''; }catch{}
+          const rl=String(reason).toLowerCase();
+          if(rl.includes('locked')){
+            try{ showLockedPanel(reason || 'Account locked', 'default'); }catch{}
+            try{ stopRevalidate(); }catch{}
+            return;
+          }
+          const dead=rl.includes('invalid')||rl.includes('expired')||rl.includes('not found')||rl.includes('no account')||rl.includes('incorrect');
+          if(dead){
+            // token truly dead: full wipe + prompt (the only path that asks to link)
+            cleanTokenStorage(); hasWelcomed=false;
+            try{ stopRevalidate(); }catch{}
+            setTimeout(()=>{ showTokenPrompt(); showToast('Session expired - enter new token', true); }, 800);
+          } else {
+            try{ logInfo(`[AUTH] revalidate failed (${reason||'network'}) - retrying quietly`); }catch{}
+            scheduleRevalidate();
+          }
+        }catch{}
+      });
+    }catch{}
   }
 
   const PAL_EARLY = { bgInfo: 'background:#1f2937;color:#e5e7eb;padding:1px 6px;border-radius:3px' };
@@ -209,32 +266,10 @@
   if(sessionId && currentReqToken){
     logInfoEarly(`session restored ${String(sessionId).slice(0,8)}… counter=${reqCounter}`);
   } else if(loginToken){
-    // boot re-validation: an explicit rejection means the login token is
-    // dead (wipe + prompt is correct), but a timeout/500/empty at boot is
-    // transient — wiping on it logs the user out for a blip. Retry twice.
-    let _valTries=0;
-    const tryValidate=()=>{
-      apiPost('/api/validate-token', {token: loginToken, _quiet:true}, (ok, txt)=>{
-        if(ok){
-          try{ const j=JSON.parse(txt); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.session_id) storeSession(j); }catch{}
-          return;
-        }
-        let reason=''; let scope='default'; try{ const _p=JSON.parse(txt||'{}'); reason=_p.error||''; scope=_p.lock_scope||(_p.is_admin_locked?'admin':'default'); }catch{}
-        if(String(reason).toLowerCase().includes('locked')){
-          showLockedPanel(reason || 'Account locked', scope);
-          return;
-        }
-        const rl=String(reason).toLowerCase();
-        const deadToken=rl.includes('invalid')||rl.includes('expired')||rl.includes('not found')||rl.includes('no account');
-        if(!deadToken && ++_valTries<=2){
-          try{ logInfo(`[AUTH] validate failed (${reason||'network'}) - retry ${_valTries}/2`); }catch{}
-          setTimeout(tryValidate, _valTries===1?3000:8000);
-          return;
-        }
-        cleanTokenStorage(); hasWelcomed=false; setTimeout(()=>{ showTokenPrompt(); showToast('Session expired - enter new token', true); }, 800);
-      });
-    };
-    setTimeout(tryValidate, 600);
+    // session-less boot with a kept login token: silent re-validate restores
+    // the still-active session (server reuse path) with no prompt. Retries
+    // quietly on network failure; only an explicit rejection wipes + prompts.
+    setTimeout(()=>{ try{ silentRevalidate('boot'); }catch{} }, 600);
   }
 
   // queue: one at a time to avoid req_token reuse
@@ -309,12 +344,13 @@
               if(j.current){ currentReqToken=j.current; GMSet('bnc_req_token', currentReqToken); logInfo(`mismatch sync token → ${String(currentReqToken).slice(0,4)}…`); if(!retried){ logInfo(`mismatch retry ${path}`); apiQueue.unshift({path, body: {...origBody, _retried:true}, cb, retried:true, quiet, noLive, noTok, noWipe}); apiBusy=false; setTimeout(processApiQueue,30); return; } }
               // rejected with no resync token: historically wiped the session
               // on first sight — but that fires on transient DB read misses
-              // ("Invalid auth session") too, logging the user out for a
-              // blip. Retry once, wipe only on the second consecutive
-              // failure. _noWipe requests (heartbeat) never wipe at all.
+              // ("Invalid auth session") too. Retry once, then clear the
+              // SESSION only (login token kept) and re-validate silently;
+              // full wipe + prompt happens only on explicit rejection
+              // inside silentRevalidate. _noWipe requests never touch this.
               else if(noWipe){ try{ logErr(`auth rejected (${path}) - no-wipe request, session kept`); }catch{} }
-              else if(!retried){ try{ logInfo(`auth rejected (${path}) - retry once before wiping`); }catch{} apiQueue.unshift({path, body: {...origBody, _retried:true}, cb, retried:true, quiet, noLive, noTok, noWipe}); apiBusy=false; setTimeout(processApiQueue,1500); return; }
-              else { logErr(`req_token rejected twice - clearing session`); cleanTokenStorage(); }
+              else if(!retried){ try{ logInfo(`auth rejected (${path}) - retry once before clearing`); }catch{} apiQueue.unshift({path, body: {...origBody, _retried:true}, cb, retried:true, quiet, noLive, noTok, noWipe}); apiBusy=false; setTimeout(processApiQueue,1500); return; }
+              else { logErr(`auth rejected twice - clearing session, re-validating`); try{ clearSessionOnly(); }catch{} try{ silentRevalidate('invalid'); }catch{} }
             }
           }catch{}
         }
@@ -2239,13 +2275,13 @@
       if(useGM && GM){
         try{
           GM({method:'GET', url, headers:{'Content-Type':'application/json'}, timeout:8000,
-            onload: r=>{ if(!fresh(mySeq)) return; if(r.status>=200&&r.status<300){ try{ const j=JSON.parse(r.responseText); statsCache=j; logInfo(`[AUDIO] stats fetched lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } try{ _reconcileServerState(j.session); }catch{} try{ _reconcileRankedSession(j.session); }catch{} try{ noteRankedBlockPoll(!!(j.ranked&&j.ranked.active)); }catch{} renderInfoPanel(); try{ const _pi=getPartyInfo(j.session); const _inMatch=j.session&&String(j.session.state||'').toLowerCase()==='match'; if((_pi.isParty&&_pi.code)||_inMatch) fetchPlayers(false); }catch{} }catch(e){ logErr(`[AUDIO] stats parse err ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ updateApiDot(); }catch{} },
+            onload: r=>{ if(!fresh(mySeq)) return; if(r.status>=200&&r.status<300){ try{ const j=JSON.parse(r.responseText); statsCache=j; logInfo(`[AUDIO] stats fetched lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } try{ _reconcileServerState(j.session); }catch{} try{ _reconcileRankedSession(j.session); }catch{} try{ noteRankedBlockPoll(!!(j.ranked&&j.ranked.active)); }catch{} renderInfoPanel(); try{ _hbFails=0; startHeartbeat(); }catch{} try{ const _pi=getPartyInfo(j.session); const _inMatch=j.session&&String(j.session.state||'').toLowerCase()==='match'; if((_pi.isParty&&_pi.code)||_inMatch) fetchPlayers(false); }catch{} }catch(e){ logErr(`[AUDIO] stats parse err ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ updateApiDot(); }catch{} },
             onerror: ()=>{ if(!fresh(mySeq)) return; apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} },
             ontimeout: ()=>{ if(!fresh(mySeq)) return; apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} }});
           return;
         }catch{}
       }
-      fetch(url, {method:'GET'}).then(r=>r.text().then(t=>{ if(!fresh(mySeq)) return; if(r.ok){ try{ const j=JSON.parse(t); statsCache=j; logInfo(`[AUDIO] stats fetched (fetch) lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats-fetch', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} try{ _reconcileServerState(j.session); }catch{} try{ _reconcileRankedSession(j.session); }catch{} try{ noteRankedBlockPoll(!!(j.ranked&&j.ranked.active)); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } renderInfoPanel(); try{ const _pi2=getPartyInfo(j.session); const _inMatch2=j.session&&String(j.session.state||'').toLowerCase()==='match'; if((_pi2.isParty&&_pi2.code)||_inMatch2) fetchPlayers(false); }catch{} }catch(e){ logErr(`[AUDIO] stats parse err (fetch) ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ updateApiDot(); }catch{} }).catch(()=>{ if(!fresh(mySeq)) return; apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} })).catch(()=>{ if(!fresh(mySeq)) return; apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} });
+      fetch(url, {method:'GET'}).then(r=>r.text().then(t=>{ if(!fresh(mySeq)) return; if(r.ok){ try{ const j=JSON.parse(t); statsCache=j; logInfo(`[AUDIO] stats fetched (fetch) lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats-fetch', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} try{ _reconcileServerState(j.session); }catch{} try{ _reconcileRankedSession(j.session); }catch{} try{ noteRankedBlockPoll(!!(j.ranked&&j.ranked.active)); }catch{} apiOnline=true; try{ _hbFails=0; startHeartbeat(); }catch{} if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } renderInfoPanel(); try{ const _pi2=getPartyInfo(j.session); const _inMatch2=j.session&&String(j.session.state||'').toLowerCase()==='match'; if((_pi2.isParty&&_pi2.code)||_inMatch2) fetchPlayers(false); }catch{} }catch(e){ logErr(`[AUDIO] stats parse err (fetch) ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ updateApiDot(); }catch{} }).catch(()=>{ if(!fresh(mySeq)) return; apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} })).catch(()=>{ if(!fresh(mySeq)) return; apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} });
     };
     doFetch(true);
   }
@@ -4459,19 +4495,13 @@
         if(String(txt).includes('Invalid req_token') || String(txt).includes('expired')){
           queue=[]; feedLog('err', {msg:'token error - re-link'});
           if(String(txt).toLowerCase().includes('session expired') && sessionId){
-            // 2-day session expiry: drop session (keep login token), re-validate for a
-            // fresh session; fall back to the token prompt when revalidation fails.
+            // 2-day session expiry: drop session (login token kept) and
+            // re-validate silently; the token prompt only appears on
+            // explicit rejection inside silentRevalidate.
             logInfo('[AUTH] session expired - refreshing');
-            sessionId=null; currentReqToken=null; reqCounter=0;
-            try{ GMDel('bnc_session_id'); GMDel('bn_session_id'); GMDel('bnc_req_token'); GMDel('bn_req_token'); GMDel('bnc_req_counter'); GMDel('bn_req_counter'); }catch{}
-            if(loginToken){
-              showToast('Session expired - refreshing...', false);
-              apiPost('/api/validate-token', {token: loginToken}, (ok2, txt2)=>{
-                if(!ok2){ cleanTokenStorage(); setTimeout(()=>{ showTokenPrompt(); showToast('Session expired - enter new token', true); }, 800); }
-              });
-            } else {
-              cleanTokenStorage(); setTimeout(()=>{ showTokenPrompt(); showToast('Session expired - enter new token', true); }, 800);
-            }
+            try{ clearSessionOnly(); }catch{}
+            try{ showToast('Session expired - refreshing...', false); }catch{}
+            try{ silentRevalidate('expired'); }catch{}
           }
         } else {
           queue=batch.concat(queue).slice(0,BATCH_MAX*4);

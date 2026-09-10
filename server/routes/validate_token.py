@@ -95,53 +95,62 @@ async def validate_token(request: Request):
         session_expired_refresh = False
         if login_token.get("used"):
             # If there's already an active, fresh session for this discord_id, return it
-            # instead of locking — prevents userscript re-validate loops
+            # instead of locking — prevents userscript re-validate loops.
+            # NOTE: limit(1) (not single()) so an empty result is data, not an
+            # exception. Only a PROVEN empty lookup may fall through to the
+            # lock below — a transport/DB error returns 503 transient instead,
+            # so a blip during auto re-validation can never lock an account.
+            _lookup_ok = False
+            _existing = None
             try:
-                existing = (
+                _res = (
                     supabase.table("bngc_sessions")
                     .select("session_id, current_token, created_at")
                     .eq("discord_id", login_token["discord_id"])
                     .eq("is_active", True)
                     .order("created_at", desc=True)
                     .limit(1)
-                    .single()
                     .execute()
                 )
-                if existing.data and not is_session_expired(existing.data):
-                    sess = existing.data
-                    log_sys(
-                        f"VALIDATE reuse but active session exists {str(sess['session_id'])[:8]} — returning existing"
-                    )
+                _lookup_ok = True
+                _rows = _res.data or []
+                _existing = _rows[0] if _rows else None
+            except Exception as e:
+                log_err(f"VALIDATE session lookup failed ({e}) — transient, not reuse")
+                return JSONResponse({"error": "Lookup failed - try again"}, status_code=503)
+            if _lookup_ok and _existing and not is_session_expired(_existing):
+                sess = _existing
+                log_sys(
+                    f"VALIDATE reuse but active session exists {str(sess['session_id'])[:8]} — returning existing"
+                )
 
-                    # Fetch user for extra fields
-                    try:
-                        user_res = supabase.table("bngc_users").select("*").eq("discord_id", login_token["discord_id"]).single().execute()
-                        user = user_res.data
-                    except Exception:
-                        user = None
+                # Fetch user for extra fields
+                try:
+                    user_res = supabase.table("bngc_users").select("*").eq("discord_id", login_token["discord_id"]).single().execute()
+                    user = user_res.data
+                except Exception:
+                    user = None
 
-                    return JSONResponse({
-                        "valid": True,
-                        "discord_username": (user.get("discord_username") if user else login_token["discord_id"]),
-                        "discord_id": login_token["discord_id"],
-                        "first_seen": not (user.get("game_username") if user else False),
-                        "game_username": user.get("game_username") if user else None,
-                        "game_id": user.get("game_id") if user else None,
-                        "session_id": sess["session_id"],
-                        "initial_token": sess["current_token"],
-                        "reused": True,
-                    })
-                if existing.data:
-                    # Active session is older than 2 days — deactivate it and fall through
-                    # to fresh creation below (refresh, NOT a lock)
-                    try:
-                        supabase.table("bngc_sessions").update({"is_active": False}).eq("session_id", existing.data["session_id"]).execute()
-                    except Exception:
-                        pass
-                    log_sys(f"VALIDATE refresh expired session {str(existing.data['session_id'])[:8]} — issuing new")
-                    session_expired_refresh = True
-            except Exception:
-                pass
+                return JSONResponse({
+                    "valid": True,
+                    "discord_username": (user.get("discord_username") if user else login_token["discord_id"]),
+                    "discord_id": login_token["discord_id"],
+                    "first_seen": not (user.get("game_username") if user else False),
+                    "game_username": user.get("game_username") if user else None,
+                    "game_id": user.get("game_id") if user else None,
+                    "session_id": sess["session_id"],
+                    "initial_token": sess["current_token"],
+                    "reused": True,
+                })
+            if _lookup_ok and _existing:
+                # Active session is older than 2 days — deactivate it and fall through
+                # to fresh creation below (refresh, NOT a lock)
+                try:
+                    supabase.table("bngc_sessions").update({"is_active": False}).eq("session_id", _existing["session_id"]).execute()
+                except Exception:
+                    pass
+                log_sys(f"VALIDATE refresh expired session {str(_existing['session_id'])[:8]} — issuing new")
+                session_expired_refresh = True
 
             if session_expired_refresh:
                 pass  # fall through to fresh creation below (refresh, NOT a lock)
