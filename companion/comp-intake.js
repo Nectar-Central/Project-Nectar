@@ -74,6 +74,7 @@ function createTracker(opts) {
   const log = opts.log || (() => {});
   const st = {
     tourneyId: opts.tourneyId != null ? opts.tourneyId : null,
+    tourneyCode: null, // 5-char room code of the tracked tourney (null = codeless/manual: no room gate)
     room: null,
     roster: new Map(), // actorNr -> {name}
     selfName: null,    // local player (first outbound PlayerProperties 255)
@@ -139,6 +140,15 @@ function createTracker(opts) {
   function openMatch(manual) {
     try {
       if (st.openMatch) return st.openMatch;
+      // room gate: a coded tourney only scores its own room. Playing
+      // elsewhere (public matchmaking, another room) must not open — and
+      // therefore never seal — into the tracked tourney. Codeless tourneys
+      // and explicit manual opens bypass the gate. Unknown room fails open
+      // (missed join packet must not eat a real match).
+      if (!manual && st.tourneyCode && st.room && String(st.room).toUpperCase() !== st.tourneyCode) {
+        log(`comp match suppressed: room ${st.room} != tourney room ${st.tourneyCode}`);
+        return null;
+      }
       st.openMatch = {
         version: st.nextVersion,
         room: st.room,
@@ -207,6 +217,7 @@ function createTracker(opts) {
       if (!msg) return;
       // room tracking from create/join ops
       if (msg.req && (msg.req.opName === 'CreateRoom' || msg.req.opName === 'JoinRoom' || msg.req.opName === 'JoinRandomRoom')) {
+        const isRandom = msg.req.opName === 'JoinRandomRoom';
         const rn = paramVal(msg.req.params, 'RoomName');
         const code = rn && typeof rn === 'object' && 'value' in rn ? rn.value : rn;
         // Prefer the 5-char pID (private rooms): it matches tourney codes
@@ -219,7 +230,11 @@ function createTracker(opts) {
           if (typeof v === 'string' && /^[A-Z0-9]{5}$/i.test(v.trim())) pid = v.trim().toUpperCase();
         } catch {}
         if (pid) setRoom(pid);
-        else if (code) setRoom(String(code));
+        // JoinRandomRoom without a pID is public matchmaking: ignore it
+        // completely (no RoomName fallback). A random uuid would flip the
+        // tracker out of the tourney room and wipe the roster for a room
+        // that can never score.
+        else if (!isRandom && code) setRoom(String(code));
         // self identity: the FIRST outbound PlayerProperties 255 is this box.
         // (Host-skip for non-playing hosts keys off this name.)
         if (rec && rec.dir === 'out' && !st.selfName) {
@@ -294,6 +309,7 @@ function createTracker(opts) {
       st.tourneyId = id;
       st.nextVersion = 0;
       st.hostPlaying = true;
+      st.tourneyCode = null;
       if (sink && typeof sink.nextVersion === 'function' && id != null) {
         try { st.nextVersion = await sink.nextVersion(id); } catch {}
       }
@@ -301,6 +317,9 @@ function createTracker(opts) {
         try {
           const t = await sink.getTourney(id);
           if (t && t.host_playing === false) st.hostPlaying = false;
+          if (t && t.code && /^[A-Z0-9]{5}$/i.test(String(t.code).trim())) {
+            st.tourneyCode = String(t.code).trim().toUpperCase();
+          }
         } catch {}
       }
       // flush buffered matches
@@ -320,12 +339,19 @@ function createTracker(opts) {
   function status() {
     try {
       return {
-        tourneyId: st.tourneyId, room: st.room,
+        tourneyId: st.tourneyId, tourneyCode: st.tourneyCode, room: st.room,
         open: st.openMatch ? { version: st.openMatch.version, events: st.openMatch.events.length, manual: !!st.openMatch.manual } : null,
         nextVersion: st.nextVersion, sealed: st.sealed, dropped: st.dropped,
         buffered: st.pending.length, roster: st.roster.size,
       };
     } catch { return {}; }
+  }
+
+  // A preset tourney id (COMP_TOURNEY_ID) loads its row immediately so the
+  // room gate, host flag and version counter apply from the first packet.
+  // setTourney never rejects (false on failure), so this is fire-and-forget.
+  if (st.tourneyId != null) {
+    try { setTourney(st.tourneyId); } catch {}
   }
 
   return { handle, status, setTourney, openManual: () => openMatch(true), sealManual: () => sealMatch(true), _state: st };
@@ -402,7 +428,7 @@ function createSupabaseSink() {
   return {
     async getTourney(tourneyId) {
       try {
-        const rows = await sbReq('GET', `/bngc_comp_tourneys?select=id,host_playing&id=eq.${encodeURIComponent(tourneyId)}&limit=1`);
+        const rows = await sbReq('GET', `/bngc_comp_tourneys?select=id,host_playing,code&id=eq.${encodeURIComponent(tourneyId)}&limit=1`);
         return (rows && rows[0]) || null;
       } catch { return null; }
     },

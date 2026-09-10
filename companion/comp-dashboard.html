@@ -171,7 +171,7 @@ async function refreshTracker() {
     window._trackerOpen = !!o;
     $('tracker').innerHTML =
       `<table class="grid"><tr><th>Tourney</th><th>Match</th><th>Events</th><th>Room</th></tr>` +
-      `<tr><td>${c.tourneyId != null ? '#' + esc(c.tourneyId) : '—'}</td>` +
+      `<tr><td>${c.tourneyId != null ? '#' + esc(c.tourneyId) + (c.tourneyCode ? ' · ' + esc(c.tourneyCode) : '') : '—'}</td>` +
       `<td>${o ? 'v' + o.version + (o.manual ? ' (manual)' : '') : '—'}</td>` +
       `<td>${o ? o.events : 0}</td><td>${esc(c.room || '—')}</td></tr></table>` +
       `<div class="dim" style="margin-top:4px">sealed ${c.sealed || 0} · buffered ${c.buffered || 0} · dropped ${c.dropped || 0} · roster ${c.roster || 0}</div>`;

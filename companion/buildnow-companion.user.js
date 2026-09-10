@@ -3125,14 +3125,8 @@
     }
     const escS=(v)=> String(v==null?'—':v).replace(/</g,'&lt;');
     const pts=d.points!=null?Number(d.points).toLocaleString('en-US'):'—';
-    // counter shows points only: no tourney name, and zero kill/win parts
-    // are dropped (a bare counter never reads "0K · 0W").
-    const sub=[];
-    if(d.rank!=null) sub.push('#'+d.rank+(d.players?' of '+d.players:''));
-    if(Number(d.kills||0)>0) sub.push(`${d.kills}K`);
-    if(Number(d.wins||0)>0) sub.push(`${d.wins}W`);
-    el.innerHTML=`<div style="font-size:23px;font-weight:800;color:#fff">${escS(pts)}<span style="font-size:11px;font-weight:600;color:#9ca3af"> pts</span></div>`
-      + (sub.length?`<div style="font-size:11px;color:#9ca3af">${escS(sub.join(' · '))}</div>`:'');
+    // bare counter: just the number. No name, no rank, no K/W, no "pts".
+    el.innerHTML=`<div style="font-size:23px;font-weight:800;color:#fff">${escS(pts)}</div>`;
     el.style.display='flex';
   }
   // Party-invite gate: pID required, plus tourney rooms and mid-match both

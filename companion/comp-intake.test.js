@@ -172,6 +172,17 @@ function joinRoomPid(pid) {
     { keyName: 'GameProperties', value: { value: { pID: { value: pid } } } },
   ] } };
 }
+function joinRandomRoomNoPid() {
+  return { req: { opName: 'JoinRandomRoom', opCode: 225, params: [
+    { keyName: 'RoomName', value: { value: 'uuid-random-9' } },
+  ] } };
+}
+function codedSink(code) {
+  const sink = memSink();
+  sink.getTourney = async () => ({ id: 4, host_playing: true, code });
+  sink.nextVersion = async () => 0;
+  return sink;
+}
 
 test('pID room auto-tracks the open tourney with that code', async () => {
   let tracked = null;
@@ -221,4 +232,59 @@ test('tourneyByCode matches any non-ended status (v232 lifecycle)', async () => 
     if (oldUrl === undefined) delete process.env.SUPABASE_URL; else process.env.SUPABASE_URL = oldUrl;
     if (oldKey === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY; else process.env.SUPABASE_SERVICE_ROLE_KEY = oldKey;
   }
+});
+
+test('JoinRandomRoom without pID is ignored', async () => {
+  const sink = memSink();
+  const t = comp.createTracker({ sink, log: () => {} });
+  t.handle({ dir: 'out' }, joinRoomPid('ABCDE'));
+  t.handle(null, joinEv(1, 'Alice'));
+  assert.equal(t.status().room, 'ABCDE');
+  assert.equal(t.status().roster, 1);
+  t.handle({ dir: 'out' }, joinRandomRoomNoPid());
+  assert.equal(t.status().room, 'ABCDE'); // untouched, no uuid flip
+  assert.equal(t.status().roster, 1); // roster not wiped
+});
+
+test('coded tourney only scores its own room', async () => {
+  const sink = codedSink('ABCDE');
+  const t = comp.createTracker({ sink, log: () => {} });
+  await t.setTourney(4);
+  assert.equal(t.status().tourneyCode, 'ABCDE');
+  // foreign room: stG boundaries open and seal nothing
+  t.handle({ dir: 'out' }, joinRoomPid('ZZZ99'));
+  t.handle(null, stg(1));
+  assert.equal(t.status().open, null);
+  t.handle(null, stg(3));
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(sink.saved.length, 0);
+  // own room: opens and seals into the tourney
+  t.handle({ dir: 'out' }, joinRoomPid('ABCDE'));
+  t.handle(null, stg(1));
+  assert.ok(t.status().open);
+  t.handle(null, stg(3));
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(sink.saved.length, 1);
+  assert.equal(sink.saved[0].tourneyId, 4);
+});
+
+test('manual open bypasses the room gate', async () => {
+  const sink = codedSink('ABCDE');
+  const t = comp.createTracker({ sink, log: () => {} });
+  await t.setTourney(4);
+  t.handle({ dir: 'out' }, joinRoomPid('ZZZ99'));
+  t.openManual();
+  assert.ok(t.status().open);
+  await t.sealManual();
+  assert.equal(sink.saved.length, 1);
+});
+
+test('codeless tourney scores any room', async () => {
+  const sink = codedSink(null);
+  const t = comp.createTracker({ sink, log: () => {} });
+  await t.setTourney(5);
+  assert.equal(t.status().tourneyCode, null);
+  t.handle({ dir: 'out' }, joinRoomPid('ZZZ99'));
+  t.handle(null, stg(1));
+  assert.ok(t.status().open);
 });
