@@ -474,7 +474,12 @@ def _buf_event(buf, discord_id, session_id, event_type, event_data):
 
     When buf is None the row is inserted directly (old behavior, kept for
     callers outside process_batch). Never raises.
+
+    zone_change rows are retired: no writer produces them anymore (legacy
+    volume with zero consumers) — drop them here so they can never return.
     """
+    if event_type == "zone_change":
+        return
     row = {"discord_id": discord_id,       # Which Discord user owns this session
            "session_id": session_id,       # Which session
            "event_type": event_type,       # Event type for querying
@@ -500,6 +505,54 @@ def _flush_events(buf):
         except Exception:
             n = -1
         log_err(f"processor bulk event flush failed ({n} rows): {exc}")
+
+
+def _flush_user_counters(discord_id, pending_user_updates, dirty, user, attempts=3) -> bool:
+    """Persist counter + field updates in ONE bngc_users UPDATE, retried.
+
+    A win row and its counter increment flush in back-to-back queries; a
+    blip between them used to save the row while losing the counter
+    ("wins not saved"). Retrying here closes that window. Returns True
+    when persisted. Never raises (runs in a db_io worker thread; blocking
+    backoff sleep is fine there).
+    """
+    try:
+        final_user_update = dict(pending_user_updates or {})
+        for _k in (dirty or set()):
+            try:
+                final_user_update[_k] = user.get(_k)
+            except Exception:
+                continue
+        if not final_user_update:
+            return True
+        last_exc = None
+        for _a in range(max(1, int(attempts or 1))):
+            try:
+                supabase.table("bngc_users").update(
+                    final_user_update).eq("discord_id", discord_id).execute()
+                if _a:
+                    try:
+                        log_sys(f"PROCESSOR flush user {discord_id[:6]} ok on retry {_a}")
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        log_dbg(f"PROCESSOR flush user {discord_id[:6]} {final_user_update}")
+                    except Exception:
+                        pass
+                return True
+            except Exception as exc:
+                last_exc = exc
+                try:
+                    import time as _t
+                    _t.sleep(0.25 * (_a + 1))
+                except Exception:
+                    pass
+        log_err(f"processor user flush failed {last_exc}")
+        return False
+    except Exception as exc:
+        log_err(f"processor user flush failed {exc}")
+        return False
 
 
 def _bump_user(user, dirty, key, delta=1):
@@ -2348,15 +2401,7 @@ async def process_batch(
         except Exception as exc:
             log_err(f"processor event flush failed {exc}")
         try:
-            final_user_update = dict(pending_user_updates)
-            for _k in (dirty or set()):
-                try:
-                    final_user_update[_k] = user.get(_k)
-                except Exception:
-                    continue
-            if final_user_update:
-                await db_io(lambda: supabase.table("bngc_users").update(final_user_update).eq("discord_id", discord_id).execute())
-                log_dbg(f"PROCESSOR flush user {discord_id[:6]} {final_user_update}")
+            await db_io(_flush_user_counters, discord_id, pending_user_updates, dirty, user)
         except Exception as exc:
             log_err(f"processor user flush failed {exc}")
 
