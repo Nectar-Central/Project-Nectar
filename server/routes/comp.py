@@ -1086,7 +1086,9 @@ async def comp_match_kills(request: Request):
 
     Positive delta inserts manual kill rows; negative removes that many of
     the player's manual rows (newest first). Tracked (non-manual) rows are
-    never touched. Returns the player's new kill total for the match.
+    never touched. Returns the player's new kill total plus how many manual
+    rows were actually removed (requested vs removed tells the dashboard when
+    tracked kills were kept).
     """
     err = _need()
     if err:
@@ -1116,15 +1118,21 @@ async def comp_match_kills(request: Request):
             eres = supabase.table("bngc_comp_events").select("id").eq(
                 "match_id", mid).eq("discord_id", did).eq("etype", "kill").eq(
                 "manual", True).order("id", desc=True).limit(abs(delta)).execute()
+            removed = 0
             for r in (eres.data or []):
                 try:
                     supabase.table("bngc_comp_events").delete().eq("id", r["id"]).execute()
+                    removed += 1
                 except Exception:
                     pass
-        cres = supabase.table("bngc_comp_events").select("id").eq(
+        cres = supabase.table("bngc_comp_events").select("id,manual").eq(
             "match_id", mid).eq("discord_id", did).eq("etype", "kill").execute()
+        rows = cres.data or []
+        tracked = sum(1 for r in rows if not (r or {}).get("manual"))
         return JSONResponse({"ok": True, "match_id": mid, "discord_id": did,
-                             "kills": len(cres.data or [])})
+                             "kills": len(rows), "tracked_kept": tracked,
+                             "requested": abs(delta) if delta < 0 else delta,
+                             "removed_manual": removed if delta < 0 else delta})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -1185,20 +1193,23 @@ async def comp_match_unmapped(request: Request):
         return JSONResponse({"error": "match_id required"}, status_code=400)
     try:
         eres = supabase.table("bngc_comp_events").select(
-            "etype,discord_id,actor_name").eq("match_id", mid).limit(5000).execute()
+            "etype,discord_id,actor_name,target_name,alive").eq("match_id", mid).limit(5000).execute()
         agg: dict[str, dict] = {}
         for e in (eres.data or []):
             try:
                 if (e or {}).get("discord_id"):
                     continue
-                nm = str((e or {}).get("actor_name") or "").strip()
-                if not nm:
-                    continue
-                d = agg.setdefault(nm, {"name": nm, "kills": 0, "deaths": 0})
-                if (e or {}).get("etype") == "kill":
-                    d["kills"] += 1
-                elif (e or {}).get("etype") in ("death", "knock"):
-                    d["deaths"] += 1
+                for nm_raw in ((e or {}).get("actor_name"), (e or {}).get("target_name")):
+                    nm = str(nm_raw or "").strip()
+                    if not nm:
+                        continue
+                    d = agg.setdefault(nm, {"name": nm, "kills": 0, "deaths": 0})
+                    if (e or {}).get("etype") == "kill":
+                        d["kills"] += 1
+                    elif (e or {}).get("etype") in ("death", "knock"):
+                        d["deaths"] += 1
+                    elif (e or {}).get("etype") == "alv" and (e or {}).get("alive") is False:
+                        d["deaths"] += 1
             except Exception:
                 continue
         return JSONResponse({"match_id": mid,
@@ -1213,7 +1224,8 @@ async def comp_match_link(request: Request):
 
     Writes discord_id directly onto the null rows, so boards, HUD and stored
     results all agree with zero special cases. {match_id, actor_name,
-    discord_id|null}. Unlink passes null.
+    discord_id|null, apply_to_all?}. Unlink passes null. apply_to_all backfills
+    the same actor_name across all matches of the tourney.
     """
     err = _need()
     if err:
@@ -1229,13 +1241,34 @@ async def comp_match_link(request: Request):
     try:
         did = b.get("discord_id")
         did = str(did).strip() if did else None
+        apply_all = bool(b.get("apply_to_all"))
         q = supabase.table("bngc_comp_events").update(
             {"discord_id": did}).eq("match_id", mid).is_("discord_id", "null").eq(
             "actor_name", name)
         res = q.execute()
         n = len(res.data or [])
+        n_all = 0
+        if apply_all and did:
+            try:
+                mrow = supabase.table("bngc_comp_matches").select(
+                    "tourney_id").eq("id", mid).limit(1).execute()
+                tid = ((mrow.data or [{}])[0] or {}).get("tourney_id")
+                if tid is not None:
+                    mids = supabase.table("bngc_comp_matches").select(
+                        "id").eq("tourney_id", tid).limit(200).execute()
+                    ids = [m.get("id") for m in (mids.data or []) if m.get("id") != mid]
+                    for oid in ids[:200]:
+                        try:
+                            r2 = supabase.table("bngc_comp_events").update(
+                                {"discord_id": did}).eq("match_id", oid).is_(
+                                "discord_id", "null").eq("actor_name", name).execute()
+                            n_all += len(r2.data or [])
+                        except Exception:
+                            continue
+            except Exception:
+                pass
         return JSONResponse({"ok": True, "match_id": mid, "actor_name": name,
-                             "discord_id": did, "linked": n})
+                             "discord_id": did, "linked": n, "linked_all": n_all})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 

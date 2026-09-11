@@ -142,6 +142,11 @@ function createTracker(opts) {
   function openMatch(manual) {
     try {
       if (st.openMatch) return st.openMatch;
+      // series complete: no new auto-opens (manual blanks bypass).
+      if (!manual && st.seriesLen > 0 && st.seriesSealed >= st.seriesLen) {
+        log(`comp match suppressed: series complete (${st.seriesSealed}/${st.seriesLen})`);
+        return null;
+      }
       // room gate: a coded tourney only scores its own room. Playing
       // elsewhere (public matchmaking, another room) must not open — and
       // therefore never seal — into the tracked tourney. Codeless tourneys
@@ -207,6 +212,7 @@ function createTracker(opts) {
           events: m.events,
         });
         st.sealed++;
+        try { st.seriesSealed = (st.seriesSealed || 0) + 1; } catch {}
         // summary log: kills + winner
         const kills = m.events.filter(e => e.etype === 'kill').length;
         const alive = m.events.filter(e => e.etype === 'alv' && !e.alive);
@@ -340,6 +346,8 @@ function createTracker(opts) {
       st.nextVersion = 0;
       st.hostPlaying = true;
       st.tourneyCode = null;
+      st.seriesLen = 0;
+      st.seriesSealed = 0;
       if (sink && typeof sink.nextVersion === 'function' && id != null) {
         try { st.nextVersion = await sink.nextVersion(id); } catch {}
       }
@@ -349,6 +357,12 @@ function createTracker(opts) {
           if (t && t.host_playing === false) st.hostPlaying = false;
           if (t && t.code && /^[A-Z0-9]{5}$/i.test(String(t.code).trim())) {
             st.tourneyCode = String(t.code).trim().toUpperCase();
+          }
+          if (t && Number(t.series_len) > 0) st.seriesLen = Number(t.series_len);
+        } catch {}
+        try {
+          if (sink && typeof sink.sealedCount === 'function') {
+            st.seriesSealed = await sink.sealedCount(id);
           }
         } catch {}
       }
@@ -459,9 +473,15 @@ function createSupabaseSink() {
   return {
     async getTourney(tourneyId) {
       try {
-        const rows = await sbReq('GET', `/bngc_comp_tourneys?select=id,host_playing,code&id=eq.${encodeURIComponent(tourneyId)}&limit=1`);
+        const rows = await sbReq('GET', `/bngc_comp_tourneys?select=id,host_playing,code,series_len&id=eq.${encodeURIComponent(tourneyId)}&limit=1`);
         return (rows && rows[0]) || null;
       } catch { return null; }
+    },
+    async sealedCount(tourneyId) {
+      try {
+        const rows = await sbReq('GET', `/bngc_comp_matches?select=id&tourney_id=eq.${encodeURIComponent(tourneyId)}&status=in.(sealed,manual)&limit=500`);
+        return (rows || []).length;
+      } catch { return 0; }
     },
     async tourneyByCode(code) {
       // exactly one NON-ENDED tourney carrying this room code -> its id, else null
