@@ -21,9 +21,25 @@ Standings math (shared by bot, dashboard, Events tab — one implementation):
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from ..lib.supabase_client import supabase
+from ..lib.supabase_client import supabase, db_io, is_transient_error
+from ..lib.logger import log_err
 
 router = APIRouter()
+
+
+def _db_err(e: Exception, what: str):
+    """Transient pool blips degrade (503, retryable); real errors stay 500."""
+    try:
+        msg = str(e)[:160]
+    except Exception:
+        msg = "db error"
+    try:
+        log_err(f"COMP {what} DB error ({msg[:80]})")
+    except Exception:
+        pass
+    if is_transient_error(e):
+        return JSONResponse({"error": "temporarily unavailable", "retry": True}, status_code=503)
+    return JSONResponse({"error": msg}, status_code=500)
 
 DEFAULT_TABLE = {"kill": 1, "win": 3, "placement": [10, 7, 5, 3, 1]}
 
@@ -146,8 +162,110 @@ def compute_match_points(events: list[dict], table: dict | None = None,
     return rows
 
 
+def group_standings_by_team(board: list[dict], regs: list[dict] | None,
+                            names: dict | None = None) -> list[dict]:
+    """Fold a per-player series board into team rows. Pure, unit-tested.
+
+    Teams come from accepted regs ({team_label, member_ids}); each team acts
+    as one player sharing summed points/kills/wins. Display name is the
+    label when set, else @a & @b over member display names. Unregistered
+    players (played but never registered) stand alone under their own name.
+    Rows carry member_ids so the dashboard can still resolve individuals.
+    """
+    try:
+        regs = regs or []
+        names = names or {}
+        team_of: dict[str, int] = {}
+        teams: list[dict] = []
+        for r in regs:
+            try:
+                members = [str(x) for x in ((r or {}).get("member_ids") or []) if x]
+            except Exception:
+                members = []
+            if not members:
+                continue
+            label = str((r or {}).get("team_label") or "").strip() or None
+            teams.append({"label": label, "member_ids": members,
+                          "kills": 0, "wins": 0, "points": 0, "matches": 0,
+                          "avg_w": 0.0, "avg_n": 0})
+            idx = len(teams) - 1
+            for m in members:
+                team_of.setdefault(m, idx)
+        solos: dict[str, dict] = {}
+        for row in (board or []):
+            try:
+                did = str((row or {}).get("discord_id") or "")
+                if not did:
+                    continue
+                k = int((row or {}).get("kills") or 0)
+                w = int((row or {}).get("wins") or 0)
+                pts = int((row or {}).get("points") or 0)
+                mt = int((row or {}).get("matches") or 0)
+                nm = (row or {}).get("name") or names.get(did) or did[:6]
+                try:
+                    av = (row or {}).get("avg_placement")
+                    av = float(av) if av is not None else None
+                except Exception:
+                    av = None
+                if did in team_of:
+                    t = teams[team_of[did]]
+                    t["kills"] += k
+                    t["wins"] += w
+                    t["points"] += pts
+                    t["matches"] = max(t["matches"], mt)
+                    if av is not None and mt > 0:
+                        t["avg_w"] += av * mt
+                        t["avg_n"] += mt
+                else:
+                    s = solos.setdefault(did, {"member_ids": [did], "kills": 0,
+                                               "wins": 0, "points": 0, "matches": 0,
+                                               "name": nm, "avg_w": 0.0, "avg_n": 0})
+                    s["kills"] += k
+                    s["wins"] += w
+                    s["points"] += pts
+                    s["matches"] = max(s["matches"], mt)
+                    if av is not None and mt > 0:
+                        s["avg_w"] += av * mt
+                        s["avg_n"] += mt
+            except Exception:
+                continue
+
+        def _avg_of(t) -> float | None:
+            try:
+                n = int(t.get("avg_n") or 0)
+                return round(float(t.get("avg_w") or 0.0) / n, 1) if n > 0 else None
+            except Exception:
+                return None
+
+        out = []
+        for t in teams:
+            try:
+                disp = [str(names.get(m) or m[:6]) for m in t["member_ids"]]
+            except Exception:
+                disp = [str(m)[:6] for m in t["member_ids"]]
+            name = t["label"] or ("@" + " & @".join(disp) if disp else "?")
+            out.append({"team": True, "team_label": t["label"],
+                        "name": name, "member_ids": t["member_ids"],
+                        "kills": t["kills"], "wins": t["wins"],
+                        "points": t["points"], "matches": t["matches"],
+                        "avg_placement": _avg_of(t)})
+        for did, s in solos.items():
+            out.append({"team": False, "discord_id": did, "name": s["name"],
+                        "member_ids": s["member_ids"], "kills": s["kills"],
+                        "wins": s["wins"], "points": s["points"],
+                        "matches": s["matches"], "avg_placement": _avg_of(s)})
+        out.sort(key=lambda r: (r["points"], r["kills"]), reverse=True)
+        return out
+    except Exception:
+        return list(board or [])
+
+
 def aggregate_standings(per_match: list[list[dict]]) -> list[dict]:
-    """Sum match rows into a series board. Pure, unit-tested."""
+    """Sum match rows into a series board. Pure, unit-tested.
+
+    Adds avg_placement (mean of per-match placements, 1 decimal; None when
+    the player has no placed match, e.g. kills-only scoring).
+    """
     tot: dict[str, dict] = {}
     try:
         for rows in (per_match or []):
@@ -156,14 +274,28 @@ def aggregate_standings(per_match: list[list[dict]]) -> list[dict]:
                 if not did:
                     continue
                 d = tot.setdefault(did, {"discord_id": did, "name": (r or {}).get("name") or did[:6],
-                                         "kills": 0, "wins": 0, "points": 0, "matches": 0})
+                                         "kills": 0, "wins": 0, "points": 0, "matches": 0,
+                                         "placements": []})
                 d["kills"] += int((r or {}).get("kills") or 0)
                 d["wins"] += 1 if (r or {}).get("won") else 0
                 d["points"] += int((r or {}).get("points") or 0)
                 d["matches"] += 1
+                try:
+                    p = (r or {}).get("placement")
+                    if p is not None:
+                        d["placements"].append(int(p))
+                except Exception:
+                    pass
     except Exception:
         pass
-    out = list(tot.values())
+    out = []
+    for d in tot.values():
+        try:
+            pl = d.pop("placements", [])
+            d["avg_placement"] = round(sum(pl) / len(pl), 1) if pl else None
+        except Exception:
+            d["avg_placement"] = None
+        out.append(d)
     out.sort(key=lambda r: (r["points"], r["kills"]), reverse=True)
     return out
 
@@ -233,10 +365,12 @@ def code_tourney_points(code: str | None, discord_id: str | None) -> dict | None
         rank = next((i + 1 for i, r in enumerate(board) if str(r.get("discord_id")) == did), None)
         if me is None:
             return {"tourney_id": t["id"], "name": t.get("name"), "points": 0,
-                    "kills": 0, "wins": 0, "rank": None, "players": len(board)}
+                    "kills": 0, "wins": 0, "avg_placement": None,
+                    "rank": None, "players": len(board)}
         return {"tourney_id": t["id"], "name": t.get("name"),
                 "points": int(me.get("points") or 0), "kills": int(me.get("kills") or 0),
-                "wins": int(me.get("wins") or 0), "rank": rank, "players": len(board)}
+                "wins": int(me.get("wins") or 0), "avg_placement": me.get("avg_placement"),
+                "rank": rank, "players": len(board)}
     except Exception:
         return None
 
@@ -267,9 +401,13 @@ def open_tourney_points(discord_ids: list[str]):
         if not sealed:
             return {}
         mids = [m["id"] for m in sealed]
+        # Full event scope (NOT filtered by user): placement order and the
+        # win bonus depend on every player's alv rows. Filtering per user
+        # made everyone the "winner" of their own view (9W instead of 7W).
+        # Row selection by `want` happens after scoring, below.
         eres = supabase.table("bngc_comp_events").select(
             "match_id,etype,discord_id,actor_name,alive").in_(
-            "match_id", mids[:200]).in_("discord_id", want).limit(5000).execute()
+            "match_id", mids[:200]).limit(5000).execute()
         by_mid: dict = {}
         for e in (eres.data or []):
             by_mid.setdefault((e or {}).get("match_id"), []).append(e)
@@ -288,7 +426,9 @@ def open_tourney_points(discord_ids: list[str]):
                     cur = out.get(did)
                     if cur is None or r.get("points", 0) > cur.get("points", 0):
                         out[did] = {"points": r.get("points", 0), "kills": r.get("kills", 0),
-                                    "wins": r.get("wins", 0), "tourney_id": t["id"],
+                                    "wins": r.get("wins", 0),
+                                    "avg_placement": r.get("avg_placement"),
+                                    "tourney_id": t["id"],
                                     "tourney_name": t.get("name")}
         return out
     except Exception:
@@ -415,9 +555,19 @@ async def tourney_detail(request: Request):
                         u.get("game_username") or u.get("discord_username") or u.get("discord_id"))
         except Exception:
             pass
+        # Duo mode: the series board shows teams (@a & @b sharing summed
+        # points/kills/wins) instead of individuals. Per-player source rows
+        # stay untouched (calculate/results, match boards, bot lines read the
+        # same shapes as before).
+        try:
+            if str(t.get("mode") or "solo").lower() == "duo":
+                board = group_standings_by_team(board, regs, names)
+        except Exception:
+            pass
         return JSONResponse({
             "tourney": {"id": t["id"], "code": t.get("code"), "name": t.get("name"),
                         "status": derive_status(t, len(sealed)),
+                        "mode": str(t.get("mode") or "solo").lower(),
                         "series_len": t.get("series_len") or 0, "sealed": len(sealed),
                         "points_table": table, "scheduled_at": t.get("scheduled_at"),
                         "started_at": t.get("started_at"), "ended_at": t.get("ended_at")},
@@ -562,14 +712,18 @@ async def comp_match_seal(request: Request):
         return JSONResponse({"error": "match_id required"}, status_code=400)
     try:
         from datetime import datetime, timezone
-        res = supabase.table("bngc_comp_matches").update(
+        res = await db_io(lambda: supabase.table("bngc_comp_matches").update(
             {"status": "sealed", "sealed_at": datetime.now(timezone.utc).isoformat()}
-        ).eq("id", mid).in_("status", ["open", "manual"]).execute()
+        ).eq("id", mid).in_("status", ["open", "manual"]).execute())
         if not res.data:
             return JSONResponse({"error": "match not found or already sealed"}, status_code=404)
+        try:
+            log_comp(f"sealed match={mid} via dashboard")
+        except Exception:
+            pass
         return JSONResponse({"ok": True, "match_id": mid})
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return _db_err(e, f"seal match={mid}")
 
 
 @router.post("/api/comp/match/winner")
@@ -710,6 +864,75 @@ async def comp_tourney_hosts(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+def _calculate_sync(trous: dict, matches: list, by_mid: dict,
+                    computed_by: str = "dashboard") -> dict:
+    """Shared calculate core: per-match points + aggregate boards + snapshot
+    rows into bngc_comp_results. Sync (direct supabase calls, for request and
+    bridge threads alike). Never raises; returns {str(tid): board}."""
+    boards: dict = {}
+    try:
+        from datetime import datetime, timezone
+        by_tid: dict = {}
+        for m in matches or []:
+            by_tid.setdefault((m or {}).get("tourney_id"), []).append(m)
+        for tid, ms in by_tid.items():
+            trow = (trous or {}).get(tid) or {}
+            table = _table_of(trow)
+            per: dict = {}
+            for m in ms:
+                try:
+                    per[m["id"]] = compute_match_points(
+                        (by_mid or {}).get(m["id"], []), table, (m or {}).get("winner_discord_id"),
+                        (m or {}).get("placements"))
+                except Exception:
+                    per[m["id"]] = []
+            _pm = [per[m["id"]] for m in ms]
+            boards[str(tid)] = aggregate_standings(_pm)
+            for m in ms:
+                try:
+                    supabase.table("bngc_comp_results").upsert({
+                        "match_id": m["id"], "standings": per[m["id"]],
+                        "computed_at": datetime.now(timezone.utc).isoformat(),
+                        "computed_by": str(computed_by or "dashboard"),
+                    }, on_conflict="match_id").execute()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return boards
+
+
+def calculate_tourney_sync(tid: int, computed_by: str = "bridge") -> list:
+    """Tourney-branch calculate for non-request callers (bridge auto-calc
+    after every seal, so stored placements never go stale). Sync. Never
+    raises; returns the board list."""
+    try:
+        if not supabase:
+            return []
+        trows = supabase.table("bngc_comp_tourneys").select(
+            "id,points_table").eq("id", int(tid)).limit(1).execute()
+        if not trows.data:
+            return []
+        mres = supabase.table("bngc_comp_matches").select(
+            "id,tourney_id,version,room_id,status,winner_discord_id,placements").eq(
+            "tourney_id", int(tid)).in_("status", ["sealed", "manual"]).order(
+            "version").limit(200).execute()
+        matches = mres.data or []
+        if not matches:
+            return []
+        mids = [m["id"] for m in matches]
+        eres = supabase.table("bngc_comp_events").select(
+            "match_id,etype,discord_id,actor_name,alive").in_(
+            "match_id", mids[:200]).limit(5000).execute()
+        by_mid: dict = {}
+        for e in (eres.data or []):
+            by_mid.setdefault((e or {}).get("match_id"), []).append(e)
+        boards = _calculate_sync({int(tid): trows.data[0]}, matches, by_mid, computed_by)
+        return boards.get(str(int(tid)), [])
+    except Exception:
+        return []
+
+
 @router.post("/api/comp/calculate")
 async def comp_calculate(request: Request):
     """Compute standings with the shared math and snapshot per-match rows
@@ -763,33 +986,10 @@ async def comp_calculate(request: Request):
                 "match_id", mids[:200]).limit(5000).execute()
             for e in (eres.data or []):
                 by_mid.setdefault((e or {}).get("match_id"), []).append(e)
-        by_tid: dict = {}
-        for m in matches:
-            by_tid.setdefault((m or {}).get("tourney_id"), []).append(m)
-        boards: dict = {}
-        for tid, ms in by_tid.items():
-            trow = trous.get(tid) or {}
-            table = _table_of(trow)
-            per: dict = {}
-            for m in ms:
-                try:
-                    per[m["id"]] = compute_match_points(
-                        by_mid.get(m["id"], []), table, (m or {}).get("winner_discord_id"),
-                        (m or {}).get("placements"))
-                except Exception:
-                    per[m["id"]] = []
-            _pm = [per[m["id"]] for m in ms]
-            boards[str(tid)] = aggregate_standings(_pm)
-            for m in ms:
-                try:
-                    supabase.table("bngc_comp_results").upsert({
-                        "match_id": m["id"], "standings": per[m["id"]],
-                        "computed_at": datetime.now(timezone.utc).isoformat(),
-                        "computed_by": str(b.get("computed_by") or "dashboard"),
-                    }, on_conflict="match_id").execute()
-                except Exception:
-                    pass
-        first = boards.get(str((list(by_tid) or [None])[0]), [])
+        boards = _calculate_sync(trous, matches, by_mid,
+                                 str(b.get("computed_by") or "dashboard"))
+        first_tid = matches[0]["tourney_id"] if matches else None
+        first = boards.get(str(first_tid), [])
         return JSONResponse({"ok": True, "standings": first, "tourneys": list(boards)})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -1057,9 +1257,9 @@ async def comp_tourney_by_code(request: Request):
     if len(code) != 5 or not code.isalnum():
         return JSONResponse({"tourney": None})
     try:
-        res = supabase.table("bngc_comp_tourneys").select(
+        res = await db_io(lambda: supabase.table("bngc_comp_tourneys").select(
             "id,code,name,status,mode,series_len").eq("code", code).neq(
-            "status", "ended").limit(2).execute()
+            "status", "ended").limit(2).execute())
         rows = res.data or []
         if len(rows) != 1:
             return JSONResponse({"tourney": None})
@@ -1069,4 +1269,13 @@ async def comp_tourney_by_code(request: Request):
             "status": t.get("status"), "mode": t.get("mode"),
             "series_len": t.get("series_len") or 0}})
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        # Join-detection polls this every few seconds — a pool blip must
+        # resolve to null (retry on next poll), never a 500 that the
+        # userscript treats as fatal.
+        if is_transient_error(e):
+            try:
+                log_err(f"COMP by-code={code} transient ({str(e)[:60]}) → null")
+            except Exception:
+                pass
+            return JSONResponse({"tourney": None})
+        return _db_err(e, f"by-code={code}")

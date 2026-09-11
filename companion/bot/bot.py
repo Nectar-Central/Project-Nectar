@@ -1892,6 +1892,52 @@ async def tourney_remove_host_cmd(interaction: discord.Interaction, tourney_id: 
         return await interaction.followup.send(f"Couldn't remove host: {e}", ephemeral=True)
 
 
+def _ord(n):
+    """1 -> 1st, 2 -> 2nd, ... Pure."""
+    try:
+        n = int(n)
+        if 10 <= n % 100 <= 20:
+            suf = "th"
+        else:
+            suf = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+        return f"{n}{suf}"
+    except Exception:
+        return str(n)
+
+
+def _points_table_lines(t: dict) -> list:
+    """POINTS section lines from the tourney points_table. Pure.
+
+    Returns [] when there is no table (caller skips the section).
+    Missing keys fall back to server defaults (kill 1 / win 3 /
+    placement [10,7,5,3,1]) so the post always mirrors live scoring.
+    """
+    try:
+        pt = (t or {}).get("points_table")
+        if isinstance(pt, str):
+            import json as _j
+            pt = _j.loads(pt)
+        if not isinstance(pt, dict):
+            return []
+        place = pt.get("placement")
+        if not isinstance(place, list) or not place:
+            place = [10, 7, 5, 3, 1]
+        try:
+            kill = int(pt.get("kill", 1))
+        except Exception:
+            kill = 1
+        try:
+            win = int(pt.get("win", 3))
+        except Exception:
+            win = 3
+        lines = [f"{_ord(i + 1)} = {p} pts" for i, p in enumerate(place)]
+        lines.append(f"KILL = {kill} pts")
+        lines.append(f"WIN = {win} pts")
+        return lines
+    except Exception:
+        return []
+
+
 def _comp_announce_text(t: dict):
     """Announcement message matching the host template exactly. Pure-ish."""
     try:
@@ -1911,6 +1957,14 @@ def _comp_announce_text(t: dict):
                 or COMP_PLAYER_ROLE_ID or "")
         ping = str(ping).strip()
         ping_line = f"<@&{ping}>" if ping else "@role"
+        try:
+            _hosts = [str(h) for h in ((t or {}).get("hosts") or []) if str(h or "").strip()]
+            _creator = str((t or {}).get("created_by") or "").strip()
+            if _creator and _creator not in _hosts:
+                _hosts.append(_creator)
+            hosted_by = " ".join(f"<@{h}>" for h in _hosts) if _hosts else "—"
+        except Exception:
+            hosted_by = "—"
         lines = [
             f"## {mode} {name}",
             f"**GAME MODE**: {gm}",
@@ -1919,6 +1973,12 @@ def _comp_announce_text(t: dict):
             f"**RULES**: {rules}",
             f"**SIGNUPS**: {signups}",
             f"**SHOOT TIMER**: {timer}",
+            f"**HOSTED BY**: {hosted_by}",
+        ]
+        pts = _points_table_lines(t)
+        if pts:
+            lines += ["", "**POINTS**:"] + pts
+        lines += [
             "",
             "**WINNER IS HAVING TOURNAMENT MVP UNTIL THE NEXT TOURNEY**",
             "",
@@ -1929,6 +1989,32 @@ def _comp_announce_text(t: dict):
         return "\n".join(lines)
     except Exception:
         return str((t or {}).get("name") or "Tourney")
+
+
+async def _announce_upsert(sb, guild, target, t, text):
+    """Edit the stored announce message, else send new + persist ids.
+
+    Returns (message, is_new). None message on failure. Never raises."""
+    try:
+        mid, cid = (t or {}).get("announce_message_id"), (t or {}).get("announce_channel_id")
+        if mid and cid and guild is not None:
+            try:
+                old_ch = guild.get_channel(int(cid))
+                if old_ch is not None:
+                    posted = await (await old_ch.fetch_message(int(mid))).edit(content=text)
+                    return posted, False
+            except Exception:
+                pass
+        posted = await target.send(content=text)
+        try:
+            sb.table("bngc_comp_tourneys").update(
+                {"announce_channel_id": str(target.id),
+                 "announce_message_id": str(posted.id)}).eq("id", int((t or {}).get("id"))).execute()
+        except Exception:
+            pass
+        return posted, True
+    except Exception:
+        return None, False
 
 
 @bot.tree.command(name="tourney-post", description="Post the tourney announcement (host). Re-post edits it.")
@@ -1967,35 +2053,55 @@ async def tourney_post_cmd(interaction: discord.Interaction, tourney_id: int,
             target = interaction.channel
         embed = None
         text = _comp_announce_text(t)
-        mid, cid = t.get("announce_message_id"), t.get("announce_channel_id")
-        posted = None
-        if mid and cid:
-            # re-post = edit (code filled in later without spam)
-            try:
-                old_ch = interaction.guild.get_channel(int(cid)) if interaction.guild else None
-                if old_ch is not None:
-                    posted = await (await old_ch.fetch_message(int(mid))).edit(content=text)
-            except Exception:
-                posted = None
+        # re-post = edit (code filled in later without spam)
+        posted, is_new = await _announce_upsert(sb, interaction.guild, target, t, text)
         if posted is None:
-            try:
-                posted = await target.send(content=text)
-            except Exception as e:
-                return await interaction.followup.send(f"Couldn't post: {e}", ephemeral=True)
+            return await interaction.followup.send("Couldn't post.", ephemeral=True)
+        if is_new:
             try:
                 await posted.add_reaction("✅")
-            except Exception:
-                pass
-            try:
-                sb.table("bngc_comp_tourneys").update(
-                    {"announce_channel_id": str(target.id),
-                     "announce_message_id": str(posted.id)}).eq("id", int(tourney_id)).execute()
             except Exception:
                 pass
         return await interaction.followup.send(
             f"📢 Announcement for **#{tourney_id}** is live in {target.mention}.", ephemeral=True)
     except Exception as e:
         return await interaction.followup.send(f"Couldn't post: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="tourney-refresh-points", description="Push the current points table into the posted announcement (host).")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)",
+                       channel="Channel override (default: stored announce channel)")
+async def tourney_refresh_points_cmd(interaction: discord.Interaction, tourney_id: int,
+                                     channel: discord.TextChannel | None = None):
+    await interaction.response.defer(ephemeral=True)
+    sb, me = await _comp_require_manager(interaction, tourney_id)
+    if sb is None:
+        return
+    try:
+        tres = sb.table("bngc_comp_tourneys").select("*").eq("id", int(tourney_id)).limit(1).execute()
+        if not tres.data:
+            return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
+        t = tres.data[0]
+        text = _comp_announce_text(t)
+        target = None
+        try:
+            if channel is not None:
+                target = channel
+            elif interaction.guild and t.get("announce_channel_id"):
+                target = interaction.guild.get_channel(int(t.get("announce_channel_id")))
+        except Exception:
+            target = None
+        if target is None:
+            target = interaction.channel
+        posted, _ = await _announce_upsert(sb, interaction.guild, target, t, text)
+        if posted is None:
+            return await interaction.followup.send("Couldn't update the post.", ephemeral=True)
+        lines = _points_table_lines(t)
+        return await interaction.followup.send(
+            "✅ Points refreshed: " + (" · ".join(lines) if lines else "no table"),
+            ephemeral=True)
+    except Exception as e:
+        return await interaction.followup.send(f"Couldn't refresh: {e}", ephemeral=True)
 
 
 @bot.tree.command(name="tourney-schedule", description="Schedule a tourney (host). Shows it in Events.")
@@ -2046,8 +2152,10 @@ def _comp_board_lines(board, limit=15):
             pts = (r or {}).get("points", 0)
             kills = (r or {}).get("kills", 0)
             wins = (r or {}).get("wins", 0)
+            avg = (r or {}).get("avg_placement")
+            tail = f" ({kills}K, {wins}W" + (f", {avg} avg" if avg is not None else "") + ")"
             prefix = medals[i - 1] if i <= 3 else f"{i}."
-            lines.append(f"{prefix} **{name}** — {pts} pts ({kills}K, {wins}W)")
+            lines.append(f"{prefix} **{name}** — {pts} pts{tail}")
     except Exception:
         pass
     return lines

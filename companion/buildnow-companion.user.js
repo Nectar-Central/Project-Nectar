@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Nectar Buildnow Companion
 // @namespace    https://github.com/Nectar-Central
-// @version      2.20.0
-// @description  Nectar Buildnow Companion v2.20.0 — leaderboard panel, insights, friends & chat, play points.
+// @version      2.21.0
+// @description  Nectar Buildnow Companion v2.21.0 — leaderboard panel, insights, friends & chat, play points.
 // @author       Nectar Labs
 // @match        https://buildnow-gg.game-files.crazygames.com/*
 // @match        https://*.crazygames.com/*
@@ -31,7 +31,7 @@
 
 (function () {
   'use strict';
-  const BNC_VERSION = '2.20.0';
+  const BNC_VERSION = '2.21.0';
   const HREF = (() => { try { return location.href; } catch { return ''; } })();
   const IS_GAME_FRAME = HREF.includes('buildnow-gg.game-files.crazygames.com');
   // Loading shell lives inside an intermediate iframe (games.crazygames.com),
@@ -494,6 +494,8 @@
     }catch{ return false; }
   }
   // diff player lists -> join/leave toasts. Silent on first snapshot or full reset.
+  // Never toasts yourself: your own join populates the list too, and your
+  // own leave/return would spam the card for no information.
   let _prevPartyNames=null;
   function detectPartyJoins(pc){
     try{
@@ -503,8 +505,11 @@
       const prev=_prevPartyNames;
       _prevPartyNames=curSet;
       if(!_partyToastAllowed()) return;
-      for(const n of curSet){ if(!prev.has(n)){ showPartyToast(n, true); try{ logInfo(`[PARTY] join ${n}`); }catch{} } }
-      for(const n of prev){ if(!curSet.has(n)){ showPartyToast(n, false); try{ logInfo(`[PARTY] leave ${n}`); }catch{} } }
+      let me='';
+      try{ me=String(_normName(GMGet('bnc_game_username','')||((statsCache&&statsCache.game_username)||''))||'').toLowerCase(); }catch{}
+      const isMe=(n)=>{ try{ return !!me && String(_normName(n)||'').toLowerCase()===me; }catch{ return false; } };
+      for(const n of curSet){ if(!prev.has(n)){ if(isMe(n)) continue; showPartyToast(n, true); try{ logInfo(`[PARTY] join ${n}`); }catch{} } }
+      for(const n of prev){ if(!curSet.has(n)){ if(isMe(n)) continue; showPartyToast(n, false); try{ logInfo(`[PARTY] leave ${n}`); }catch{} } }
     }catch{}
   }
   function resetPartyJoins(){ _prevPartyNames=null; }
@@ -1121,6 +1126,22 @@
   // capture shadow while stats catches up) is the whole truth. No endpoint
   // polls, no roster checks. Leave guard + dead captures hide locally and
   // never re-show from a stale block.
+  // Comp-tourney rooms score manually: every ranked surface (toasts,
+  // overlays, lobby card, seal queue) stays dark while holding one. Gates:
+  // server comp_tourney block, local _compRoom code match, or tourney/scrim
+  // room tag — the same trio the tourney HUD uses. Never throws.
+  function _inCompRoom(code){
+    try{
+      const sess=statsCache&&statsCache.session;
+      const cur=sess&&sess.short_code?String(sess.short_code).toUpperCase():null;
+      if(!cur) return false;
+      if(code && String(code).toUpperCase()!==cur) return false;
+      if(statsCache&&statsCache.comp_tourney) return true;
+      try{ if(typeof _compRoom!=='undefined'&&_compRoom&&String(_compRoom.code||'').toUpperCase()===cur) return true; }catch{}
+      try{ const tg=sess&&sess.tag; if(tg&&(tg.kind==='tourney'||tg.kind==='scrim')) return true; }catch{}
+      return false;
+    }catch{ return false; }
+  }
   function liveRanked(){
     try{
       if(typeof RANKED_SLEEPING!=='undefined' && RANKED_SLEEPING) return null;
@@ -1129,6 +1150,7 @@
       let verdict='no-block', out=null;
       if(!rk) verdict='no-block';
       else if(_rankedLeaveGuard) verdict='left-room';
+      else if(_inCompRoom()) verdict='comp-room';
       else if(!captureFresh()) verdict='stale-captures';
       else { verdict='in-session'; out=rk; }
       const sig=(rk?String(rk.rid||'?'):'-')+'|'+(captureFresh()?'F':'S')+'|'+verdict;
@@ -2053,13 +2075,26 @@
         if(_st.best_match_kills!=null) arenaRowsHtml += `<div style="display:flex;justify-content:space-between;width:100%;max-width:240px;font-size:12px"><span style="color:#9ca3af">💀 Best match</span><span style="color:#fff;font-weight:700">${_esc(_st.best_match_kills)} kills</span></div>`;
       }
     }catch{}
+    // 🏆 comp rows are "my points in THIS tourney" — only while holding the
+    // tourney room. sc.comp is lifetime open-tourney data (server sends it
+    // whenever a tourney is open) and would otherwise linger in the drawer
+    // long after leaving. Gate mirrors updateTourneyHud: server comp_tourney
+    // block, local _compRoom code match, or room tag.
+    const _inTourneyRoom = (()=>{ try{
+      const _code=(sess&&sess.short_code)||null;
+      if(!_code) return false;
+      if(statsCache&&statsCache.comp_tourney) return true;
+      try{ if(_compRoom&&String(_compRoom.code||'').toUpperCase()===String(_code).toUpperCase()) return true; }catch{}
+      try{ const _tg=sess&&sess.tag; if(_tg&&(_tg.kind==='tourney'||_tg.kind==='scrim')) return true; }catch{}
+      return false;
+    }catch{ return false; } })();
     const statsRowsHtml = noStats ? emptyStatsHtml : `
           ${row('Kills', kills)}
           ${row('Deaths', deaths)}
           ${row('K/D', kd)}
           ${arenaRowsHtml}
           ${row('Play points', sc && sc.play_points!=null ? fmtPts(sc.play_points) : null)}
-          ${sc && sc.comp && sc.comp.length ? sc.comp.map(c=>row('🏆 '+String(c.tourney_name!=null?c.tourney_name:('Event #'+c.tourney_id)).replace(/</g,'&lt;'), fmtPts(c.points)+` (${c.wins||0}W)`)).join('') : ''}
+          ${(_inTourneyRoom && sc && sc.comp && sc.comp.length ? sc.comp.map(c=>row('🏆 '+String(c.tourney_name!=null?c.tourney_name:('Event #'+c.tourney_id)).replace(/</g,'&lt;'), fmtPts(c.points)+` (${c.wins||0}W)`)).join('') : '')}
           ${row('Wins', wins)}
           ${row('Defeats', defeats)}
           ${row('Playtime', pGlobal!=null? fmtPlaytimeDrawer(pGlobal):null)}
@@ -3770,6 +3805,18 @@
     const m=evStatusMeta(t.status);
     if(sub) sub.textContent=`Event #${t.id}`;
     const card=(label,val)=>`<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 12px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;font-size:12px"><span style="color:#9ca3af">${label}</span><span style="color:#fff;font-weight:700;text-align:right">${val}</span></div>`;
+    // Scoring readout from the tourney points table (1st = X pts …).
+    const evOrd=(n)=>{ try{ n=Number(n); const s=['th','st','nd','rd']; const v=n%100; return n+(s[(v-20)%10]||s[v]||s[0]); }catch{ return '—'; } };
+    let scoringHtml='';
+    try{
+      const pt=(t&&t.points_table)||{};
+      const pl=pt.placement||[10,7,5,3,1];
+      const parts=pl.map((p,i)=>`${evOrd(i+1)} = ${p} pts`);
+      parts.push(`KILL = ${pt.kill!=null?pt.kill:1} pts`);
+      parts.push(`WIN = ${pt.win!=null?pt.win:3} pts`);
+      scoringHtml=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">SCORING</div>`
+        + `<div style="font-size:12px;color:#e5e7eb;padding:5px 12px;line-height:1.7">${parts.map(esc).join(' · ')}</div>`;
+    }catch{}
     const players=lbEventDetail.players||[];
     const standings=lbEventDetail.standings||[];
     const matches=lbEventDetail.matches||[];
@@ -3779,8 +3826,9 @@
       + `<div style="display:flex;align-items:center;gap:10px"><button id="bnc-ev-back" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:5px 12px;cursor:pointer;font-size:12px;font-weight:700;flex-shrink:0">‹ Back</button><b style="font-size:15px;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0">#${t.id} ${esc(t.name)}</b><span style="font-size:10px;font-weight:800;color:${m.color}">${m.label.toUpperCase()}</span></div>`
       + card('Series', `${t.sealed||0}/${t.series_len||'∞'} matches`)
       + (t.code?card('Room code', `<span style="font-family:monospace">${esc(t.code)}</span>`):'')
+      + scoringHtml
       + `<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">LEADERBOARD (${standings.length})</div>`
-      + (standings.length ? standings.slice(0,15).map((r,i)=>`<div style="font-size:12px;color:#e5e7eb;padding:5px 12px;display:flex;justify-content:space-between"><span>${i+1}. ${esc(r.name||'?')}</span><span><b>${r.points||0}</b> pts · ${r.kills||0}K · ${r.wins||0}W</span></div>`).join('') : `<div style="font-size:12px;color:#9ca3af;padding:5px 12px">No sealed matches yet.</div>`)
+      + (standings.length ? standings.slice(0,15).map((r,i)=>`<div style="font-size:12px;color:#e5e7eb;padding:5px 12px;display:flex;justify-content:space-between"><span>${i+1}. ${esc(r.name||'?')}</span><span><b>${r.points||0}</b> pts · ${r.kills||0}K · ${r.wins||0}W${r.avg_placement!=null?' · '+r.avg_placement+' avg':''}</span></div>`).join('') : `<div style="font-size:12px;color:#9ca3af;padding:5px 12px">No sealed matches yet.</div>`)
       + `<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">MATCHES (${matches.length})</div>`
       + (matches.length ? matches.map(mm=>{
           const rows=boardFor(mm.version);
@@ -4066,19 +4114,20 @@
       }catch{}
     }catch{}
   }
-  // v2.19.0 streak toasts + update nudge (dedupe by signature, never spam).
-  let _lastStatsAt=0, _lastStreakSig='?', _updateNudged=false;
+  // v2.19.0 streak toasts + update nudge (never spam, never misfire).
+  // Each streak toasts only when THAT streak advanced since the last poll:
+  // the old signature check fired the daily branch on any unrelated change
+  // (e.g. a win that moved win 0->1 showed "daily" instead of nothing).
+  let _lastStatsAt=0, _lastStreakWin=null, _lastStreakDaily=null, _updateNudged=false;
   function maybeStreakToast(){
     try{
       const st=statsCache && statsCache.arena && statsCache.arena.streaks;
       if(!st) return;
-      const sig=`${st.daily||0}|${st.win||0}|${st.best_match_kills||0}`;
-      if(sig===_lastStreakSig) return;
-      const first=_lastStreakSig==='?';
-      _lastStreakSig=sig;
-      if(first) return;
-      if((st.win||0)>=2) showToast(`🔥 Win streak x${st.win}`, false);
-      else if((st.daily||0)>=2) showToast(`📅 Daily streak x${st.daily}`, false);
+      const w=Number(st.win||0), d=Number(st.daily||0);
+      if(_lastStreakWin===null){ _lastStreakWin=w; _lastStreakDaily=d; return; }
+      if(w>=2 && w>_lastStreakWin) showToast(`🔥 Win streak x${w}`, false);
+      else if(d>=2 && d>_lastStreakDaily) showToast(`📅 Daily streak x${d}`, false);
+      _lastStreakWin=w; _lastStreakDaily=d;
     }catch{}
   }
 
@@ -4337,8 +4386,12 @@
   // stretches (idle lobby, mobile players). Records carry NO rawHex, so the
   // server skips them before engine.feed AND the processor — zero effect on
   // kills/wins/versions/seals — and NO req_token, so no rotation is burned.
-  // Client liveness is deliberately untouched (_noLiveness): a heartbeat
-  // must never resurrect ghost blocks or green the API dot. Never throws.
+  // A 200 response stamps client liveness (dot Online, captureFresh true):
+  // the server answered fine, so Cap STALE must not fire while heartbeats
+  // land. Ghost safety: the response body is ignored (no noteCaptureSnap),
+  // and server session freshness runs on engine last_packet_at (real
+  // packets only), so a truly dead session still ages out server-side and
+  // its ranked/comp blocks drop. Never throws.
   let _lastRealFlushAt=0, _hbTimer=null, _hbLoggedOk=false, _hbFails=0;
   function sendHeartbeat(){
     try{
@@ -4350,7 +4403,11 @@
       if(flushInFlight) return;
       apiPost('/api/capture', { sessionId: captureSessionId, records: [{hb:1, t:now}], _quiet:true, _noLiveness:true, _noToken:true, _noWipe:true }, (ok)=>{
         try{
-          if(ok){ _hbFails=0; if(!_hbLoggedOk){ _hbLoggedOk=true; try{ logInfo('[CAPTURE] heartbeat ok (session warm)'); }catch{} } }
+          if(ok){
+            _hbFails=0;
+            try{ lastCaptureOkAt=Date.now(); lastCaptureSentAt=Date.now(); _capFails=0; }catch{}
+            if(!_hbLoggedOk){ _hbLoggedOk=true; try{ logInfo('[CAPTURE] heartbeat ok (session warm)'); }catch{} }
+          }
           else{
             _hbLoggedOk=false; _hbFails++;
             // persistent failure (dead session, long outage): stop instead
@@ -4458,7 +4515,7 @@
             // delta (the seal toast covers it). The server corrects on the
             // next stats poll. Names compared color/dc-stripped.
             try{
-              if(j.ranked_room && j.ranked_room.code){
+              if(j.ranked_room && j.ranked_room.code && !_inCompRoom(j.ranked_room.code)){
                 const rc=String(j.ranked_room.code).toUpperCase();
                 if(_optPtsCode!==rc) _optPtsReset();
                 _optPtsCode=rc;

@@ -951,9 +951,21 @@ class Engine:
                             break
             if not gv_val and gpb.get("properties", {}).get("gv") is not None:
                 gv_val = str(gpb["properties"]["gv"])
-            if gv_val and not room.gv:
-                room.gv = gv_val
+            if gv_val and room.adopt_gv(gv_val):
                 log_engine("room", session_id[:13], action="gv", gv=room.gv, duo=room.is_duo, room=room.room_id[:8])
+                # adopt_gv purged room-scoped duo remnants on a flip to solo;
+                # session-level me copies (same object as room.me / players
+                # entries in practice, but be thorough) go here.
+                if str(gv_val).lower() == "solo":
+                    try:
+                        for _me_cand in (getattr(room, "me", None), getattr(view, "me", None)):
+                            try:
+                                if _me_cand is not None:
+                                    _me_cand.pt = None
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
             if is_first_join and gpb.get("opName") in ("CreateRoom", "JoinRoom", "JoinRandomRoom"):
                 log_engine("room", session_id[:13], action="discover", op=gpb.get("opName"),
                            gm=gpb.get("gm"), gv=room.gv or gv_val, max=room.max_players,

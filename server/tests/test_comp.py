@@ -5,6 +5,7 @@ from server.routes.comp import (
     aggregate_standings,
     compute_match_points,
     derive_status,
+    group_standings_by_team,
     open_tourney_points,
     standings_for_matches,
 )
@@ -105,3 +106,36 @@ def test_valid_table():
 
 def test_next_version_fail_open():
     assert _next_version(999) == 0  # no DB in tests -> safe default
+
+
+def test_group_duo_teams_share_points():
+    board = [
+        {"discord_id": "a", "name": "cis6led", "kills": 2, "wins": 1, "points": 15, "matches": 2},
+        {"discord_id": "b", "name": "chris7", "kills": 1, "wins": 0, "points": 4, "matches": 2},
+        {"discord_id": "c", "name": "Solo", "kills": 5, "wins": 0, "points": 9, "matches": 1},
+    ]
+    regs = [{"team_label": "", "member_ids": ["a", "b"]}]
+    names = {"a": "cis6led", "b": "chris7", "c": "Solo"}
+    out = group_standings_by_team(board, regs, names)
+    assert len(out) == 2
+    team = out[0]
+    assert team["team"] is True
+    assert team["name"] == "@cis6led & @chris7"
+    assert team["member_ids"] == ["a", "b"]
+    assert (team["points"], team["kills"], team["wins"]) == (19, 3, 1)
+    solo = out[1]
+    assert solo["team"] is False and solo["discord_id"] == "c"
+
+
+def test_group_duo_label_and_unregistered():
+    board = [
+        {"discord_id": "a", "name": "A", "kills": 1, "wins": 0, "points": 3, "matches": 1},
+        {"discord_id": "ghost", "name": "Ghost", "kills": 2, "wins": 0, "points": 2, "matches": 1},
+    ]
+    regs = [{"team_label": "Champs", "member_ids": ["a", "b"]}]
+    out = group_standings_by_team(board, regs, {"a": "A", "b": "B"})
+    by_name = {r["name"]: r for r in out}
+    assert by_name["Champs"]["points"] == 3
+    assert by_name["Champs"]["member_ids"] == ["a", "b"]
+    assert by_name["Ghost"]["team"] is False  # played, never registered: stands alone
+    assert group_standings_by_team([], []) == []

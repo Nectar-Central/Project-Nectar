@@ -372,6 +372,48 @@ class RoomView:
                 return t
         return None
 
+    def adopt_gv(self, gv_val) -> bool:
+        """Adopt a game variant, correcting mid-room lobby changes.
+
+        First value inits; a DIFFERENT later value updates (the host changed
+        the mode on a live room, e.g. wwzw->zw_lg+solo — gv used to be
+        write-once, so solo matches ran duo rules and defeats held forever).
+        Same value (any case) is a no-op. A flip to solo purges stale duo
+        remnants (_pt teams, player pts, pending pts) or _team_alive_for_me
+        keeps applying team logic. Returns True on change.
+        """
+        try:
+            gv_val = str(gv_val or "").strip()
+        except Exception:
+            return False
+        if not gv_val:
+            return False
+        try:
+            cur = str(self.gv or "")
+        except Exception:
+            cur = ""
+        if cur.lower() == gv_val.lower():
+            return False
+        self.gv = gv_val
+        if gv_val.lower() == "solo":
+            try:
+                self.teams.clear()
+            except Exception:
+                pass
+            try:
+                for _pl in (self.players or {}).values():
+                    try:
+                        _pl.pt = None
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                self.pending_pt.clear()
+            except Exception:
+                pass
+        return True
+
     def adopt_game_mode(self, mode) -> bool:
         """Adopt a game mode, treating DF/UNKNOWN/None as placeholders.
 

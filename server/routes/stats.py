@@ -40,9 +40,9 @@ from fastapi.responses import JSONResponse
 
 import time as _time
 
-from ..lib.supabase_client import supabase, db, db_io
+from ..lib.supabase_client import supabase, db, db_io, is_transient_error
 from ..lib.redis_client import cache
-from ..lib.logger import log_sys, log_ranked, log_dbg
+from ..lib.logger import log_sys, log_ranked, log_dbg, log_err
 from ..lib import ranked as ranked_mod
 from .capture import engine as capture_engine
 
@@ -188,7 +188,13 @@ async def get_stats(request: Request):
     except Exception as e:
         if "PGRST116" in str(e):
             return JSONResponse({"error": "user not found"}, status_code=404)
-        return JSONResponse({"error": str(e)}, status_code=500)
+        if is_transient_error(e):
+            try:
+                log_err(f"STATS transient for {str(discord_id)[:8]} ({str(e)[:60]})")
+            except Exception:
+                pass
+            return JSONResponse({"error": "temporarily unavailable", "retry": True}, status_code=503)
+        return JSONResponse({"error": str(e)[:160]}, status_code=500)
 
     if not user:
         return JSONResponse({"error": "user not found"}, status_code=404)

@@ -90,7 +90,11 @@ const esc = (v) => String(v == null ? '—' : v).replace(/</g, '&lt;');
 let SRV = localStorage.getItem('comp_server') || 'http://127.0.0.1:8000';
 let selTid = null;
 try {
-  const saved = Number(localStorage.getItem('comp_sel_tid'));
+  // getItem returns null when missing — Number(null) is 0, which would
+  // wrongly select tourney #0. (Tourney ids can start at 0, so only null
+  // is rejected here; a stale non-listed id is re-selected in refreshList.)
+  const savedRaw = localStorage.getItem('comp_sel_tid');
+  const saved = savedRaw == null ? NaN : Number(savedRaw);
   if (Number.isFinite(saved)) selTid = saved;
 } catch {}
 let editMatchId = null;
@@ -104,8 +108,12 @@ let rosterCache = [];
 let namesCache = {};
 let _shellTid = null;
 try {
-  const savedM = Number(localStorage.getItem('comp_sel_match'));
-  if (Number.isFinite(savedM)) editMatchId = savedM;
+  // getItem returns null when missing — Number(null) is 0, which is never a
+  // valid match id (identity starts at 1) and would 404 as ?id=0.
+  const savedMRaw = localStorage.getItem('comp_sel_match');
+  const savedM = savedMRaw == null ? NaN : Number(savedMRaw);
+  if (Number.isFinite(savedM) && savedM > 0) editMatchId = savedM;
+  else localStorage.removeItem('comp_sel_match');
 } catch {}
 function persistMatch() {
   try {
@@ -266,19 +274,32 @@ async function refreshDetail() {
     await refreshRegs(j);
   } catch (e) { box.innerHTML = '<span class="bad">Failed: ' + esc(e.message) + '</span>'; _shellTid = null; }
 }
+function scoringHtml(table) {
+  // Read-only scoring readout (1st = X pts … KILL = X pts · WIN = X pts).
+  // Editing still happens in Placement points below; this just mirrors it.
+  try {
+    const t = table || {};
+    const place = t.placement || [10, 7, 5, 3, 1];
+    const parts = place.map((p, i) => ord(i + 1) + ' = ' + p + ' pts');
+    parts.push('KILL = ' + (t.kill != null ? t.kill : 1) + ' pts');
+    parts.push('WIN = ' + (t.win != null ? t.win : 3) + ' pts');
+    return `<div class="dim" style="margin-top:3px">SCORING · ${parts.map(esc).join(' · ')}</div>`;
+  } catch { return ''; }
+}
 function renderHead(j) {
   const el = $('thead');
   if (!el) return;
   const t = (j && j.tourney) || {};
   el.innerHTML = `<b style="font-size:14px">#${t.id} ${esc(t.name)}</b> ` +
-    `<span class="dim">${esc(t.status)} · series ${t.sealed || 0}/${t.series_len || '∞'} · code ${esc(t.code || '—')}</span>`;
+    `<span class="dim">${esc(t.status)}${t.mode && t.mode !== 'solo' ? ' · ' + esc(t.mode) : ''} · series ${t.sealed || 0}/${t.series_len || '∞'} · code ${esc(t.code || '—')}</span>` +
+    scoringHtml(t.points_table);
 }
 function renderBoard(j) {
   const el = $('board');
   if (!el) return;
   const bd = ((j && j.standings) || []).map((r, i) =>
-    `<tr><td>${i + 1}</td><td>${esc(r.name)}</td><td>${r.points}</td><td>${r.kills}</td><td>${r.wins}</td></tr>`).join('');
-  el.innerHTML = bd ? `<table class="grid"><tr><th>#</th><th>Player</th><th>Pts</th><th>K</th><th>W</th></tr>${bd}</table>` : '<span class="dim">No sealed matches.</span>';
+    `<tr><td>${i + 1}</td><td>${esc(r.name)}</td><td>${r.points}</td><td>${r.kills}</td><td>${r.wins}</td><td>${r.avg_placement != null ? r.avg_placement : '—'}</td></tr>`).join('');
+  el.innerHTML = bd ? `<table class="grid"><tr><th>#</th><th>Player</th><th>Pts</th><th>K</th><th>W</th><th>Avg</th></tr>${bd}</table>` : '<span class="dim">No sealed matches.</span>';
 }
 // Hosts panel: host-playing toggle + add/remove, optimistic with lite
 // rollback on failure. The creator always hosts (even if unlisted).
