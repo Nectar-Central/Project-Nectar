@@ -7,7 +7,8 @@ Flags must reset only on a fresh stG=1 (match start), edge-triggered.
 """
 import pytest
 
-from server.lib.photon_engine.engine import _stg_starts_new_life, _stg_bumps_version
+from server.lib.photon_engine.engine import Engine, _stg_starts_new_life, _stg_bumps_version
+from server.lib.photon_engine.enums import GameMode, State
 from server.lib.photon_engine.models import RoomView
 
 
@@ -52,3 +53,42 @@ def test_room_armed_by_default():
     # new rooms can bump once (join-mid-match seals still work); the bump
     # consumes the arm and stG=1 re-arms it.
     assert RoomView(room_id="r1").stg3_armed is True
+
+
+def _match_room(**kw):
+    r = RoomView(room_id="r1")
+    r.state = State.MATCH
+    r.game_mode = GameMode.ZW_LG
+    r.last_stg = 2
+    for k, v in kw.items():
+        setattr(r, k, v)
+    return r
+
+
+def test_bump_without_identity():
+    # Null-identity sessions (view.me never resolved) must still number
+    # their matches: the version belongs to the room, and the processor win
+    # drain can't fire at version 0. No view.me anywhere in this test.
+    eng = Engine()
+    r = _match_room()
+    assert eng._phase_end_bump(r, "sess-null-me", 3) is True
+    assert r.match_version == 1
+    assert r.stg_is_phase_end is True
+
+
+def test_bump_skips_non_match_state_but_arms():
+    eng = Engine()
+    r = _match_room()
+    r.state = State.LOBBY
+    assert eng._phase_end_bump(r, "sess-lobby", 3) is True  # armed, version untouched
+    assert r.match_version == 0
+    assert r.stg_is_phase_end is True
+
+
+def test_bump_one_shot_flap():
+    eng = Engine()
+    r = _match_room()
+    assert eng._phase_end_bump(r, "s", 3) is True
+    r.last_stg = 3  # timer tick repeat: caller gate + matrix both say no
+    assert eng._phase_end_bump(r, "s", 3) is False
+    assert r.match_version == 1

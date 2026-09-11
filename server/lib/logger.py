@@ -91,6 +91,7 @@ COL = {
 # Background tags
 TAG = {
     "SYS": _bg(124, 58, 237, _color(255, 255, 255, " SYS ")),
+    "COMP": _bg(6, 182, 212, _color(0, 32, 32, " COMP ")),
     "RANKED": _bg(234, 179, 8, _color(32, 24, 0, " RANK ")),
     "OK": _bg(16, 185, 129, _color(0, 32, 24, " OK  ")),
     "ERR": _bg(239, 68, 68, _color(255, 255, 255, " ERR ")),
@@ -204,17 +205,58 @@ except (OSError, PermissionError):
 
 
 def log_ranked(message: str) -> None:
-    """Ranked stream: console line + append to logs/ranked.log.
-
-    All [ranked] call sites go through here so one file tells the whole
-    story of a session (seals, placements, awards, bumps, verdicts).
-    Never raises.
-    """
+    """Ranked stream: append to logs/ranked.log (always). Console line
+    gated behind BNC_RANKED_LOG=1 to keep the terminal clean."""
     try:
         line = f"{datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3]} {message}"
-        print(f"{_timestamp()} {TAG['RANKED']} {message}")
         try:
             _ranked_logger.info(line)
+        except Exception:
+            pass
+        try:
+            if _os.getenv("BNC_RANKED_LOG") == "1":
+                print(f"{_timestamp()} {TAG['RANKED']} {message}")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Comp file log — logs/comp.log (rotating, 10MB, 3 backups)
+# ---------------------------------------------------------------------------
+
+_comp_logger = logging.getLogger("comp.file")
+_comp_logger.setLevel(logging.INFO)
+_comp_logger.propagate = False
+
+try:
+    if _os.getenv("VERCEL"):
+        _comp_dir = Path("/tmp/logs")
+    else:
+        _comp_dir = Path(__file__).parent.parent.parent / "logs"
+    _comp_dir.mkdir(parents=True, exist_ok=True)
+    _comp_handler = RotatingFileHandler(
+        _comp_dir / "comp.log", maxBytes=10_000_000, backupCount=3, encoding="utf-8"
+    )
+    _comp_handler.setFormatter(logging.Formatter("%(message)s"))
+    _comp_logger.addHandler(_comp_handler)
+except (OSError, PermissionError):
+    pass
+
+
+def log_comp(message: str) -> None:
+    """Comp stream: append to logs/comp.log (always). Console line
+    gated behind BNC_COMP_LOG=1 (or BNC_DEBUG=1) to keep terminal clean."""
+    try:
+        line = f"{datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3]} {message}"
+        try:
+            _comp_logger.info(line)
+        except Exception:
+            pass
+        try:
+            if _os.getenv("BNC_COMP_LOG") == "1" or _os.getenv("BNC_DEBUG") == "1":
+                print(f"{_timestamp()} {TAG['COMP']} {message}")
         except Exception:
             pass
     except Exception:

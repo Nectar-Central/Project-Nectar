@@ -39,7 +39,7 @@ try {
     sink: useSink ? comp.createSupabaseSink() : null,
     tourneyId: process.env.COMP_TOURNEY_ID != null && process.env.COMP_TOURNEY_ID !== ''
       ? Number(process.env.COMP_TOURNEY_ID) : null,
-    log: (m) => { try { console.log(`[COMP] ${m}`); } catch {} },
+    log: (m) => { try { console.log(`${ts()} ${TAG.COMP} ${COL.info(m)}`); } catch {} },
   });
   compHandle = (rec, msg) => { try { compTracker.handle(rec, msg); } catch {} };
   if (!useSink) console.log('[COMP] tracker on (no Supabase creds: matches buffer in memory, set COMP_TOURNEY_ID + creds to persist)');
@@ -87,6 +87,7 @@ const TAG = {
   ERR: bg(239, 68, 68, c(255, 255, 255, ' ERR ')),
   EVT: bg(109, 40, 217, c(255, 255, 255, ' EVT ')),
   OP: bg(194, 65, 12, c(255, 255, 255, ' OP  ')),
+  COMP: bg(100, 116, 139, c(255, 255, 255, ' COMP ')),
 };
 
 function ts() {
@@ -1063,6 +1064,47 @@ const server = http.createServer((req,res)=>{
     let comp = { enabled: !!compTracker };
     try { if (compTracker) comp = Object.assign(comp, compTracker.status()); } catch {}
     sendJson(res,200,{ ok:true, comp });
+    return;
+  }
+  if (req.method==='GET' && (req.url==='/comp/' || req.url==='/comp/dashboard')){
+    // Host console (loopback-only by listen address): matches, manual
+    // controls, table editor, calculate, registrations.
+    try {
+      const html = fs.readFileSync(path.join(__dirname, 'comp-dashboard.html'), 'utf8');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+    } catch (e) {
+      sendJson(res, 500, { error: 'dashboard file missing' });
+    }
+    return;
+  }
+  if (req.method==='POST' && req.url==='/comp/manual/open'){
+    readBody(req, () => {
+      try {
+        if (compTracker) compTracker.openManual();
+        sendJson(res, 200, { ok: true });
+      } catch (e) { sendJson(res, 500, { error: String((e && e.message) || e) }); }
+    });
+    return;
+  }
+  if (req.method==='POST' && req.url==='/comp/manual/seal'){
+    readBody(req, () => {
+      Promise.resolve()
+        .then(() => (compTracker ? compTracker.sealManual() : null))
+        .then((m) => sendJson(res, 200, { ok: true, version: m ? m.version : null }))
+        .catch((e) => sendJson(res, 500, { error: String((e && e.message) || e) }));
+    });
+    return;
+  }
+  if (req.method==='POST' && req.url==='/comp/tourney'){
+    readBody(req, (body) => {
+      let id = null;
+      try { id = body ? JSON.parse(body.toString()).id : null; } catch {}
+      if (id == null || !compTracker) { sendJson(res, 400, { error: 'id required' }); return; }
+      Promise.resolve(compTracker.setTourney(Number(id)))
+        .then(() => sendJson(res, 200, { ok: true, tourneyId: Number(id) }))
+        .catch((e) => sendJson(res, 500, { error: String((e && e.message) || e) }));
+    });
     return;
   }
   if ((req.method==='POST' || req.method==='GET') && req.url==='/clear'){

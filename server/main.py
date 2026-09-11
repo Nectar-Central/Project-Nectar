@@ -67,6 +67,8 @@ from server.routes.discovery import router as discovery_router
 from server.routes.insights import router as insights_router
 from server.routes.friends import router as friends_router
 from server.routes.chat import router as chat_router
+from server.routes.comp import router as comp_router
+from server.routes.comp_pages import router as comp_pages_router
 from server.routes.players import router as players_router
 from server.routes.health import router as health_router
 
@@ -110,6 +112,8 @@ app.include_router(discovery_router)
 app.include_router(insights_router)
 app.include_router(friends_router)
 app.include_router(chat_router)
+app.include_router(comp_router)
+app.include_router(comp_pages_router)
 app.include_router(players_router)
 app.include_router(health_router)
 

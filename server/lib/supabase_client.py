@@ -43,9 +43,89 @@ if not _supabase_url:
 
 supabase: Client | None = None
 
+# Transient pool/disconnect signatures — safe to retry once with a fresh client.
+_TRANSIENT_MARKERS = (
+    "Server disconnected",
+    "connection closed",
+    "connection reset",
+    "pool",
+    "timeout",
+    "temporarily unavailable",
+    "ConnectionTerminated",
+    "RemoteProtocolError",
+)
+
+
+def _is_transient(exc: Exception | str) -> bool:
+    try:
+        s = str(exc or "")
+    except Exception:
+        return False
+    sl = s.lower()
+    return any(m.lower() in sl for m in _TRANSIENT_MARKERS)
+
+
+def _build_client():
+    """Build a Supabase client with explicit httpx pooling/timeout.
+
+    The default shared httpx pool exhausts under capture burst
+    (stats poll every ~2s + capture POSTs) and surfaces as
+    "Server disconnected". Explicit limits + timeouts keep one
+    slow BAR far from poisoning the pool.
+    """
+    try:
+        import httpx as _httpx
+        from supabase.lib.client_options import SyncClientOptions
+
+        _http = _httpx.Client(
+            limits=_httpx.Limits(max_connections=50, max_keepalive_connections=20),
+            timeout=_httpx.Timeout(10.0, connect=5.0),
+        )
+        return create_client(
+            _supabase_url,
+            _supabase_key,
+            options=SyncClientOptions(
+                httpx_client=_http, postgrest_client_timeout=10,
+            ),
+        )
+    except Exception:
+        pass
+    return create_client(_supabase_url, _supabase_key)
+
+
+def refresh_client():
+    """Rebuild the singleton after a pool disconnect. Returns new client or None."""
+    global supabase
+    if not _supabase_url or not _supabase_key:
+        return None
+    try:
+        try:
+            old = supabase
+            if old is not None:
+                try:
+                    sess = getattr(getattr(old, "postgrest", None), "session", None)
+                    if sess is not None:
+                        try:
+                            sess.close()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        supabase = _build_client()
+        return supabase
+    except Exception as exc:
+        try:
+            print(f"[supabase] refresh failed ({exc})")
+        except Exception:
+            pass
+        return supabase
+
+
 if _supabase_url and _supabase_key:
     try:
-        supabase = create_client(_supabase_url, _supabase_key)
+        supabase = _build_client()
     except Exception as exc:
         # Never crash the container on a bad key (e.g. new-format sb_secret_
         # key with pinned supabase==2.7.0, which only accepts legacy JWTs).
@@ -96,28 +176,47 @@ class DB:
 
     @staticmethod
     def get_session_sync(session_id: str) -> dict:
-        """Get session by ID (sync)."""
+        """Get session by ID (sync).
+
+        Primary path joins bngc_users for is_locked; on join/column
+        failure falls back to a plain session lookup so a transient
+        schema/pool blip never wipes discord_id downstream.
+        """
 
         if not supabase:
             return {"data": None, "error": "no supabase"}
 
-        try:
-            result = (
-                supabase.table("bngc_sessions")
-                .select("*, bngc_users!inner(is_locked)")
+        def _query(client, with_join: bool):
+            q = client.table("bngc_sessions")
+            sel = "*, bngc_users!inner(is_locked)" if with_join else "*"
+            return (
+                q.select(sel)
                 .eq("session_id", session_id)
                 .eq("is_active", True)
                 .single()
                 .execute()
             )
+
+        try:
+            result = _query(supabase, True)
             data = result.data
             if data and "bngc_users" in data:
-                data["is_locked"] = data["bngc_users"].get("is_locked", False)
+                try:
+                    data["is_locked"] = data["bngc_users"].get("is_locked", False)
+                except Exception:
+                    pass
             return {"data": data, "error": None}
         except Exception as exc:
             if "PGRST116" in str(exc):
                 return {"data": None, "error": None}
-            return {"data": None, "error": str(exc)}
+            # Join failed (or pool blip) — retry without the join once.
+            try:
+                result = _query(supabase, False)
+                return {"data": result.data, "error": None}
+            except Exception as exc2:
+                if "PGRST116" in str(exc2):
+                    return {"data": None, "error": None}
+                return {"data": None, "error": str(exc2)}
 
     @staticmethod
     def update_session_sync(session_id: str, updates: dict) -> dict:
@@ -203,5 +302,23 @@ async def db_io(fn, *args, **kwargs):
     its full RTT, serializing ALL concurrent requests on one worker. Awaiting
     through here keeps ordering (still sequential per request) while letting
     other requests use the loop. httpx pools are thread-safe for this shape.
+
+    On a transient pool disconnect ("Server disconnected") the client is
+    refreshed and the call retried exactly once.
     """
-    return await asyncio.to_thread(fn, *args, **kwargs)
+    try:
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    except Exception as exc:
+        if not _is_transient(exc):
+            raise
+        try:
+            refresh_client()
+        except Exception:
+            pass
+        await asyncio.sleep(0.25)
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+def is_transient_error(exc: Exception | str) -> bool:
+    """Public helper for routes: True when the error is a pool blip worth degrading (not 500)."""
+    return _is_transient(exc)
