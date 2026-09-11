@@ -662,6 +662,25 @@ class Engine:
                 if isinstance(_rm, dict) and _rm.get("code"):
                     pkt_room_hint = _rm.get("code")
             except: pass
+        # Matchmaking joins (JoinRandomRoom) carry no RoomName by design —
+        # the server picks the room. Without this, every packet of a
+        # matchmaking match lands in the lobby pseudo-room, where wins can
+        # never drain (lobby is always skipped) while kills/deaths/defeats
+        # record fine — the "wins stuck, everything else works" symptom.
+        # Open one stable per-session matchmaking room instead; stG versions
+        # still separate matches, and the lack of short_code keeps ranked +
+        # comp (both code-gated) away from it.
+        if (gpb and gpb.get("opName") == "JoinRandomRoom" and not room_name
+                and not (pkt_room_hint and str(pkt_room_hint) != "lobby")):
+            try:
+                _mm_id = f"mm-{session_id}"
+                if _mm_id not in view.rooms:
+                    view.rooms[_mm_id] = RoomView(room_id=_mm_id, code=None,
+                        created_at=datetime.now(timezone.utc).isoformat())
+                    log_engine("room", session_id[:13], action="mm-room", room=_mm_id[:8])
+                room_name = _mm_id
+            except Exception:
+                pass
         if pkt_room_hint and str(pkt_room_hint) != "lobby":
             room = _ensure_room(str(pkt_room_hint))
         elif is_first_join and room_name:
