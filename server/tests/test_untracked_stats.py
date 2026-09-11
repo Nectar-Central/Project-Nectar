@@ -51,16 +51,18 @@ def test_gid_match_when_name_drifts():
     assert _is_self(room2, None, user, "xX_sniper_Xx") is True
 
 
-def test_gid_mismatch_is_not_self():
+def test_gid_mismatch_name_still_credits():
+    # name match credits fail-open even when the roster gid differs —
+    # dropping the kill loses stats; twins resolve via dashboard /link.
     room = _room(Player(actor_nr=7, username="ALICE", game_id="G2"))
     user = _user("alice", "G1")
-    assert _is_self(room, None, user, "ALICE") is False
+    assert _is_self(room, None, user, "ALICE") is True
 
 
-def test_no_gid_no_match():
+def test_no_gid_name_still_credits():
     room = _room(Player(actor_nr=7, username="ALICE", game_id="G9"))
     user = _user("alice", None)
-    assert _is_self(room, None, user, "ALICE") is False
+    assert _is_self(room, None, user, "ALICE") is True  # fail-open name match
     assert _is_self(None, None, user, "alice") is True  # name fallback, no room
     assert _is_self(None, None, _user(None, None), "alice") is False
 

@@ -1443,6 +1443,18 @@ async def _comp_reg_rows(tourney_id):
         return []
 
 
+def _norm_game(n) -> str:
+    """Normalize a game name for duplicate checks (tags/dc:/case). Pure."""
+    try:
+        import re as _re
+        s = _re.sub(r"<[^>]*>", "", str(n or "")).strip()
+        if s.lower().startswith("dc:"):
+            s = s[3:].strip()
+        return s.lower()
+    except Exception:
+        return ""
+
+
 @bot.tree.command(name="untag", description="Remove the scrim/tourney tag from a room code")
 @app_commands.describe(code="5-letter private party code")
 async def untag_cmd(interaction: discord.Interaction, code: str):
@@ -1890,6 +1902,95 @@ async def tourney_remove_host_cmd(interaction: discord.Interaction, tourney_id: 
         return await interaction.followup.send(f"{user.mention} is no longer a host of tourney **#{tourney_id}**.", ephemeral=True)
     except Exception as e:
         return await interaction.followup.send(f"Couldn't remove host: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="tourney-add-player", description="Add a player to a tourney roster (host)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)", user="Player to add")
+async def tourney_add_player_cmd(interaction: discord.Interaction, tourney_id: int, user: discord.User):
+    await interaction.response.defer(ephemeral=True)
+    sb, me = await _comp_require_manager(interaction, tourney_id)
+    if sb is None:
+        return
+    try:
+        trow = sb.table("bngc_comp_tourneys").select(
+            "id,mode,player_role_id").eq("id", int(tourney_id)).limit(1).execute()
+        if not trow.data:
+            return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
+        t = trow.data[0] or {}
+        did = str(user.id)
+        rows = await _comp_reg_rows(int(tourney_id))
+        if any((r or {}).get("status") != "banned" and did in ((r or {}).get("member_ids") or []) for r in rows):
+            return await interaction.followup.send(f"{user.mention} is already on the roster.", ephemeral=True)
+        sb.table("bngc_comp_registrations").insert({
+            "tourney_id": int(tourney_id),
+            "team_label": f"<@{did}>",
+            "member_ids": [did],
+            "captain_id": did,
+            "source_message_id": None,
+            "status": "accepted",
+        }).execute()
+        try:
+            _rid = (t or {}).get("player_role_id") or COMP_PLAYER_ROLE_ID
+            await _comp_grant_role(interaction.guild, did, _rid)
+        except Exception:
+            pass
+        try:
+            _comp_reg_cache["at"] = 0.0
+        except Exception:
+            pass
+        return await interaction.followup.send(f"{user.mention} added to tourney **#{tourney_id}** roster.", ephemeral=True)
+    except Exception as e:
+        return await interaction.followup.send(f"Couldn't add player: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="tourney-remove-player", description="Remove a player from a tourney roster (host)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)", user="Player to remove")
+async def tourney_remove_player_cmd(interaction: discord.Interaction, tourney_id: int, user: discord.User):
+    await interaction.response.defer(ephemeral=True)
+    sb, me = await _comp_require_manager(interaction, tourney_id)
+    if sb is None:
+        return
+    try:
+        trow = sb.table("bngc_comp_tourneys").select(
+            "id,player_role_id").eq("id", int(tourney_id)).limit(1).execute()
+        if not trow.data:
+            return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
+        did = str(user.id)
+        rows = sb.table("bngc_comp_registrations").select(
+            "id,member_ids").eq("tourney_id", int(tourney_id)).neq("status", "banned").limit(1000).execute()
+        hit = [r for r in (rows.data or []) if did in ((r or {}).get("member_ids") or [])]
+        for r in hit:
+            try:
+                remaining = [m for m in ((r or {}).get("member_ids") or []) if m != did]
+                if not remaining:
+                    sb.table("bngc_comp_registrations").delete().eq("id", (r or {}).get("id")).execute()
+                else:
+                    sb.table("bngc_comp_registrations").update({"member_ids": remaining}).eq("id", (r or {}).get("id")).execute()
+            except Exception:
+                continue
+        try:
+            from discord.utils import get as _dget
+            _rid = ((trow.data[0] or {}).get("player_role_id") or COMP_PLAYER_ROLE_ID) if trow.data else COMP_PLAYER_ROLE_ID
+            if _rid and interaction.guild is not None:
+                role = _dget(interaction.guild.roles, id=int(_rid)) if str(_rid).isdigit() else None
+                if role is not None:
+                    try:
+                        m = interaction.guild.get_member(int(did))
+                        if m is None:
+                            m = await interaction.guild.fetch_member(int(did))
+                        if m is not None:
+                            await m.remove_roles(role, reason=f"tourney #{tourney_id} roster removal")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            _comp_reg_cache["at"] = 0.0
+        except Exception:
+            pass
+        return await interaction.followup.send(f"{user.mention} removed from tourney **#{tourney_id}** roster.", ephemeral=True)
+    except Exception as e:
+        return await interaction.followup.send(f"Couldn't remove player: {e}", ephemeral=True)
 
 
 def _ord(n):
@@ -2466,7 +2567,8 @@ def _comp_open_text(mode: str, ping_role_id: str | None = None, name: str = "Tou
     try:
         head = (f"## {str(name).upper()} SIGNUPS REGISTRATIONS OPEN:\n\n"
                 f"*@yourself to register (type @ and pick your name from the popup — "
-                f"typed-out names don't count).*")
+                f"typed-out names don't count).*\n"
+                f"*Then press **Set game name** below so kills map to you.*")
         ping = str(ping_role_id or "").strip()
         return (f"<@&{ping}>\n" if ping else "") + head
     except Exception:
@@ -2482,6 +2584,82 @@ def _comp_closed_text(mode: str, players: int, teams: int, name: str) -> str:
         return "SIGNUPS CLOSED"
 
 
+class _GameNameModal(discord.ui.Modal):
+    """Game-name prompt for comp mapping. Writes bngc_users.game_username.
+
+    Duplicates (normalized, cross-tourney-roster) are refused so the engine
+    mapping stays 1:1; twins fail closed and resolve via dashboard /link.
+    """
+
+    def __init__(self, tourney_id: int):
+        super().__init__(title="Set your in-game name")
+        self.tourney_id = int(tourney_id)
+        self.game_name = discord.ui.TextInput(
+            label="In-game name",
+            placeholder="Exactly as it appears in-game",
+            min_length=1, max_length=32, required=True)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+        try:
+            raw = str(self.game_name.value or "").strip()[:32]
+            norm = _norm_game(raw)
+            if not norm:
+                return await interaction.followup.send("Enter your in-game name (1–32 chars).", ephemeral=True)
+            sb = _comp_sb()
+            if sb is None:
+                return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+            me = str(interaction.user.id)
+            rows = await _comp_reg_rows(self.tourney_id)
+            if not any(me in ((r or {}).get("member_ids") or []) and (r or {}).get("status") != "banned" for r in rows):
+                return await interaction.followup.send("Register for this tourney first (@yourself in the signup channel).", ephemeral=True)
+            dids = sorted({str(x) for r in rows for x in ((r or {}).get("member_ids") or [])
+                           if (r or {}).get("status") != "banned" and x and str(x) != me})[:100]
+            taken_by = None
+            if dids:
+                try:
+                    gres = sb.table("bngc_users").select(
+                        "discord_id,game_username").in_("discord_id", dids).execute()
+                    for u in (gres.data or []):
+                        try:
+                            if _norm_game((u or {}).get("game_username")) == norm:
+                                taken_by = str((u or {}).get("discord_id"))
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+            if taken_by:
+                return await interaction.followup.send(
+                    f"'{raw}' is already registered — ask a host to link it if it's yours.", ephemeral=True)
+            try:
+                upd = sb.table("bngc_users").update(
+                    {"game_username": raw}).eq("discord_id", me).execute()
+                wrote = bool(upd.data)
+            except Exception:
+                wrote = False
+            if not wrote:
+                try:
+                    sb.table("bngc_users").insert({
+                        "discord_id": me,
+                        "discord_username": getattr(interaction.user, "display_name", None) or str(interaction.user),
+                        "game_username": raw,
+                    }).execute()
+                    wrote = True
+                except Exception as e:
+                    return await interaction.followup.send(f"Couldn't save: {e}", ephemeral=True)
+            return await interaction.followup.send(
+                f"Saved — {interaction.user.mention} known as **{raw}** for tourney **#{self.tourney_id}**.", ephemeral=True)
+        except Exception as e:
+            try:
+                return await interaction.followup.send(f"Couldn't save: {e}", ephemeral=True)
+            except Exception:
+                pass
+
+
 class _CompPlayersView(discord.ui.View):
     """Persistent 'see players' button (survives restarts via fixed custom_id).
 
@@ -2490,6 +2668,27 @@ class _CompPlayersView(discord.ui.View):
 
     def __init__(self):
         super().__init__(timeout=None)
+
+    @discord.ui.button(label="Set game name", style=discord.ButtonStyle.success,
+                       custom_id="comp:gamename")
+    async def set_game_name(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            regs = await _comp_open_regs()
+            mine = [r for r in (regs or [])
+                    if str((r or {}).get("reg_channel_id") or "") == str(getattr(interaction.channel, "id", ""))]
+            if not mine:
+                try:
+                    return await interaction.response.send_message(
+                        "No open registration here.", ephemeral=True)
+                except Exception:
+                    return
+            return await interaction.response.send_modal(_GameNameModal(int(mine[0]["id"])))
+        except Exception:
+            try:
+                return await interaction.response.send_message(
+                    "Couldn't open the form, try again.", ephemeral=True)
+            except Exception:
+                pass
 
     @discord.ui.button(label="See players", style=discord.ButtonStyle.primary,
                        custom_id="comp:players")
@@ -2514,10 +2713,18 @@ class _CompPlayersView(discord.ui.View):
                 sb = _comp_sb()
                 dids = sorted({str(x) for r in acc for x in ((r or {}).get("member_ids") or []) if x})[:100]
                 umap = {}
+                gmap = {}
                 if sb is not None and dids:
                     ures = sb.table("bngc_users").select(
                         "discord_id,game_username,discord_username").in_("discord_id", dids).execute()
-                    umap = {str(u.get("discord_id")): (u.get("game_username") or u.get("discord_username")) for u in (ures.data or [])}
+                    for u in (ures.data or []):
+                        try:
+                            dd = str((u or {}).get("discord_id"))
+                            umap[dd] = (u.get("discord_username") or dd[:6])
+                            if (u or {}).get("game_username"):
+                                gmap[dd] = str((u or {}).get("game_username"))
+                        except Exception:
+                            continue
                 # misses (no bngc_users row) resolve live via Discord itself
                 missing = [d for d in dids if not umap.get(d)][:25]
                 if missing and interaction.guild is not None:
@@ -2531,7 +2738,10 @@ class _CompPlayersView(discord.ui.View):
                         except Exception:
                             continue
                 for r in acc:
-                    ms = [umap.get(str(x), str(x)[:6]) for x in ((r or {}).get("member_ids") or [])]
+                    ms = []
+                    for x in ((r or {}).get("member_ids") or []):
+                        base = umap.get(str(x), str(x)[:6])
+                        ms.append(f"{base} (known as {gmap[str(x)]})" if gmap.get(str(x)) else base)
                     tag = (r or {}).get("team_color") or ""
                     names.append(f"{tag + ' ' if tag else ''}{' / '.join(ms)}")
             except Exception:
@@ -2647,6 +2857,36 @@ async def on_message(message):
                 return
         except Exception:
             pass
+        # duplicate game name across the tourney -> refuse (user input is
+        # checked here so the engine mapping stays 1:1; twins fail closed).
+        try:
+            _rows_g = await _comp_reg_rows(t["id"])
+            _dids_g = sorted({str(x) for r in _rows_g for x in ((r or {}).get("member_ids") or [])
+                              if (r or {}).get("status") != "banned" and x})[:100]
+            _gmap = {}
+            if sb is not None and _dids_g:
+                _gres = sb.table("bngc_users").select(
+                    "discord_id,game_username").in_("discord_id", _dids_g).execute()
+                for _u in ((_gres.data or [])):
+                    try:
+                        _gn = _norm_game((_u or {}).get("game_username"))
+                        if _gn:
+                            _gmap[_gn] = str((_u or {}).get("discord_id"))
+                    except Exception:
+                        continue
+            if sb is not None and members:
+                _nres = sb.table("bngc_users").select(
+                    "discord_id,game_username").in_("discord_id", members).execute()
+                for _u in ((_nres.data or [])):
+                    try:
+                        _gn = _norm_game((_u or {}).get("game_username"))
+                        if _gn and _gn in _gmap and _gmap[_gn] not in members:
+                            await _refuse(f"Game name '{(_u or {}).get('game_username')}' is already registered — ask a host to link it.")
+                            return
+                    except Exception:
+                        continue
+        except Exception:
+            pass
         try:
             existing = await _comp_reg_rows(t["id"])
             team_idx = sum(1 for r in existing if (r or {}).get("status") != "banned")
@@ -2679,6 +2919,31 @@ async def on_message(message):
             await message.add_reaction(color or "✅")
         except Exception as e:
             print(f"[comp] intake reaction failed: {e}")
+        # nudge members with no game name to the Set-game-name button so
+        # the engine can map their kills (registration without a game name
+        # scores nothing until linked).
+        try:
+            if sb is not None and members:
+                _mres = sb.table("bngc_users").select(
+                    "discord_id,game_username").in_("discord_id", members).execute()
+                _have = set()
+                for _u in ((_mres.data or [])):
+                    try:
+                        if str((_u or {}).get("game_username") or "").strip():
+                            _have.add(str((_u or {}).get("discord_id")))
+                    except Exception:
+                        continue
+                _missing = [m for m in members if m not in _have]
+                if _missing:
+                    _pings = " ".join(f"<@{m}>" for m in _missing)
+                    try:
+                        await message.reply(
+                            f"{_pings} registered — press **Set game name** below "
+                            f"(exactly as in-game) so your kills count.")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
     except Exception as e:
         print(f"[comp] on_message failed: {e}")
     try:

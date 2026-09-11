@@ -547,8 +547,25 @@ function nameOfDid(did) {
   return k.slice(0, 6);
 }
 // typed winner / name or raw did -> discord_id (or null when unknown).
-// Candidates: board + roster + tourney players, matched by name
-// (case-insensitive) or exact did.
+// Candidates: board + roster + tourney players. Match order: exact did,
+// exact name (case-insensitive), normalized substring (tags/dc: stripped),
+// then edit-distance <= 2.
+function _normLink(s) {
+  try {
+    return String(s || '').replace(/<[^>]*>/g, '').replace(/^dc:\s*/i, '').trim().toLowerCase();
+  } catch { return String(s || '').toLowerCase(); }
+}
+function _lev(a, b) {
+  try {
+    a = String(a || ''); b = String(b || '');
+    if (Math.abs(a.length - b.length) > 2) return 99;
+    const dp = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
+    for (let j = 1; j <= b.length; j++) dp[0][j] = j;
+    for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++)
+      dp[i][j] = Math.min(dp[i-1][j] + 1, dp[i][j-1] + 1, dp[i-1][j-1] + (a[i-1] === b[j-1] ? 0 : 1));
+    return dp[a.length][b.length];
+  } catch { return 99; }
+}
 function resolveDid(v) {
   const s = String(v || '').trim();
   if (!s) return null;
@@ -562,6 +579,21 @@ function resolveDid(v) {
   const low = s.toLowerCase();
   for (const [did, nm] of Object.entries(pool)) {
     if (String(nm).toLowerCase() === low) return did;
+  }
+  const ns = _normLink(s);
+  if (ns) {
+    let best = null;
+    for (const [did, nm] of Object.entries(pool)) {
+      const nn = _normLink(nm);
+      if (!nn) continue;
+      if (nn === ns || nn.includes(ns) || ns.includes(nn)) {
+        if (!best || nn.length < String(pool[best] || '').length) best = did;
+      }
+    }
+    if (best) return best;
+    for (const [did, nm] of Object.entries(pool)) {
+      if (_lev(_normLink(nm), ns) <= 2) return did;
+    }
   }
   return null;
 }
@@ -653,8 +685,13 @@ async function mutMatch(btn, patch, fn, what, liteToo) {
   try { renderMatchPanel(); } catch {}
   btn.disabled = true;
   try {
-    await fn();
+    const res = await fn();
     log(what);
+    try {
+      if (res && res.tracked_kept > 0 && (res.removed_manual || 0) < (res.requested || 0)) {
+        log(`kept ${res.tracked_kept} tracked kill(s) — remove wins/placements separately`, true);
+      }
+    } catch {}
     btn.disabled = false;
     if (liteToo) refreshTourneyLite();
     if (what.startsWith('winner') || what.startsWith('+win')) {
@@ -774,11 +811,19 @@ function renderMatchPanel() {
       const v = `<b>${esc(e.target_name || '?')}</b>`;
       if (e.etype === 'kill') return `<div>${t}🔪 ${a} killed ${v}</div>`;
       if (e.etype === 'knock') return `<div>${t}💥 ${a} knocked ${v}</div>`;
-      if (e.etype === 'alv' && e.alive === false) return `<div>${t}💀 ${a} eliminated</div>`;
+      if (e.etype === 'alv' && e.alive === false) return `<div>${t}💀 ${a} is eliminated</div>`;
       if (e.etype === 'leave') return `<div>${t}🚪 ${a} left</div>`;
       return '';
     };
-    feed.innerHTML = kills.map(line).join('') || '<span class="dim">No events yet.</span>';
+    const bookends = [];
+    try {
+      if (m.started_at) bookends.push(`<div>🟢 <b>Match Started</b> <span class="dim">${esc(new Date(m.started_at).toLocaleTimeString())}</span></div>`);
+    } catch {}
+    const body = kills.map(line).join('');
+    try {
+      if (m.sealed_at) bookends.push(`<div>🏁 <b>Match Ended</b> <span class="dim">${esc(new Date(m.sealed_at).toLocaleTimeString())}</span></div>`);
+    } catch {}
+    feed.innerHTML = (bookends.length && body ? bookends[0] + body + (bookends[1] || '') : bookends.join('') + body) || '<span class="dim">No events yet.</span>';
     try { feed.scrollTop = sc; } catch {}
 }
 function wireMatchList(matches) {
@@ -868,28 +913,41 @@ async function refreshUnmapped(t) {
     ((t && t.players) || []).forEach((p) => { pmap[String(p.discord_id)] = p.name; });
     roster.forEach((d) => { if (!pmap[d]) pmap[d] = String(d).slice(0, 6); });
     const opts = roster.map((d) => `<option value="${esc(d)}">${esc(pmap[d] || d.slice(0, 6))}</option>`).join('');
-    let html = '';
+    let html = '<div style="margin:4px 0"><input id="unmap-q" size="18" placeholder="filter names…"> ' +
+      '<label class="dim"><input type="checkbox" id="link-all" checked> apply to all matches</label></div><div id="unmap-rows">';
     for (const m of matches) {
       const u = await api('/api/comp/match/unmapped?match_id=' + encodeURIComponent(m.id)).catch(() => null);
       const rows = ((u && u.unmapped) || []).filter((r) => (r.kills || 0) > 0 || (r.deaths || 0) > 0);
       if (!rows.length) continue;
-      html += `<div style="margin:4px 0"><b>v${m.version}</b> ` + rows.map((r, i) => {
+      html += `<div style="margin:4px 0" data-ver="${m.version}"><b>v${m.version}</b> ` + rows.map((r, i) => {
         const an = String(r.name || '').replace(/"/g, '&quot;');
-        return `<div>${esc(r.name)} <span class="dim">${r.kills}K/${r.deaths}D</span> ` +
+        return `<div data-aname="${an.toLowerCase()}">${esc(r.name)} <span class="dim">${r.kills}K/${r.deaths}D</span> ` +
         `<select id="link-${m.id}-${i}">${opts}</select> ` +
         `<button data-link="${m.id}:${i}" data-aname="${an}">Link</button></div>`;
       }).join('') + `</div>`;
     }
+    html += '</div>';
     box.innerHTML = html || '<span class="dim">Everything mapped.</span>';
+    try {
+      const q = document.querySelector('#unmap-q');
+      if (q) q.oninput = () => {
+        const needle = String(q.value || '').toLowerCase();
+        box.querySelectorAll('[data-aname]').forEach((el) => {
+          el.style.display = !needle || String(el.dataset.aname).includes(needle) ? '' : 'none';
+        });
+      };
+    } catch {}
     box.querySelectorAll('[data-link]').forEach((b) => {
       b.onclick = async () => {
         b.disabled = true;
         try {
           const [mid, idx] = String(b.dataset.link).split(':');
           const sel = document.querySelector(`[id="link-${mid}-${idx}"]`);
+          const allBox = document.querySelector('#link-all');
           await api('/api/comp/match/link', post({
             match_id: Number(mid), actor_name: b.dataset.aname,
             discord_id: sel && sel.value ? sel.value : null,
+            apply_to_all: !!(allBox && allBox.checked),
           }));
           log('linked ' + b.dataset.aname); refreshDetail();
         } catch (e) { log('link: ' + e.message, true); b.disabled = false; }

@@ -83,82 +83,131 @@ def _last_seen_due(last_seen_raw, now_ts: float | None = None, max_age_s: int = 
 
 
 def _names_equal(a, b) -> bool:
-    """Case-sensitive comparison of two player names after stripping color tags.
-    Returns True if both names match exactly after normalization.
-    Example: "dc: Alice" and "dc: Alice" → True
-    Example: "Name" and "name" → False (case matters!)
+    """Strict (case-sensitive) comparison after stripping tags + dc: prefix.
+
+    Solid primary: "Name" != "name" — twins and lookalikes never cross-credit
+    here. Casing drift is handled one layer up by _names_equal_fold, which
+    only credits when no twin conflict exists. Never raises.
     """
-    na = _norm_name(a)              # Normalize first name
-    nb = _norm_name(b)              # Normalize second name
-    return na and nb and na == nb   # Both non-empty and exact match (case-sensitive)
+    try:
+        na = _norm_name(a)              # Normalize first name
+        nb = _norm_name(b)              # Normalize second name
+        return bool(na and nb and na == nb)
+    except Exception:
+        return False
 
 
-def _is_self(room, view, user, name) -> bool:
-    """Is this killfeed name the session owner? Name match OR stable game-ID.
+def _names_equal_fold(a, b) -> bool:
+    """Open fallback: case-insensitive comparison after normalization.
 
-    Names alone misfire for some players (killfeed casing/tags drift from the
-    join-time username, or view.me never resolved) — while playtime, which is
-    session-scoped, keeps counting. The pfid game_id is stable per account:
-    when the name doesn't match, resolve it through the room roster and
-    compare against the user's game_id.
+    Catches killfeed casing drift ("ALICE" vs "alice") that strict misses.
+    Callers must still twin-guard (see _twin_ambiguous_fold) so a genuine
+    same-name pair can't miscredit. Never raises.
+    """
+    try:
+        na = _norm_name(a).lower()
+        nb = _norm_name(b).lower()
+        return bool(na and nb and na == nb)
+    except Exception:
+        return False
 
-    Twins rule (fail-closed): when 2+ roster entries share the normalized
-    name, a normalized-only match credits nobody — it could be either twin.
-    Exact raw matches and game_id-disambiguated matches still credit, so
-    legitimate self-hits are never dropped. Never raises.
+
+def _self_match_tier(room, view, user, name) -> int:
+    """Attribution tier for one killfeed name: 0 none, 1 exact, 2 strict,
+    3 fold (casing drift), 4 game-ID. Pure, unit-tested. Never raises.
+
+    Exposed so the kill path can log WHEN the open fallback saves a player
+    (tier 3) instead of silently crediting — that log line is the early
+    warning before anyone sits at 0 kills for hours.
     """
     try:
         if not name:
-            return False
+            return 0
         me_name = None
         try:
             me_name = (view.me.username if view and view.me else None) or (
                 user.get("game_username") if isinstance(user, dict) else None)
         except Exception:
             me_name = None
-        if me_name and _names_equal(name, me_name):
+        if me_name:
             try:
                 if str(name or "").strip() == str(me_name or "").strip():
-                    return True  # exact raw match: unambiguous
+                    return 1
             except Exception:
                 pass
-            if _twin_ambiguous(room, user, name):
-                try:
-                    log_dbg(f"PROCESSOR twin skip {name} (shared name, no gid)")
-                except Exception:
-                    pass
-                return False
-            return True
+            if _names_equal(name, me_name) and not _twin_ambiguous(room, user, name):
+                return 2
+            if _names_equal_fold(name, me_name) and not _twin_ambiguous_fold(room, user, name):
+                return 3
         try:
             ugid = str((user.get("game_id") if isinstance(user, dict) else None) or "").strip()
         except Exception:
             ugid = ""
         if not ugid or room is None:
-            return False
+            return 0
         try:
             players = getattr(room, "players", None) or {}
         except Exception:
-            return False
+            return 0
         for p in players.values():
             try:
-                if not getattr(p, "username", None) or not _names_equal(getattr(p, "username"), name):
+                pun = getattr(p, "username", None)
+                if not pun or not (_names_equal(pun, name) or _names_equal_fold(pun, name)):
                     continue
                 if str(getattr(p, "game_id", "") or "").strip() == ugid:
-                    return True
+                    return 4
             except Exception:
                 continue
-        return False
+        return 0
+    except Exception:
+        return 0
+
+
+def _is_self(room, view, user, name) -> bool:
+    """Is this killfeed name the session owner? Tiered: solid first, open fallback.
+
+    Tier 1 (exact raw): byte-identical names credit — unambiguous, even with twins.
+    Tier 2 (strict norm + twin guard): tags/dc: stripped, case-sensitive; blocked
+      only when 2+ roster entries share the name and gid can't disambiguate.
+    Tier 3 (fold + twin guard): case-insensitive catch for killfeed casing drift
+      ("ALICE" vs "alice") — this is what kept players at 0 kills for hours while
+      playtime counted. Blocked only on genuine fold-level twin conflict.
+    Tier 4 (game-ID): stable pfid through the room roster (strict or fold).
+    Never raises.
+    """
+    try:
+        return _self_match_tier(room, view, user, name) > 0
     except Exception:
         return False
 
 
 def _twin_ambiguous(room, user, name) -> bool:
-    """True when 2+ roster entries share this normalized name and the user's
-    game_id doesn't single one out. Pure helper, unit-tested. Never raises."""
+    """True when 2+ roster entries share this strict-normalized name and the
+    user's game_id doesn't single one out. Pure helper. Never raises."""
     try:
         players = getattr(room, "players", None) or {} if room is not None else {}
         mates = [p for p in players.values()
                  if getattr(p, "username", None) and _names_equal(getattr(p, "username"), name)]
+        if len(mates) < 2:
+            return False
+        try:
+            ugid = str((user.get("game_id") if isinstance(user, dict) else None) or "").strip()
+        except Exception:
+            ugid = ""
+        if ugid and any(str(getattr(p, "game_id", "") or "").strip() == ugid for p in mates):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _twin_ambiguous_fold(room, user, name) -> bool:
+    """Twin check at fold (case-insensitive) level for the Tier-3 fallback.
+    Same rule as _twin_ambiguous, just wider net. Never raises."""
+    try:
+        players = getattr(room, "players", None) or {} if room is not None else {}
+        mates = [p for p in players.values()
+                 if getattr(p, "username", None) and _names_equal_fold(getattr(p, "username"), name)]
         if len(mates) < 2:
             return False
         try:
@@ -365,12 +414,53 @@ def _is_kd_only(gm) -> bool:
     return str(gm or "").lower() in ("df", "tdm_bvr")
 
 
+def _eff_is_duo(room) -> bool:
+    """Effective duo: gv flag OR party-of-2 fallback.
+
+    Private zw_lg duos often arrive without gv (default solo) and without
+    _pt teams, so room.is_duo stays False and defeat-now degrades to solo
+    rules (alive winner saved as defeat). Treat as duo when an explicit
+    2-member team exists or the party room holds 2+ tracked players.
+    Never raises.
+    """
+    try:
+        if room is None:
+            return False
+        try:
+            if bool(getattr(room, "is_duo", False)):
+                return True
+        except Exception:
+            pass
+        try:
+            for t in (getattr(room, "teams", None) or {}).values():
+                if len(getattr(t, "members", []) or []) == 2:
+                    return True
+        except Exception:
+            pass
+        try:
+            party = getattr(room, "party", None)
+            if party is not None and bool(getattr(party, "is_party", False)):
+                try:
+                    n = len(getattr(room, "players", None) or {})
+                except Exception:
+                    n = 0
+                if n >= 2:
+                    return True
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return False
+
+
 def _kill_count_dup(room, killer, victim, kind, pkt_t) -> bool:
-    """Retransmit guard for kill counting: same killer->victim kind already
-    counted within the window. State lives on the room (survives batches via
-    Upstash) and is stamped ONLY here — engine appends use recent_kills, so the
-    two paths can never suppress each other. Genuine same-pair re-kills need a
-    respawn cycle, far outside the window."""
+    """Retransmit guard: same killer->victim kind already counted within the
+    window, scoped per room+match_version so suppression can never leak across
+    matches (the "0 kills for hours" class). Photon retransmits arrive with
+    the same server timestamp, so pkt_t-keyed comparison is exact; packets
+    without a timestamp fall back to wall-clock — still scoped, so the worst
+    case is one same-pair re-kill inside 5s in the same match being skipped.
+    State lives on the room (survives batches via Upstash)."""
     try:
         if not killer or not victim or room is None:
             return False
@@ -384,7 +474,11 @@ def _kill_count_dup(room, killer, victim, kind, pkt_t) -> bool:
                 now_ms = _pt.time() * 1000.0
             except Exception:
                 return False
-        key = f"{_norm_name(killer)}\x00{_norm_name(victim)}\x00{kind}"
+        try:
+            _scope = f"{getattr(room, 'room_id', '')}\x00{getattr(room, 'match_version', 0)}"
+        except Exception:
+            _scope = ""
+        key = f"{_scope}\x00{_norm_name(killer)}\x00{_norm_name(victim)}\x00{kind}"
         seen = getattr(room, "proc_kill_seen", None)
         if not isinstance(seen, dict):
             return False
@@ -409,7 +503,9 @@ def _kill_count_dup(room, killer, victim, kind, pkt_t) -> bool:
 
 
 def _kill_count_stamp(room, killer, victim, kind, pkt_t) -> None:
-    """Record a counted kill for the retransmit guard above."""
+    """Record a counted kill for the retransmit guard above, scoped per
+    room+match_version (mirrors _kill_count_dup). Timestamp-less packets use
+    wall-clock so the guard still catches echo pairs."""
     try:
         if not killer or not victim or room is None:
             return
@@ -423,7 +519,11 @@ def _kill_count_stamp(room, killer, victim, kind, pkt_t) -> None:
                 now_ms = _pt.time() * 1000.0
             except Exception:
                 return
-        key = f"{_norm_name(killer)}\x00{_norm_name(victim)}\x00{kind}"
+        try:
+            _scope = f"{getattr(room, 'room_id', '')}\x00{getattr(room, 'match_version', 0)}"
+        except Exception:
+            _scope = ""
+        key = f"{_scope}\x00{_norm_name(killer)}\x00{_norm_name(victim)}\x00{kind}"
         seen = getattr(room, "proc_kill_seen", None)
         if not isinstance(seen, dict):
             try:
@@ -1147,6 +1247,24 @@ def _comp_bank_alv(tourney, mid, room) -> None:
 _comp_host_warned: set = set()  # (session, code) already told they're not host
 
 
+def _comp_series_complete(tid, series_len) -> bool:
+    """True when sealed+manual count reached series_len (0 = open-ended).
+    Auto-opens stop here; dashboard manual blanks still allowed. Never raises."""
+    try:
+        sl = int(series_len or 0)
+    except Exception:
+        return False
+    if sl <= 0 or tid is None:
+        return False
+    try:
+        res = supabase.table("bngc_comp_matches").select("id").eq(
+            "tourney_id", int(tid)).in_("status", ["sealed", "manual"]).limit(500).execute()
+        n = len(res.data or [])
+        return n >= sl
+    except Exception:
+        return False
+
+
 def seal_comp_match(session_id, discord_id, room, room_id, gm) -> None:
     """Auto open/seal comp matches from the HOST capture. Never raises.
 
@@ -1186,7 +1304,7 @@ def seal_comp_match(session_id, discord_id, room, room_id, gm) -> None:
             last_stg = None
         try:
             tres = supabase.table("bngc_comp_tourneys").select(
-                "id,code,status,hosts,created_by,host_playing").eq("code", code).neq(
+                "id,code,status,hosts,created_by,host_playing,series_len").eq("code", code).neq(
                 "status", "ended").limit(2).execute()
             rows = tres.data or []
         except Exception as exc:
@@ -1267,6 +1385,14 @@ def seal_comp_match(session_id, discord_id, room, room_id, gm) -> None:
             # stG 1 may create one. Ignore.
             return
         if mid is None:
+            # Series complete: no new auto-opens (manual dashboard blanks
+            # still allowed — they bypass the bridge entirely).
+            try:
+                if _comp_series_complete(tid, (t or {}).get("series_len")):
+                    log_comp(f"tid={tid} code={code} series complete — auto-open ignored")
+                    return
+            except Exception:
+                pass
             # stG == 1: open a blank match, enable writes. Version is the
             # per-tourney max+1 (rooms share the counter, so engine versions
             # can't be reused across rooms). A lost insert race re-reads the
@@ -1592,6 +1718,8 @@ async def process_batch(
     # Track which match_versions already had a death counted (dedup alv + killfeed)
     # Prevents double-counting when both killfeed and alv report the same death
     death_counted_for_match = set()  # Set of (discord_id, match_version) tuples
+    _kf_credited = 0      # kills credited to self this batch (tripwire denominator)
+    _kf_unattributed = 0  # valid killfeed kills credited to NOBODY (tripwire numerator)
     me_name = (view.me.username if view.me else None) or user.get("game_username")  # My game username
     gm_val = view.game_mode.value if view.game_mode else None  # Current game mode string
     last_zone_phase = getattr(view, "_lastZonePhase", None)  # Last zone phase (persisted on view)
@@ -1756,6 +1884,21 @@ async def process_batch(
                 # kills silently missed. The gid path heals exactly that.
                 _self_kill = (not skip_kf and not _me_hosting_only and kf_type == "killed"
                               and _is_self(_kf_room, view, user, instigator))
+                if kf_type == "killed" and not skip_kf and not _me_hosting_only:
+                    if _self_kill:
+                        _kf_credited += 1
+                        # Tier-3 tripwire: casing drift credited via the open
+                        # fallback — log once per session so a drifting client
+                        # gets fixed (game-name relink) before hours pass.
+                        try:
+                            if _self_match_tier(_kf_room, view, user, instigator) == 3 and not getattr(view, "_drift_logged", False):
+                                view._drift_logged = True
+                                log_sys(f"PROCESSOR drift credited killer={instigator} me={me_name} "
+                                        f"gm={eff_gm} room={str(pkt_room_id or '')[:8]} (tier-3 fold fallback)")
+                        except Exception:
+                            pass
+                    else:
+                        _kf_unattributed += 1
                 # Diagnostic for the null-identity class of bug (game_username
                 # null, view.me None): valid kill, nobody credited. Once per
                 # session so a broken client doesn't spam the log.
@@ -1811,8 +1954,12 @@ async def process_batch(
                 # Kills only: being knocked is not death (revive possible) — the
                 # finishing "killed" feed or alv=false counts it.
                 elif not skip_kf and not _me_hosting_only and kf_type == "killed" and _is_self(_kf_room, view, user, instigated):  # I am the victim
-                    # Dedup key: prevent double-counting from killfeed + alv
-                    dedup_key = (discord_id, pkt_match_ver if pkt_match_ver is not None else pkt_room_id)
+                    # Dedup key per room+version: killfeed + alv for the same
+                    # death count once, but different rooms never collide.
+                    _dr0 = getattr(_kf_room, "room_id", None) or pkt_room_id
+                    _dv0 = getattr(_kf_room, "match_version", None)
+                    _dv0 = _dv0 if _dv0 is not None else pkt_match_ver
+                    dedup_key = (discord_id, _dr0, _dv0)
                     if dedup_key not in death_counted_for_match:  # Not yet counted
                         death_room = _get_room(pkt_room_id, view)  # Resolve room for per-life flag
                         if death_room is not None and death_room.had_self_death:
@@ -1839,13 +1986,17 @@ async def process_batch(
                             try:
                                 if not _me_hosting_only and not _is_kd_only(eff_gm) and not (death_room is not None and death_room.had_self_defeat):
                                     _tstat = _team_alive_for_me(death_room, view, me_name)
-                                    if _tstat is True or (_tstat is None and death_room is not None and death_room.is_duo):
+                                    if _tstat is True or (_tstat is None and _eff_is_duo(death_room)):
                                         # Duo + teammate alive OR duo + no team data yet → defer defeat for drain
                                         if death_room is not None and death_room.last_defeat_version != death_room.match_version:
                                             death_room.last_defeat_version = death_room.match_version
                                         log_sys(f"PROCESSOR defeat deferred duo teammate alive gm={eff_gm} (held for drain)")
                                     else:  # solo, no team data (non-duo), or whole team dead
-                                        await db_io(_write_defeat, discord_id, session_id, user, eff_gm, pkt_room_id, pkt_short, pkt_match_ver, death_room, ev_rows, dirty)
+                                        _dr_id = getattr(death_room, "room_id", None) or pkt_room_id
+                                        _dr_ver = getattr(death_room, "match_version", None)
+                                        _dr_ver = _dr_ver if _dr_ver is not None else pkt_match_ver
+                                        _dr_short = getattr(death_room, "short_code", None) or pkt_short
+                                        await db_io(_write_defeat, discord_id, session_id, user, eff_gm, _dr_id, _dr_short, _dr_ver, death_room, ev_rows, dirty)
                             except Exception as e:
                                 log_err(f"processor defeat-via-kill failed {e}")
 
@@ -1899,7 +2050,11 @@ async def process_batch(
                     # Check if this alv packet indicates death
                     is_dead_alv = (alv_is_alive is False) or bool(alv_is_elim)
                     if is_dead_alv and not _me_hosting_only and alv_player and _is_self(_get_room(pkt_room_id, view), view, user, alv_player):  # I died
-                        dedup_key_alv = (discord_id, pkt_match_ver if pkt_match_ver is not None else pkt_room_id)
+                        _ar0 = _get_room(pkt_room_id, view)
+                        _arid = getattr(_ar0, "room_id", None) or pkt_room_id
+                        _arv = getattr(_ar0, "match_version", None)
+                        _arv = _arv if _arv is not None else pkt_match_ver
+                        dedup_key_alv = (discord_id, _arid, _arv)
                         if dedup_key_alv not in death_counted_for_match:  # Not yet counted
                             room_alv = _get_room(pkt_room_id, view)  # Resolve room
                             # One death per life: stale alv=false repeats (still dead from
@@ -1921,13 +2076,17 @@ async def process_batch(
                                 try:
                                     if not _me_hosting_only and not _is_kd_only(eff_gm) and not room_alv.had_self_defeat:
                                         _tstat_alv = _team_alive_for_me(room_alv, view, me_name)
-                                        if _tstat_alv is True or (_tstat_alv is None and room_alv.is_duo):
+                                        if _tstat_alv is True or (_tstat_alv is None and _eff_is_duo(room_alv)):
                                             # Duo + teammate alive OR duo + no team data yet → defer defeat for drain
                                             if room_alv.last_defeat_version != room_alv.match_version:
                                                 room_alv.last_defeat_version = room_alv.match_version
                                             log_sys(f"PROCESSOR defeat deferred duo teammate alive gm={eff_gm} via=alv (held for drain)")
                                         else:  # solo, no team data (non-duo), or whole team dead
-                                            await db_io(_write_defeat, discord_id, session_id, user, eff_gm, pkt_room_id, pkt_short, pkt_match_ver, room_alv, ev_rows, dirty)
+                                            _ar_id = getattr(room_alv, "room_id", None) or pkt_room_id
+                                            _ar_ver = getattr(room_alv, "match_version", None)
+                                            _ar_ver = _ar_ver if _ar_ver is not None else pkt_match_ver
+                                            _ar_short = getattr(room_alv, "short_code", None) or pkt_short
+                                            await db_io(_write_defeat, discord_id, session_id, user, eff_gm, _ar_id, _ar_short, _ar_ver, room_alv, ev_rows, dirty)
                                 except Exception as e_def:
                                     log_err(f"processor defeat-via-alv failed {e_def}")
                             else:
@@ -2236,7 +2395,7 @@ async def process_batch(
                     _ta2 = _team_alive_for_me(room2, view, me_name_local2)
                     if _ta2 is not None:
                         is_dead = not _ta2
-                    elif room2.is_duo:
+                    elif _eff_is_duo(room2):
                         is_dead = False  # duo + no team data yet → defer to drain
 
                     if is_dead or end_res == "defeat":
@@ -2270,7 +2429,7 @@ async def process_batch(
                 elif room2.last_win_version == room2.match_version:
                     log_sys(f"PROCESSOR DEFEAT skip win already recorded gm={gm2}")
                     room2.last_defeat_version = -1  # Discard stale marker
-                elif room2.is_duo and _team_alive_for_me(room2, view, me_name_local2) is not False:
+                elif _eff_is_duo(room2) and _team_alive_for_me(room2, view, me_name_local2) is not False:
                     pass  # hold marker silently — teammate still alive or no team data yet (duo ONLY; solo has no team data coming, so it must drain below)
                 elif await db_io(_defeat_recorded, session_id, room_id2, room2.match_version, ev_rows):
                     log_sys(f"PROCESSOR DEFEAT skip already recorded gm={gm2} room={room_id2[:8]} ver={room2.match_version}")
@@ -2396,6 +2555,15 @@ async def process_batch(
         # --- Batch-end flush: ONE bulk event insert + ONE user update ---
         # All killfeed/kill/death/leave/win/defeat rows queued above go out
         # in a single query, and all counter + field updates merge into one.
+        # Stuck-player tripwire: valid kills nobody got credit for. A healthy
+        # session sits near zero; a drifting-identity client pins this high
+        # while playtime keeps counting — investigate before hours pass.
+        try:
+            if _kf_unattributed > 0 and _kf_credited == 0:
+                log_sys(f"PROCESSOR unattributed session={session_id[:13]} "
+                        f"unattributed={_kf_unattributed} credited=0 me={me_name} — identity unresolved")
+        except Exception:
+            pass
         try:
             await db_io(_flush_events, ev_rows)
         except Exception as exc:
