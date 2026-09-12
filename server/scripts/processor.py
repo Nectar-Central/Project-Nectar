@@ -1614,9 +1614,9 @@ async def process_batch(
     if not view:                     # No session view
         return                       # Can't access player/room state
 
-    # Entry log (SYS, always): proves the batch reached the processor with
-    # real packets. If a kill never credits AND this line is missing, the
-    # batch died in capture (view/packets empty), not in here.
+    # Entry log (always visible): proves the batch reached the processor
+    # with real packets. If a kill never credits AND this line is missing,
+    # the batch died in capture (view/packets empty), not in here.
     try:
         _kinds: dict = {}
         for _p in packets:
@@ -1625,8 +1625,9 @@ async def process_batch(
                 _kinds[str(_t)] = _kinds.get(str(_t), 0) + 1
             except Exception:
                 continue
-        log_sys(f"PROCESSOR batch session={session_id[:13]} pkts={len(packets)} kinds={_kinds} "
-                f"me={(view.me.username if view and view.me else None) or '?'}")
+        _kinds_s = ",".join(f"{k}:{v}" for k, v in sorted(_kinds.items()))
+        log_engine("proc", session_id[:13], action="batch", pkts=len(packets),
+                   kinds=_kinds_s, me=(view.me.username if view and view.me else None) or "?")
     except Exception:
         pass
 
@@ -1837,7 +1838,8 @@ async def process_batch(
                     log_sys(f"PROCESSOR killfeed echo ignored {instigator}->{instigated} ({kf_type})")
                     try:
                         if me_name and (_names_equal(instigator, me_name) or _names_equal(instigated, me_name)):
-                            log_sys(f"PROCESSOR killfeed SELF-echo skipped {instigator}->{instigated} ({kf_type}) — broadcast must follow or the kill is lost")
+                            log_engine("proc", session_id[:13], action="self-skip", reason="echo",
+                                       killer=instigator, victim=instigated, kind=kf_type)
                     except Exception:
                         pass
                 elif _kill_count_dup(_kf_room, instigator, instigated, kf_type, _kf_t):
@@ -1845,7 +1847,8 @@ async def process_batch(
                     log_sys(f"PROCESSOR killfeed dup ignored {instigator}->{instigated} ({kf_type}, retransmit window)")
                     try:
                         if me_name and (_names_equal(instigator, me_name) or _names_equal(instigated, me_name)):
-                            log_sys(f"PROCESSOR killfeed SELF-dup skipped {instigator}->{instigated} ({kf_type}) — already counted this window")
+                            log_engine("proc", session_id[:13], action="self-skip", reason="dup",
+                                       killer=instigator, victim=instigated, kind=kf_type)
                     except Exception:
                         pass
                 else:
@@ -1929,7 +1932,8 @@ async def process_batch(
                         _k_actors = _extract_actors(pkt)
                     except Exception:
                         _k_actors = (None, None)
-                    log_sys(f"PROCESSOR KILL victim={instigated} kills {old_kills}->{new_kills} actors={_k_actors}")
+                    log_engine("proc", session_id[:13], action="kill", victim=instigated,
+                               kills=f"{old_kills}->{new_kills}", actors=str(_k_actors))
                     _precision.schedule("kill", session_id=session_id, discord_id=discord_id,
                                         expected=new_kills, match_version=pkt_match_ver,
                                         room_id=pkt_room_id, extra={"victim": instigated})
@@ -1965,7 +1969,8 @@ async def process_batch(
                             _buf_event(ev_rows, discord_id, session_id, "death",
                                        {"gm": eff_gm, "killer": instigator, "via": "killfeed",
                                         "room_id": pkt_room_id, "code": pkt_short, "match_version": pkt_match_ver})
-                            log_sys(f"PROCESSOR DEATH via killfeed killer={instigator} deaths {old_deaths}->{new_deaths}")
+                            log_engine("proc", session_id[:13], action="death", via="killfeed",
+                                       killer=instigator, deaths=f"{old_deaths}->{new_deaths}")
                             death_counted_for_match.add(dedup_key)  # Mark as counted
                             _precision.schedule("death", session_id=session_id, discord_id=discord_id,
                                                 expected=new_deaths, match_version=pkt_match_ver,
@@ -2014,7 +2019,8 @@ async def process_batch(
                                     _mine_v = _is_self(_get_room(pkt_room_id, view), view, user, alv_player)
                                 except Exception:
                                     _mine_v = "?"
-                                log_sys(f"PROCESSOR alv resolve actors={(_pa, _pt)} -> {alv_player} via={_alv_via} mine={_mine_v}")
+                                log_engine("proc", session_id[:13], action="alv-resolve",
+                                           actors=str((_pa, _pt)), name=alv_player, via=_alv_via, mine=_mine_v)
                         except Exception:
                             pass
                     # Last resort: no name AND no actor info — if I'm dead in room state,
@@ -2030,7 +2036,7 @@ async def process_batch(
                                             alv_player = me_name  # Found myself
                                             alv_is_alive = False  # Confirm dead
                                             _alv_via = "assume-mine heuristic"
-                                            log_sys(f"PROCESSOR alv assume-mine heuristic fired for {me_name} (truly anonymous alv=false)")
+                                            log_engine("proc", session_id[:13], action="alv-assume-mine", name=me_name)
                                             break                # Stop searching
                             except Exception:
                                 pass   # Silently ignore lookup errors
@@ -2056,7 +2062,9 @@ async def process_batch(
                                 _buf_event(ev_rows, discord_id, session_id, "death",
                                            {"gm": eff_gm, "killer": None, "via": "alv",
                                             "room_id": pkt_room_id, "code": pkt_short, "match_version": pkt_match_ver})
-                                log_sys(f"PROCESSOR DEATH via alv deaths {old_deaths_alv}->{new_deaths_alv} name={alv_player} via={_alv_via} actors={_alv_actors}")
+                                log_engine("proc", session_id[:13], action="death", via="alv",
+                                           name=alv_player, deaths=f"{old_deaths_alv}->{new_deaths_alv}",
+                                           actors=str(_alv_actors))
                                 death_counted_for_match.add(dedup_key_alv)  # Mark as counted
                                 _precision.schedule("death", session_id=session_id, discord_id=discord_id,
                                                     expected=new_deaths_alv, match_version=pkt_match_ver,
@@ -2430,8 +2438,8 @@ async def process_batch(
         # while playtime keeps counting — investigate before hours pass.
         try:
             if _kf_unattributed > 0 and _kf_credited == 0:
-                log_sys(f"PROCESSOR unattributed session={session_id[:13]} "
-                        f"unattributed={_kf_unattributed} credited=0 me={me_name} — identity unresolved")
+                log_engine("proc", session_id[:13], action="unattributed",
+                           unattributed=_kf_unattributed, credited=0, me=me_name or "?")
         except Exception:
             pass
         # DB write summary: one SYS line per gameplay batch so a silent
@@ -2459,11 +2467,11 @@ async def process_batch(
             log_err(f"processor user flush failed {exc}")
         try:
             if _n_rows or (dirty or set()):
-                log_sys(f"PROCESSOR db session={session_id[:13]} pkts={len(packets)} "
-                        f"rows={_n_rows} ev_ok={_ev_flushed} ev_dropped={_ev_dropped} "
-                        f"user_ok={_u_ok} dirty={sorted(dirty or [])} "
-                        f"kills={user.get('kills', 0)} deaths={user.get('deaths', 0)} "
-                        f"wins={user.get('wins', 0)}")
+                log_engine("proc", session_id[:13], action="db", pkts=len(packets),
+                           rows=_n_rows, ev_ok=_ev_flushed, ev_dropped=_ev_dropped,
+                           user_ok=_u_ok, dirty=",".join(sorted(dirty or [])) or "-",
+                           kills=user.get("kills", 0), deaths=user.get("deaths", 0),
+                           wins=user.get("wins", 0))
         except Exception:
             pass
 
