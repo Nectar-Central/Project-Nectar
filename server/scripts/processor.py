@@ -589,18 +589,61 @@ def _buf_event(buf, discord_id, session_id, event_type, event_data):
         log_err(f"processor event write failed {event_type}: {exc}")
 
 
-def _flush_events(buf):
-    """Bulk-insert all queued game events in ONE query. Never raises."""
+def _flush_events(buf, chunk: int = 50):
+    """Bulk-insert queued game events in ONE query. Never raises.
+
+    Returns (flushed, dropped): on bulk failure retries in chunks, then
+    row-by-row inside the failing chunk, so ONE poison row can never nuke
+    the whole batch silently. Dropped rows are logged with their event_type.
+    The buffer is always drained (never requeued across batches).
+    """
     try:
-        if buf:
-            supabase.table("bngc_game_events").insert(list(buf)).execute()
-            buf.clear()
+        rows = list(buf or [])
+    except Exception:
+        rows = []
+    try:
+        buf.clear()
+    except Exception:
+        pass
+    if not rows:
+        return 0, 0
+    try:
+        supabase.table("bngc_game_events").insert(rows).execute()
+        return len(rows), 0
+    except Exception as bulk_exc:
+        pass
+    flushed, dropped = 0, 0
+    try:
+        step = max(1, int(chunk or 50))
+        for i in range(0, len(rows), step):
+            piece = rows[i:i + step]
+            try:
+                supabase.table("bngc_game_events").insert(piece).execute()
+                flushed += len(piece)
+                continue
+            except Exception:
+                pass
+            for r in piece:
+                try:
+                    supabase.table("bngc_game_events").insert(r).execute()
+                    flushed += 1
+                except Exception as row_exc:
+                    dropped += 1
+                    try:
+                        log_err(f"processor event row dropped type={(r or {}).get('event_type')}: {row_exc}")
+                    except Exception:
+                        pass
+        try:
+            log_err(f"processor bulk event flush split {flushed}/{len(rows)} ok, {dropped} dropped")
+        except Exception:
+            pass
+        return flushed, dropped
     except Exception as exc:
         try:
-            n = len(buf) if buf else 0
+            log_err(f"processor event flush failed ({len(rows)} rows): {exc}")
         except Exception:
-            n = -1
-        log_err(f"processor bulk event flush failed ({n} rows): {exc}")
+            pass
+        return 0, len(rows)
 
 
 def _flush_user_counters(discord_id, pending_user_updates, dirty, user, attempts=3) -> bool:
@@ -1571,10 +1614,22 @@ async def process_batch(
     if not view:                     # No session view
         return                       # Can't access player/room state
 
-    # Log processor start with session metadata (debug-gated: every batch)
-    log_dbg(f"PROCESSOR START session={session_id[:13]} packets={len(packets)} "
-            f"state={view.state.value} gm={view.game_mode.value if view.game_mode else '?'} "
-            f"me={view.me.username if view.me else '?'} players={view.players_count}")
+    # Entry log (always visible): proves the batch reached the processor
+    # with real packets. If a kill never credits AND this line is missing,
+    # the batch died in capture (view/packets empty), not in here.
+    try:
+        _kinds: dict = {}
+        for _p in packets:
+            try:
+                _t = (_p.get("packet") or _p.get("packet_type") or "?") if isinstance(_p, dict) else getattr(_p, "packet_type", "?")
+                _kinds[str(_t)] = _kinds.get(str(_t), 0) + 1
+            except Exception:
+                continue
+        _kinds_s = ",".join(f"{k}:{v}" for k, v in sorted(_kinds.items()))
+        log_engine("proc", session_id[:13], action="batch", pkts=len(packets),
+                   kinds=_kinds_s, me=(view.me.username if view and view.me else None) or "?")
+    except Exception:
+        pass
 
     # Fetch discord_id from bngc_sessions table
     try:
@@ -1781,9 +1836,21 @@ async def process_batch(
                 if pkt_is_echo:
                     skip_kf = True
                     log_sys(f"PROCESSOR killfeed echo ignored {instigator}->{instigated} ({kf_type})")
+                    try:
+                        if me_name and (_names_equal(instigator, me_name) or _names_equal(instigated, me_name)):
+                            log_engine("proc", session_id[:13], action="self-skip", reason="echo",
+                                       killer=instigator, victim=instigated, kind=kf_type)
+                    except Exception:
+                        pass
                 elif _kill_count_dup(_kf_room, instigator, instigated, kf_type, _kf_t):
                     skip_kf = True
                     log_sys(f"PROCESSOR killfeed dup ignored {instigator}->{instigated} ({kf_type}, retransmit window)")
+                    try:
+                        if me_name and (_names_equal(instigator, me_name) or _names_equal(instigated, me_name)):
+                            log_engine("proc", session_id[:13], action="self-skip", reason="dup",
+                                       killer=instigator, victim=instigated, kind=kf_type)
+                    except Exception:
+                        pass
                 else:
                     skip_kf = False
                 # Queue killfeed event (records ALL kills/knocks in the lobby;
@@ -1861,7 +1928,12 @@ async def process_batch(
                     _buf_event(ev_rows, discord_id, session_id, "kill",
                                {"gm": eff_gm, "victim": instigated, "room_id": pkt_room_id,
                                 "code": pkt_short, "match_version": pkt_match_ver})
-                    log_sys(f"PROCESSOR KILL victim={instigated} kills {old_kills}->{new_kills}")
+                    try:
+                        _k_actors = _extract_actors(pkt)
+                    except Exception:
+                        _k_actors = (None, None)
+                    log_engine("proc", session_id[:13], action="kill", victim=instigated,
+                               kills=f"{old_kills}->{new_kills}", actors=str(_k_actors))
                     _precision.schedule("kill", session_id=session_id, discord_id=discord_id,
                                         expected=new_kills, match_version=pkt_match_ver,
                                         room_id=pkt_room_id, extra={"victim": instigated})
@@ -1897,7 +1969,8 @@ async def process_batch(
                             _buf_event(ev_rows, discord_id, session_id, "death",
                                        {"gm": eff_gm, "killer": instigator, "via": "killfeed",
                                         "room_id": pkt_room_id, "code": pkt_short, "match_version": pkt_match_ver})
-                            log_sys(f"PROCESSOR DEATH via killfeed killer={instigator} deaths {old_deaths}->{new_deaths}")
+                            log_engine("proc", session_id[:13], action="death", via="killfeed",
+                                       killer=instigator, deaths=f"{old_deaths}->{new_deaths}")
                             death_counted_for_match.add(dedup_key)  # Mark as counted
                             _precision.schedule("death", session_id=session_id, discord_id=discord_id,
                                                 expected=new_deaths, match_version=pkt_match_ver,
@@ -1915,12 +1988,19 @@ async def process_batch(
                     alv_is_alive = pkt.get("is_alive") if isinstance(pkt, dict) else getattr(pkt, "is_alive", None)
                     alv_is_elim = pkt.get("is_eliminated") if isinstance(pkt, dict) else getattr(pkt, "is_eliminated", None)
                     alv_player = pkt.get("player_name") or player_name or instigator  # Which player
+                    _alv_via = "explicit-name" if alv_player else "unknown"
+                    _alv_actors = (None, None)
+                    try:
+                        if isinstance(pkt, dict):
+                            _alv_actors = _extract_actors(pkt)
+                    except Exception:
+                        pass
 
                     # Resolve nameless alv via actor map FIRST (correct attribution:
                     # actor 2's death must not count as mine just because I'm also dead)
                     if not alv_player and isinstance(pkt, dict):
                         try:
-                            _pa, _pt = _extract_actors(pkt)  # Threaded from Engine params
+                            _pa, _pt = _alv_actors  # Threaded from Engine params
                             _rm0 = _get_room(pkt_room_id, view) if pkt_room_id else view.current_room
                             if _rm0:  # Try sender then subject actor
                                 for _nr in (_pa, _pt):
@@ -1932,13 +2012,21 @@ async def process_batch(
                                         _nm = None
                                     if _nm:  # Resolved: trust the map (may or may not be me)
                                         alv_player = _nm
+                                        _alv_via = f"actor_map[{_nr}]"
                                         break
+                            if alv_player:
+                                try:
+                                    _mine_v = _is_self(_get_room(pkt_room_id, view), view, user, alv_player)
+                                except Exception:
+                                    _mine_v = "?"
+                                log_engine("proc", session_id[:13], action="alv-resolve",
+                                           actors=str((_pa, _pt)), name=alv_player, via=_alv_via, mine=_mine_v)
                         except Exception:
                             pass
                     # Last resort: no name AND no actor info — if I'm dead in room state,
                     # assume this nameless alv=false is mine (my own broadcast without 255)
                     if not alv_player and pkt_room_id and isinstance(pkt, dict) and pkt.get("is_alive") is False:
-                        _pa2, _pt2 = _extract_actors(pkt)
+                        _pa2, _pt2 = _alv_actors
                         if _pa2 is None and _pt2 is None:  # Truly anonymous — heuristic allowed
                             try:
                                 room_alv = _get_room(pkt_room_id, view)  # Resolve room
@@ -1947,6 +2035,8 @@ async def process_batch(
                                         if _names_equal(pp.username, me_name) and not pp.is_alive:  # My player is dead
                                             alv_player = me_name  # Found myself
                                             alv_is_alive = False  # Confirm dead
+                                            _alv_via = "assume-mine heuristic"
+                                            log_engine("proc", session_id[:13], action="alv-assume-mine", name=me_name)
                                             break                # Stop searching
                             except Exception:
                                 pass   # Silently ignore lookup errors
@@ -1972,7 +2062,9 @@ async def process_batch(
                                 _buf_event(ev_rows, discord_id, session_id, "death",
                                            {"gm": eff_gm, "killer": None, "via": "alv",
                                             "room_id": pkt_room_id, "code": pkt_short, "match_version": pkt_match_ver})
-                                log_sys(f"PROCESSOR DEATH via alv deaths {old_deaths_alv}->{new_deaths_alv}")
+                                log_engine("proc", session_id[:13], action="death", via="alv",
+                                           name=alv_player, deaths=f"{old_deaths_alv}->{new_deaths_alv}",
+                                           actors=str(_alv_actors))
                                 death_counted_for_match.add(dedup_key_alv)  # Mark as counted
                                 _precision.schedule("death", session_id=session_id, discord_id=discord_id,
                                                     expected=new_deaths_alv, match_version=pkt_match_ver,
@@ -2248,134 +2340,159 @@ async def process_batch(
     except Exception as exc:
         log_err(f"processor phase-end seal stub failed {exc}")
 
-        # --- Ranked seal sweep: one host call per phase end ---
-        # Playing hosts usually sealed already via the win/defeat drains
-        # above (idempotent no-ops here). hosting_only hosts never drain a
-        # win/defeat, so without this their players' kills would never seal.
-        # seal_ranked_match skips the spectating host from awards itself.
-        try:
-            for room_id_s, room_s in list(view.rooms.items()):
-                if room_s.room_id == "lobby":
-                    continue
-                if (room_s.stg_is_phase_end and room_s.match_version > 0
-                        and room_s.state.value == "match"):
-                    await db_io(seal_ranked_match, session_id, discord_id, room_s, room_id_s, gm_val)
-                    room_s.stg_is_phase_end = False
-        except Exception as exc:
-            log_err(f"processor ranked sweep failed {exc}")
+    # --- Ranked seal sweep: one host call per phase end ---
+    # Playing hosts usually sealed already via the win/defeat drains
+    # above (idempotent no-ops here). hosting_only hosts never drain a
+    # win/defeat, so without this their players' kills would never seal.
+    # seal_ranked_match skips the spectating host from awards itself.
+    try:
+        for room_id_s, room_s in list(view.rooms.items()):
+            if room_s.room_id == "lobby":
+                continue
+            if (room_s.stg_is_phase_end and room_s.match_version > 0
+                    and room_s.state.value == "match"):
+                await db_io(seal_ranked_match, session_id, discord_id, room_s, room_id_s, gm_val)
+                room_s.stg_is_phase_end = False
+    except Exception as exc:
+        log_err(f"processor ranked sweep failed {exc}")
 
-        # --- Comp seal sweep: every session (host or not) feeds the bridge ---
-        # seal_comp_match gates on room short_code → tourney, opens the
-        # match row if needed, banks unmapped kill events, seals on phase
-        # end. Idempotent; never raises.
-        try:
-            for room_id_c, room_c in list(view.rooms.items()):
-                if getattr(room_c, "room_id", None) == "lobby":
-                    continue
-                if not getattr(room_c, "short_code", None):
-                    continue
+    # --- Comp seal sweep: every session (host or not) feeds the bridge ---
+    # seal_comp_match gates on room short_code → tourney, opens the
+    # match row if needed, banks unmapped kill events, seals on phase
+    # end. Idempotent; never raises.
+    try:
+        for room_id_c, room_c in list(view.rooms.items()):
+            if getattr(room_c, "room_id", None) == "lobby":
+                continue
+            if not getattr(room_c, "short_code", None):
+                continue
+            try:
+                await db_io(seal_comp_match, session_id, discord_id, room_c, room_id_c, gm_val)
+            except Exception:
+                pass
+    except Exception as exc:
+        log_comp(f"sweep failed ({exc})")
+
+    # --- Competitive sealing (host collab only) ---
+    # Only when host_mode is enabled and room is server-created (short_code)
+    # Creates competitive_matches and matches records for replay
+    try:
+        for room_id3, room3 in view.rooms.items():  # Iterate all rooms
+            if room3.room_id == "lobby":    # Skip lobby
+                continue
+            gm3 = room3.game_mode.value if room3.game_mode else ""  # Room's game mode
+            # Competitive conditions: host mode + zw_lg/wwzw/zw + server room + party + I'm host
+            if is_host and gm3.lower() in ("zw_lg", "wwzw", "zw") and room3.short_code and room3.party.is_party and room3.me and room3.me.username == (view.me.username if view.me else None):
+                # Check if match just ended (win or defeat just drained)
+                is_ended = (room3.last_win_version == -1 and room3.last_defeat_version == -1)
                 try:
-                    await db_io(seal_comp_match, session_id, discord_id, room_c, room_id_c, gm_val)
-                except Exception:
-                    pass
-        except Exception as exc:
-            log_comp(f"sweep failed ({exc})")
+                    # Check if competitive record already exists
+                    existing = await db_io(lambda: supabase.table("competitive_matches").select("match_id").eq("match_id", f"{room_id3}_{room3.match_version}").limit(1).execute())
+                    if not existing.data:    # No existing record → create
+                        total_players = len(room3.players)  # Count players
+                        total_teams = len(room3.teams) if room3.teams else 1  # Count teams
+                        # Insert competitive match record
+                        await db_io(lambda: supabase.table("competitive_matches").insert({
+                            "match_id": f"{room_id3}_{room3.match_version}",  # room_id_version
+                            "host_pfid": view.me.game_id if view.me else None,  # Host's player ID
+                            "verified_by_server": False,  # Not yet verified
+                            "total_players": total_players,
+                            "total_teams": total_teams,
+                        }).execute())
+                        # Upsert sealed match record
+                        await db_io(lambda: supabase.table("matches").upsert({
+                            "match_id": f"{room_id3}_{room3.match_version}",
+                            "match_type": "private_casual" if not room3.teams else "competitive",
+                            "game_mode": room3.game_mode.value if room3.game_mode else "unknown",
+                            "scene": room3.cur_scn,
+                            "host_pfid": view.me.game_id if view.me else None,
+                            "is_sealed": False,   # Not sealed yet (sealed on host upload)
+                        }, on_conflict="match_id").execute())
+                        log_sys(f"PROCESSOR competitive {room_id3[:8]} version={room3.match_version}")
+                except Exception as e:
+                    log_err(f"processor competitive failed {room_id3[:8]} {e}")
+    except Exception as e:
+        log_err(f"processor competitive outer failed {e}")
 
-        # --- Competitive sealing (host collab only) ---
-        # Only when host_mode is enabled and room is server-created (short_code)
-        # Creates competitive_matches and matches records for replay
-        try:
-            for room_id3, room3 in view.rooms.items():  # Iterate all rooms
-                if room3.room_id == "lobby":    # Skip lobby
-                    continue
-                gm3 = room3.game_mode.value if room3.game_mode else ""  # Room's game mode
-                # Competitive conditions: host mode + zw_lg/wwzw/zw + server room + party + I'm host
-                if is_host and gm3.lower() in ("zw_lg", "wwzw", "zw") and room3.short_code and room3.party.is_party and room3.me and room3.me.username == (view.me.username if view.me else None):
-                    # Check if match just ended (win or defeat just drained)
-                    is_ended = (room3.last_win_version == -1 and room3.last_defeat_version == -1)
-                    try:
-                        # Check if competitive record already exists
-                        existing = await db_io(lambda: supabase.table("competitive_matches").select("match_id").eq("match_id", f"{room_id3}_{room3.match_version}").limit(1).execute())
-                        if not existing.data:    # No existing record → create
-                            total_players = len(room3.players)  # Count players
-                            total_teams = len(room3.teams) if room3.teams else 1  # Count teams
-                            # Insert competitive match record
-                            await db_io(lambda: supabase.table("competitive_matches").insert({
-                                "match_id": f"{room_id3}_{room3.match_version}",  # room_id_version
-                                "host_pfid": view.me.game_id if view.me else None,  # Host's player ID
-                                "verified_by_server": False,  # Not yet verified
-                                "total_players": total_players,
-                                "total_teams": total_teams,
-                            }).execute())
-                            # Upsert sealed match record
-                            await db_io(lambda: supabase.table("matches").upsert({
-                                "match_id": f"{room_id3}_{room3.match_version}",
-                                "match_type": "private_casual" if not room3.teams else "competitive",
-                                "game_mode": room3.game_mode.value if room3.game_mode else "unknown",
-                                "scene": room3.cur_scn,
-                                "host_pfid": view.me.game_id if view.me else None,
-                                "is_sealed": False,   # Not sealed yet (sealed on host upload)
-                            }, on_conflict="match_id").execute())
-                            log_sys(f"PROCESSOR competitive {room_id3[:8]} version={room3.match_version}")
-                    except Exception as e:
-                        log_err(f"processor competitive failed {room_id3[:8]} {e}")
-        except Exception as e:
-            log_err(f"processor competitive outer failed {e}")
+    # --- v2.19.0 streaks: batch-end accrual (queued into flush) ---
+    # Queues daily/win/kill counter updates + pays bonus into arena
+    # points (ranked_points ledger) best-effort. Never breaks the batch.
+    try:
+        _streak_bonus = _apply_streaks(user, dirty, ev_rows, view)
+        if _streak_bonus:
+            try:
+                from server.lib import ranked as _rk_pay
+                _cur_pts = _rk_pay.get_ranked_points(discord_id)
+                _rk_pay._bump_points_many({str(discord_id): int(_streak_bonus)})
+                log_sys(f"PROCESSOR streak bonus did={discord_id[:6]} +{_streak_bonus} pts={_cur_pts}+{_streak_bonus}")
+            except Exception as _e_pay:
+                log_err(f"processor streak payout failed {_e_pay}")
+    except Exception as _e_st:
+        log_err(f"processor streaks failed {_e_st}")
 
-        # --- v2.19.0 streaks: batch-end accrual (queued into flush) ---
-        # Queues daily/win/kill counter updates + pays bonus into arena
-        # points (ranked_points ledger) best-effort. Never breaks the batch.
+    # --- Batch-end flush: ONE bulk event insert + ONE user update ---
+    # All killfeed/kill/death/leave/win/defeat rows queued above go out
+    # in a single query, and all counter + field updates merge into one.
+    # Stuck-player tripwire: valid kills nobody got credit for. A healthy
+    # session sits near zero; a drifting-identity client pins this high
+    # while playtime keeps counting — investigate before hours pass.
         try:
-            _streak_bonus = _apply_streaks(user, dirty, ev_rows, view)
-            if _streak_bonus:
-                try:
-                    from server.lib import ranked as _rk_pay
-                    _cur_pts = _rk_pay.get_ranked_points(discord_id)
-                    _rk_pay._bump_points_many({str(discord_id): int(_streak_bonus)})
-                    log_sys(f"PROCESSOR streak bonus did={discord_id[:6]} +{_streak_bonus} pts={_cur_pts}+{_streak_bonus}")
-                except Exception as _e_pay:
-                    log_err(f"processor streak payout failed {_e_pay}")
-        except Exception as _e_st:
-            log_err(f"processor streaks failed {_e_st}")
-
-        # --- Batch-end flush: ONE bulk event insert + ONE user update ---
-        # All killfeed/kill/death/leave/win/defeat rows queued above go out
-        # in a single query, and all counter + field updates merge into one.
-        # Stuck-player tripwire: valid kills nobody got credit for. A healthy
-        # session sits near zero; a drifting-identity client pins this high
-        # while playtime keeps counting — investigate before hours pass.
-        try:
-            if _kf_unattributed > 0 and _kf_credited == 0:
-                log_sys(f"PROCESSOR unattributed session={session_id[:13]} "
-                        f"unattributed={_kf_unattributed} credited=0 me={me_name} — identity unresolved")
+            # Thresholded: a single foreign kill in a batch is normal play,
+            # not broken identity — only pine when nothing credits across a
+            # whole lobby's worth of kills.
+            if _kf_unattributed >= 5 and _kf_credited == 0:
+                log_engine("proc", session_id[:13], action="unattributed",
+                           unattributed=_kf_unattributed, credited=0, me=me_name or "?")
         except Exception:
             pass
-        try:
-            await db_io(_flush_events, ev_rows)
-        except Exception as exc:
-            log_err(f"processor event flush failed {exc}")
-        try:
-            await db_io(_flush_user_counters, discord_id, pending_user_updates, dirty, user)
-        except Exception as exc:
-            log_err(f"processor user flush failed {exc}")
-
-        # --- Playtime sync ---
-        # Aggregate per-room playtime into bngc_users and reset counters
-        try:
-            await db_io(_sync_playtime, view, user, discord_id)  # Call helper
-        except Exception as exc:
-            log_err(f"processor playtime failed {exc}")
-
-        # --- Sync to bngc_player_stats ---
-        # Upsert stats table so SELECT * FROM bngc_player_stats is populated
-        try:
-            await db_io(_upsert_stats, discord_id, user)  # Call helper
-            log_dbg(f"PROCESSOR sync player_stats kills={user.get('kills',0)} defeats={user.get('defeats',0)} wins={user.get('wins',0)}")
-        except Exception as exc:
-            log_err(f"processor player_stats sync failed {exc}")
-
+    # DB write summary: one SYS line per gameplay batch so a silent
+    # write stall (rows buffered but never landing) is visible in one
+    # grep instead of inferred from missing counters hours later.
+    _n_rows = 0
+    try:
+        _n_rows = len(ev_rows)
+    except Exception:
+        pass
+    _ev_flushed, _ev_dropped = 0, 0
+    try:
+        _ev_flushed, _ev_dropped = await db_io(_flush_events, ev_rows) or (0, 0)
     except Exception as exc:
-        log_err(f"processor win/defeat failed {exc}")
+        log_err(f"processor event flush failed {exc}")
+        try:
+            _ev_dropped = _n_rows
+        except Exception:
+            pass
+    _u_ok = True
+    try:
+        await db_io(_flush_user_counters, discord_id, pending_user_updates, dirty, user)
+    except Exception as exc:
+        _u_ok = False
+        log_err(f"processor user flush failed {exc}")
+    try:
+        if _n_rows or (dirty or set()):
+            log_engine("proc", session_id[:13], action="db", pkts=len(packets),
+                       rows=_n_rows, ev_ok=_ev_flushed, ev_dropped=_ev_dropped,
+                       user_ok=_u_ok, dirty=",".join(sorted(dirty or [])) or "-",
+                       kills=user.get("kills", 0), deaths=user.get("deaths", 0),
+                       wins=user.get("wins", 0))
+    except Exception:
+        pass
+
+    # --- Playtime sync ---
+    # Aggregate per-room playtime into bngc_users and reset counters
+    try:
+        await db_io(_sync_playtime, view, user, discord_id)  # Call helper
+    except Exception as exc:
+        log_err(f"processor playtime failed {exc}")
+
+    # --- Sync to bngc_player_stats ---
+    # Upsert stats table so SELECT * FROM bngc_player_stats is populated
+    try:
+        await db_io(_upsert_stats, discord_id, user)  # Call helper
+        log_dbg(f"PROCESSOR sync player_stats kills={user.get('kills',0)} defeats={user.get('defeats',0)} wins={user.get('wins',0)}")
+    except Exception as exc:
+        log_err(f"processor player_stats sync failed {exc}")
+
 
     # Log final stats after processing all packets (debug-gated: every batch)
     log_dbg(f"PROCESSOR DONE session={session_id[:13]} kills={user.get('kills',0)} "

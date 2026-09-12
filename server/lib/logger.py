@@ -331,6 +331,8 @@ _EVENT_TAG = {
     "stg": TAG["STG"],
     "state": TAG["STATE"],
     "name_change": TAG["SYS"],
+    "proc": TAG["SYS"],
+    "warn": TAG["SYS"],
 }
 
 # Per-packet detail events never reach the console (BNC_DEBUG=1 reveals

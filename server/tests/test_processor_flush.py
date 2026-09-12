@@ -3,6 +3,7 @@
 - zone_change rows are retired: _buf_event must never queue them.
 - User counter flush retries blips so a saved win row can't lose its
   counter increment ("wins not saved").
+- Event flush resilience: one poison row must not nuke the batch.
 """
 import server.scripts.processor as proc
 
@@ -70,3 +71,69 @@ def test_user_flush_empty_is_noop(monkeypatch):
     monkeypatch.setattr(proc, "supabase", _FailOnce(calls))
     assert proc._flush_user_counters("did1", {}, set(), {}) is True
     assert calls == []
+
+
+class _FakeTable:
+    def __init__(self, fail_on=None):
+        # fail_on: 'bulk' (multi-row inserts fail), {'row', i} etc.
+        self.fail_on = fail_on
+        self.written = []
+
+    def insert(self, payload):
+        self._payload = payload
+        return self
+
+    def execute(self):
+        rows = self._payload if isinstance(self._payload, list) else [self._payload]
+        if self.fail_on == "bulk" and len(rows) > 1:
+            raise RuntimeError("bulk rejected")
+        if isinstance(self.fail_on, dict) and self.fail_on.get("event_type"):
+            bad = [r for r in rows if (r or {}).get("event_type") == self.fail_on["event_type"]]
+            if bad:
+                raise RuntimeError("poison row")
+        self.written.extend(rows)
+        return {"data": rows}
+
+
+class _FakeSupabase:
+    def __init__(self, table):
+        self._table = table
+
+    def table(self, name):
+        assert name == "bngc_game_events"
+        return self._table
+
+
+def test_flush_all_ok(monkeypatch):
+    t = _FakeTable()
+    monkeypatch.setattr(proc, "supabase", _FakeSupabase(t))
+    buf = [{"event_type": "kill"}, {"event_type": "killfeed"}]
+    assert proc._flush_events(buf) == (2, 0)
+    assert buf == []
+    assert len(t.written) == 2
+
+
+def test_flush_empty_noop(monkeypatch):
+    t = _FakeTable()
+    monkeypatch.setattr(proc, "supabase", _FakeSupabase(t))
+    assert proc._flush_events([]) == (0, 0)
+
+
+def test_flush_bulk_fail_splits_chunks(monkeypatch):
+    t = _FakeTable(fail_on="bulk")
+    monkeypatch.setattr(proc, "supabase", _FakeSupabase(t))
+    buf = [{"event_type": "kill", "i": i} for i in range(5)]
+    flushed, dropped = proc._flush_events(buf, chunk=2)
+    assert (flushed, dropped) == (5, 0)
+    assert buf == []
+    assert len(t.written) == 5
+
+
+def test_flush_poison_row_dropped_rest_saved(monkeypatch):
+    t = _FakeTable(fail_on={"event_type": "poison"})
+    monkeypatch.setattr(proc, "supabase", _FakeSupabase(t))
+    buf = [{"event_type": "kill"}, {"event_type": "poison"}, {"event_type": "death"}]
+    flushed, dropped = proc._flush_events(buf, chunk=50)
+    assert flushed == 2 and dropped == 1
+    assert buf == []
+    assert sorted(r["event_type"] for r in t.written) == ["death", "kill"]
