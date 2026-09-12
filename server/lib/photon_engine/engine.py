@@ -1185,6 +1185,16 @@ class Engine:
                 # (Resetting at the stG=3 bump instead caused double defeats:
                 # the ended match's guards were wiped before its drain ran.)
                 if _stg_starts_new_life(stg, room.last_stg):
+                    # Continuous party series (pID rooms cycle 3->2->1 with no
+                    # lobby return and often no scene packet): a room parked in
+                    # LOBBY by an intermission blip must re-enter MATCH here or
+                    # every later phase-end drain starves and wins are lost.
+                    try:
+                        from .fsm import RoomFSM as _FSM
+                        if _FSM.reenter_match_for_series(room, view, session_id):
+                            log_engine("debug", session_id[:13], msg="stG 1 series re-enter match", room=room.room_id[:8])
+                    except Exception:
+                        pass
                     if room.had_self_death or room.had_self_defeat:
                         log_engine("debug", session_id[:13], msg="stG 1 new life flags reset", room=room.room_id[:8])
                     room.had_self_death = False

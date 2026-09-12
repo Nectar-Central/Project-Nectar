@@ -397,6 +397,22 @@ def _phase_end_result(room, view, me_name) -> str | None:
             return None
         if team is False:
             return None
+        # Leavers never win via phase end: quitting exits to LOBBY, and the
+        # zero-info fallback below must not credit it. Absent-from-roster +
+        # a leave event = left (rejoining re-adds the row, so later matches
+        # are unaffected); every other absent shape keeps old behavior.
+        try:
+            _present = False
+            for p in room.players.values():
+                if _names_equal(p.username, me_name):
+                    _present = True
+                    break
+            if not _present:
+                for k in (getattr(room, "recent_kills", None) or []):
+                    if getattr(k, "event_type", None) == "left" and _names_equal(getattr(k, "instigator", None), me_name):
+                        return None
+        except Exception:
+            pass
         return "win"
     except Exception:
         pass
@@ -2259,7 +2275,12 @@ async def process_batch(
                 # duo-team incl. presumed-alive quiet members) and falls back to
                 # killfeed/flag evidence when the room already emptied.
                 me_name_local = (view.me.username if view.me else None) or user.get("game_username")
-                if me_name_local and room.state.value == "match" and not _me_hosting_only:
+                # Armed phase ends drain even when the FSM already exited on
+                # an intermission blip: the arm proves a real stG=3 fired in
+                # this room (continuous party series cycle 3->2->1 with no
+                # lobby return), and leavers are excluded by the guard in
+                # _phase_end_result above — never by state alone.
+                if me_name_local and (room.state.value == "match" or room.stg_is_phase_end) and not _me_hosting_only:
                     if _phase_end_result(room, view, me_name_local) == "win":
                         # I'm alive → WIN (helper marks version so it records once)
                         winner = me_name_local
@@ -2334,7 +2355,10 @@ async def process_batch(
                 continue
             if room2.last_defeat_version == room2.match_version and room2.last_defeat_version != -1:
                 room2.last_defeat_version = -1  # discard stale defeat marker
-            if room2.stg_is_phase_end and room2.match_version > 0 and room2.state.value == "match":
+            # Armed ends seal even when the FSM already exited on an
+            # intermission blip (continuous party series) — the arm, not the
+            # state, proves the phase end fired here.
+            if room2.stg_is_phase_end and room2.match_version > 0:
                 await db_io(seal_ranked_match, session_id, discord_id, room2, room_id2, gm2)
                 room2.stg_is_phase_end = False
     except Exception as exc:
@@ -2345,12 +2369,12 @@ async def process_batch(
     # above (idempotent no-ops here). hosting_only hosts never drain a
     # win/defeat, so without this their players' kills would never seal.
     # seal_ranked_match skips the spectating host from awards itself.
+    # Armed ends seal regardless of FSM state (intermission blip, see above).
     try:
         for room_id_s, room_s in list(view.rooms.items()):
             if room_s.room_id == "lobby":
                 continue
-            if (room_s.stg_is_phase_end and room_s.match_version > 0
-                    and room_s.state.value == "match"):
+            if room_s.stg_is_phase_end and room_s.match_version > 0:
                 await db_io(seal_ranked_match, session_id, discord_id, room_s, room_id_s, gm_val)
                 room_s.stg_is_phase_end = False
     except Exception as exc:
