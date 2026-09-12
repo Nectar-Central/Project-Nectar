@@ -2934,6 +2934,7 @@ async def tourney_name_cmd(interaction: discord.Interaction, allow: bool):
                 "discord_id": me,
                 "discord_username": getattr(interaction.user, "display_name", None) or str(interaction.user),
                 "tourney_name_optin": bool(allow),
+                "token": gen_token(),
             }).execute()
         except Exception as e:
             if "tourney_name_optin" in str(e):
@@ -3540,6 +3541,9 @@ class _GameNameModal(discord.ui.Modal):
                         "discord_id": me,
                         "discord_username": getattr(interaction.user, "display_name", None) or str(interaction.user),
                         "game_username": raw,
+                        # token is NOT NULL: mint an inert one (same as /register;
+                        # unknowable, so it can never be presented for login).
+                        "token": gen_token(),
                     }).execute()
                     wrote = True
                 except Exception as e:
