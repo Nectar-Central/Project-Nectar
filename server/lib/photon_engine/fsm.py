@@ -142,6 +142,57 @@ class RoomFSM:
         if target is None or target == cur:
             return False, cur, cur, None
 
+    @staticmethod
+    def reenter_match_for_series(room, view, session_id: str) -> bool:
+        """stG=1 fresh edge while LOBBY in a server-created (pID) room: a
+        continuous party series starts its next match with no lobby return
+        and often no scene packet, so without this the room sits in LOBBY
+        and phase-end drains (which require MATCH) never fire — wins silently
+        lost after the first match of the series.
+
+        Guards (all must hold): pID room, currently LOBBY, and I'm still on
+        the roster — leavers (row pruned on leave) and empty rooms stay
+        lobby. Unknown identity + a populated room (>= 2 tracked players)
+        still re-enters (a live room cycling matches with an unresolved me).
+        Runs the normal on_exit/on_enter pair (flag/marker reset, re-arm,
+        map reseed), so post-conditions match a scene-driven enter. Never
+        raises.
+        """
+        try:
+            from .enums import State as _State
+            if getattr(room, "state", None) != _State.LOBBY:
+                return False
+            if not getattr(room, "short_code", None):
+                return False
+            me = getattr(room, "me", None) or getattr(view, "me", None)
+            me_name = getattr(me, "username", None) if me is not None else None
+            try:
+                players = list((getattr(room, "players", None) or {}).values())
+            except Exception:
+                players = []
+            if me_name:
+                try:
+                    if not any(_names_equal(getattr(p, "username", None), me_name) for p in players):
+                        return False
+                except Exception:
+                    return False
+            elif len(players) < 2:
+                return False
+            old = room.state
+            RoomFSM._on_exit(room, view, old, _State.MATCH, "stg:1", session_id, None, None)
+            room.state = _State.MATCH
+            RoomFSM._on_enter(room, view, old, _State.MATCH, "stg:1", session_id, None, None, None)
+            try:
+                room.match_playtime.last_state = _State.MATCH.value
+                view.playtime.last_state = _State.MATCH.value
+            except Exception:
+                pass
+            log_engine("state", session_id[:13], old=old.value, new=_State.MATCH.value,
+                       room=room.room_id[:8], via="stg:1", curScn="-")
+            return True
+        except Exception:
+            return False
+
         # ---- guards passed: perform on_exit + on_enter atomically ----
         old = cur
         # on_exit for old state
@@ -198,7 +249,9 @@ class RoomFSM:
                 except Exception:
                     pass
             # if still no gm, keep pending_gm plumbing in engine.py to fill later on pending pop
-            room.cur_scn = cur_scn
+            # (stG-driven re-enters pass cur_scn=None: never wipe the known scene)
+            if cur_scn is not None:
+                room.cur_scn = cur_scn
             # new match = new life: reset per-life death/defeat flags + drain markers
             room.had_self_death = False
             room.had_self_defeat = False
