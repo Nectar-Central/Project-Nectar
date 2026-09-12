@@ -2436,12 +2436,15 @@ async def process_batch(
     # Stuck-player tripwire: valid kills nobody got credit for. A healthy
     # session sits near zero; a drifting-identity client pins this high
     # while playtime keeps counting — investigate before hours pass.
-    try:
-        if _kf_unattributed > 0 and _kf_credited == 0:
-            log_engine("proc", session_id[:13], action="unattributed",
-                       unattributed=_kf_unattributed, credited=0, me=me_name or "?")
-    except Exception:
-        pass
+        try:
+            # Thresholded: a single foreign kill in a batch is normal play,
+            # not broken identity — only pine when nothing credits across a
+            # whole lobby's worth of kills.
+            if _kf_unattributed >= 5 and _kf_credited == 0:
+                log_engine("proc", session_id[:13], action="unattributed",
+                           unattributed=_kf_unattributed, credited=0, me=me_name or "?")
+        except Exception:
+            pass
     # DB write summary: one SYS line per gameplay batch so a silent
     # write stall (rows buffered but never landing) is visible in one
     # grep instead of inferred from missing counters hours later.
