@@ -15,6 +15,10 @@ from ..lib.redis_client import cache
 from ..lib.supabase_client import supabase
 from ..lib import precision as _precision
 
+# Build stamp: bump on every ship so /api/health proves which code is live.
+# (Render gives no branch signal in logs; this ends "is the fix deployed" guessing.)
+BUILD = "2026-09-12.4-tracing"
+
 router = APIRouter()
 
 
@@ -39,6 +43,7 @@ async def health():
         precision = {"precision_pct": 99.0, "verified": 0}
     return JSONResponse({
         "ok": True,
+        "build": BUILD,
         "upstash_configured": upstash_configured,
         "upstash_reachable": upstash_reachable,
         "supabase_configured": bool(supabase),
