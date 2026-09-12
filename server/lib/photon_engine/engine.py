@@ -168,6 +168,57 @@ def _stg_bumps_version(stg, last_stg, armed) -> bool:
         return False
 
 
+def room_enter_on_combat(room, view, session_id, killer, victim, game_mode=None) -> bool:
+    """First combat in a LOBBY-state real room means the match is live even
+    though no scene packet ever arrived (Create/Join carry no curScn) — enter
+    MATCH so drains, drawer, and playtime stop starving in lobby forever.
+
+    Deliberately light and idempotent: flips state + adopts a concrete gm +
+    syncs playtime clocks. No roster/map/kill wipe and no flag/marker touches
+    (those stay on the stG/rejoin/revive/scene paths — wiping the actor map
+    built from lobby joins would break attribution for the rest of the
+    match). Skips the lobby pseudo-room and tag-garbage names. Never raises.
+    """
+    try:
+        if getattr(room, "state", None) != State.LOBBY:
+            return False
+        if str(getattr(room, "room_id", "") or "") == "lobby":
+            return False
+        try:
+            k = _strip_color_tags(str(killer or "")).strip()
+            v = _strip_color_tags(str(victim or "")).strip()
+        except Exception:
+            return False
+        if not k or not v or "<" in k or "<" in v:
+            return False
+        old = room.state
+        room.state = State.MATCH
+        try:
+            # Adopt a concrete join gm (never DF/UNKNOWN placeholders) so the
+            # drawer shows "In Match - gm" instead of a bare room.
+            gm = game_mode or getattr(room, "game_mode", None)
+            if (getattr(room, "game_mode", None) is None and gm is not None
+                    and gm not in (GameMode.DF, GameMode.UNKNOWN)):
+                try:
+                    if room.adopt_game_mode(gm):
+                        log_engine("room", session_id[:13], action="gm", gm=gm.value,
+                                   room=room.room_id[:8], via="combat-enter")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            room.match_playtime.last_state = State.MATCH.value
+            view.playtime.last_state = State.MATCH.value
+        except Exception:
+            pass
+        log_engine("state", session_id[:13], old=old.value, new=State.MATCH.value,
+                   room=room.room_id[:8], via="killfeed", curScn=getattr(room, "cur_scn", None) or "-")
+        return True
+    except Exception:
+        return False
+
+
 def _resolve_alv_subject(room, player_name, gpb, actor_nr):
     """Return (name|None, actor|None) for a nameless alv packet.
     TargetActorNr (the subject) wins over sender ActorNr (often the room
@@ -1678,6 +1729,14 @@ class Engine:
             from ..gpbinary import _strip_color_tags as _strip
             killer = _strip(str(packet.killer)).strip()
             victim = _strip(str(packet.victim)).strip()
+            # First combat in a scene-less LOBBY room = the match is live
+            # (Create/Join carry no curScn): enter MATCH so the drawer and
+            # drains stop starving. Idempotent, roster-preserving.
+            try:
+                room_enter_on_combat(room, view, session_id, killer, victim,
+                                     getattr(packet, "game_mode", None))
+            except Exception:
+                pass
             if not killer or not victim or "<" in killer or "<" in victim:
                 log_engine("debug", session_id[:13], msg=f"kill dropped empty killer={killer!r} victim={victim!r}", room=room.room_id[:8])
             elif packet.is_echo:
@@ -1719,6 +1778,11 @@ class Engine:
                                 )
                                 log_engine("join", session_id[:13], name=name, source="killfeed", alive=not is_target, room=room.room_id[:8])
         elif packet.is_knock and packet.killer and packet.victim:
+            try:
+                room_enter_on_combat(room, view, session_id, packet.killer, packet.victim,
+                                     getattr(packet, "game_mode", None))
+            except Exception:
+                pass
             if packet.is_echo:
                 log_engine("debug", session_id[:13], msg="knock echo ignored (broadcast counts)", room=room.room_id[:8])
             else:
