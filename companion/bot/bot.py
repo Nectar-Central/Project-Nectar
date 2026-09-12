@@ -2683,12 +2683,13 @@ async def _comp_tourney(tourney_id) -> dict | None:
         return None
 
 
-def _comp_board_lines(board, limit=15):
-    """Render aggregate standings lines (with mentions). Pure."""
+def _comp_board_lines(board, limit=0):
+    """Render aggregate standings lines (with mentions). Pure. limit=0 → all."""
     medals = ["🥇", "🥈", "🥉"]
     lines = []
     try:
-        for i, r in enumerate((board or [])[:limit], 1):
+        rows = (board or []) if not limit else (board or [])[:limit]
+        for i, r in enumerate(rows, 1):
             name = (r or {}).get("name") or "?"
             did = (r or {}).get("discord_id")
             who = f"{_comp_mention(did)} **{name}**" if did else f"**{name}**"
@@ -2715,10 +2716,10 @@ async def tourney_board_cmd(interaction: discord.Interaction, tourney_id: int):
     board = data.get("standings") or []
     if not board:
         return await interaction.followup.send(f"No sealed matches in **{t.get('name')}** yet.")
-    e = discord.Embed(title=f"🏆 {t.get('name')} — #{t.get('id')} ({t.get('status')})", color=0xFFD700,
-                      description="\n".join(_comp_board_lines(board))[:4000])
-    e.set_footer(text=f"{len(board)} players · {t.get('sealed', 0)}/{t.get('series_len') or '∞'} matches")
-    await interaction.followup.send(embed=e)
+    return await _send_paginated(
+        interaction, f"🏆 {t.get('name')} — #{t.get('id')} ({t.get('status')})", 0xFFD700,
+        _comp_board_lines(board),
+        footer=f"{len(board)} players · {t.get('sealed', 0)}/{t.get('series_len') or '∞'} matches")
 
 
 @bot.tree.command(name="tourney-match", description="Per-match board for a comp tourney match")
@@ -2760,9 +2761,11 @@ async def tourney_match_cmd(interaction: discord.Interaction, tourney_id: int, v
         k = (r or {}).get("kills", 0)
         p = (r or {}).get("placement")
         lines.append(f"{i}. {who} — {pts} pts ({k}K{', P' + str(p) if p else ''})")
-    e = discord.Embed(title=f"{t.get('name')} — match v{version}", color=0x7c3aed,
-                      description=(f"Winner: **{w or '—'}**{w_mention}\n" + ("\n".join(lines) if lines else "No rows."))[:4000])
-    await interaction.followup.send(embed=e)
+    if not lines:
+        lines = ["No rows."]
+    return await _send_paginated(
+        interaction, f"{t.get('name')} — match v{version}", 0x7c3aed, lines,
+        header=f"Winner: **{w or '—'}**{w_mention}")
 
 
 def _comp_mention(did) -> str:
@@ -2772,6 +2775,81 @@ def _comp_mention(did) -> str:
         return f"<@{did}>" if did else "?"
     except Exception:
         return "?"
+
+
+class _LBView(discord.ui.View):
+    """◀/▶ pagination for leaderboard embeds (10 rows/page). Not persistent:
+    each command reply owns its instance. Never raises out."""
+
+    def __init__(self, title: str, color: int, pages: list, header: str = "", footer: str = ""):
+        super().__init__(timeout=300)
+        self._lb_title = title
+        self._lb_color = color
+        self._lb_pages = pages or [[]]
+        self._lb_header = header or ""
+        self._lb_footer = footer or ""
+        self._lb_idx = 0
+        self._lb_sync()
+
+    def _lb_sync(self):
+        try:
+            self.lb_prev.disabled = self._lb_idx <= 0
+            self.lb_next.disabled = self._lb_idx >= len(self._lb_pages) - 1
+        except Exception:
+            pass
+
+    def _lb_embed(self):
+        try:
+            desc = ((self._lb_header + "\n") if self._lb_header else "") + "\n".join(self._lb_pages[self._lb_idx])
+            e = discord.Embed(title=self._lb_title, color=self._lb_color, description=desc[:4000])
+            bits = [f"Page {self._lb_idx + 1}/{len(self._lb_pages)}"]
+            if self._lb_footer:
+                bits.append(self._lb_footer)
+            e.set_footer(text=" · ".join(bits)[:200])
+            return e
+        except Exception:
+            return discord.Embed(title=self._lb_title, color=self._lb_color, description="Couldn't render page.")
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="lb:prev")
+    async def lb_prev(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            self._lb_idx = max(0, self._lb_idx - 1)
+            self._lb_sync()
+            await interaction.response.edit_message(embed=self._lb_embed(), view=self)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="lb:next")
+    async def lb_next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            self._lb_idx = min(len(self._lb_pages) - 1, self._lb_idx + 1)
+            self._lb_sync()
+            await interaction.response.edit_message(embed=self._lb_embed(), view=self)
+        except Exception:
+            pass
+
+
+async def _send_paginated(interaction: discord.Interaction, title: str, color: int,
+                          lines: list, header: str = "", footer: str = "", per: int = 10,
+                          ephemeral: bool = False):
+    """Send leaderboard lines with ◀/▶ pagination (single page: no buttons)."""
+    try:
+        pages = [lines[i:i + per] for i in range(0, len(lines), per)] or [[]]
+        if len(pages) == 1:
+            e = discord.Embed(title=title, color=color,
+                              description=((header + "\n") if header else "") + "\n".join(pages[0])[:4000])
+            if footer:
+                e.set_footer(text=footer[:200])
+            return await interaction.followup.send(embed=e, ephemeral=ephemeral)
+        view = _LBView(title, color, pages, header, footer)
+        return await interaction.followup.send(embed=view._lb_embed(), view=view, ephemeral=ephemeral)
+    except Exception as e:
+        print(f"[lb] paginated send failed: {e}")
+        try:
+            return await interaction.followup.send(embed=discord.Embed(
+                title=title, color=color, description="\n".join(lines[:per])[:4000]), ephemeral=ephemeral)
+        except Exception:
+            return None
 
 
 @bot.tree.command(name="tourney-winner", description="Winner of a comp tourney (most points)")
@@ -3001,23 +3079,22 @@ async def pr_leaderboard_cmd(interaction: discord.Interaction, limit: int = 10):
         seen = {str((r or {}).get("discord_id")) for r in ranked}
         fresh = [r for r in rows
                  if str((r or {}).get("discord_id") or "") not in seen
-                 and str((r or {}).get("game_username") or "").strip()][:10]
+                 and str((r or {}).get("game_username") or "").strip()]
         for r in fresh:
             nm = (r or {}).get("game_username") or (r or {}).get("discord_username") or "?"
             lines.append(f"• {_comp_mention((r or {}).get('discord_id'))} **{nm}** — no PR yet")
     except Exception:
         pass
-    e = discord.Embed(title="📊 PR Leaderboard", color=0x10b981, description="\n".join(lines)[:4000])
-    await interaction.followup.send(embed=e)
+    return await _send_paginated(interaction, "📊 PR Leaderboard", 0x10b981, lines)
 
 
 @bot.tree.command(name="comp-account", description="See your comp stats (kills, wins, placements, PR)")
 @app_commands.describe(user="Player to look up (default: you)")
 async def comp_account_cmd(interaction: discord.Interaction, user: discord.User | None = None):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
     sb = _comp_sb()
     if sb is None:
-        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+        return await interaction.followup.send("Supabase not configured.")
     target = user or interaction.user
     did = str(target.id)
     try:
@@ -3030,7 +3107,7 @@ async def comp_account_cmd(interaction: discord.Interaction, user: discord.User 
     gname = (urow.get("game_username") or "").strip()
     if not gname:
         return await interaction.followup.send(
-            f"{getattr(target, 'mention', 'That user')} has no comp profile yet.", ephemeral=True)
+            f"{getattr(target, 'mention', 'That user')} has no comp profile yet.")
     kills, mids = 0, set()
     try:
         eres = sb.table("bngc_comp_events").select("match_id,etype").eq(
@@ -3102,7 +3179,7 @@ async def comp_account_cmd(interaction: discord.Interaction, user: discord.User 
                      f"**PR:** {pr if pr is not None else '—'} {dline}\n"
                      f"**Kills:** {kills} · **Wins:** {wins} · **Matches:** {matches}\n"
                      f"**Avg placement:** {avg if avg is not None else '—'}"))
-    return await interaction.followup.send(embed=e, ephemeral=True)
+    return await interaction.followup.send(embed=e)
 
 
 @bot.tree.command(name="tourney-list", description="List comp tourneys (id, status, matches)")
@@ -3936,11 +4013,10 @@ async def leaderboard_cmd(interaction: discord.Interaction, stat: str = "kills",
     if not rows:
         return await interaction.followup.send("No players yet. Play a match first.")
     title = f"Leaderboard — {'Kills' if stat == 'kills' else 'Wins'}"
-    e = discord.Embed(title=title, color=0x7c3aed)
     medals = ["🥇", "🥈", "🥉"]
     lines = []
     for i, r in enumerate(rows, 1):
-        name = r.get("discord_username") or r.get("game_username") or "?"
+        name = r.get("game_username") or r.get("discord_username") or "?"
         did = r.get("discord_id")
         who = f"{_comp_mention(did)} **{name}**" if did else f"**{name}**"
         kills = r.get("kills") or 0
@@ -3953,8 +4029,7 @@ async def leaderboard_cmd(interaction: discord.Interaction, stat: str = "kills",
             val = f"{kills} kills ({kd})"
         prefix = medals[i - 1] if i <= 3 else f"{i}."
         lines.append(f"{prefix} {who} — {val}")
-    e.description = "\n".join(lines)[:4000]
-    await interaction.followup.send(embed=e)
+    return await _send_paginated(interaction, title, 0x7c3aed, lines)
 
 
 @bot.tree.command(name="streaks", description="Show daily / win streaks and best match")
@@ -4840,9 +4915,10 @@ async def ranked_leaderboard_cmd(interaction: discord.Interaction, rid: str = No
         nm = await _display_name(did)
         tag = " 👑" if did == str(room.get("host_discord_id")) else ""
         lines.append(f"**{i}.** {nm} — {'+' if gained >= 0 else ''}{gained} pts ({wins}W · {played} match{'es' if played != 1 else ''}){tag}")
-    e = discord.Embed(title=f"Session standings {room['id']}", color=0x7c3aed, description="\n".join(lines))
-    e.set_footer(text=f"{room['id']} · {sealed}/{room.get('max_matches')} sealed · {room.get('status')}")
-    await interaction.followup.send(embed=e, ephemeral=True)
+    return await _send_paginated(
+        interaction, f"Session standings {room['id']}", 0x7c3aed, lines,
+        footer=f"{room['id']} · {sealed}/{room.get('max_matches')} sealed · {room.get('status')}",
+        ephemeral=True)
 
 
 @ranked_group.command(name="ban", description="Ban a player from ranked (admin)")
