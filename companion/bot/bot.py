@@ -1560,7 +1560,7 @@ async def _comp_reg_rows(tourney_id):
         if sb is None:
             return []
         res = sb.table("bngc_comp_registrations").select(
-            "id,member_ids,status,source_message_id").eq("tourney_id", int(tourney_id)).limit(1000).execute()
+            "id,member_ids,status,source_message_id,team_color").eq("tourney_id", int(tourney_id)).limit(1000).execute()
         return res.data or []
     except Exception:
         return []
@@ -3683,7 +3683,7 @@ class _CompPlayersView(discord.ui.View):
                        custom_id="comp:players")
     async def show_players(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
-            await interaction.response.defer(ephemeral=True)
+            await interaction.response.defer(ephemeral=False)
         except Exception:
             pass
         try:
@@ -3691,58 +3691,85 @@ class _CompPlayersView(discord.ui.View):
             mine = [r for r in (regs or [])
                     if str((r or {}).get("reg_channel_id") or "") == str(getattr(interaction.channel, "id", ""))]
             if not mine:
-                return await interaction.followup.send("No open registration here.", ephemeral=True)
-            t = mine[0]
-            rows = await _comp_reg_rows(t["id"])
-            acc = [r for r in rows if (r or {}).get("status") == "accepted"]
-            if not acc:
-                return await interaction.followup.send("No accepted players yet.", ephemeral=True)
-            names = []
-            try:
-                sb = _comp_sb()
-                dids = sorted({str(x) for r in acc for x in ((r or {}).get("member_ids") or []) if x})[:100]
-                umap = {}
-                gmap = {}
-                if sb is not None and dids:
-                    ures = sb.table("bngc_users").select(
-                        "discord_id,game_username,discord_username").in_("discord_id", dids).execute()
-                    for u in (ures.data or []):
-                        try:
-                            dd = str((u or {}).get("discord_id"))
-                            umap[dd] = (u.get("discord_username") or dd[:6])
-                            if (u or {}).get("game_username"):
-                                gmap[dd] = str((u or {}).get("game_username"))
-                        except Exception:
-                            continue
-                # misses (no bngc_users row) resolve live via Discord itself
-                missing = [d for d in dids if not umap.get(d)][:25]
-                if missing and interaction.guild is not None:
-                    for d in missing:
-                        try:
-                            m = interaction.guild.get_member(int(d))
-                            if m is None:
-                                m = await interaction.guild.fetch_member(int(d))
-                            if m is not None:
-                                umap[d] = m.display_name
-                        except Exception:
-                            continue
-                for r in acc:
-                    ms = []
-                    for x in ((r or {}).get("member_ids") or []):
-                        base = umap.get(str(x), str(x)[:6])
-                        ms.append(f"{base} (known as {gmap[str(x)]})" if gmap.get(str(x)) else base)
-                    tag = (r or {}).get("team_color") or ""
-                    names.append(f"{tag + ' ' if tag else ''}{' / '.join(ms)}")
-            except Exception:
-                names = [", ".join((r or {}).get("member_ids") or []) for r in acc]
-            e = discord.Embed(title=f"Players — tourney #{t['id']}", color=0x7c3aed,
-                              description="\n".join(names[:50])[:4000])
-            return await interaction.followup.send(embed=e, ephemeral=True)
+                return await interaction.followup.send("No open registration here.")
+            e, err = await _comp_players_embed(int(mine[0]["id"]), interaction.guild)
+            if err:
+                return await interaction.followup.send(err)
+            return await interaction.followup.send(embed=e)
         except Exception as e:
             try:
-                return await interaction.followup.send(f"Couldn't load: {e}", ephemeral=True)
+                return await interaction.followup.send(f"Couldn't load: {e}")
             except Exception:
                 pass
+
+
+async def _comp_players_embed(tourney_id: int, guild=None):
+    """Accepted-roster embed for a tourney. Returns (embed, None) or (None, err). Never raises."""
+    try:
+        sb = _comp_sb()
+        if sb is None:
+            return None, "Supabase not configured."
+        try:
+            trow = sb.table("bngc_comp_tourneys").select("id,name").eq(
+                "id", int(tourney_id)).limit(1).execute()
+            tname = (((trow.data or [{}])[0] or {}).get("name")) or f"#{tourney_id}"
+        except Exception:
+            tname = f"#{tourney_id}"
+        rows = await _comp_reg_rows(int(tourney_id))
+        acc = [r for r in rows if (r or {}).get("status") == "accepted"]
+        if not acc:
+            return None, f"No accepted players in tourney **#{tourney_id}** yet."
+        names = []
+        try:
+            dids = sorted({str(x) for r in acc for x in ((r or {}).get("member_ids") or []) if x})[:100]
+            umap, gmap = {}, {}
+            if sb is not None and dids:
+                ures = sb.table("bngc_users").select(
+                    "discord_id,game_username,discord_username").in_("discord_id", dids).execute()
+                for u in (ures.data or []):
+                    try:
+                        dd = str((u or {}).get("discord_id"))
+                        umap[dd] = (u.get("discord_username") or dd[:6])
+                        if (u or {}).get("game_username"):
+                            gmap[dd] = str((u or {}).get("game_username"))
+                    except Exception:
+                        continue
+            missing = [d for d in dids if not umap.get(d)][:25]
+            if missing and guild is not None:
+                for d in missing:
+                    try:
+                        m = guild.get_member(int(d))
+                        if m is None:
+                            m = await guild.fetch_member(int(d))
+                        if m is not None:
+                            umap[d] = m.display_name
+                    except Exception:
+                        continue
+            for r in acc:
+                ms = []
+                for x in ((r or {}).get("member_ids") or []):
+                    base = umap.get(str(x), str(x)[:6])
+                    ms.append(f"{base} (known as {gmap[str(x)]})" if gmap.get(str(x)) else base)
+                tag = (r or {}).get("team_color") or ""
+                names.append(f"{tag + ' ' if tag else ''}{' / '.join(ms)}")
+        except Exception:
+            names = [", ".join((r or {}).get("member_ids") or []) for r in acc]
+        e = discord.Embed(title=f"Players — tourney #{tourney_id} ({tname})", color=0x7c3aed,
+                          description="\n".join(names[:50])[:4000])
+        e.set_footer(text=f"{sum(len((r or {}).get('member_ids') or []) for r in acc)} players · {len(acc)} teams")
+        return e, None
+    except Exception as e:
+        return None, f"Couldn't load: {e}"
+
+
+@bot.tree.command(name="tourney-players", description="List the accepted players of a comp tourney")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)")
+async def tourney_players_cmd(interaction: discord.Interaction, tourney_id: int):
+    await interaction.response.defer(ephemeral=False)
+    e, err = await _comp_players_embed(int(tourney_id), interaction.guild)
+    if err:
+        return await interaction.followup.send(err)
+    return await interaction.followup.send(embed=e)
 
 
 async def _comp_open_regs():
