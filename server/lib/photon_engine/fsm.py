@@ -151,14 +151,15 @@ class RoomFSM:
         — wins silently lost after the first match.
 
         Guards (all must hold): currently LOBBY, not the lobby pseudo-room,
-        a proven match in THIS room (pID rooms always qualify; public rooms
-        need match_version > 0 so a never-started room can't false-enter),
         and I'm still on the roster — leavers (row pruned on leave) and empty
-        rooms stay lobby. Unknown identity + a populated room (>= 2 tracked
-        players) still re-enters (a live room cycling matches with an
-        unresolved me). Runs the normal on_exit/on_enter pair (flag/marker
-        reset, re-arm, map reseed), so post-conditions match a scene-driven
-        enter. Never raises.
+        rooms stay lobby. Public rooms prove the match via match_version > 0,
+        but a first public match (v0) still qualifies when I'm on the roster:
+        stG=1 with me present means the match is starting even though no scene
+        ever arrived (JoinRoom carries no curScn). Unknown identity + a
+        populated room (>= 2 tracked players) still re-enters when versioned.
+        Runs the normal on_exit/on_enter pair (flag/marker reset, re-arm, map
+        reseed), so post-conditions match a scene-driven enter. Numbers the
+        match 0->1 on first enter so the win drain gate can fire. Never raises.
         """
         try:
             from .enums import State as _State
@@ -166,30 +167,37 @@ class RoomFSM:
                 return False
             if str(getattr(room, "room_id", "") or "") == "lobby":
                 return False
-            if not getattr(room, "short_code", None):
-                try:
-                    if int(getattr(room, "match_version", 0) or 0) <= 0:
-                        return False
-                except Exception:
-                    return False
             me = getattr(room, "me", None) or getattr(view, "me", None)
             me_name = getattr(me, "username", None) if me is not None else None
             try:
                 players = list((getattr(room, "players", None) or {}).values())
             except Exception:
                 players = []
+            _me_on_roster = False
             if me_name:
                 try:
-                    if not any(_names_equal(getattr(p, "username", None), me_name) for p in players):
+                    _me_on_roster = any(_names_equal(getattr(p, "username", None), me_name) for p in players)
+                    if not _me_on_roster:
                         return False
                 except Exception:
                     return False
             elif len(players) < 2:
                 return False
+            try:
+                _v0 = int(getattr(room, "match_version", 0) or 0) <= 0
+            except Exception:
+                _v0 = True
+            if _v0 and not getattr(room, "short_code", None) and not _me_on_roster:
+                return False
             old = room.state
             RoomFSM._on_exit(room, view, old, _State.MATCH, "stg:1", session_id, None, None)
             room.state = _State.MATCH
             RoomFSM._on_enter(room, view, old, _State.MATCH, "stg:1", session_id, None, None, None)
+            try:
+                if int(getattr(room, "match_version", 0) or 0) <= 0:
+                    room.match_version = 1
+            except Exception:
+                pass
             try:
                 room.match_playtime.last_state = _State.MATCH.value
                 view.playtime.last_state = _State.MATCH.value
@@ -242,7 +250,7 @@ class RoomFSM:
             gm = packet.game_mode if packet and packet.game_mode else None
             if (not gm or gm == GameMode.DF or gm == GameMode.UNKNOWN) and cur_scn:
                 try:
-                    scene_gm = GameMode.from_curscn(cur_scn)
+                    scene_gm = GameMode.from_curscn(cur_scn, gm or getattr(room, "game_mode", None))
                     if scene_gm is not None:
                         gm = scene_gm
                 except Exception:
