@@ -41,13 +41,56 @@ if not _supabase_url:
     except Exception:
         pass
 
-supabase: Client | None = None
+class _SupabaseProxy:
+    """Forwarding proxy for the singleton client.
+
+    ~10 modules do ``from ... import supabase`` at import time. When
+    refresh_client() used to swap the module global for a new object, every
+    one of those holders kept pointing at the OLD (closed) httpx session and
+    failed permanently with "client has been closed" until the next restart
+    (stats 500s + processor get-user failures across all sessions).
+
+    The proxy is bound once at import; refresh only repoints its target, so
+    every holder always reaches the current client. Falsy while unconfigured
+    (no env), exactly like the previous ``None``.
+    """
+
+    def __init__(self):
+        object.__setattr__(self, "_target", None)
+
+    def _set(self, client):
+        object.__setattr__(self, "_target", client)
+
+    def _get(self):
+        return object.__getattribute__(self, "_target")
+
+    def __bool__(self):
+        try:
+            return object.__getattribute__(self, "_target") is not None
+        except Exception:
+            return False
+
+    __nonzero__ = __bool__
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        target = object.__getattribute__(self, "_target")
+        if target is None:
+            raise AttributeError(f"supabase not configured (attr {name})")
+        return getattr(target, name)
+
+
+supabase = _SupabaseProxy()
 
 # Transient pool/disconnect signatures — safe to retry once with a fresh client.
 _TRANSIENT_MARKERS = (
     "Server disconnected",
     "connection closed",
     "connection reset",
+    "has been closed",
+    "is closed",
+    "closed client",
     "pool",
     "timeout",
     "temporarily unavailable",
@@ -93,31 +136,51 @@ def _build_client():
     return create_client(_supabase_url, _supabase_key)
 
 
+def _close_session(client) -> None:
+    """Best-effort httpx session close. Never raises."""
+    try:
+        if client is None:
+            return
+        sess = getattr(getattr(client, "postgrest", None), "session", None)
+        if sess is not None:
+            try:
+                sess.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def refresh_client():
-    """Rebuild the singleton after a pool disconnect. Returns new client or None."""
+    """Rebuild the singleton after a pool disconnect. Repoints the proxy
+    target FIRST, then closes the old session — holders never observe a
+    closed client. Returns the new client (or the current one on failure)."""
     global supabase
     if not _supabase_url or not _supabase_key:
         return None
     try:
         try:
-            old = supabase
-            if old is not None:
-                try:
-                    sess = getattr(getattr(old, "postgrest", None), "session", None)
-                    if sess is not None:
-                        try:
-                            sess.close()
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+            old = supabase._get() if isinstance(supabase, _SupabaseProxy) else supabase
         except Exception:
-            pass
-        supabase = _build_client()
-        return supabase
+            old = None
+        new_client = _build_client()
+        try:
+            if isinstance(supabase, _SupabaseProxy):
+                supabase._set(new_client)
+            else:
+                supabase = new_client
+        except Exception:
+            supabase = new_client
+        _close_session(old)
+        return new_client
     except Exception as exc:
         try:
             print(f"[supabase] refresh failed ({exc})")
+        except Exception:
+            pass
+        try:
+            if isinstance(supabase, _SupabaseProxy):
+                return supabase._get()
         except Exception:
             pass
         return supabase
@@ -125,7 +188,7 @@ def refresh_client():
 
 if _supabase_url and _supabase_key:
     try:
-        supabase = _build_client()
+        supabase._set(_build_client())
     except Exception as exc:
         # Never crash the container on a bad key (e.g. new-format sb_secret_
         # key with pinned supabase==2.7.0, which only accepts legacy JWTs).
@@ -134,9 +197,9 @@ if _supabase_url and _supabase_key:
             print(f"[supabase] create_client failed ({exc}); running unconfigured")
         except Exception:
             pass
-        supabase = None
+        # proxy target stays None -> `if not supabase` guards keep working
 else:
-    supabase = None  # Will be None in tests without env
+    pass  # proxy target stays None in tests without env
 
 
 # ---------------------------------------------------------------------------

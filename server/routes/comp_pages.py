@@ -101,7 +101,7 @@ async def admin_panel():
 @router.get("/comp/status")
 async def comp_status():
     """Live bridge status: open/sealed matches + unmapped event count. Never 500s on blips."""
-    if supabase is None:
+    if not supabase:
         return {"ok": False, "error": "Server not configured", "open_matches": 0}
     try:
         mres = await db_io(lambda: supabase.table("bngc_comp_matches").select(

@@ -103,7 +103,7 @@ def _verify_item(item: dict[str, Any]) -> tuple[bool | None, str]:
     """
     from .supabase_client import supabase
 
-    if supabase is None:
+    if not supabase:
         return None, "no-supabase"
     try:
         action = item["action"]

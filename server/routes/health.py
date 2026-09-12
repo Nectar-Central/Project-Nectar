@@ -41,7 +41,7 @@ async def health():
         "ok": True,
         "upstash_configured": upstash_configured,
         "upstash_reachable": upstash_reachable,
-        "supabase_configured": supabase is not None,
+        "supabase_configured": bool(supabase),
         "engine_sessions": engine_sessions,
         "precision": precision,
     })
