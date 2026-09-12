@@ -144,26 +144,34 @@ class RoomFSM:
 
     @staticmethod
     def reenter_match_for_series(room, view, session_id: str) -> bool:
-        """stG=1 fresh edge while LOBBY in a server-created (pID) room: a
-        continuous party series starts its next match with no lobby return
-        and often no scene packet, so without this the room sits in LOBBY
-        and phase-end drains (which require MATCH) never fire — wins silently
-        lost after the first match of the series.
+        """stG=1 fresh edge while LOBBY: the next match is starting but no
+        scene packet arrived to re-enter MATCH (continuous party series with
+        no lobby return, or a public room parked by an intermission blip), so
+        without this the room sits in LOBBY and phase-end drains never fire
+        — wins silently lost after the first match.
 
-        Guards (all must hold): pID room, currently LOBBY, and I'm still on
-        the roster — leavers (row pruned on leave) and empty rooms stay
-        lobby. Unknown identity + a populated room (>= 2 tracked players)
-        still re-enters (a live room cycling matches with an unresolved me).
-        Runs the normal on_exit/on_enter pair (flag/marker reset, re-arm,
-        map reseed), so post-conditions match a scene-driven enter. Never
-        raises.
+        Guards (all must hold): currently LOBBY, not the lobby pseudo-room,
+        a proven match in THIS room (pID rooms always qualify; public rooms
+        need match_version > 0 so a never-started room can't false-enter),
+        and I'm still on the roster — leavers (row pruned on leave) and empty
+        rooms stay lobby. Unknown identity + a populated room (>= 2 tracked
+        players) still re-enters (a live room cycling matches with an
+        unresolved me). Runs the normal on_exit/on_enter pair (flag/marker
+        reset, re-arm, map reseed), so post-conditions match a scene-driven
+        enter. Never raises.
         """
         try:
             from .enums import State as _State
             if getattr(room, "state", None) != _State.LOBBY:
                 return False
-            if not getattr(room, "short_code", None):
+            if str(getattr(room, "room_id", "") or "") == "lobby":
                 return False
+            if not getattr(room, "short_code", None):
+                try:
+                    if int(getattr(room, "match_version", 0) or 0) <= 0:
+                        return False
+                except Exception:
+                    return False
             me = getattr(room, "me", None) or getattr(view, "me", None)
             me_name = getattr(me, "username", None) if me is not None else None
             try:

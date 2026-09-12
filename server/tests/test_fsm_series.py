@@ -46,10 +46,24 @@ def test_reenter_keeps_scene():
     assert r.cur_scn == "ZoneWars_LateGame_12Players"
 
 
-def test_no_reenter_without_code():
-    r, v = _room(code=None)
+def test_no_reenter_public_room_without_prior_match():
+    r, v = _room(code=None, version=0)
     assert RoomFSM.reenter_match_for_series(r, v, "sess_test") is False
     assert r.state == State.LOBBY
+
+
+def test_reenter_public_room_with_prior_match():
+    # same symptom in public matches: parked in LOBBY after a proven match
+    # here, series cycles -> re-enter like party rooms
+    r, v = _room(code=None, version=2)
+    assert RoomFSM.reenter_match_for_series(r, v, "sess_test") is True
+    assert r.state == State.MATCH
+
+
+def test_no_reenter_lobby_pseudo_room():
+    r, v = _room(code=None, version=0)
+    r.room_id = "lobby"
+    assert RoomFSM.reenter_match_for_series(r, v, "sess_test") is False
 
 
 def test_no_reenter_when_already_match():
