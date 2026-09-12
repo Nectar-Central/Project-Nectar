@@ -1614,10 +1614,21 @@ async def process_batch(
     if not view:                     # No session view
         return                       # Can't access player/room state
 
-    # Log processor start with session metadata (debug-gated: every batch)
-    log_dbg(f"PROCESSOR START session={session_id[:13]} packets={len(packets)} "
-            f"state={view.state.value} gm={view.game_mode.value if view.game_mode else '?'} "
-            f"me={view.me.username if view.me else '?'} players={view.players_count}")
+    # Entry log (SYS, always): proves the batch reached the processor with
+    # real packets. If a kill never credits AND this line is missing, the
+    # batch died in capture (view/packets empty), not in here.
+    try:
+        _kinds: dict = {}
+        for _p in packets:
+            try:
+                _t = (_p.get("packet") or _p.get("packet_type") or "?") if isinstance(_p, dict) else getattr(_p, "packet_type", "?")
+                _kinds[str(_t)] = _kinds.get(str(_t), 0) + 1
+            except Exception:
+                continue
+        log_sys(f"PROCESSOR batch session={session_id[:13]} pkts={len(packets)} kinds={_kinds} "
+                f"me={(view.me.username if view and view.me else None) or '?'}")
+    except Exception:
+        pass
 
     # Fetch discord_id from bngc_sessions table
     try:

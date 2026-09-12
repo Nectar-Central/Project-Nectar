@@ -184,6 +184,10 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
                 log_err(f"PROCESSOR FAILED session={auth_session_id[:13]} {type(e).__name__}: {e}")
         except Exception as e:
             log_err(f"CAPTURE processor import failed {e} — packets still returned, DB write skipped")
+    elif auth_session_id and packets:
+        # Gameplay packets that will NEVER reach the processor (no view):
+        # this is the silent-drop hole — log it loud.
+        log_err(f"CAPTURE skip processor session={auth_session_id[:13]} pkts={len(packets)} view={'none' if view is None else 'no-dict'} — DB write skipped")
     _ct["proc"] = _t.time()
 
     # Persist Engine state to Upstash ONCE, after the processor (finally
