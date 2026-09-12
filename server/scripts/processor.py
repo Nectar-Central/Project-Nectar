@@ -589,18 +589,61 @@ def _buf_event(buf, discord_id, session_id, event_type, event_data):
         log_err(f"processor event write failed {event_type}: {exc}")
 
 
-def _flush_events(buf):
-    """Bulk-insert all queued game events in ONE query. Never raises."""
+def _flush_events(buf, chunk: int = 50):
+    """Bulk-insert queued game events in ONE query. Never raises.
+
+    Returns (flushed, dropped): on bulk failure retries in chunks, then
+    row-by-row inside the failing chunk, so ONE poison row can never nuke
+    the whole batch silently. Dropped rows are logged with their event_type.
+    The buffer is always drained (never requeued across batches).
+    """
     try:
-        if buf:
-            supabase.table("bngc_game_events").insert(list(buf)).execute()
-            buf.clear()
+        rows = list(buf or [])
+    except Exception:
+        rows = []
+    try:
+        buf.clear()
+    except Exception:
+        pass
+    if not rows:
+        return 0, 0
+    try:
+        supabase.table("bngc_game_events").insert(rows).execute()
+        return len(rows), 0
+    except Exception as bulk_exc:
+        pass
+    flushed, dropped = 0, 0
+    try:
+        step = max(1, int(chunk or 50))
+        for i in range(0, len(rows), step):
+            piece = rows[i:i + step]
+            try:
+                supabase.table("bngc_game_events").insert(piece).execute()
+                flushed += len(piece)
+                continue
+            except Exception:
+                pass
+            for r in piece:
+                try:
+                    supabase.table("bngc_game_events").insert(r).execute()
+                    flushed += 1
+                except Exception as row_exc:
+                    dropped += 1
+                    try:
+                        log_err(f"processor event row dropped type={(r or {}).get('event_type')}: {row_exc}")
+                    except Exception:
+                        pass
+        try:
+            log_err(f"processor bulk event flush split {flushed}/{len(rows)} ok, {dropped} dropped")
+        except Exception:
+            pass
+        return flushed, dropped
     except Exception as exc:
         try:
-            n = len(buf) if buf else 0
+            log_err(f"processor event flush failed ({len(rows)} rows): {exc}")
         except Exception:
-            n = -1
-        log_err(f"processor bulk event flush failed ({n} rows): {exc}")
+            pass
+        return 0, len(rows)
 
 
 def _flush_user_counters(discord_id, pending_user_updates, dirty, user, attempts=3) -> bool:
@@ -1781,9 +1824,19 @@ async def process_batch(
                 if pkt_is_echo:
                     skip_kf = True
                     log_sys(f"PROCESSOR killfeed echo ignored {instigator}->{instigated} ({kf_type})")
+                    try:
+                        if me_name and (_names_equal(instigator, me_name) or _names_equal(instigated, me_name)):
+                            log_sys(f"PROCESSOR killfeed SELF-echo skipped {instigator}->{instigated} ({kf_type}) — broadcast must follow or the kill is lost")
+                    except Exception:
+                        pass
                 elif _kill_count_dup(_kf_room, instigator, instigated, kf_type, _kf_t):
                     skip_kf = True
                     log_sys(f"PROCESSOR killfeed dup ignored {instigator}->{instigated} ({kf_type}, retransmit window)")
+                    try:
+                        if me_name and (_names_equal(instigator, me_name) or _names_equal(instigated, me_name)):
+                            log_sys(f"PROCESSOR killfeed SELF-dup skipped {instigator}->{instigated} ({kf_type}) — already counted this window")
+                    except Exception:
+                        pass
                 else:
                     skip_kf = False
                 # Queue killfeed event (records ALL kills/knocks in the lobby;
@@ -2370,14 +2423,38 @@ async def process_batch(
                         f"unattributed={_kf_unattributed} credited=0 me={me_name} — identity unresolved")
         except Exception:
             pass
+        # DB write summary: one SYS line per gameplay batch so a silent
+        # write stall (rows buffered but never landing) is visible in one
+        # grep instead of inferred from missing counters hours later.
+        _n_rows = 0
         try:
-            await db_io(_flush_events, ev_rows)
+            _n_rows = len(ev_rows)
+        except Exception:
+            pass
+        _ev_flushed, _ev_dropped = 0, 0
+        try:
+            _ev_flushed, _ev_dropped = await db_io(_flush_events, ev_rows) or (0, 0)
         except Exception as exc:
             log_err(f"processor event flush failed {exc}")
+            try:
+                _ev_dropped = _n_rows
+            except Exception:
+                pass
+        _u_ok = True
         try:
             await db_io(_flush_user_counters, discord_id, pending_user_updates, dirty, user)
         except Exception as exc:
+            _u_ok = False
             log_err(f"processor user flush failed {exc}")
+        try:
+            if _n_rows or (dirty or set()):
+                log_sys(f"PROCESSOR db session={session_id[:13]} pkts={len(packets)} "
+                        f"rows={_n_rows} ev_ok={_ev_flushed} ev_dropped={_ev_dropped} "
+                        f"user_ok={_u_ok} dirty={sorted(dirty or [])} "
+                        f"kills={user.get('kills', 0)} deaths={user.get('deaths', 0)} "
+                        f"wins={user.get('wins', 0)}")
+        except Exception:
+            pass
 
         # --- Playtime sync ---
         # Aggregate per-room playtime into bngc_users and reset counters
