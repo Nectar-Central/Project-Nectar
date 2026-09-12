@@ -1723,10 +1723,11 @@ class _CompProfileView(discord.ui.View):
     async def create_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             return await interaction.response.send_modal(_GameNameModal(int(self.tourney_id)))
-        except Exception:
+        except Exception as e:
+            print(f"[comp] open profile modal failed: {e!r}")
             try:
                 return await interaction.response.send_message(
-                    "Couldn't open the form, try again.", ephemeral=True)
+                    f"Couldn't open the form ({str(e)[:120]}), try again.", ephemeral=True)
             except Exception:
                 pass
 
@@ -3474,6 +3475,10 @@ class _GameNameModal(discord.ui.Modal):
             label="Current in-game username",
             placeholder="Exactly as it appears in-game",
             min_length=1, max_length=32, required=True)
+        # instance-assigned inputs are NOT auto-collected by discord.py
+        # (only class-level attributes are) — an empty modal gets a 400
+        # from the API, so register explicitly.
+        self.add_item(self.game_name)
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
@@ -3644,10 +3649,11 @@ class _CompPlayersView(discord.ui.View):
                 except Exception:
                     return
             return await interaction.response.send_modal(_GameNameModal(int(mine[0]["id"])))
-        except Exception:
+        except Exception as e:
+            print(f"[comp] open game-name modal failed: {e!r}")
             try:
                 return await interaction.response.send_message(
-                    "Couldn't open the form, try again.", ephemeral=True)
+                    f"Couldn't open the form ({str(e)[:120]}), try again.", ephemeral=True)
             except Exception:
                 pass
 
