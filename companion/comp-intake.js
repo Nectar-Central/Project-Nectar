@@ -166,6 +166,7 @@ function createTracker(opts) {
         manual: !!manual,
         openedAt: new Date().toISOString(),
         events: [],
+        leaves: [], // actorNames seen leaving (event 254) — auto-removed at seal
       };
       log(`match v${st.openMatch.version} OPEN${manual ? ' (manual)' : ''} room=${(st.room || '?').slice(0, 8)}${st.tourneyCode ? ' code=' + st.tourneyCode : ''}`);
       return st.openMatch;
@@ -210,6 +211,7 @@ function createTracker(opts) {
           room: m.room,
           manual: !!manual || !!m.manual,
           events: m.events,
+          leaves: m.leaves || [],
         });
         st.sealed++;
         try { st.seriesSealed = (st.seriesSealed || 0) + 1; } catch {}
@@ -296,7 +298,16 @@ function createTracker(opts) {
         if (actorNr != null) ensureActor(actorNr, name || null);
       } else if (code === 254) { // Leave
         const actorNr = num(paramVal(msg.ev.params, 'ActorNr'));
-        pushEvent('leave', { actorNr, actorName: actorNr != null ? rosterName(actorNr) : null });
+        const nm = actorNr != null ? rosterName(actorNr) : null;
+        pushEvent('leave', { actorNr, actorName: nm });
+        // auto-remove: remember the leaver so seal excludes them from the
+        // roster (host can add back via /tourney add-back or dashboard).
+        try {
+          if (st.openMatch && nm) {
+            st.openMatch.leaves = st.openMatch.leaves || [];
+            if (!st.openMatch.leaves.includes(nm)) st.openMatch.leaves.push(nm);
+          }
+        } catch {}
       } else if (code === 253) { // Properties: stG / alv / curScn...
         const props = paramVal(msg.ev.params, 'Properties') || {};
         try { log(`253 props keys=${props && typeof props === 'object' ? Object.keys(props).join(',') : typeof props}`); } catch {}
@@ -371,7 +382,7 @@ function createTracker(opts) {
       for (const m of pend) {
         try {
           if (sink && typeof sink.saveMatch === 'function') {
-            await sink.saveMatch({ tourneyId: id, version: m.version, room: m.room, manual: !!m.manual, events: m.events });
+            await sink.saveMatch({ tourneyId: id, version: m.version, room: m.room, manual: !!m.manual, events: m.events, leaves: m.leaves || [] });
             st.sealed++;
           }
         } catch {}
@@ -513,12 +524,13 @@ function createSupabaseSink() {
       }
       return mapNamesToDiscord(names, byGame);
     },
-    async saveMatch({ tourneyId, version, room, manual, events }) {
+    async saveMatch({ tourneyId, version, room, manual, events, leaves }) {
       const names = [];
       for (const e of (events || [])) {
         if (e.actorName) names.push(e.actorName);
         if (e.targetName) names.push(e.targetName);
       }
+      for (const n of (leaves || [])) names.push(n);
       let mapping = {};
       try { mapping = await this.resolveNames(names); } catch {}
       const mrows = await sbReq('POST', '/bngc_comp_matches',
@@ -538,6 +550,14 @@ function createSupabaseSink() {
       for (let i = 0; i < erows.length; i += 100) {
         await sbReq('POST', '/bngc_comp_events', erows.slice(i, i + 100));
       }
+      // auto-removed leavers: resolve leave names -> dids, store on the match
+      // (best effort; pre-migration DBs ignore the column).
+      try {
+        const removed = [...new Set((leaves || []).map((n) => mapping[n]).filter(Boolean))];
+        if (removed.length) {
+          await sbReq('PATCH', `/bngc_comp_matches?id=eq.${encodeURIComponent(mid)}`, { removed_discord_ids: removed });
+        }
+      } catch {}
       return mid;
     },
   };
