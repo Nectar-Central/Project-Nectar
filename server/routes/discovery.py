@@ -2,7 +2,7 @@
 discovery.py — GET /api/search, GET /api/leaderboard, GET /api/user, GET /api/matches
 
 Search: ?q=xxx → users matching discord_username / game_username / game_id
-Leaderboard: ?sort=kills|wins|kd|win_rate|playtime&limit=20&offset=0 -> ordered bngc_users + computed fields
+Leaderboard: ?sort=kills|wins|kd|playtime|pr&limit=20&offset=0 -> ordered bngc_users + computed fields
 User: ?discord_id=xxx | ?game_username=xxx | ?game_id=xxx -> public player profile (no secrets)
 Matches: ?discord_id=xxx | ?game_username=xxx | ?game_id=xxx -> recent grouped matches (room+version)
 """
@@ -131,15 +131,13 @@ async def search(request: Request):
                 pass
 
         out = list(results.values())[:limit]
-        # add computed kd/win_rate
+        # add computed kd (wins-only: no defeats/win_rate in output)
         for r in out:
             kills = int(r.get("kills") or 0)
             deaths = int(r.get("deaths") or 0)
-            wins = int(r.get("wins") or 0)
-            defeats = int(r.get("defeats") or 0)
             r["kd"] = round(kills / deaths, 2) if deaths else float(kills)
-            total = wins + defeats
-            r["win_rate"] = round(wins / total, 3) if total else 0
+            r.pop("defeats", None)
+            r.pop("win_rate", None)
 
         return JSONResponse({"query": q, "count": len(out), "results": out})
     except Exception as e:
@@ -217,7 +215,7 @@ async def leaderboard(request: Request):
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
-    allowed = {"kills", "deaths", "wins", "defeats", "playtime_global", "kd", "win_rate", "points", "comp"}
+    allowed = {"kills", "deaths", "wins", "playtime_global", "kd", "points", "comp", "pr"}
     if sort not in allowed:
         return JSONResponse({"error": f"sort must be one of {', '.join(sorted(allowed))}"}, status_code=400)
 
@@ -248,37 +246,43 @@ async def leaderboard(request: Request):
             for r in rows:
                 kills = int(r.get("kills") or 0)
                 deaths = int(r.get("deaths") or 0)
-                wins = int(r.get("wins") or 0)
-                defeats = int(r.get("defeats") or 0)
-                total = wins + defeats
                 r["kd"] = round(kills / deaths, 2) if deaths else float(kills)
-                r["win_rate"] = round(wins / total, 3) if total else 0
+                r.pop("defeats", None)
+                r.pop("win_rate", None)
             _attach_points(rows)
             for i, r in enumerate(rows):
                 r["rank"] = offset + i + 1
             return JSONResponse({"sort": sort, "order": order, "limit": limit, "offset": offset,
                                  "count": len(rows), "results": rows})
-        # For direct columns, let Supabase order; for computed (kd/win_rate), fetch and sort in python
-        if sort in ("kills", "deaths", "wins", "defeats", "playtime_global"):
+        # For direct columns, let Supabase order; for computed (kd), fetch and sort in python.
+        # pr sorts by the bngc_users.tourney_pr column (latest computed rating).
+        if sort in ("kills", "deaths", "wins", "playtime_global", "pr"):
             # supabase order: .order(col, desc=True/False)
             desc = order == "desc"
-            res = supabase.table("bngc_users").select("discord_id,discord_username,game_username,game_id,skin,kills,deaths,wins,defeats,playtime_global,play_points,last_seen").order(sort, desc=desc).range(offset, offset + limit - 1).execute()
+            order_col = "tourney_pr" if sort == "pr" else sort
+            try:
+                res = supabase.table("bngc_users").select("discord_id,discord_username,game_username,game_id,skin,kills,deaths,wins,defeats,playtime_global,play_points,tourney_pr,last_seen").order(order_col, desc=desc).range(offset, offset + limit - 1).execute()
+            except Exception:
+                res = supabase.table("bngc_users").select("discord_id,discord_username,game_username,game_id,skin,kills,deaths,wins,defeats,playtime_global,play_points,last_seen").order(sort if sort != "pr" else "kills", desc=desc).range(offset, offset + limit - 1).execute()
             rows = res.data or []
             for r in rows:
                 kills = int(r.get("kills") or 0)
                 deaths = int(r.get("deaths") or 0)
-                wins = int(r.get("wins") or 0)
-                defeats = int(r.get("defeats") or 0)
                 r["kd"] = round(kills / deaths, 2) if deaths else float(kills)
-                total = wins + defeats
-                r["win_rate"] = round(wins / total, 3) if total else 0
+                try:
+                    _pr = r.get("tourney_pr")
+                    r["tourney_pr"] = float(_pr) if _pr is not None else None
+                except Exception:
+                    r["tourney_pr"] = None
+                r.pop("defeats", None)
+                r.pop("win_rate", None)
             _attach_points(rows)
             # add rank
             for i, r in enumerate(rows):
                 r["rank"] = offset + i + 1
             return JSONResponse({"sort": sort, "order": order, "limit": limit, "offset": offset, "count": len(rows), "results": rows})
         else:
-            # kd / win_rate / comp — computed in python over a candidate window.
+            # kd / comp — computed in python over a candidate window.
             # comp: open-tourney totals per user (best tourney each); the Points
             # column carries the comp total under this sort (milestones are the
             # play-points ladder and don't apply here).
@@ -288,11 +292,9 @@ async def leaderboard(request: Request):
             for r in rows:
                 kills = int(r.get("kills") or 0)
                 deaths = int(r.get("deaths") or 0)
-                wins = int(r.get("wins") or 0)
-                defeats = int(r.get("defeats") or 0)
                 r["kd"] = round(kills / deaths, 2) if deaths else float(kills)
-                total = wins + defeats
-                r["win_rate"] = round(wins / total, 3) if total else 0
+                r.pop("defeats", None)
+                r.pop("win_rate", None)
             if sort == "comp":
                 try:
                     from .comp import open_tourney_points as _otp
@@ -441,7 +443,6 @@ async def get_user(request: Request):
         kills = int(row.get("kills") or 0)
         deaths = int(row.get("deaths") or 0)
         wins = int(row.get("wins") or 0)
-        defeats = int(row.get("defeats") or 0)
         per_gm = row.get("playtime_per_gm")
         if isinstance(per_gm, str):
             try:
@@ -459,9 +460,7 @@ async def get_user(request: Request):
             "kills": kills,
             "deaths": deaths,
             "wins": wins,
-            "defeats": defeats,
             "kd": round(kills / deaths, 2) if deaths else float(kills),
-            "win_rate": round(wins / (wins + defeats), 3) if (wins + defeats) else 0,
             "playtime_global": int(row.get("playtime_global") or 0),
             "playtime_per_gm": per_gm or {},
             "last_seen": row.get("last_seen"),

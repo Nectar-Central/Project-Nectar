@@ -10,9 +10,9 @@ Response:
   {
     "discord_username": "...", "discord_id": "...",
     "game_username": "...", "game_id": "...", "skin": "...", "pickaxe": "...",
-    "kills": 12, "deaths": 5, "wins": 3, "defeats": 8,
+    "kills": 12, "deaths": 5, "wins": 3,
     "playtime_global": 1234, "playtime_per_gm": {...},
-    "kd": 2.4, "win_rate": 0.27,
+    "kd": 2.4,
     "rank": {"by": "kills", "pct": 87, "rank": 5, "total": 120},
     "is_dev": false,
     "arena": {
@@ -202,10 +202,7 @@ async def get_stats(request: Request):
     kills = int(user.get("kills") or 0)
     deaths = int(user.get("deaths") or 0)
     wins = int(user.get("wins") or 0)
-    defeats = int(user.get("defeats") or 0)
     kd = round(kills / deaths, 2) if deaths else (float(kills) if kills else 0)
-    total_games = wins + defeats
-    win_rate = round(wins / total_games, 3) if total_games else 0
 
     # live session fallback: if no live view but user has game_mode hints, leave null
     session_out = None
@@ -491,6 +488,38 @@ async def get_stats(request: Request):
     except Exception:
         comp = []
 
+    # Tourney PR (latest computed rating + delta vs previous tourney).
+    # Additive, never breaks stats: missing column/table -> nulls.
+    tourney_pr = None
+    pr_prev = None
+    try:
+        try:
+            tourney_pr = user.get("tourney_pr")
+            tourney_pr = float(tourney_pr) if tourney_pr is not None else None
+        except Exception:
+            tourney_pr = None
+        try:
+            _ph = await db_io(lambda: supabase.table("bngc_comp_pr_history").select(
+                "pr").eq("discord_id", str(discord_id)).order(
+                "computed_at", desc=True).limit(2).execute())
+            _prs = [float(r.get("pr")) for r in ((_ph.data if hasattr(_ph, "data") else []) or [])
+                    if (r or {}).get("pr") is not None]
+            if _prs:
+                if tourney_pr is None:
+                    tourney_pr = _prs[0]
+                if len(_prs) > 1:
+                    pr_prev = _prs[1]
+        except Exception:
+            pass
+    except Exception:
+        tourney_pr, pr_prev = None, None
+    pr_delta_pct = None
+    try:
+        if tourney_pr is not None and pr_prev:
+            pr_delta_pct = round((tourney_pr - pr_prev) / pr_prev * 100, 1)
+    except Exception:
+        pr_delta_pct = None
+
     return JSONResponse({
         "discord_id": user.get("discord_id"),
         "discord_username": user.get("discord_username"),
@@ -501,12 +530,13 @@ async def get_stats(request: Request):
         "kills": kills,
         "deaths": deaths,
         "wins": wins,
-        "defeats": defeats,
         "play_points": int(user.get("play_points") or 0),
         "playtime_global": int(user.get("playtime_global") or 0),
         "playtime_per_gm": ppg or {},
         "kd": kd,
-        "win_rate": win_rate,
+        "tourney_pr": tourney_pr,
+        "pr_prev": pr_prev,
+        "pr_delta_pct": pr_delta_pct,
         "identity": identity,
         "comp": comp,
         "comp_tourney": comp_tourney,

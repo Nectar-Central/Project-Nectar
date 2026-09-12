@@ -371,17 +371,13 @@ def _self_death_evidence(room, view, me_name) -> bool:
 
 
 def _phase_end_result(room, view, me_name) -> str | None:
-    """Decide a real phase end (stG=3): 'win', 'defeat', or None (undecidable).
+    """Decide a real phase end (stG=3): 'win' or None (no win).
 
-    Same generosity as the live paths (quiet teammates presumed alive), but
-    total: it resolves from killfeed/flag evidence when the room has emptied
-    and live players can't be judged. Mid-match deferral is untouched — this
-    runs only at phase end, when the team's fate is final and holding the
-    marker past it would freeze the arm forever.
-
-    Zero-info fallback is 'win': the arm existing means our client saw this
-    room's match end while connected, and deaths are loud (killfeed + alv
-    always broadcast) — no death evidence anywhere means survived.
+    Wins-only: defeats are deleted, so non-win outcomes resolve to None and
+    the seal-only drain still seals ranked. Same generosity as before (quiet
+    teammates presumed alive; zero-info fallback is 'win': the arm existing
+    means our client saw this room's match end while connected, and deaths
+    are loud — no death evidence anywhere means survived).
     """
     try:
         if not room or not me_name:
@@ -398,9 +394,9 @@ def _phase_end_result(room, view, me_name) -> str | None:
         if alive or team is True:
             return "win"
         if _self_death_evidence(room, view, me_name):
-            return "defeat"
+            return None
         if team is False:
-            return "defeat"
+            return None
         return "win"
     except Exception:
         pass
@@ -740,36 +736,12 @@ def _sealed_count(rid) -> int:
         return 0
 
 
-def _defeat_recorded(session_id, room_id, match_ver, buf=None) -> bool:
-    """Phase-end-tolerant defeat check: matches the current version OR the
-    pre-bump one.
-
-    The stG=3 bump renumbers the room (N -> N+1) AFTER an early elimination
-    already wrote its defeat at N. A stale arm firing post-bump (flags reset
-    by the next stG=1, killfeed death evidence still present) must see that
-    write or it records a second defeat for the same match. Versions bump
-    exactly once per real phase end, so a V-1 hit can only be this match's
-    own pre-bump write — never a neighbouring match. Live (pre-bump) paths
-    must NOT use this: same-version-only there, or a new match's legitimate
-    defeat would be swallowed by the previous match's record.
-    """
-    try:
-        cur = int(match_ver)
-    except Exception:
-        return _result_event_exists(session_id, "defeat", room_id, match_ver, buf)
-    if _result_event_exists(session_id, "defeat", room_id, cur, buf):
-        return True
-    if cur > 0 and _result_event_exists(session_id, "defeat", room_id, cur - 1, buf):
-        return True
-    return False
-
-
 def _write_win(discord_id, session_id, user, gm, room_id, short_code, match_ver, winner, room,
                buf=None, dirty=None):
     """Queue one win (bngc_users counter + bngc_game_events row) + log lines.
     The counter UPDATE and event INSERT are flushed once at batch end —
     pass the process_batch buf/dirty pair. Marks room.last_win_version
-    (NOT drained — version bump re-enables next match).
+    (NOT drained — version bump re-enables next match). Wins-only: no defeats.
     """
     if _result_event_exists(session_id, "win", room_id, match_ver, buf):
         log_sys(f"PROCESSOR WIN skip already recorded gm={gm} room={str(room_id or '')[:8]} ver={match_ver}")
@@ -795,53 +767,6 @@ def _write_win(discord_id, session_id, user, gm, room_id, short_code, match_ver,
     _precision.schedule("win", session_id=session_id, discord_id=discord_id,
                         expected=new_wins, match_version=match_ver, room_id=room_id)
     return new_wins
-
-
-def _write_defeat(discord_id, session_id, user, gm, room_id, short_code, match_ver, room,
-                  buf=None, dirty=None):
-    """Queue one defeat (bngc_users counter + bngc_game_events row) + log lines.
-    The counter UPDATE and event INSERT are flushed once at batch end —
-    pass the process_batch buf/dirty pair.
-    Sets room.had_self_defeat so later stG=3 / leave defeats are blocked. DF excluded by caller.
-    Suppressed when a win was already recorded for this version (win stands).
-    """
-    if room is not None and (room.last_win_version == match_ver or room.last_win_version > match_ver):
-        log_sys(f"PROCESSOR DEFEAT skip win already recorded gm={gm}")  # Win stands
-        return user.get("defeats") or 0
-    # Cross-batch/worker: the in-memory marker above is lost on serverless
-    # restore, so a win sealed for this version on another pass would still
-    # let a stale defeat through. A personal win and defeat in one version
-    # are contradictory — the win stands, always. DB-checked (one query per
-    # defeat write at most; defeats are rare).
-    if _result_event_exists(session_id, "win", room_id, match_ver, buf):
-        log_sys(f"PROCESSOR DEFEAT skip sealed win exists gm={gm} room={str(room_id or '')[:8]} ver={match_ver}")
-        if room is not None:
-            room.last_win_version = match_ver  # heal marker so it isn't retried
-            room.had_self_defeat = True
-        return user.get("defeats") or 0
-    if _result_event_exists(session_id, "defeat", room_id, match_ver, buf):
-        log_sys(f"PROCESSOR DEFEAT skip already recorded gm={gm} room={str(room_id or '')[:8]} ver={match_ver}")
-        if room is not None:
-            room.had_self_defeat = True  # heal marker so it isn't retried
-        return user.get("defeats") or 0
-    new_def = _bump_user(user, dirty, "defeats")  # Increment (flushed at batch end)
-    if buf is None:
-        supabase.table("bngc_users").update({"defeats": new_def}).eq("discord_id", discord_id).execute()
-    _buf_event(buf, discord_id, session_id, "defeat",
-               {"gm": gm, "room_id": room_id, "short_code": short_code,
-                "match_version": match_ver})
-    try:
-        _duo = bool(room.is_duo) if room is not None else False
-    except Exception:
-        _duo = False
-    log_engine("defeat", session_id[:13], gm=gm, duo=_duo, room=str(room_id or "")[:8])
-    log_sys(f"PROCESSOR DEFEAT gm={gm} defeats {user.get('defeats',0)}->{new_def}")
-    user["defeats"] = new_def           # Update local cache
-    if room is not None:
-        room.had_self_defeat = True     # Block later stG=3 / leave defeats this life
-    _precision.schedule("defeat", session_id=session_id, discord_id=discord_id,
-                        expected=new_def, match_version=match_ver, room_id=room_id)
-    return new_def
 
 
 def _upsert_stats(discord_id, user):
@@ -1979,26 +1904,7 @@ async def process_batch(
                                                 room_id=pkt_room_id, extra={"via": "killfeed"})
                             if death_room is not None:
                                 death_room.had_self_death = True  # One death per life
-                            # Defeat NOW: death before stG=3 counts immediately (K/D-only
-                            # modes excluded), EXCEPT in duos with a living teammate
-                            # (defeat only when whole team dead). Later stG=3 / leave
-                            # defeats are blocked by had_self_defeat.
-                            try:
-                                if not _me_hosting_only and not _is_kd_only(eff_gm) and not (death_room is not None and death_room.had_self_defeat):
-                                    _tstat = _team_alive_for_me(death_room, view, me_name)
-                                    if _tstat is True or (_tstat is None and _eff_is_duo(death_room)):
-                                        # Duo + teammate alive OR duo + no team data yet → defer defeat for drain
-                                        if death_room is not None and death_room.last_defeat_version != death_room.match_version:
-                                            death_room.last_defeat_version = death_room.match_version
-                                        log_sys(f"PROCESSOR defeat deferred duo teammate alive gm={eff_gm} (held for drain)")
-                                    else:  # solo, no team data (non-duo), or whole team dead
-                                        _dr_id = getattr(death_room, "room_id", None) or pkt_room_id
-                                        _dr_ver = getattr(death_room, "match_version", None)
-                                        _dr_ver = _dr_ver if _dr_ver is not None else pkt_match_ver
-                                        _dr_short = getattr(death_room, "short_code", None) or pkt_short
-                                        await db_io(_write_defeat, discord_id, session_id, user, eff_gm, _dr_id, _dr_short, _dr_ver, death_room, ev_rows, dirty)
-                            except Exception as e:
-                                log_err(f"processor defeat-via-kill failed {e}")
+                            # Wins-only: no immediate defeat (deaths still count above).
 
             # --- Death via alv (self elim not in killfeed) ---
             # Some eliminations don't appear in killfeed (e.g. zone damage, disconnect)
@@ -2072,23 +1978,7 @@ async def process_batch(
                                                     expected=new_deaths_alv, match_version=pkt_match_ver,
                                                     room_id=pkt_room_id, extra={"via": "alv"})
                                 room_alv.had_self_death = True  # One death per life
-                                # Defeat NOW (same rule as killfeed path, K/D-only excluded)
-                                try:
-                                    if not _me_hosting_only and not _is_kd_only(eff_gm) and not room_alv.had_self_defeat:
-                                        _tstat_alv = _team_alive_for_me(room_alv, view, me_name)
-                                        if _tstat_alv is True or (_tstat_alv is None and _eff_is_duo(room_alv)):
-                                            # Duo + teammate alive OR duo + no team data yet → defer defeat for drain
-                                            if room_alv.last_defeat_version != room_alv.match_version:
-                                                room_alv.last_defeat_version = room_alv.match_version
-                                            log_sys(f"PROCESSOR defeat deferred duo teammate alive gm={eff_gm} via=alv (held for drain)")
-                                        else:  # solo, no team data (non-duo), or whole team dead
-                                            _ar_id = getattr(room_alv, "room_id", None) or pkt_room_id
-                                            _ar_ver = getattr(room_alv, "match_version", None)
-                                            _ar_ver = _ar_ver if _ar_ver is not None else pkt_match_ver
-                                            _ar_short = getattr(room_alv, "short_code", None) or pkt_short
-                                            await db_io(_write_defeat, discord_id, session_id, user, eff_gm, _ar_id, _ar_short, _ar_ver, room_alv, ev_rows, dirty)
-                                except Exception as e_def:
-                                    log_err(f"processor defeat-via-alv failed {e_def}")
+                                # Wins-only: no immediate defeat (deaths still count above).
                             else:
                                 log_sys(f"PROCESSOR DEATH via alv skip already counted this life")
                 except Exception as e:
@@ -2135,35 +2025,17 @@ async def process_batch(
                     except Exception as e_rl:
                         log_err(f"processor host-leave auto-end failed {e_rl}")
 
-                    # Defeat via leave: quitting mid-match is a personal defeat immediately
-                    # (abandon = loss, teammate status irrelevant). Blocked when already
-                    # recorded this life, when a win stands, or in K/D-only modes.
-                    try:
-                        if _names_equal(leaver, me_name):  # I am the leaver
-                            gm_low_lv = str(eff_gm or "").lower()  # Lowercase game mode
-                            if gm_low_lv and not _is_kd_only(eff_gm):  # K/D-only has no defeat
-                                room2 = _get_room(pkt_room_id, view)  # Resolve room
-                                # Room must be in MATCH state (pcount unused: I just left it)
-                                if room2 and room2.state.value == "match":
-                                    if (not _me_hosting_only
-                                            and not room2.had_self_defeat
-                                            and room2.last_win_version != room2.match_version):
-                                        await db_io(_write_defeat, discord_id, session_id, user, eff_gm, pkt_room_id, pkt_short, pkt_match_ver, room2, ev_rows, dirty)
-                                        log_sys(f"PROCESSOR DEFEAT via leave gm={eff_gm}")
-                                    else:
-                                        log_sys(f"PROCESSOR defeat-via-leave skip already recorded this life gm={eff_gm}")
-                    except Exception as e:
-                        log_err(f"processor defeat-via-leave failed {e}")
+                    # Wins-only: no defeat via leave (leave events still buffered
+                    # above for walkover detection).
 
                     # Walkover win: whole enemy team left (duo/small-team modes + 1v1s).
-                    # My own leave takes the defeat path above, never a walkover.
+                    # My own leave never walkovers (wins-only: no defeat via leave).
                     try:
                         _wo_gm = str(eff_gm or "").lower()
                         _wo_room = _get_room(pkt_room_id, view)  # Resolve independently (room2 is self-leave scoped)
                         if (not _me_hosting_only and _wo_gm and not _is_kd_only(eff_gm) and _wo_room is not None
                                 and _wo_room.state.value == "match" and me_name
                                 and not _names_equal(leaver, me_name)
-                                and not _wo_room.had_self_defeat
                                 and _wo_room.last_win_version != _wo_room.match_version):
                             _wo_winner = None
                             if _wo_room.teams and all(len(t.members) <= 2 for t in _wo_room.teams.values()):
@@ -2255,13 +2127,13 @@ async def process_batch(
 
     def _should_skip_room(r) -> bool:
         """Skip the lobby pseudo-room always (it can never produce a valid
-        win/defeat: its version never advances, so an arm there is undrainable),
-        plus lobby rooms with no game mode and no pending win/defeat.
+        win: its version never advances, so an arm there is undrainable),
+        plus lobby rooms with no game mode and no pending win.
         This prevents processing lobby-only batches that have no match data.
         """
         if r.room_id == "lobby":
             return True
-        return not r.game_mode and r.last_win_version != r.match_version and r.last_defeat_version != r.match_version
+        return not r.game_mode and r.last_win_version != r.match_version
 
     def _is_server_room(r) -> bool:
         """Server-created rooms carry a 5-char short_code.
@@ -2355,112 +2227,26 @@ async def process_batch(
             if not _me_hosting_only and my_k >= 15 and room4.last_win_version != room4.match_version:
                 await db_io(_write_win, discord_id, session_id, user, gm4, room_id4, room4.short_code, room4.match_version, my_tid4, room4, ev_rows, dirty)
                 log_sys(f"PROCESSOR WIN via race-to-15 team={my_tid4} {my_k}-{foe_best} gm={gm4}")
-            elif not _me_hosting_only and foe_best >= 15 and not room4.had_self_defeat:
-                await db_io(_write_defeat, discord_id, session_id, user, gm4, room_id4, room4.short_code, room4.match_version, room4, ev_rows, dirty)
-                log_sys(f"PROCESSOR DEFEAT via race-to-15 enemy hit 15 ({my_k}-{foe_best}) gm={gm4}")
+            # Wins-only: foe hitting 15 is no-win (no defeat).
     except Exception as exc:
         log_err(f"processor race-to-15 failed {exc}")
 
-    # --- Defeats: check alv=false, kill victim, or leave ---
-    # Processor uses alv fields directly (Engine just updates is_alive)
+    # --- Phase-end seal stub (wins-only): no defeat sweep/drain. Deaths
+    # still count via killfeed/alv live paths above. Ranked sealing unchanged.
     try:
-        for room_id2, room2 in list(view.rooms.items()):  # Iterate all rooms
-            if _should_skip_room(room2):  # Skip lobby with no pending defeat
+        for room_id2, room2 in list(view.rooms.items()):
+            if _should_skip_room(room2):
                 continue
-            gm2 = room2.game_mode.value if room2.game_mode else gm_val  # Room's game mode
-            if gm2 and gm2.lower() == "df":  # DF has no defeat
+            gm2 = room2.game_mode.value if room2.game_mode else gm_val
+            if gm2 and gm2.lower() == "df":
                 continue
-
-            # End-of-match sweep: phase just ended and I'm dead in room state (covers
-            # zone deaths with no killfeed/alv packets) — mark for drain below. Skipped
-            # when a defeat was already recorded this life (no double defeat at match
-            # end). Edge-triggered via stg_is_phase_end (a batch ending on stG=2 must
-            # still sweep).
-            me_name_local2 = (view.me.username if view.me else None) or user.get("game_username")
-            if (not _me_hosting_only
-                    and room2.last_defeat_version != room2.match_version and not room2.had_self_defeat
-                    and room2.stg_is_phase_end
-                    and me_name_local2 and room2.state.value == "match"):
-                # Phase-end verdict from live + evidence rules (resolves emptied rooms)
-                end_res = _phase_end_result(room2, view, me_name_local2)
-                if room2.players_count > 1 or end_res == "defeat":
-                    # Check if I'm dead (solo rule)
-                    is_dead = False
-                    for p in room2.players.values():
-                        if _names_equal(p.username, me_name_local2) and not p.is_alive:
-                            is_dead = True
-                            break
-
-                    # Duo: defeat only if whole team dead (quiet members presumed alive)
-                    _ta2 = _team_alive_for_me(room2, view, me_name_local2)
-                    if _ta2 is not None:
-                        is_dead = not _ta2
-                    elif _eff_is_duo(room2):
-                        is_dead = False  # duo + no team data yet → defer to drain
-
-                    if is_dead or end_res == "defeat":
-                        room2.last_defeat_version = room2.match_version  # Mark for drain
-                        log_sys(f"PROCESSOR marked defeat via stG room={room_id2[:8]} gm={gm2}")
-                        # Reconcile a death the live paths missed (keeps deaths == defeats)
-                        if not room2.had_self_death:
-                            old_def_death = user.get("deaths", 0)  # Pre-increment value for the log
-                            new_def_death = _bump_user(user, dirty, "deaths")  # Queued for batch-end flush
-                            _buf_event(ev_rows, discord_id, session_id, "death",
-                                       {"gm": gm2, "killer": None, "via": "stG",
-                                        "room_id": room_id2, "code": room2.short_code, "match_version": room2.match_version})
-                            log_sys(f"PROCESSOR DEATH via stG reconcile deaths {old_def_death}->{new_def_death}")
-                            room2.had_self_death = True
-                            _precision.schedule("death", session_id=session_id, discord_id=discord_id,
-                                                expected=new_def_death, match_version=room2.match_version,
-                                                room_id=room_id2, extra={"via": "stG"})
-
-            # Drain: single DB write point for defeats (kill/alv/stG markers set above;
-            # leave writes immediately). One defeat per life — a stale marker for an
-            # already-recorded defeat is discarded. A recorded win suppresses any defeat
-            # for the same version (win stands). A marker held while a duo teammate
-            # lives is kept (silent) until the team dies, then written.
             if room2.last_defeat_version == room2.match_version and room2.last_defeat_version != -1:
-                if room2.had_self_defeat:
-                    log_sys(f"PROCESSOR DEFEAT skip already recorded this life gm={gm2}")
-                    if room2.stg_is_phase_end:  # phase-end skip (not a mid-match live drain) -> seal ranked
-                        await db_io(seal_ranked_match, session_id, discord_id, room2, room_id2, gm2)
-                    room2.last_defeat_version = -1  # Discard stale marker
-                    room2.stg_is_phase_end = False  # resolved — arm must not outlive the guard
-                elif room2.last_win_version == room2.match_version:
-                    log_sys(f"PROCESSOR DEFEAT skip win already recorded gm={gm2}")
-                    room2.last_defeat_version = -1  # Discard stale marker
-                elif _eff_is_duo(room2) and _team_alive_for_me(room2, view, me_name_local2) is not False:
-                    pass  # hold marker silently — teammate still alive or no team data yet (duo ONLY; solo has no team data coming, so it must drain below)
-                elif await db_io(_defeat_recorded, session_id, room_id2, room2.match_version, ev_rows):
-                    log_sys(f"PROCESSOR DEFEAT skip already recorded gm={gm2} room={room_id2[:8]} ver={room2.match_version}")
-                    if room2.stg_is_phase_end:  # phase-end heal (not a mid-match live drain) -> seal ranked
-                        await db_io(seal_ranked_match, session_id, discord_id, room2, room_id2, gm2)
-                    room2.had_self_defeat = True  # heal marker so it isn't retried
-                    room2.last_defeat_version = -1  # Discard stale marker
-                    room2.stg_is_phase_end = False
-                elif _me_hosting_only:
-                    log_sys(f"PROCESSOR DEFEAT skip hosting_only gm={gm2}")
-                    room2.had_self_defeat = True
-                    room2.last_defeat_version = -1
-                    room2.stg_is_phase_end = False
-                    if room2.stg_is_phase_end:
-                        seal_ranked_match(session_id, discord_id, room2, room_id2, gm2)
-                else:
-                    old_def = user.get("defeats", 0)  # Pre-increment value for the log
-                    new_def = _bump_user(user, dirty, "defeats")  # Queued for batch-end flush
-                    _buf_event(ev_rows, discord_id, session_id, "defeat",
-                               {"gm": gm2, "room_id": room_id2, "short_code": room2.short_code,
-                                "match_version": room2.match_version})
-                    log_engine("defeat", session_id[:13], gm=gm2, duo=room2.is_duo, room=room_id2[:8])
-                    log_sys(f"PROCESSOR DEFEAT gm={gm2} defeats {old_def}->{new_def}")
-                    if room2.stg_is_phase_end:  # phase-end write (not a mid-match live drain) -> seal ranked
-                        await db_io(seal_ranked_match, session_id, discord_id, room2, room_id2, gm2)
-                    room2.had_self_defeat = True  # One defeat per life
-                    room2.last_defeat_version = -1  # Drain (prevent re-processing)
-                    room2.stg_is_phase_end = False  # consume phase-end arm for this version
-                    _precision.schedule("defeat", session_id=session_id, discord_id=discord_id,
-                                        expected=new_def, match_version=room2.match_version,
-                                        room_id=room_id2)
+                room2.last_defeat_version = -1  # discard stale defeat marker
+            if room2.stg_is_phase_end and room2.match_version > 0 and room2.state.value == "match":
+                await db_io(seal_ranked_match, session_id, discord_id, room2, room_id2, gm2)
+                room2.stg_is_phase_end = False
+    except Exception as exc:
+        log_err(f"processor phase-end seal stub failed {exc}")
 
         # --- Ranked seal sweep: one host call per phase end ---
         # Playing hosts usually sealed already via the win/defeat drains

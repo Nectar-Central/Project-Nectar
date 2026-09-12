@@ -17,9 +17,10 @@ def test_ord():
 
 
 def test_points_table_lines():
+    # WIN owns P1: 1st dropped, WIN + KILLS lead, then 2ND.. in bold caps.
     t = {"points_table": {"kill": 1, "win": 5, "placement": [10, 7]}}
     assert bot_mod._points_table_lines(t) == [
-        "1st = 10 pts", "2nd = 7 pts", "KILL = 1 pts", "WIN = 5 pts"]
+        "**WIN = 5 PTS**", "**KILLS = 1 PTS**", "**2ND = 7 PTS**"]
     # JSON string table also works
     import json
     assert bot_mod._points_table_lines(
@@ -34,13 +35,23 @@ def test_announce_has_points_section():
          "points_table": {"kill": 1, "win": 3, "placement": [10, 7, 5]}}
     text = bot_mod._comp_announce_text(t)
     assert "**POINTS**:" in text
-    assert "1st = 10 pts" in text
-    assert "KILL = 1 pts" in text
-    assert "WIN = 3 pts" in text
+    assert "**WIN = 3 PTS**" in text
+    assert "**KILLS = 1 PTS**" in text
+    assert "**2ND = 7 PTS**" in text
+    assert "1st" not in text.split("**POINTS**:")[1].split("WINNER")[0]
     # no table -> section omitted, template intact
     text2 = bot_mod._comp_announce_text({"id": 4, "name": "X"})
     assert "**POINTS**:" not in text2
     assert "## SOLO X" in text2
+
+
+def test_announce_start_time():
+    t = {"id": 4, "name": "Cup", "scheduled_at": "2026-09-12T18:30:00+00:00"}
+    text = bot_mod._comp_announce_text(t)
+    assert "**START TIME**:" in text
+    assert "<t:" in text and ":R>" in text
+    text2 = bot_mod._comp_announce_text({"id": 4, "name": "Cup"})
+    assert "**START TIME**:" not in text2
 
 
 def test_announce_hosted_by():

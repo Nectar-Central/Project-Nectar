@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Nectar Buildnow Companion
 // @namespace    https://github.com/Nectar-Central
-// @version      2.21.0
-// @description  Nectar Buildnow Companion v2.21.0 — leaderboard panel, insights, friends & chat, play points.
+// @version      2.22.0
+// @description  Nectar Buildnow Companion v2.22.0 — leaderboard panel, insights, friends & chat, play points.
 // @author       Nectar Labs
 // @match        https://buildnow-gg.game-files.crazygames.com/*
 // @match        https://*.crazygames.com/*
@@ -31,7 +31,7 @@
 
 (function () {
   'use strict';
-  const BNC_VERSION = '2.21.0';
+  const BNC_VERSION = '2.22.0';
   const HREF = (() => { try { return location.href; } catch { return ''; } })();
   const IS_GAME_FRAME = HREF.includes('buildnow-gg.game-files.crazygames.com');
   // Loading shell lives inside an intermediate iframe (games.crazygames.com),
@@ -1955,7 +1955,9 @@
     const deaths = sc? sc.deaths : null;
     const kd = sc && sc.kd!=null ? sc.kd : null;
     const wins = sc? sc.wins : null;
-    const defeats = sc? sc.defeats : null;
+    const tpr = sc && sc.tourney_pr!=null ? sc.tourney_pr : null;
+    const tprDelta = sc && sc.pr_delta_pct!=null ? sc.pr_delta_pct : null;
+    const tprTxt = tpr==null ? null : (`${tpr}` + (tprDelta==null ? '' : (tprDelta>0 ? ` (+${tprDelta}%)` : (tprDelta<0 ? ` (${tprDelta}%)` : ' (=)'))));
     const rankPct = sc && sc.rank && sc.rank.total>=2 ? sc.rank.pct : null;
     const pGlobal = sc? sc.playtime_global : null;
     const sess = sc && sc.session ? sc.session : null;
@@ -2096,7 +2098,7 @@
           ${row('Play points', sc && sc.play_points!=null ? fmtPts(sc.play_points) : null)}
           ${(_inTourneyRoom && sc && sc.comp && sc.comp.length ? sc.comp.map(c=>row('🏆 '+String(c.tourney_name!=null?c.tourney_name:('Event #'+c.tourney_id)).replace(/</g,'&lt;'), fmtPts(c.points)+` (${c.wins||0}W)`)).join('') : '')}
           ${row('Wins', wins)}
-          ${row('Defeats', defeats)}
+          ${row('Tourney PR', tprTxt)}
           ${row('Playtime', pGlobal!=null? fmtPlaytimeDrawer(pGlobal):null)}
           ${perGmRow}
           ${rankPct!=null? `<div style="font-size:12px;color:#9ca3af;text-align:center;margin-top:2px">Better than <span style="color:#fff;font-weight:800">${rankPct}%</span> of players</div>`:''}`;
@@ -3179,6 +3181,25 @@
     // bare counter: just the number. No name, no rank, no K/W, no "pts".
     el.innerHTML=`<div style="font-size:23px;font-weight:800;color:#fff">${escS(pts)}</div>`;
     el.style.display='flex';
+    try{ updateCompToast(d); }catch{}
+  }
+  // --- COMP TOASTS: ELIMINATION / VICTORY / PLACEMENT +X Points (left-slide,
+  // same queue as ranked). Fires on tourney-point increases within one
+  // tourney: wins up -> VICTORY, kills up -> ELIMINATION, else PLACEMENT.
+  let _prevCompSnap=null;
+  function updateCompToast(d){
+    const snap=(d && d.tourney_id!=null)
+      ? {tid:String(d.tourney_id), pts:Number(d.points)||0, kills:Number(d.kills)||0, wins:Number(d.wins)||0}
+      : {tid:'', pts:0, kills:0, wins:0};
+    const prev=_prevCompSnap;
+    _prevCompSnap=snap;
+    if(!prev) return;  // first sighting: baseline only
+    if(!IS_GAME_FRAME) return;  // track baseline everywhere, toast in game only
+    if(!snap.tid || snap.tid!==prev.tid) return;  // left room / new tourney: re-baseline silently
+    const delta=snap.pts-prev.pts;
+    if(!(delta>0)) return;
+    const label=(snap.wins>prev.wins) ? 'VICTORY' : ((snap.kills>prev.kills) ? 'ELIMINATION' : 'PLACEMENT');
+    queuePtsToast(label, delta, {key:`comp:${snap.tid}:${snap.pts}`});
   }
   // Party-invite gate: pID required, plus tourney rooms and mid-match both
   // block invites (locked by comp rules). Single choke point for every
@@ -3247,7 +3268,7 @@
   let lbFriends=null, lbFriendsLoading=false, lbInvites=null, lbSearch=[], lbSearchLoading=false;
   let lbUnread=null, lbChatWith=null, lbChat=[], lbChatLoading=false, lbChatTimer=null, _chatRefocus=false;
   const LB_LIMIT=20;
-  const LB_SORTS=[['points','Points'],['kills','Kills'],['wins','Wins'],['kd','K/D'],['playtime_global','Playtime'],['comp','Comp']];
+  const LB_SORTS=[['points','Points'],['kills','Kills'],['wins','Wins'],['kd','K/D'],['playtime_global','Playtime'],['comp','Comp'],['pr','PR']];
   function createLbPanel(){
     if(document.getElementById('bnc-lb')){ lbPanel=document.getElementById('bnc-lb'); return; }
     const ov=document.createElement('div');
@@ -3805,15 +3826,14 @@
     const m=evStatusMeta(t.status);
     if(sub) sub.textContent=`Event #${t.id}`;
     const card=(label,val)=>`<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 12px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;font-size:12px"><span style="color:#9ca3af">${label}</span><span style="color:#fff;font-weight:700;text-align:right">${val}</span></div>`;
-    // Scoring readout from the tourney points table (1st = X pts …).
-    const evOrd=(n)=>{ try{ n=Number(n); const s=['th','st','nd','rd']; const v=n%100; return n+(s[(v-20)%10]||s[v]||s[0]); }catch{ return '—'; } };
+    // Scoring readout from the tourney points table (WIN owns P1: 1st dropped).
+    const evOrd=(n)=>{ try{ n=Number(n); const s=['th','st','nd','rd']; const v=n%100; return (n+(s[(v-20)%10]||s[v]||s[0])).toUpperCase(); }catch{ return '—'; } };
     let scoringHtml='';
     try{
       const pt=(t&&t.points_table)||{};
       const pl=pt.placement||[10,7,5,3,1];
-      const parts=pl.map((p,i)=>`${evOrd(i+1)} = ${p} pts`);
-      parts.push(`KILL = ${pt.kill!=null?pt.kill:1} pts`);
-      parts.push(`WIN = ${pt.win!=null?pt.win:3} pts`);
+      const parts=[`WIN = ${pt.win!=null?pt.win:3} PTS`, `KILLS = ${pt.kill!=null?pt.kill:1} PTS`];
+      pl.forEach((p,i)=>{ if(i===0) return; parts.push(`${evOrd(i+1)} = ${p} PTS`); });
       scoringHtml=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">SCORING</div>`
         + `<div style="font-size:12px;color:#e5e7eb;padding:5px 12px;line-height:1.7">${parts.map(esc).join(' · ')}</div>`;
     }catch{}
@@ -3848,14 +3868,15 @@
     if(!body) return;
     const esc=(v)=> String(v==null?'—':v).replace(/</g,'&lt;');    if(lbLoading){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Loading…</div>`; return; }
     if(!lbRows.length){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">No players yet — play a match first.</div>`; return; }
+    const prMode=(typeof lbSort!=='undefined' && lbSort==='pr');
     const rows=lbRows.map(r=>{
       const name=r.game_username || r.discord_username || '—';
       const kd=(r.kd==null)?'—':r.kd;
-      const pt=(r.points==null)?'—':Number(r.points).toLocaleString('en-US');
+      const pt=prMode ? (r.tourney_pr==null?'—':r.tourney_pr) : ((r.points==null)?'—':Number(r.points).toLocaleString('en-US'));
       const color=r.milestone_color || '#fff';
       return `<div style="display:grid;grid-template-columns:34px 1fr 70px 56px 56px 56px 76px;gap:6px;align-items:center;padding:7px 4px;border-bottom:1px solid rgba(255,255,255,0.05);font-size:12px"><span style="color:#6b7280">#${esc(r.rank)}</span><span data-prof="${esc(r.discord_id||'')}" title="Open profile" style="color:#fff;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer;text-decoration:underline;text-decoration-color:rgba(255,255,255,0.25)">${esc(name)}</span><span style="color:${color};font-weight:700;text-align:right">${esc(pt)}</span><span style="color:#e5e7eb;text-align:right">${esc(r.kills)}</span><span style="color:#e5e7eb;text-align:right">${esc(r.wins)}</span><span style="color:#e5e7eb;text-align:right">${esc(kd)}</span><span style="color:#9ca3af;text-align:right">${esc(fmtPlaytimeDrawer(r.playtime_global))}</span></div>`;
     }).join('');
-    body.innerHTML=`<div style="display:grid;grid-template-columns:34px 1fr 70px 56px 56px 56px 76px;gap:6px;padding:4px;font-size:10px;font-weight:800;color:#6b7280;letter-spacing:.06em"><span>RANK</span><span>PLAYER</span><span style="text-align:right">POINTS</span><span style="text-align:right">KILLS</span><span style="text-align:right">WINS</span><span style="text-align:right">K/D</span><span style="text-align:right">PLAYTIME</span></div>`+rows;
+    body.innerHTML=`<div style="display:grid;grid-template-columns:34px 1fr 70px 56px 56px 56px 76px;gap:6px;padding:4px;font-size:10px;font-weight:800;color:#6b7280;letter-spacing:.06em"><span>RANK</span><span>PLAYER</span><span style="text-align:right">${prMode?'PR':'POINTS'}</span><span style="text-align:right">KILLS</span><span style="text-align:right">WINS</span><span style="text-align:right">K/D</span><span style="text-align:right">PLAYTIME</span></div>`+rows;
     try{
       body.querySelectorAll('[data-prof]').forEach(el=>{
         el.onclick=(e)=>{
@@ -3914,7 +3935,6 @@
       box('Deaths', esc(r.deaths)),
       box('K/D', esc(r.kd)),
       box('Wins', esc(r.wins)),
-      box('Win rate', (r.win_rate!=null?Math.round(r.win_rate*100)+'%':'—')),
       box('Playtime', esc(fmtPlaytimeDrawer(r.playtime_global))),
       box('Last online', esc(fmtLastSeen(r.last_seen)), r.last_seen ? ('Last seen ' + r.last_seen) : 'No heartbeat yet'),
       box('Playstyle', styleVal, styleTip),

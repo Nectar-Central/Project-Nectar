@@ -1,6 +1,7 @@
-"""Regression: phase-end (stG=3) must resolve win/defeat even when the room has
+"""Regression: phase-end (stG=3) must resolve wins even when the room has
 emptied (no live players to judge) — the duo zw_lg case where matches ended
-with an undrained arm and nothing was ever recorded.
+with an undrained arm and nothing was ever recorded. Wins-only: non-wins
+resolve to None (seal-only drain still seals ranked).
 
 Uses the real helpers against constructed RoomViews (no DB, no engine feed).
 """
@@ -49,9 +50,9 @@ def test_solo_alive_is_win():
     assert _phase_end_result(r, v, "me") == "win"
 
 
-def test_solo_dead_tracked_is_defeat():
+def test_solo_dead_tracked_is_no_win():
     r, v = _room(dead=("me",))
-    assert _phase_end_result(r, v, "me") == "defeat"
+    assert _phase_end_result(r, v, "me") is None
 
 
 def test_duo_teammate_alive_carries_win():
@@ -59,10 +60,10 @@ def test_duo_teammate_alive_carries_win():
     assert _phase_end_result(r, v, "me") == "win"
 
 
-def test_duo_both_dead_is_defeat():
+def test_duo_both_dead_is_no_win():
     r, v = _room(teammates=("mate",), dead=("me", "mate"),
                  feed_killed_me=True)
-    assert _phase_end_result(r, v, "me") == "defeat"
+    assert _phase_end_result(r, v, "me") is None
 
 
 def test_emptied_room_no_death_evidence_is_win():
@@ -74,15 +75,15 @@ def test_emptied_room_no_death_evidence_is_win():
     assert _phase_end_result(r, v, "me") == "win"
 
 
-def test_emptied_room_with_death_flag_is_defeat():
+def test_emptied_room_with_death_flag_is_no_win():
     r, v = _room(players=False, flag=True)
-    assert _phase_end_result(r, v, "me") == "defeat"
+    assert _phase_end_result(r, v, "me") is None
 
 
-def test_emptied_room_with_killfeed_death_is_defeat():
+def test_emptied_room_with_killfeed_death_is_no_win():
     r, v = _room(players=False, feed_killed_me=True)
     r.me = None
-    assert _phase_end_result(r, v, "me") == "defeat"
+    assert _phase_end_result(r, v, "me") is None
 
 
 def test_no_info_at_all_falls_back_to_win():
