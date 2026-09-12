@@ -1861,7 +1861,11 @@ async def process_batch(
                     _buf_event(ev_rows, discord_id, session_id, "kill",
                                {"gm": eff_gm, "victim": instigated, "room_id": pkt_room_id,
                                 "code": pkt_short, "match_version": pkt_match_ver})
-                    log_sys(f"PROCESSOR KILL victim={instigated} kills {old_kills}->{new_kills}")
+                    try:
+                        _k_actors = _extract_actors(pkt)
+                    except Exception:
+                        _k_actors = (None, None)
+                    log_sys(f"PROCESSOR KILL victim={instigated} kills {old_kills}->{new_kills} actors={_k_actors}")
                     _precision.schedule("kill", session_id=session_id, discord_id=discord_id,
                                         expected=new_kills, match_version=pkt_match_ver,
                                         room_id=pkt_room_id, extra={"victim": instigated})
@@ -1915,12 +1919,19 @@ async def process_batch(
                     alv_is_alive = pkt.get("is_alive") if isinstance(pkt, dict) else getattr(pkt, "is_alive", None)
                     alv_is_elim = pkt.get("is_eliminated") if isinstance(pkt, dict) else getattr(pkt, "is_eliminated", None)
                     alv_player = pkt.get("player_name") or player_name or instigator  # Which player
+                    _alv_via = "explicit-name" if alv_player else "unknown"
+                    _alv_actors = (None, None)
+                    try:
+                        if isinstance(pkt, dict):
+                            _alv_actors = _extract_actors(pkt)
+                    except Exception:
+                        pass
 
                     # Resolve nameless alv via actor map FIRST (correct attribution:
                     # actor 2's death must not count as mine just because I'm also dead)
                     if not alv_player and isinstance(pkt, dict):
                         try:
-                            _pa, _pt = _extract_actors(pkt)  # Threaded from Engine params
+                            _pa, _pt = _alv_actors  # Threaded from Engine params
                             _rm0 = _get_room(pkt_room_id, view) if pkt_room_id else view.current_room
                             if _rm0:  # Try sender then subject actor
                                 for _nr in (_pa, _pt):
@@ -1932,13 +1943,20 @@ async def process_batch(
                                         _nm = None
                                     if _nm:  # Resolved: trust the map (may or may not be me)
                                         alv_player = _nm
+                                        _alv_via = f"actor_map[{_nr}]"
                                         break
+                            if alv_player:
+                                try:
+                                    _mine_v = _is_self(_get_room(pkt_room_id, view), view, user, alv_player)
+                                except Exception:
+                                    _mine_v = "?"
+                                log_sys(f"PROCESSOR alv resolve actors={(_pa, _pt)} -> {alv_player} via={_alv_via} mine={_mine_v}")
                         except Exception:
                             pass
                     # Last resort: no name AND no actor info — if I'm dead in room state,
                     # assume this nameless alv=false is mine (my own broadcast without 255)
                     if not alv_player and pkt_room_id and isinstance(pkt, dict) and pkt.get("is_alive") is False:
-                        _pa2, _pt2 = _extract_actors(pkt)
+                        _pa2, _pt2 = _alv_actors
                         if _pa2 is None and _pt2 is None:  # Truly anonymous — heuristic allowed
                             try:
                                 room_alv = _get_room(pkt_room_id, view)  # Resolve room
@@ -1947,6 +1965,8 @@ async def process_batch(
                                         if _names_equal(pp.username, me_name) and not pp.is_alive:  # My player is dead
                                             alv_player = me_name  # Found myself
                                             alv_is_alive = False  # Confirm dead
+                                            _alv_via = "assume-mine heuristic"
+                                            log_sys(f"PROCESSOR alv assume-mine heuristic fired for {me_name} (truly anonymous alv=false)")
                                             break                # Stop searching
                             except Exception:
                                 pass   # Silently ignore lookup errors
@@ -1972,7 +1992,7 @@ async def process_batch(
                                 _buf_event(ev_rows, discord_id, session_id, "death",
                                            {"gm": eff_gm, "killer": None, "via": "alv",
                                             "room_id": pkt_room_id, "code": pkt_short, "match_version": pkt_match_ver})
-                                log_sys(f"PROCESSOR DEATH via alv deaths {old_deaths_alv}->{new_deaths_alv}")
+                                log_sys(f"PROCESSOR DEATH via alv deaths {old_deaths_alv}->{new_deaths_alv} name={alv_player} via={_alv_via} actors={_alv_actors}")
                                 death_counted_for_match.add(dedup_key_alv)  # Mark as counted
                                 _precision.schedule("death", session_id=session_id, discord_id=discord_id,
                                                     expected=new_deaths_alv, match_version=pkt_match_ver,

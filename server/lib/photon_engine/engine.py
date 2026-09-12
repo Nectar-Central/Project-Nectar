@@ -234,8 +234,9 @@ def _resolve_actor(room, nr: int | None) -> str | None:
             return str(room.actor_map[nr])
         if nr_int is not None and nr_int in room.actor_map:
             return str(room.actor_map[nr_int])
-        if nr in room.players:
-            return str(room.players[nr].username)
+        # NOTE: room.players dict keys are opaque slot ids (actor-or-bumped-
+        # key), NOT actor numbers — never resolve nr via dict key (that
+        # misattributed teammate alvs to whoever sat in the numbered slot).
         for p in room.players.values():
             try:
                 if nr_int is not None and int(p.actor_nr) == nr_int:
@@ -264,7 +265,9 @@ def _resolve_actor(room, nr: int | None) -> str | None:
 def _find_player(room, actor=None, target=None, name=None):
     """Resolve (key, player): TargetActorNr subject first, then sender ActorNr, then name.
     _pt/skin packets address the subject ONLY via TargetActorNr (actor is the room
-    master), so target must win. Actor 0 = room-level, never a player — skipped."""
+    master), so target must win. Actor 0 = room-level, never a player — skipped.
+    Dict keys are opaque slot ids, never actor numbers: match the Player.actor_nr
+    field (or the actor_map name), never the dict key."""
     for nr in (target, actor):
         if nr is None:
             continue
@@ -274,11 +277,12 @@ def _find_player(room, actor=None, target=None, name=None):
             continue
         if nr == 0:
             continue
-        try:
-            if nr in room.players:
-                return nr, room.players[nr]
-        except Exception:
-            pass
+        for k, p in room.players.items():
+            try:
+                if int(getattr(p, "actor_nr", -1)) == nr:
+                    return k, p
+            except Exception:
+                continue
         nm = None
         try:
             nm = room.actor_map.get(nr)
@@ -288,9 +292,6 @@ def _find_player(room, actor=None, target=None, name=None):
             for k, p in room.players.items():
                 if _names_equal(p.username, nm):
                     return k, p
-        for k, p in room.players.items():
-            if p.actor_nr == nr:
-                return k, p
     if name:
         for k, p in room.players.items():
             if _names_equal(p.username, name):
@@ -1298,6 +1299,32 @@ class Engine:
                         existing_key = k
                         break
                 if existing_key is not None:
+                    # Rejoin under a new actor number (reconnect): evict the
+                    # stale actor->name map entry or later alvs for the old
+                    # number misattribute to this player. Then refresh the
+                    # player's actor_nr + map to the current number.
+                    try:
+                        if p_actor is not None:
+                            _new_nr = int(p_actor)
+                            _old_nr = None
+                            try:
+                                _old_nr = int(getattr(room.players[existing_key], "actor_nr", -1))
+                            except Exception:
+                                _old_nr = None
+                            if _old_nr is not None and _old_nr != -1 and _old_nr != _new_nr:
+                                try:
+                                    if _names_equal(room.actor_map.get(_old_nr), join_name):
+                                        room.actor_map.pop(_old_nr, None)
+                                        log_engine("debug", session_id[:13], msg=f"actor_map evicted stale {_old_nr}->{join_name} (rejoined as {_new_nr})", room=room.room_id[:8])
+                                except Exception:
+                                    pass
+                            try:
+                                room.players[existing_key].actor_nr = _new_nr
+                                room.actor_map[_new_nr] = join_name
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                     was_dead = not room.players[existing_key].is_alive
                     room.players[existing_key].is_alive = True
                     # re-join of a dead player (e.g. multi-round reset) = new life for self
@@ -1327,7 +1354,10 @@ class Engine:
                         pt = room.pending_pt.pop(key)
                         log_engine("team_pt", session_id[:13], team=pt, target=key, player=join_name, via="pending apply on join", room=room.room_id[:8])
                     room.players[key] = Player(
-                        actor_nr=key if p_actor is not None else -1,
+                        # dict key may be bumped on collision — the actor_nr
+                        # field must stay the REAL number (or -1), never the
+                        # slot key, or later actor lookups hit the wrong row.
+                        actor_nr=int(p_actor) if p_actor is not None else -1,
                         username=join_name,
                         game_id=str(pfid) if pfid else None,
                         skin=str(skid) if skid else None,
@@ -1444,29 +1474,61 @@ class Engine:
             alv_name, actor_nr = _resolve_alv_subject(room, packet.player_name, gpb, actor_nr)
             target = None
             target_key = None
-            if actor_nr is not None and int(actor_nr) in room.players:
-                target = room.players[int(actor_nr)]
-                target_key = int(actor_nr)
-            elif alv_name:
+            alv_via = "unknown"
+            # Name first (fresh 255/map name beats a possibly-stale number),
+            # then the Player.actor_nr field — never the opaque dict key.
+            # Both candidates are compared: when they name DIFFERENT known
+            # players the stored number is stale (rejoin under a new number)
+            # and the name wins.
+            _name_hit = None
+            if alv_name:
                 for k, p in room.players.items():
                     if _names_equal(p.username, alv_name):
-                        target = p
-                        target_key = k
+                        _name_hit = (k, p)
                         break
                 # fallback to packet.player_name if alv_name differs
-                if not target and packet.player_name:
+                if _name_hit is None and packet.player_name:
                     for k, p in room.players.items():
                         if _names_equal(p.username, packet.player_name):
-                            target = p
-                            target_key = k
+                            _name_hit = (k, p)
                             break
+            _field_hit = None
+            if actor_nr is not None:
+                try:
+                    _an = int(actor_nr)
+                    for k, p in room.players.items():
+                        try:
+                            if int(getattr(p, "actor_nr", -1)) == _an:
+                                _field_hit = (k, p)
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+            if _name_hit is not None and _field_hit is not None and not _names_equal(
+                    _name_hit[1].username, _field_hit[1].username):
+                # stale-number misattribution caught red-handed: heal the
+                # stale field + map so it can never fire again, and log it.
+                try:
+                    log_engine("warn", session_id[:13], msg=f"alv subject mismatch name={_name_hit[1].username} field-player={_field_hit[1].username} actor={actor_nr} target={target_actor_nr} — trusting name, healing field", room=room.room_id[:8])
+                except Exception:
+                    pass
+                try:
+                    _field_hit[1].actor_nr = -1
+                    if actor_nr is not None and alv_name:
+                        room.actor_map[int(actor_nr)] = alv_name
+                except Exception:
+                    pass
+                target, target_key = _name_hit[1], _name_hit[0]
+                alv_via = "explicit-name" if packet.player_name and _names_equal(packet.player_name, alv_name) else "map-name"
+            elif _name_hit is not None:
+                target, target_key = _name_hit[1], _name_hit[0]
+                alv_via = "explicit-name" if packet.player_name and _names_equal(packet.player_name, alv_name) else "map-name"
+            elif _field_hit is not None:
+                target, target_key = _field_hit[1], _field_hit[0]
+                alv_via = "actor_nr-field"
             if target is None and alv_name:
-                for k, p in room.players.items():
-                    if _names_equal(p.username, alv_name):
-                        target = p
-                        target_key = k
-                        break
-                if target is None:
+                    alv_via = "backfill-new"
                     key = int(actor_nr) if actor_nr is not None else -1
                     if key == -1:
                         key = hash(alv_name) % 100000
@@ -1474,7 +1536,8 @@ class Engine:
                             key = (key + 1) % 100000
                     skid, pid, pfid, pt = _other_props()
                     target = Player(
-                        actor_nr=key,
+                        # never store a hash/slot key as the actor number
+                        actor_nr=int(actor_nr) if actor_nr is not None else -1,
                         username=alv_name,
                         game_id=str(pfid) if pfid else None,
                         skin=str(skid) if skid else None,
@@ -1524,10 +1587,10 @@ class Engine:
                 if not target.is_alive and was_alive:
                     if room.players_count > 0:
                         room.players_count = max(0, room.players_count - 1)
-                    log_engine("alv", session_id[:13], name=target.username, alive=False, count=room.players_count, room=room.room_id[:8], actor=actor_nr, target=target_actor_nr)
+                    log_engine("alv", session_id[:13], name=target.username, alive=False, count=room.players_count, room=room.room_id[:8], actor=actor_nr, target=target_actor_nr, via=alv_via)
                 elif target.is_alive and not was_alive:
                     room.players_count += 1
-                    log_engine("alv", session_id[:13], name=target.username, alive=True, count=room.players_count, room=room.room_id[:8], actor=actor_nr, target=target_actor_nr)
+                    log_engine("alv", session_id[:13], name=target.username, alive=True, count=room.players_count, room=room.room_id[:8], actor=actor_nr, target=target_actor_nr, via=alv_via)
                     # revive/respawn/round-reset for self = new life: reset per-life flags
                     if target.is_self or (view.me and _names_equal(target.username, view.me.username)):
                         room.had_self_death = False

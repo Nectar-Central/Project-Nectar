@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Nectar Buildnow Companion
 // @namespace    https://github.com/Nectar-Central
-// @version      2.22.0
-// @description  Nectar Buildnow Companion v2.22.0 — leaderboard panel, insights, friends & chat, play points.
+// @version      2.22.1
+// @description  Nectar Buildnow Companion v2.22.1 — leaderboard panel, insights, friends & chat, play points.
 // @author       Nectar Labs
 // @match        https://buildnow-gg.game-files.crazygames.com/*
 // @match        https://*.crazygames.com/*
@@ -31,7 +31,7 @@
 
 (function () {
   'use strict';
-  const BNC_VERSION = '2.22.0';
+  const BNC_VERSION = '2.22.1';
   const HREF = (() => { try { return location.href; } catch { return ''; } })();
   const IS_GAME_FRAME = HREF.includes('buildnow-gg.game-files.crazygames.com');
   // Loading shell lives inside an intermediate iframe (games.crazygames.com),
@@ -828,6 +828,10 @@
     } catch(e) { return false; }
   }
 
+  // Optimistic killfeed dedup: the broadcast + its inbound retransmit arrive
+  // as separate sightings ~0.5s apart — without this every kill shows +2
+  // then "flips back" on the next stats poll. Same pair inside 5s bumps once.
+  let _optKfLast = { key: '', at: 0 };
   function _applyOptimisticKillfeed(killer, victim) {
     const myName = GMGet('bnc_game_username', '') || '';
     if (!myName) return;
@@ -835,6 +839,15 @@
     const killerNorm = _normName(killer);
     const victimNorm = _normName(victim);
     if (!statsCache) return;
+    try {
+      const key = `${killerNorm || ''}>${victimNorm || ''}`;
+      const now = Date.now();
+      if (key && key === _optKfLast.key && now - _optKfLast.at < 5000) {
+        logSys(`[OPTIMISTIC] killfeed dup ignored ${killer}→${victim}`);
+        return;
+      }
+      _optKfLast = { key, at: now };
+    } catch {}
     if (myNorm && killerNorm && myNorm === killerNorm) {
       statsCache.kills = (statsCache.kills || 0) + 1;
       logSys(`[OPTIMISTIC] KILL +1 → ${statsCache.kills} victim=${victim}`);
