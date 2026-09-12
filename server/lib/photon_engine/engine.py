@@ -208,6 +208,16 @@ def room_enter_on_combat(room, view, session_id, killer, victim, game_mode=None)
         except Exception:
             pass
         try:
+            # First combat numbers the match: a public room stuck at v0 can never
+            # drain (processor requires match_version > 0). Bump 0->1 here and
+            # ensure the stG=3 one-shot is armed for the coming phase end.
+            if int(getattr(room, "match_version", 0) or 0) <= 0:
+                room.match_version = 1
+            if not getattr(room, "stg3_armed", True):
+                room.stg3_armed = True
+        except Exception:
+            pass
+        try:
             room.match_playtime.last_state = State.MATCH.value
             view.playtime.last_state = State.MATCH.value
         except Exception:
@@ -567,15 +577,12 @@ class Engine:
                 except Exception:
                     pass
                 room.stg_is_phase_end = True  # arm win path (repeats/timers leave it)
-                # Bump unconditionally on a real phase end in a live
-                # room: the version numbers the MATCH, not the player.
-                # Gating it on identity (old code required view.me)
-                # stranded null-identity sessions at version 0, where
-                # the processor win drain (`match_version > 0`) can
-                # never fire — wins silently lost while killfeed and
-                # defeats recorded fine. Winner attribution still
-                # needs identity downstream; numbering must not.
-                if room.state == State.MATCH:
+                # Bump on a real phase end in any real room: the version numbers
+                # the MATCH, not the FSM state. A room flapped to LOBBY by an
+                # intermission blip (scene MainLobby/auth) before stG=3 must
+                # still advance, or the processor `match_version > 0` gate
+                # blocks the drain forever. The lobby pseudo-room never bumps.
+                if str(getattr(room, "room_id", "") or "") != "lobby":
                     # bump version for next match — Processor checks stG==3 to calculate win/defeat
                     # (per-life flags are left untouched: the ended match's
                     # drain still needs them; they reset on next stG=1)
@@ -991,11 +998,17 @@ class Engine:
                     log_engine("room", session_id[:13], action="pID", code=room.short_code, room=room.room_id[:8], note="from pending")
                 elif pending:
                     log_engine("debug", session_id[:13], msg=f"stale pending pID {pending} dropped", room=room.room_id[:8])
-            # Pending GM: JoinRandomRoom with gm but no RoomName → next room gets it (wwzw vs BF2V2 mix)
-            if packet.game_mode and not room_name:
+            # Pending GM: JoinRandomRoom with gm but no real RoomName → next real room
+            # gets it (wwzw vs BF2V2 mix, public zw_lg -> JoinRoom flow). A synthetic
+            # mm-* room_name counts as "no real room": the gm must ALSO be stashed
+            # so the following real JoinRoom (gm=?) can inherit it. Only concrete
+            # modes are stashed (DF/UNKNOWN placeholders must not pollute next room).
+            _is_mm_name = isinstance(room_name, str) and room_name.startswith("mm-")
+            _concrete_gm = (packet.game_mode and packet.game_mode not in (GameMode.DF, GameMode.UNKNOWN))
+            if packet.game_mode and (not room_name or _is_mm_name) and _concrete_gm:
                 self._pending_gm[session_id] = packet.game_mode
                 log_engine("debug", session_id[:13], msg=f"pending gm {packet.game_mode.value} for next room", room=room.room_id[:8])
-            elif room_name and room.game_mode in (None, GameMode.UNKNOWN) and session_id in self._pending_gm:
+            elif room_name and not _is_mm_name and room.game_mode in (None, GameMode.UNKNOWN) and session_id in self._pending_gm:
                 pending_gm = self._pending_gm.pop(session_id, None)
                 if pending_gm:
                     room.game_mode = pending_gm
@@ -1197,7 +1210,14 @@ class Engine:
                 # blanks/DF placeholders or corrects concrete-vs-concrete (never
                 # clobbers with DF), so lobby scenes are safe.
                 try:
-                    _cm = GameMode.from_curscn(cur_scn)
+                    _hint = getattr(packet, "game_mode", None) or getattr(room, "game_mode", None)
+                    try:
+                        _pend = self._pending_gm.get(session_id)
+                        if _hint in (None, GameMode.DF, GameMode.UNKNOWN) and _pend not in (None, GameMode.DF, GameMode.UNKNOWN):
+                            _hint = _pend
+                    except Exception:
+                        pass
+                    _cm = GameMode.from_curscn(cur_scn, _hint)
                     if _cm is not None and room.adopt_game_mode(_cm):
                         log_engine("room", session_id[:13], action="gm", gm=_cm.value, room=room.room_id[:8], note="scene repair")
                 except Exception:
@@ -1222,7 +1242,7 @@ class Engine:
         # it (win/defeat written) or a new match begins. It is NOT cleared when stG
         # moves to 2/1 — a batch containing [3,2] must still drain the phase end,
         # otherwise wins/defeats are silently missed.
-        _STG_PHASE_MODES = (GameMode.ZW_LG, GameMode.WWZW, GameMode.BF2V2, GameMode.BF, GameMode.VA, GameMode.RVB, GameMode.R1V1)
+        _STG_PHASE_MODES = (GameMode.ZW_LG, GameMode.ZW, GameMode.WWZW, GameMode.WW, GameMode.BF2V2, GameMode.BF, GameMode.VA, GameMode.RVB, GameMode.R1V1)
         is_stg_packet = gpb and gpb.get("properties") and "stG" in gpb["properties"]
         if is_stg_packet:
             try:
@@ -1264,8 +1284,17 @@ class Engine:
                         room.stg3_armed = True
                     except Exception:
                         pass
-                # stG=3: match end marker — Processor handles win/defeat calculation
-                if stg == 3 and room.last_stg != 3 and room.game_mode and room.game_mode in _STG_PHASE_MODES:
+                # stG=3: match end marker — Processor handles win/defeat calculation.
+                # Repair a missing gm from pending first: public JoinRoom rooms
+                # (gm=?) would otherwise ignore stG=3 entirely and lose the win.
+                if stg == 3 and room.last_stg != 3 and room.game_mode is None:
+                    try:
+                        _sgm = self._pending_gm.get(session_id)
+                        if _sgm not in (None, GameMode.DF, GameMode.UNKNOWN) and room.adopt_game_mode(_sgm):
+                            log_engine("room", session_id[:13], action="gm", gm=_sgm.value, room=room.room_id[:8], note="stg repair")
+                    except Exception:
+                        pass
+                if stg == 3 and room.last_stg != 3 and (room.game_mode is None or room.game_mode in _STG_PHASE_MODES):
                     try:
                         self._phase_end_bump(room, session_id, stg)
                     except Exception:
@@ -1732,9 +1761,19 @@ class Engine:
             # First combat in a scene-less LOBBY room = the match is live
             # (Create/Join carry no curScn): enter MATCH so the drawer and
             # drains stop starving. Idempotent, roster-preserving.
+            # Fall back to stashed pending gm (public JoinRandom gm) when the
+            # kill packet itself carries none — otherwise the room stays gm=None
+            # and the win drain skips it.
             try:
-                room_enter_on_combat(room, view, session_id, killer, victim,
-                                     getattr(packet, "game_mode", None))
+                _cgm = getattr(packet, "game_mode", None)
+                if _cgm in (None, GameMode.DF, GameMode.UNKNOWN):
+                    try:
+                        _pgm = self._pending_gm.get(session_id)
+                        if _pgm not in (None, GameMode.DF, GameMode.UNKNOWN):
+                            _cgm = _pgm
+                    except Exception:
+                        pass
+                room_enter_on_combat(room, view, session_id, killer, victim, _cgm)
             except Exception:
                 pass
             if not killer or not victim or "<" in killer or "<" in victim:
@@ -1779,8 +1818,15 @@ class Engine:
                                 log_engine("join", session_id[:13], name=name, source="killfeed", alive=not is_target, room=room.room_id[:8])
         elif packet.is_knock and packet.killer and packet.victim:
             try:
-                room_enter_on_combat(room, view, session_id, packet.killer, packet.victim,
-                                     getattr(packet, "game_mode", None))
+                _kgm = getattr(packet, "game_mode", None)
+                if _kgm in (None, GameMode.DF, GameMode.UNKNOWN):
+                    try:
+                        _kpgm = self._pending_gm.get(session_id)
+                        if _kpgm not in (None, GameMode.DF, GameMode.UNKNOWN):
+                            _kgm = _kpgm
+                    except Exception:
+                        pass
+                room_enter_on_combat(room, view, session_id, packet.killer, packet.victim, _kgm)
             except Exception:
                 pass
             if packet.is_echo:

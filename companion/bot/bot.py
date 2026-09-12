@@ -403,6 +403,81 @@ async def register_cmd(interaction: discord.Interaction, game_handle: app_comman
     await interaction.followup.send(message, ephemeral=True)
 
 
+@bot.tree.command(name="fix-empty", description="Set your in-game username when stats show playtime only (null identity)")
+@app_commands.describe(game_username="Your in-game name, exactly as it appears in-game")
+async def fix_empty_cmd(interaction: discord.Interaction, game_username: app_commands.Range[str, 1, 32]):
+    """Heal null-identity tracking by writing bngc_users.game_username.
+
+    When join packets never resolve view.me (me=? in logs, /api/stats identity
+    null), kills/wins can't attribute and only session-scoped playtime ticks.
+    The processor already falls back to user.game_username for kills, wins and
+    defeats, so saving the name here fixes future matches. Past matches are
+    not backfilled. Refuses tag-garbage and names already taken by someone
+    else (normalized duplicate check, same rule as comp game names).
+    """
+    await interaction.response.defer(ephemeral=True)
+    try:
+        row = await db.get_by_discord(str(interaction.user.id))
+    except Exception:
+        row = None
+    if not row:
+        return await interaction.followup.send(
+            "Not registered — use **/register** first, then run **/fix-empty**.", ephemeral=True)
+    raw = str(game_username or "").strip()[:32]
+    norm = _norm_game(raw)
+    if not norm or "<" in raw or ">" in raw:
+        return await interaction.followup.send(
+            "Enter your in-game name (1–32 chars, exactly as it appears in-game).", ephemeral=True)
+    if not db.USE_SUPABASE or not db.supabase:
+        return await interaction.followup.send(
+            "Database not configured — try again later.", ephemeral=True)
+    try:
+        current = (row.get("game_username") or "").strip()
+        if current and _norm_game(current) == norm:
+            return await interaction.followup.send(
+                f"Already set — you are known as **{current}**. Future matches will attribute to that name.", ephemeral=True)
+        # Duplicate guard: another linked account already using this name.
+        try:
+            dup = db.supabase.table("bngc_users").select(
+                "discord_id,game_username").ilike("game_username", raw).limit(25).execute()
+            for u in ((dup.data if hasattr(dup, "data") else []) or []):
+                try:
+                    if str((u or {}).get("discord_id")) == str(interaction.user.id):
+                        continue
+                    if _norm_game((u or {}).get("game_username")) == norm:
+                        return await interaction.followup.send(
+                            f"'{raw}' is already linked to another account — ask an admin to relink it if it's yours.", ephemeral=True)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        upd = db.supabase.table("bngc_users").update(
+            {"game_username": raw}).eq("discord_id", str(interaction.user.id)).execute()
+        wrote = bool(getattr(upd, "data", None))
+        if not wrote:
+            return await interaction.followup.send(
+                "Couldn't save — try again later.", ephemeral=True)
+    except Exception as e:
+        print(f"[fix-empty] save failed: {e}")
+        return await interaction.followup.send(
+            "Couldn't save — try again later.", ephemeral=True)
+    # Live-session hint: if the active session still has null me, the drawer
+    # keeps showing lobby/unknown until the client re-identifies (rejoin or
+    # reload); the saved name covers stat attribution from here on regardless.
+    hint = ""
+    try:
+        sid = await get_active_session(str(interaction.user.id))
+        st = await get_session_state(sid) if sid else None
+        me = (st or {}).get("me") if st else None
+        if not (isinstance(me, dict) and me.get("username")):
+            hint = "\nLive session still shows no identity — rejoin/reload the game so the drawer picks it up. "
+    except Exception:
+        pass
+    await interaction.followup.send(
+        f"Saved — **{raw}** is now your tracked game name. Future kills/wins attribute to it (past matches are not backfilled).{hint}",
+        ephemeral=True)
+
+
 @bot.tree.command(name="ping", description="Check if the bot is online")
 async def ping_cmd(interaction: discord.Interaction):
     await interaction.response.send_message("🏓 Pong!")

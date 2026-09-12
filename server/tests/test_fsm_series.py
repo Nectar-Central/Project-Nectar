@@ -51,7 +51,19 @@ def test_reenter_keeps_scene():
 
 
 def test_no_reenter_public_room_without_prior_match():
+    # First public match (v0) with me on roster: stG=1 means the match is
+    # starting even though no scene ever arrived (JoinRoom carries no curScn).
+    # Without this, public rooms sit in LOBBY and wins are lost (cis6led zw_lg).
     r, v = _room(code=None, version=0)
+    assert RoomFSM.reenter_match_for_series(r, v, "sess_test") is True
+    assert r.state == State.MATCH
+    assert r.match_version == 1
+
+
+def test_no_reenter_public_room_without_me_or_history():
+    # Still no false-enter: unknown identity + thin room + v0 stays lobby.
+    r, v = _room(code=None, version=0, me=None, others=("foe",))
+    v.me = None
     assert RoomFSM.reenter_match_for_series(r, v, "sess_test") is False
     assert r.state == State.LOBBY
 

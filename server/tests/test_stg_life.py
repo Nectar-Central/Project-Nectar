@@ -77,8 +77,22 @@ def test_bump_without_identity():
 
 
 def test_bump_skips_non_match_state_but_arms():
+    # Real rooms bump even from LOBBY: the version numbers the MATCH, not the
+    # FSM state. A room flapped to LOBBY by an intermission blip before stG=3
+    # must still advance or the win drain (match_version > 0) starves.
+    # Only the lobby pseudo-room never bumps.
     eng = Engine()
     r = _match_room()
+    r.state = State.LOBBY
+    assert eng._phase_end_bump(r, "sess-lobby", 3) is True
+    assert r.match_version == 1
+    assert r.stg_is_phase_end is True
+
+
+def test_bump_never_on_lobby_pseudo_room():
+    eng = Engine()
+    r = _match_room()
+    r.room_id = "lobby"
     r.state = State.LOBBY
     assert eng._phase_end_bump(r, "sess-lobby", 3) is True  # armed, version untouched
     assert r.match_version == 0

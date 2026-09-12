@@ -72,7 +72,16 @@ class GameMode(str, Enum):
         return None
 
     @classmethod
-    def from_curscn(cls, curscn: str | None) -> "GameMode | None":
+    def from_curscn(cls, curscn: str | None, hint: "GameMode | str | None" = None) -> "GameMode | None":
+        """
+        Infer GameMode from a curScn string, with an optional gm hint for
+        generic scene names.
+
+        Live public matches report curScn="Game" (no mode substring) while the
+        JoinRandomRoom/pending gm carries the real mode (e.g. zw_lg). In that
+        case the hint is ground truth — return it when concrete. Without a
+        concrete hint, generic names return None (caller keeps pending/repair).
+        """
         """
         Infer GameMode from a curScn string.
 
@@ -106,6 +115,23 @@ class GameMode(str, Enum):
             return cls.WW
         if "free" in low:
             return cls.DF
+
+        # Generic scene vocab (live public matches use curScn="Game"): no mode
+        # substring, so fall back to the JoinRandomRoom/pending gm hint when it
+        # is a concrete mode. Never guess DF/UNKNOWN from a bare "Game".
+        if low.strip() in ("game", "match", "arena") or low.strip().startswith("game"):
+            try:
+                h = hint.value if isinstance(hint, cls) else str(hint or "").strip()
+            except Exception:
+                h = None
+            if h:
+                try:
+                    hm = cls(h)
+                except ValueError:
+                    hm = cls.from_gm(h)
+                if hm is not None and hm not in (cls.DF, cls.UNKNOWN):
+                    return hm
+            return None
 
         return None
 
