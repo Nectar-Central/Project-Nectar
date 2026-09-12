@@ -80,11 +80,14 @@ def _table_of(tourney: dict | None) -> dict:
 
 def compute_match_points(events: list[dict], table: dict | None = None,
                          winner_override: str | None = None,
-                         placements: dict | None = None) -> list[dict]:
+                         placements: dict | None = None,
+                         excluded: set | list | None = None) -> list[dict]:
     """Points for ONE sealed match. Pure, unit-tested.
 
     events: comp event rows {etype, discord_id, actor_name, alive}.
     Kills count per mapped discord_id only (twins stay null upstream).
+    excluded: discord IDs removed mid-match (left) — ignored in kills,
+    placement, winner and output rows.
     Placement: manual map first ({did: place}), else reverse alv-death order
     (last alive first). Winner: override, else manual P1, else last alive,
     else None (kills-only scoring).
@@ -101,10 +104,16 @@ def compute_match_points(events: list[dict], table: dict | None = None,
     names: dict[str, str] = {}
     death_order: list[str] = []  # first out -> last out
     seen_dead: set[str] = set()
+    try:
+        xset = {str(x) for x in (excluded or []) if str(x or "").strip()}
+    except Exception:
+        xset = set()
     for e in (events or []):
         try:
             et = (e or {}).get("etype")
             did = (e or {}).get("discord_id")
+            if did and str(did) in xset:
+                continue  # removed mid-match: ignored everywhere
             if et == "kill" and did:
                 kills[did] = kills.get(did, 0) + 1
                 if (e or {}).get("actor_name") and did not in names:
@@ -120,9 +129,13 @@ def compute_match_points(events: list[dict], table: dict | None = None,
         except Exception:
             continue
     order = list(reversed(death_order))  # last alive first
+    try:
+        order = [d for d in order if d not in xset]
+    except Exception:
+        pass
     winner = None
     try:
-        if winner_override and str(winner_override) in set(list(kills) + order):
+        if winner_override and str(winner_override) not in xset and str(winner_override) in set(list(kills) + order):
             winner = str(winner_override)
         elif order:
             winner = order[0]
@@ -133,7 +146,7 @@ def compute_match_points(events: list[dict], table: dict | None = None,
     # winner falls back to manual P1 when no override is set.
     try:
         man = {str(k): int(v) for k, v in (placements or {}).items()
-               if str(k or "").strip()}
+               if str(k or "").strip() and str(k) not in xset}
     except Exception:
         man = {}
     if man:
@@ -428,7 +441,8 @@ def standings_for_matches(tourney: dict | None, sealed: list[dict], events_by_ma
                 per_match.append(compute_match_points(
                     (events_by_match or {}).get((m or {}).get("id"), []),
                     table, (m or {}).get("winner_discord_id"),
-                    (m or {}).get("placements")))
+                    (m or {}).get("placements"),
+                    (m or {}).get("removed_discord_ids")))
             except Exception:
                 per_match.append([])
     except Exception:
@@ -746,13 +760,22 @@ async def comp_match_detail(request: Request):
     except Exception:
         return JSONResponse({"error": "id required (match id)"}, status_code=400)
     try:
-        mres = supabase.table("bngc_comp_matches").select(
-            "id,tourney_id,version,room_id,status,winner_discord_id,placements,started_at,sealed_at"
-        ).eq("id", mid).limit(1).execute()
+        try:
+            mres = supabase.table("bngc_comp_matches").select(
+                "id,tourney_id,version,room_id,status,winner_discord_id,placements,removed_discord_ids,started_at,sealed_at"
+            ).eq("id", mid).limit(1).execute()
+        except Exception:
+            mres = supabase.table("bngc_comp_matches").select(
+                "id,tourney_id,version,room_id,status,winner_discord_id,placements,started_at,sealed_at"
+            ).eq("id", mid).limit(1).execute()
         mrows = mres.data or []
         if not mrows:
             return JSONResponse({"error": "match not found"}, status_code=404)
         m = mrows[0]
+        try:
+            removed = [str(x) for x in ((m or {}).get("removed_discord_ids") or []) if str(x or "").strip()]
+        except Exception:
+            removed = []
         try:
             tres = supabase.table("bngc_comp_tourneys").select(
                 "id,name,code,status,points_table").eq(
@@ -768,7 +791,7 @@ async def comp_match_detail(request: Request):
             events = eres.data or []
         except Exception:
             events = []
-        board = compute_match_points(events, table, m.get("winner_discord_id"), m.get("placements"))
+        board = compute_match_points(events, table, m.get("winner_discord_id"), m.get("placements"), removed)
         # display names: registered game_username wins over raw actor names.
         try:
             dids = sorted({str(r.get("discord_id")) for r in board if r.get("discord_id")})[:200]
@@ -793,6 +816,7 @@ async def comp_match_detail(request: Request):
                       "room_id": m.get("room_id"),
                       "winner_discord_id": m.get("winner_discord_id"),
                       "placements": m.get("placements") or {},
+                      "removed_discord_ids": removed,
                       "started_at": m.get("started_at"), "sealed_at": m.get("sealed_at")},
             "tourney": {"id": t.get("id"), "name": t.get("name"), "code": t.get("code"),
                         "status": t.get("status"), "points_table": table},
@@ -1021,7 +1045,7 @@ def _calculate_sync(trous: dict, matches: list, by_mid: dict,
                 try:
                     per[m["id"]] = compute_match_points(
                         (by_mid or {}).get(m["id"], []), table, (m or {}).get("winner_discord_id"),
-                        (m or {}).get("placements"))
+                        (m or {}).get("placements"), (m or {}).get("removed_discord_ids"))
                 except Exception:
                     per[m["id"]] = []
             _pm = [per[m["id"]] for m in ms]
@@ -1056,7 +1080,7 @@ def calculate_tourney_sync(tid: int, computed_by: str = "bridge") -> list:
         if not trows.data:
             return []
         mres = supabase.table("bngc_comp_matches").select(
-            "id,tourney_id,version,room_id,status,winner_discord_id,placements").eq(
+            "id,tourney_id,version,room_id,status,winner_discord_id,placements,removed_discord_ids").eq(
             "tourney_id", int(tid)).in_("status", ["sealed", "manual"]).order(
             "version").limit(200).execute()
         matches = mres.data or []
@@ -1411,6 +1435,113 @@ async def comp_match_place(request: Request):
             cur[did] = place
         supabase.table("bngc_comp_matches").update({"placements": cur}).eq("id", mid).execute()
         return JSONResponse({"ok": True, "match_id": mid, "placements": cur})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+def _removed_list(m: dict) -> list:
+    try:
+        return [str(x) for x in ((m or {}).get("removed_discord_ids") or []) if str(x or "").strip()]
+    except Exception:
+        return []
+
+
+@router.post("/api/comp/match/remove")
+async def comp_match_remove(request: Request):
+    """Remove a player from a match roster (left mid-match).
+
+    Body: {match_id, discord_id?, actor_name?}. discord_id preferred; when
+    only actor_name is given the server resolves it via regs/game_username
+    (best effort — the 🚪 leave line still shows regardless). Idempotent:
+    appends to removed_discord_ids. Removed players are ignored in placement
+    and calculations. Never raises beyond JSON errors."""
+    err = _need()
+    if err:
+        return err
+    b = await _json(request)
+    try:
+        mid = int(b.get("match_id"))
+    except Exception:
+        return JSONResponse({"error": "match_id required"}, status_code=400)
+    did = str(b.get("discord_id") or "").strip() or None
+    aname = str(b.get("actor_name") or "").strip() or None
+    try:
+        try:
+            mres = supabase.table("bngc_comp_matches").select(
+                "id,tourney_id,removed_discord_ids").eq("id", mid).limit(1).execute()
+        except Exception:
+            return JSONResponse({"error": "removed_discord_ids column missing — apply add_comp_v237.sql"}, status_code=500)
+        if not mres.data:
+            return JSONResponse({"error": "match not found"}, status_code=404)
+        m = mres.data[0] or {}
+        if not did and aname:
+            # best-effort resolve: tourney regs + game_username match
+            try:
+                rres = supabase.table("bngc_comp_registrations").select(
+                    "member_ids").eq("tourney_id", m.get("tourney_id")).neq(
+                    "status", "banned").limit(500).execute()
+                dids = sorted({str(x) for r in (rres.data or [])
+                               for x in ((r or {}).get("member_ids") or []) if x})[:200]
+                if dids:
+                    ures = supabase.table("bngc_users").select(
+                        "discord_id,game_username").in_("discord_id", dids).execute()
+                    import re as _re
+                    want = _re.sub(r"<[^>]*>", "", aname).strip().lower()
+                    if want.startswith("dc:"):
+                        want = want[3:].strip()
+                    for u in (ures.data or []):
+                        try:
+                            g = _re.sub(r"<[^>]*>", "", str((u or {}).get("game_username") or "")).strip().lower()
+                            if g.startswith("dc:"):
+                                g = g[3:].strip()
+                            if g and g == want:
+                                did = str((u or {}).get("discord_id"))
+                                break
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+        if not did:
+            return JSONResponse({"error": "discord_id required (actor_name did not resolve)"}, status_code=400)
+        cur = _removed_list(m)
+        if did not in cur:
+            cur.append(did)
+            supabase.table("bngc_comp_matches").update(
+                {"removed_discord_ids": cur}).eq("id", mid).execute()
+        return JSONResponse({"ok": True, "match_id": mid, "removed_discord_ids": cur})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@router.post("/api/comp/match/add-back")
+async def comp_match_add_back(request: Request):
+    """Add a removed player back to a match roster (/tourney add-back).
+
+    Body: {match_id, discord_id}. Removes from removed_discord_ids so the
+    player scores again. Never raises beyond JSON errors."""
+    err = _need()
+    if err:
+        return err
+    b = await _json(request)
+    try:
+        mid = int(b.get("match_id"))
+        did = str(b.get("discord_id") or "").strip()
+    except Exception:
+        return JSONResponse({"error": "match_id and discord_id required"}, status_code=400)
+    if not did:
+        return JSONResponse({"error": "discord_id required"}, status_code=400)
+    try:
+        try:
+            mres = supabase.table("bngc_comp_matches").select(
+                "id,removed_discord_ids").eq("id", mid).limit(1).execute()
+        except Exception:
+            return JSONResponse({"error": "removed_discord_ids column missing — apply add_comp_v237.sql"}, status_code=500)
+        if not mres.data:
+            return JSONResponse({"error": "match not found"}, status_code=404)
+        cur = [x for x in _removed_list(mres.data[0]) if x != did]
+        supabase.table("bngc_comp_matches").update(
+            {"removed_discord_ids": cur}).eq("id", mid).execute()
+        return JSONResponse({"ok": True, "match_id": mid, "removed_discord_ids": cur})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 

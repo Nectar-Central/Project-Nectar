@@ -775,6 +775,12 @@ function renderMatchPanel() {
   left.innerHTML =
     (rows ? `<table class="grid"><tr><th>#</th><th>Player</th><th>K</th><th>Pl</th><th>Pts</th></tr>${rows}</table>`
       : '<span class="dim">No scoring events yet.</span>') +
+    ((m.removed_discord_ids && m.removed_discord_ids.length)
+      ? `<div class="gap"><span class="muted">REMOVED (left — ignored in placements)</span>` +
+        m.removed_discord_ids.map((did) =>
+          `<div style="margin:4px 0"><span class="dim">🚪 ${esc(nameOfDid(String(did)))} (${esc(String(did).slice(0, 6))})</span> ` +
+          `<button data-addback="${esc(String(did))}">Add back</button></div>`).join('') + `</div>`
+      : '') +
     `<div class="gap"><input size="14" list="mWinnerList" placeholder="winner name or id" id="mWinner" value="${esc(wv)}"> ` +
     `<datalist id="mWinnerList">${dlOpts}</datalist>` +
     `<button id="mWinGo">Set winner</button> ` +
@@ -852,6 +858,11 @@ function renderMatchPanel() {
           () => api('/api/comp/adjust', post({ tourney_id: tid, match_id: editMatchId, discord_id: did, delta_points: -pts, reason: 'dashboard subtract' })),
           '−' + pts + 'pts ' + nameOfDid(did), true);
       };
+    });
+    left.querySelectorAll('[data-addback]').forEach((b) => {
+      b.onclick = () => mutMatch(b, () => {},
+        () => api('/api/comp/match/add-back', post({ match_id: editMatchId, discord_id: b.dataset.addback })),
+        'added back ' + nameOfDid(b.dataset.addback), true);
     });
     // RIGHT: killfeed
     const line = (e) => {
