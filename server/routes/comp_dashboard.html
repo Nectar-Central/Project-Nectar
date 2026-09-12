@@ -325,7 +325,7 @@ async function renderHosts(j) {
       `<button id="hpGo">${hp ? 'Switch to Hosting Only' : 'Switch to Playing'}</button></div>` +
       `<div class="muted" style="margin:4px 0 2px">HOSTS (${rawHosts.length})</div>` +
       (rawHosts.map((d) =>
-        `<div><b>${esc(pmap[d] || String(d).slice(0, 6))}</b> <span class="dim">${esc(d)}</span> ` +
+        `<div><b title="${esc(d)}">${esc(pmap[d] || 'Unknown player')}</b> ` +
         `<button data-unhost="${esc(d)}">Remove</button></div>`).join('') || '<span class="dim">None listed.</span>') +
       `<div class="gap"><input size="14" id="hostAdd" placeholder="discord id"> <button id="hostAddGo">Add host</button></div>` +
       `<div class="dim">The creator always hosts, even if unlisted.</div>`;
@@ -447,19 +447,19 @@ async function refreshRegs(j) {
     const detailPlayers = ((j || detailCache || {}).players || []);
     const nameOf = (did) => {
       const hit = detailPlayers.find((p) => String(p.discord_id) === String(did));
-      return hit && hit.name ? hit.name : String(did).slice(0, 6);
+      return hit && hit.name ? hit.name : 'Unknown player';
     };
     const accDids = [...new Set(accRegs.flatMap((r) => r.member_ids || []))];
     const banDids = [...new Set(banRegs.flatMap((r) => r.member_ids || []))];
     box.innerHTML =
       `<div class="muted" style="margin-bottom:4px">PLAYERS (${accDids.length})</div>` +
       (accDids.length ? accDids.map((d) =>
-        `<div data-reg="${esc(d)}"><b>${esc(nameOf(d))}</b> ` +
+        `<div data-reg="${esc(d)}"><b title="${esc(d)}">${esc(nameOf(d))}</b> ` +
         `<button class="danger" data-ban="${esc(d)}">Ban</button></div>`).join('')
         : '<span class="dim">No players yet.</span>') +
       `<div class="muted" style="margin:8px 0 4px">BANNED (${banDids.length})</div>` +
       (banDids.length ? banDids.map((d) =>
-        `<div data-reg="${esc(d)}"><b>${esc(nameOf(d))}</b> ` +
+        `<div data-reg="${esc(d)}"><b title="${esc(d)}">${esc(nameOf(d))}</b> ` +
         `<button data-unban="${esc(d)}">Unban</button></div>`).join('')
         : '<span class="dim">Nobody banned.</span>');
     const setBan = async (did, ban, btn) => {
@@ -551,7 +551,7 @@ function nameOfDid(did) {
     if (b && b.name) return b.name;
     if (hit && hit.name) return hit.name;
   } catch {}
-  return k.slice(0, 6);
+  return 'Unknown player';
 }
 // typed winner / name or raw did -> discord_id (or null when unknown).
 // Candidates: board + roster + tourney players. Match order: exact did,
@@ -757,7 +757,7 @@ function renderMatchPanel() {
   const plist = Object.values(bmap).map((p) => {
     const did = String(p.discord_id);
     const nm = esc(nameOfDid(did));
-    return `<div style="margin:4px 0"><b>${nm}</b> <span class="dim">${p.kills || 0}K${p.placement ? ' · ' + ord(p.placement) : ''}</span><br>` +
+    return `<div style="margin:4px 0"><b title="${esc(did)}">${nm}</b> <span class="dim">${p.kills || 0}K${p.placement ? ' · ' + ord(p.placement) : ''}</span><br>` +
       `<button data-k="${esc(did)}">+ kill</button> ` +
       `<button data-w="${esc(did)}">+ win</button> ` +
       `<input size="3" id="sub-${esc(did)}" placeholder="pts" inputmode="numeric" title="Points to remove"> <button data-sub="${esc(did)}" title="Remove points (ledger, stable across reconcile)">−pts</button><br>` +
@@ -770,7 +770,7 @@ function renderMatchPanel() {
   const cand = {};
   board.forEach((r) => { cand[String(r.discord_id)] = r.name || String(r.discord_id); });
   roster.forEach((x) => { const k = String(x); if (!cand[k]) cand[k] = nameOfDid(k); });
-  const dlOpts = Object.entries(cand).map(([did, nm]) => `<option value="${esc(nm)}">${esc(did)}</option>`).join('');
+  const dlOpts = Object.entries(cand).map(([did, nm]) => `<option value="${esc(nm)}">${esc(nm)}</option>`).join('');
   const wv = winnerNameOf(m.winner_discord_id) || '';
   left.innerHTML =
     (rows ? `<table class="grid"><tr><th>#</th><th>Player</th><th>K</th><th>Pl</th><th>Pts</th></tr>${rows}</table>`
@@ -778,7 +778,7 @@ function renderMatchPanel() {
     ((m.removed_discord_ids && m.removed_discord_ids.length)
       ? `<div class="gap"><span class="muted">REMOVED (left — ignored in placements)</span>` +
         m.removed_discord_ids.map((did) =>
-          `<div style="margin:4px 0"><span class="dim">🚪 ${esc(nameOfDid(String(did)))} (${esc(String(did).slice(0, 6))})</span> ` +
+          `<div style="margin:4px 0"><span class="dim" title="${esc(String(did))}">🚪 ${esc(nameOfDid(String(did)))}</span> ` +
           `<button data-addback="${esc(String(did))}">Add back</button></div>`).join('') + `</div>`
       : '') +
     `<div class="gap"><input size="14" list="mWinnerList" placeholder="winner name or id" id="mWinner" value="${esc(wv)}"> ` +
@@ -971,7 +971,7 @@ async function refreshUnmapped(t) {
     const roster = [...new Set(((acc && acc.regs) || []).flatMap((r) => r.member_ids || []))];
     const pmap = {};
     ((t && t.players) || []).forEach((p) => { pmap[String(p.discord_id)] = p.name; });
-    roster.forEach((d) => { if (!pmap[d]) pmap[d] = String(d).slice(0, 6); });
+    // no did-prefix fallback: unknown roster members render as Unknown player.
     const normNm = (s) => { try { return String(s || '').replace(/<[^>]*>/g, '').replace(/^dc:\s*/i, '').trim().toLowerCase(); } catch { return String(s || '').toLowerCase(); } };
     // sticky mapping cache per tourney (localStorage): actor -> did survives
     // reloads + new matches. Roster-checked: stale dids (off-roster) never
@@ -988,7 +988,7 @@ async function refreshUnmapped(t) {
       const cached = cachedFor(actor);
       return roster.map((d) => {
         const sel = (cached && String(d) === cached) || (!cached && normNm(pmap[d]) && normNm(pmap[d]) === normNm(actor)) ? ' selected' : '';
-        return `<option value="${esc(d)}"${sel}>${esc(pmap[d] || d.slice(0, 6))}</option>`;
+        return `<option value="${esc(d)}"${sel}>${esc(pmap[d] || 'Unknown player')}</option>`;
       }).join('');
     };
     const cacheLink = (actor, did) => {

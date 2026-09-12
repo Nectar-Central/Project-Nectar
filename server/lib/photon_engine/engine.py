@@ -229,6 +229,50 @@ def room_enter_on_combat(room, view, session_id, killer, victim, game_mode=None)
         return False
 
 
+def _last_live_room(view, now_s: float, max_age_s: float = 180):
+    """Most recently active real room, for re-homing lobby-bound stG packets.
+
+    After a death-leave the session's current room is the lobby pseudo-room,
+    so room-less match markers (stG) would arm lobby — where the version never
+    bumps and the win drain always skips. The client sending stG means a match
+    is live on screen, so hand it to the room that was active most recently.
+
+    Skips the lobby pseudo-room, virgin mm-* placeholders (no combat ever —
+    lobby noise must not mint versions there), and rooms silent longer than
+    max_age_s (finished matches; leaver/death guards would likely still deny,
+    but don't even arm them). Returns None when nothing qualifies. Never raises.
+    """
+    best = None
+    best_ts = -1.0
+    try:
+        rooms = list((getattr(view, "rooms", None) or {}).values())
+    except Exception:
+        return None
+    for rv in rooms:
+        try:
+            rid = str(getattr(rv, "room_id", "") or "")
+            if not rid or rid == "lobby":
+                continue
+            if rid.startswith("mm-"):
+                try:
+                    _v = int(getattr(rv, "match_version", 0) or 0)
+                except Exception:
+                    _v = 0
+                if getattr(rv, "state", None) != State.MATCH and _v <= 0:
+                    continue
+            ts = getattr(rv, "last_packet_at", None)
+            if ts is None:
+                continue
+            ts = float(ts)
+            if now_s - ts > max_age_s:
+                continue
+            if ts > best_ts:
+                best, best_ts = rv, ts
+        except Exception:
+            continue
+    return best
+
+
 def _resolve_alv_subject(room, player_name, gpb, actor_nr):
     """Return (name|None, actor|None) for a nameless alv packet.
     TargetActorNr (the subject) wins over sender ActorNr (often the room
@@ -691,6 +735,30 @@ class Engine:
                 if rv.state == State.MATCH and rv.game_mode and not getattr(rv, "retired", False):
                     view.current_room_id = rv.room_id
                     return rv
+            # match-marker stG packets must never die in the lobby pseudo-room:
+            # after a death-leave current==lobby, so stG=3 would arm lobby (its
+            # version never bumps, the drain always skips it) and the win is
+            # silently lost while the drawer flaps lobby->match on the next
+            # kill. Re-home to the last live match room instead — wins drain
+            # regardless of lobby/match state; leaver/death guards downstream
+            # still deny false wins. Only stG is re-homed (kills already count
+            # from anywhere; alv/scene keep their routing for defeat semantics).
+            try:
+                _props = (gpb.get("properties") or {}) if isinstance(gpb, dict) else {}
+                if "stG" in _props:
+                    import time as _t3
+                    _home = _last_live_room(view, _t3.time())
+                    if _home is not None:
+                        try:
+                            if getattr(_home, "retired", False):
+                                _home.retired = False
+                                log_engine("room", session_id[:13], action="unretired", room=_home.room_id[:8], note="stg re-home")
+                        except Exception:
+                            pass
+                        log_engine("room", session_id[:13], action="stg-rehomed", room=_home.room_id[:8])
+                        return _home
+            except Exception:
+                pass
             if view.current_room_id and view.current_room_id in view.rooms:
                 return view.rooms[view.current_room_id]
             if "lobby" not in view.rooms:
