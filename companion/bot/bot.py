@@ -1554,13 +1554,13 @@ async def tourney_cmd(interaction: discord.Interaction, code: str, name: str):
 
 
 async def _comp_reg_rows(tourney_id):
-    """All registration rows for a tourney (id, members, status). Never raises."""
+    """All registration rows for a tourney (id, members, status, source msg). Never raises."""
     try:
         sb = _comp_sb()
         if sb is None:
             return []
         res = sb.table("bngc_comp_registrations").select(
-            "id,member_ids,status").eq("tourney_id", int(tourney_id)).limit(1000).execute()
+            "id,member_ids,status,source_message_id").eq("tourney_id", int(tourney_id)).limit(1000).execute()
         return res.data or []
     except Exception:
         return []
@@ -1621,19 +1621,34 @@ async def _comp_members_with_profile(sb, member_ids: list) -> set:
         return set()
 
 
-async def _comp_promote_if_complete(guild, tourney_id: int, source_message_id: str | None) -> bool:
+async def _comp_promote_if_complete(guild, tourney_id: int, source_message_id: str | None = None,
+                                    reg_id=None) -> bool:
     """Flip a pending reg to accepted once ALL members have profiles.
 
-    Grants the player role, swaps ❓→✅ on the source message. Returns True
-    when the row is now accepted. Never raises.
+    Grants the player role, swaps ❓→✅ on the source message. Row located
+    by reg_id (preferred) or source_message_id. Returns True when the row
+    is now accepted. Never raises.
     """
     try:
         sb = _comp_sb()
-        if sb is None or not source_message_id:
+        if sb is None:
             return False
-        rres = sb.table("bngc_comp_registrations").select(
-            "id,tourney_id,member_ids,status,team_color").eq(
-            "source_message_id", str(source_message_id)).limit(5).execute()
+        if reg_id is not None:
+            try:
+                rres = sb.table("bngc_comp_registrations").select(
+                    "id,tourney_id,member_ids,status,team_color,source_message_id").eq(
+                    "id", reg_id).limit(1).execute()
+            except Exception:
+                return False
+        elif source_message_id:
+            try:
+                rres = sb.table("bngc_comp_registrations").select(
+                    "id,tourney_id,member_ids,status,team_color,source_message_id").eq(
+                    "source_message_id", str(source_message_id)).limit(5).execute()
+            except Exception:
+                return False
+        else:
+            return False
         rows = rres.data or []
         if not rows:
             return False
@@ -1660,12 +1675,13 @@ async def _comp_promote_if_complete(guild, tourney_id: int, source_message_id: s
                     await _comp_grant_role(guild, did, rid)
                 except Exception:
                     continue
-        # reaction swap on the signup message
+        # reaction swap on the signup message (skipped when unknown)
         try:
-            if guild is not None:
+            _src = source_message_id or (row or {}).get("source_message_id")
+            if guild is not None and _src:
                 for ch in guild.text_channels:
                     try:
-                        msg = await ch.fetch_message(int(source_message_id))
+                        msg = await ch.fetch_message(int(_src))
                     except Exception:
                         continue
                     try:
@@ -3550,15 +3566,17 @@ class _GameNameModal(discord.ui.Modal):
                     return await interaction.followup.send(f"Couldn't save: {e}", ephemeral=True)
             # promote any pending signup for this user (❓→✅ on success)
             try:
-                src = None
+                pend = None
                 for r in (mine or []):
-                    if (r or {}).get("status") == "pending" and (r or {}).get("source_message_id"):
-                        src = (r or {}).get("source_message_id")
+                    if (r or {}).get("status") == "pending":
+                        pend = r
                         break
-                if src:
+                if pend is not None:
                     try:
                         ok = await _comp_promote_if_complete(
-                            interaction.guild, int(self.tourney_id), str(src))
+                            interaction.guild, int(self.tourney_id),
+                            str((pend or {}).get("source_message_id") or "") or None,
+                            reg_id=(pend or {}).get("id"))
                     except Exception:
                         ok = False
                     if ok:
@@ -3817,13 +3835,49 @@ async def on_message(message):
                 return
         except Exception:
             pass
-        # already in (any status but banned) -> dup
+        # already in (any status but banned) -> dup, EXCEPT your own pending
+        # row: retrying signup after creating a comp profile promotes it
+        # (accept + role + ❓→✅) instead of refusing.
         try:
-            dup = any(
-                (r or {}).get("status") != "banned"
-                and any(m in members for m in ((r or {}).get("member_ids") or []))
-                for r in await _comp_reg_rows(t["id"]))
-            if dup:
+            _rows_d = await _comp_reg_rows(t["id"])
+            _hits = [r for r in _rows_d
+                     if (r or {}).get("status") != "banned"
+                     and any(m in members for m in ((r or {}).get("member_ids") or []))]
+            if _hits:
+                _own_pending = [r for r in _hits
+                                if (r or {}).get("status") == "pending"
+                                and set(str(x) for x in ((r or {}).get("member_ids") or [])) == set(members)]
+                if _own_pending and sb is not None:
+                    _have = await _comp_members_with_profile(sb, members)
+                    _missing = [m for m in members if m not in _have]
+                    if not _missing:
+                        _prow = _own_pending[0] or {}
+                        _src = _prow.get("source_message_id")
+                        try:
+                            await _comp_promote_if_complete(
+                                message.guild, int(t["id"]),
+                                str(_src) if _src else None,
+                                reg_id=_prow.get("id"))
+                        except Exception:
+                            pass
+                        try:
+                            await message.add_reaction("✅")
+                        except Exception:
+                            pass
+                        try:
+                            await message.reply("You're in ✅ — comp profile complete.")
+                        except Exception:
+                            pass
+                        return
+                    try:
+                        _pings = " ".join(f"<@{m}>" for m in _missing)
+                        await message.reply(
+                            f"{_pings} you still need a comp profile — press **Create comp profile** "
+                            f"and set your current in-game username.",
+                            view=_CompProfileView(int(t["id"])))
+                    except Exception:
+                        pass
+                    return
                 await _refuse("Already registered for this tourney.")
                 return
         except Exception:
