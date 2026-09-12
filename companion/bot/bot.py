@@ -671,7 +671,6 @@ async def stats_cmd(interaction: discord.Interaction, user: discord.User = None)
     e.add_field(name="Kills", value=str(row["kills"]), inline=True)
     e.add_field(name="Deaths", value=str(row["deaths"]), inline=True)
     e.add_field(name="Wins", value=str(row["wins"]), inline=True)
-    e.add_field(name="Defeats", value=str(row["defeats"]), inline=True)
     e.add_field(name="Playtime", value=fmt.format_playtime(row.get("playtime_global") or 0), inline=True)
     per = fmt.format_playtime_per_mode(pp)
     e.add_field(name="Per mode", value=per[:1024] or "—", inline=False)
@@ -1173,7 +1172,7 @@ async def _fetch_health():
         print(f"[health] fetch failed: {e}")
     return None
 
-@bot.tree.command(name="precision", description="Show server-side processing precision (kills/deaths/wins/defeats)")
+@bot.tree.command(name="precision", description="Show server-side processing precision (kills/deaths/wins)")
 async def precision_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
     data = await _fetch_health()
@@ -1273,12 +1272,10 @@ def _cmp_line(row):
         k = int(row.get("kills") or 0)
         d = int(row.get("deaths") or 0)
         w = int(row.get("wins") or 0)
-        l = int(row.get("defeats") or 0)
         kd = f"{(k / d):.2f}" if d else str(k)
-        wr = f"{(w / (w + l) * 100):.1f}%" if (w + l) else "—"
         pt = fmt.format_playtime(row.get("playtime_global") or 0)
         pp = int(row.get("play_points") or 0)
-        return f"{k}K / {d}D ({kd} K/D) · {w}W ({wr}) · {pp} pts · {pt}"
+        return f"{k}K / {d}D ({kd} K/D) · {w}W · {pp} pts · {pt}"
     except Exception:
         return "—"
 
@@ -1580,6 +1577,32 @@ async def _comp_grant_role(guild, user_id, role_id) -> bool:
         return False
 
 
+async def _comp_remove_role(guild, user_id, role_id, reason="Comp tourney ended") -> bool:
+    """Best-effort role strip. Never raises (returns bool)."""
+    try:
+        if guild is None or not role_id:
+            return False
+        role = guild.get_role(int(role_id))
+        if role is None:
+            return False
+        try:
+            member = guild.get_member(int(user_id))
+        except Exception:
+            member = None
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(user_id))
+            except Exception:
+                return False
+        if member is None:
+            return False
+        await member.remove_roles(role, reason=reason)
+        return True
+    except Exception as e:
+        print(f"[comp] role remove failed: {e}")
+        return False
+
+
 def _comp_team_members(user_ids: list, mode: str):
     """Validate mention list for the mode. Pure: ([ids], None) or ([], error).
 
@@ -1616,7 +1639,8 @@ def _comp_sb():
                        shoot_timer="Shoot timer, e.g. 4:30",
                        ping_role="Role pinged on open/close",
                        max_players="Auto-close intake at N accepted players (0 = unlimited)",
-                       host_playing="Host plays too (their kills count)")
+                       host_playing="Host plays too (their kills count)",
+                       start_time="Start time YYYY-MM-DD HH:MM UTC (optional)")
 @app_commands.choices(mode=[app_commands.Choice(name="Solo", value="solo"),
                             app_commands.Choice(name="Duo", value="duo")])
 @app_commands.choices(game_mode=[
@@ -1638,7 +1662,8 @@ async def tourney_create_cmd(interaction: discord.Interaction, name: str,
                              rules_channel: discord.TextChannel | None = None,
                              shoot_timer: str | None = None,
                              ping_role: discord.Role | None = None,
-                             max_players: int = 0, host_playing: bool = True):
+                             max_players: int = 0, host_playing: bool = True,
+                             start_time: str | None = None):
     await interaction.response.defer(ephemeral=True)
     me = await _comp_member(interaction, interaction.user.id)
     if not _comp_is_host(me):
@@ -1658,8 +1683,19 @@ async def tourney_create_cmd(interaction: discord.Interaction, name: str,
         maxp = max(0, int(max_players or 0))
     except Exception:
         maxp = 0
+    sched_iso = None
+    if (start_time or "").strip():
+        try:
+            from datetime import datetime, timezone
+            _dt = datetime.strptime(str(start_time).strip(), "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+            if _dt <= datetime.now(timezone.utc):
+                return await interaction.followup.send("Start time is in the past.", ephemeral=True)
+            sched_iso = _dt.isoformat()
+        except Exception:
+            return await interaction.followup.send(
+                "Bad start time. Use exactly `YYYY-MM-DD HH:MM` in UTC (e.g. `2026-09-12 18:30`).", ephemeral=True)
     try:
-        res = sb.table("bngc_comp_tourneys").insert({
+        _ins = {
             "code": code_c, "name": str(name or "").strip()[:64] or "Tourney",
             "status": "created", "mode": mode_c, "series_len": series,
             "game_mode": (game_mode or "").strip() or None,
@@ -1673,27 +1709,41 @@ async def tourney_create_cmd(interaction: discord.Interaction, name: str,
             "board_channel_id": COMP_BOARD_CHANNEL_ID or None,
             "player_role_id": COMP_PLAYER_ROLE_ID or None,
             "created_by": str(interaction.user.id),
-        }).execute()
+        }
+        if sched_iso:
+            _ins["scheduled_at"] = sched_iso
+        res = sb.table("bngc_comp_tourneys").insert(_ins).execute()
         row = (res.data or [{}])[0]
+        tail = ""
+        try:
+            if sched_iso:
+                from datetime import datetime
+                tail = f" Starts <t:{int(datetime.fromisoformat(sched_iso).timestamp())}:R>."
+        except Exception:
+            pass
         return await interaction.followup.send(
             f"🏆 Tourney **#{row.get('id')} {row.get('name')}** created ({mode_c}, "
-            f"{series or '∞'} matches). Post it: `/tourney-post {row.get('id')}`. "
+            f"{series or '∞'} matches).{tail} Post it: `/tourney-post {row.get('id')}`. "
             f"Registrations: `/listen-registrations`.", ephemeral=True)
     except Exception as e:
         return await interaction.followup.send(f"Couldn't create: {e}", ephemeral=True)
 
 
 @bot.tree.command(name="tourney-stop", description="Close a comp tourney (host)")
-@app_commands.describe(tourney_id="Numeric tourney ID (from 0)")
-async def tourney_stop_cmd(interaction: discord.Interaction, tourney_id: int):
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)",
+                       role_to_remove="Player role to strip at end (defaults to the tourney's give-role)")
+async def tourney_stop_cmd(interaction: discord.Interaction, tourney_id: int,
+                           role_to_remove: discord.Role | None = None):
     await interaction.response.defer(ephemeral=True)
     sb, me = await _comp_require_manager(interaction, tourney_id)
     if sb is None:
         return
     try:
         from datetime import datetime, timezone
-        old = sb.table("bngc_comp_tourneys").select("code").eq("id", int(tourney_id)).limit(1).execute()
-        old_code = ((old.data or [{}])[0] or {}).get("code")
+        old = sb.table("bngc_comp_tourneys").select(
+            "code,player_role_id").eq("id", int(tourney_id)).limit(1).execute()
+        old_row = ((old.data or [{}])[0] or {})
+        old_code = old_row.get("code")
         res = sb.table("bngc_comp_tourneys").update(
             {"status": "ended", "reg_open": False, "ended_at": datetime.now(timezone.utc).isoformat()}
         ).eq("id", int(tourney_id)).execute()
@@ -1705,7 +1755,40 @@ async def tourney_stop_cmd(interaction: discord.Interaction, tourney_id: int):
                 sb.table("bngc_room_tags").delete().eq("code", str(old_code).upper()).execute()
             except Exception as e:
                 print(f"[comp] stop untag failed: {e}")
-        return await interaction.followup.send(f"🏁 Tourney **#{tourney_id}** closed.", ephemeral=True)
+        # strip the give-role from the accepted roster (best-effort)
+        stripped = 0
+        try:
+            rid = None
+            try:
+                rid = str(role_to_remove.id) if role_to_remove is not None else None
+            except Exception:
+                rid = None
+            if not rid:
+                rid = str(old_row.get("player_role_id") or "") or None
+            if not rid:
+                try:
+                    rid = str(COMP_PLAYER_ROLE_ID or "") or None
+                except Exception:
+                    rid = None
+            if rid and interaction.guild is not None:
+                dids: list = []
+                try:
+                    rres = sb.table("bngc_comp_registrations").select("member_ids").eq(
+                        "tourney_id", int(tourney_id)).eq("status", "accepted").limit(1000).execute()
+                    dids = sorted({str(x) for r in (rres.data or []) for x in ((r or {}).get("member_ids") or []) if x})
+                except Exception:
+                    dids = []
+                for _did in dids:
+                    try:
+                        if await _comp_remove_role(interaction.guild, _did, rid,
+                                                   reason=f"Comp tourney #{tourney_id} ended"):
+                            stripped += 1
+                    except Exception:
+                        continue
+        except Exception as e:
+            print(f"[comp] stop role strip failed: {e}")
+        tail = f" ({stripped} role{'s' if stripped != 1 else ''} stripped)" if stripped else ""
+        return await interaction.followup.send(f"🏁 Tourney **#{tourney_id}** closed.{tail}", ephemeral=True)
     except Exception as e:
         return await interaction.followup.send(f"Couldn't stop: {e}", ephemeral=True)
 
@@ -1921,14 +2004,23 @@ async def tourney_add_player_cmd(interaction: discord.Interaction, tourney_id: i
         rows = await _comp_reg_rows(int(tourney_id))
         if any((r or {}).get("status") != "banned" and did in ((r or {}).get("member_ids") or []) for r in rows):
             return await interaction.followup.send(f"{user.mention} is already on the roster.", ephemeral=True)
-        sb.table("bngc_comp_registrations").insert({
+        _add_row = {
             "tourney_id": int(tourney_id),
             "team_label": f"<@{did}>",
             "member_ids": [did],
             "captain_id": did,
             "source_message_id": None,
             "status": "accepted",
-        }).execute()
+            "member_names": {did: {
+                "username": str(getattr(user, "name", "") or "")[:32],
+                "display_name": str(getattr(user, "display_name", "") or getattr(user, "name", "") or "")[:32],
+            }},
+        }
+        try:
+            sb.table("bngc_comp_registrations").insert(_add_row).execute()
+        except Exception:
+            _add_row.pop("member_names", None)  # pre-migration safe
+            sb.table("bngc_comp_registrations").insert(_add_row).execute()
         try:
             _rid = (t or {}).get("player_role_id") or COMP_PLAYER_ROLE_ID
             await _comp_grant_role(interaction.guild, did, _rid)
@@ -2031,9 +2123,13 @@ def _points_table_lines(t: dict) -> list:
             win = int(pt.get("win", 3))
         except Exception:
             win = 3
-        lines = [f"{_ord(i + 1)} = {p} pts" for i, p in enumerate(place)]
-        lines.append(f"KILL = {kill} pts")
-        lines.append(f"WIN = {win} pts")
+        # WIN owns P1: 1st placement is dropped, WIN + KILLS lead, then
+        # 2ND.. in bold caps.
+        lines = [f"**WIN = {win} PTS**", f"**KILLS = {kill} PTS**"]
+        for i, p in enumerate(place):
+            if i == 0:
+                continue  # 1st place points removed — WIN owns P1
+            lines.append(f"**{_ord(i + 1).upper()} = {p} PTS**")
         return lines
     except Exception:
         return []
@@ -2066,6 +2162,19 @@ def _comp_announce_text(t: dict):
             hosted_by = " ".join(f"<@{h}>" for h in _hosts) if _hosts else "—"
         except Exception:
             hosted_by = "—"
+        start_line = None
+        try:
+            _iso = (t or {}).get("scheduled_at") or (t or {}).get("started_at")
+            if _iso:
+                from datetime import datetime
+                _s = str(_iso).strip().replace("Z", "+00:00")
+                _dd = datetime.fromisoformat(_s)
+                if _dd.tzinfo is None:
+                    from datetime import timezone as _tz
+                    _dd = _dd.replace(tzinfo=_tz.utc)
+                start_line = f"**START TIME**: Starts at <t:{int(_dd.timestamp())}:R>"
+        except Exception:
+            start_line = None
         lines = [
             f"## {mode} {name}",
             f"**GAME MODE**: {gm}",
@@ -2076,6 +2185,8 @@ def _comp_announce_text(t: dict):
             f"**SHOOT TIMER**: {timer}",
             f"**HOSTED BY**: {hosted_by}",
         ]
+        if start_line:
+            lines.append(start_line)
         pts = _points_table_lines(t)
         if pts:
             lines += ["", "**POINTS**:"] + pts
@@ -2244,19 +2355,21 @@ async def _comp_tourney(tourney_id) -> dict | None:
 
 
 def _comp_board_lines(board, limit=15):
-    """Render aggregate standings lines. Pure."""
+    """Render aggregate standings lines (with mentions). Pure."""
     medals = ["🥇", "🥈", "🥉"]
     lines = []
     try:
         for i, r in enumerate((board or [])[:limit], 1):
             name = (r or {}).get("name") or "?"
+            did = (r or {}).get("discord_id")
+            who = f"{_comp_mention(did)} **{name}**" if did else f"**{name}**"
             pts = (r or {}).get("points", 0)
             kills = (r or {}).get("kills", 0)
             wins = (r or {}).get("wins", 0)
             avg = (r or {}).get("avg_placement")
             tail = f" ({kills}K, {wins}W" + (f", {avg} avg" if avg is not None else "") + ")"
             prefix = medals[i - 1] if i <= 3 else f"{i}."
-            lines.append(f"{prefix} **{name}** — {pts} pts{tail}")
+            lines.append(f"{prefix} {who} — {pts} pts{tail}")
     except Exception:
         pass
     return lines
@@ -2295,15 +2408,141 @@ async def tourney_match_cmd(interaction: discord.Interaction, tourney_id: int, v
     boards = data.get("match_boards") or []
     b = next((x for x in boards if (x or {}).get("version") == int(version)), None)
     rows = (b or {}).get("rows") or []
+    by_did = {}
+    try:
+        for _rw in rows:
+            if (_rw or {}).get("discord_id"):
+                by_did[str(_rw.get("discord_id"))] = (_rw or {}).get("name")
+    except Exception:
+        pass
+    w_mention = ""
+    try:
+        _wd = next((str(_rw.get("discord_id")) for _rw in rows
+                    if (_rw or {}).get("won") and (_rw or {}).get("discord_id")), "")
+        w_mention = (f" {_comp_mention(_wd)}" if _wd else "")
+    except Exception:
+        pass
     lines = []
     for i, r in enumerate(rows, 1):
         nm = (r or {}).get("name") or "?"
+        did = (r or {}).get("discord_id")
+        who = f"{_comp_mention(did)} **{nm}**" if did else f"**{nm}**"
         pts = (r or {}).get("points", 0)
         k = (r or {}).get("kills", 0)
         p = (r or {}).get("placement")
-        lines.append(f"{i}. **{nm}** — {pts} pts ({k}K{', P' + str(p) if p else ''})")
+        lines.append(f"{i}. {who} — {pts} pts ({k}K{', P' + str(p) if p else ''})")
     e = discord.Embed(title=f"{t.get('name')} — match v{version}", color=0x7c3aed,
-                      description=(f"Winner: **{w or '—'}**\n" + ("\n".join(lines) if lines else "No rows."))[:4000])
+                      description=(f"Winner: **{w or '—'}**{w_mention}\n" + ("\n".join(lines) if lines else "No rows."))[:4000])
+    await interaction.followup.send(embed=e)
+
+
+def _comp_mention(did) -> str:
+    """<@did> mention, or the raw id when empty. Pure."""
+    try:
+        did = str(did or "").strip()
+        return f"<@{did}>" if did else "?"
+    except Exception:
+        return "?"
+
+
+@bot.tree.command(name="tourney-winner", description="Winner of a comp tourney (most points)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)")
+async def tourney_winner_cmd(interaction: discord.Interaction, tourney_id: int):
+    await interaction.response.defer(ephemeral=False)
+    data = await _comp_tourney(tourney_id)
+    if not data or data.get("error"):
+        return await interaction.followup.send(f"Couldn't load tourney #{tourney_id}: {(data or {}).get('error') or 'server unreachable'}.")
+    t = data.get("tourney") or {}
+    board = data.get("standings") or []
+    if not board:
+        return await interaction.followup.send(f"No sealed matches in **{t.get('name')}** yet.")
+    w = board[0] or {}
+    await interaction.followup.send(
+        f"🏆 **{t.get('name')}** winner: {_comp_mention(w.get('discord_id'))} "
+        f"**{(w or {}).get('name') or '?'}** — {(w or {}).get('points', 0)} pts "
+        f"({(w or {}).get('kills', 0)}K, {(w or {}).get('wins', 0)}W)")
+
+
+@bot.tree.command(name="tourney-best", description="Best slayer of a comp tourney (most kills)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)")
+async def tourney_best_cmd(interaction: discord.Interaction, tourney_id: int):
+    await interaction.response.defer(ephemeral=False)
+    data = await _comp_tourney(tourney_id)
+    if not data or data.get("error"):
+        return await interaction.followup.send(f"Couldn't load tourney #{tourney_id}: {(data or {}).get('error') or 'server unreachable'}.")
+    t = data.get("tourney") or {}
+    board = data.get("standings") or []
+    if not board:
+        return await interaction.followup.send(f"No sealed matches in **{t.get('name')}** yet.")
+    try:
+        b = max(board, key=lambda r: int((r or {}).get("kills") or 0))
+    except Exception:
+        b = board[0]
+    await interaction.followup.send(
+        f"🔪 **{t.get('name')}** best slayer: {_comp_mention(b.get('discord_id'))} "
+        f"**{(b or {}).get('name') or '?'}** — {(b or {}).get('kills', 0)} kills "
+        f"({(b or {}).get('points', 0)} pts)")
+
+
+@bot.tree.command(name="tourney-worst", description="Bottom of a comp tourney board (fewest points)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)")
+async def tourney_worst_cmd(interaction: discord.Interaction, tourney_id: int):
+    await interaction.response.defer(ephemeral=False)
+    data = await _comp_tourney(tourney_id)
+    if not data or data.get("error"):
+        return await interaction.followup.send(f"Couldn't load tourney #{tourney_id}: {(data or {}).get('error') or 'server unreachable'}.")
+    t = data.get("tourney") or {}
+    board = data.get("standings") or []
+    if not board:
+        return await interaction.followup.send(f"No sealed matches in **{t.get('name')}** yet.")
+    w = board[-1] or {}
+    await interaction.followup.send(
+        f"💀 **{t.get('name')}** bottom: {_comp_mention(w.get('discord_id'))} "
+        f"**{(w or {}).get('name') or '?'}** — {(w or {}).get('points', 0)} pts "
+        f"({(w or {}).get('kills', 0)}K, {(w or {}).get('wins', 0)}W)")
+
+
+@bot.tree.command(name="tourney-pr", description="Tourney PR board (computed rating)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)")
+async def tourney_pr_cmd(interaction: discord.Interaction, tourney_id: int):
+    await interaction.response.defer(ephemeral=False)
+    try:
+        _st, body = await _api_post("/api/comp/tourney/pr", {"tourney_id": int(tourney_id)})
+    except Exception:
+        _st, body = 0, {}
+    board = (body or {}).get("pr_board") or []
+    if not board:
+        return await interaction.followup.send(
+            f"No PR for tourney #{tourney_id} yet ({(body or {}).get('error') or 'no sealed matches'}).")
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, r in enumerate(board[:10], 1):
+        prefix = medals[i - 1] if i <= 3 else f"{i}."
+        nm = (r or {}).get("name") or "?"
+        lines.append(f"{prefix} {_comp_mention((r or {}).get('discord_id'))} **{nm}** — {(r or {}).get('pr')} PR")
+    e = discord.Embed(title=f"📊 Tourney PR — #{tourney_id}", color=0x10b981,
+                      description="\n".join(lines)[:4000])
+    await interaction.followup.send(embed=e)
+
+
+@bot.tree.command(name="pr-leaderboard", description="Top Tourney PR ratings (latest per player)")
+async def pr_leaderboard_cmd(interaction: discord.Interaction, limit: int = 10):
+    await interaction.response.defer(ephemeral=False)
+    try:
+        data = await _api_get(f"/api/leaderboard?sort=pr&limit={max(1, min(int(limit or 10), 25))}")
+    except Exception:
+        data = None
+    rows = (data or {}).get("results") or []
+    rows = [r for r in rows if (r or {}).get("tourney_pr") is not None]
+    if not rows:
+        return await interaction.followup.send("No PR ratings yet — they compute when a tourney ends.")
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, r in enumerate(rows, 1):
+        prefix = medals[i - 1] if i <= 3 else f"{i}."
+        nm = (r or {}).get("game_username") or (r or {}).get("discord_username") or "?"
+        lines.append(f"{prefix} {_comp_mention((r or {}).get('discord_id'))} **{nm}** — {(r or {}).get('tourney_pr')} PR")
+    e = discord.Embed(title="📊 PR Leaderboard", color=0x10b981, description="\n".join(lines)[:4000])
     await interaction.followup.send(embed=e)
 
 
@@ -2891,7 +3130,23 @@ async def on_message(message):
             existing = await _comp_reg_rows(t["id"])
             team_idx = sum(1 for r in existing if (r or {}).get("status") != "banned")
             color = _comp_team_color(team_idx) if str((t or {}).get("mode") or "solo") == "duo" else None
-            sb.table("bngc_comp_registrations").insert({
+            # display names at intake (dashboards list these, no raw IDs)
+            member_names: dict = {}
+            try:
+                for u in (message.mentions or []):
+                    try:
+                        uid = str(getattr(u, "id", ""))
+                        if not uid or uid not in (members or []):
+                            continue
+                        member_names[uid] = {
+                            "username": str(getattr(u, "name", "") or "")[:32],
+                            "display_name": str(getattr(u, "display_name", "") or getattr(u, "name", "") or "")[:32],
+                        }
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            _reg_row = {
                 "tourney_id": t["id"],
                 "team_label": " / ".join(f"<@{i}>" for i in members),
                 "member_ids": members,
@@ -2899,7 +3154,14 @@ async def on_message(message):
                 "source_message_id": str(message.id),
                 "status": "accepted",
                 "team_color": color,
-            }).execute()
+            }
+            if member_names:
+                _reg_row["member_names"] = member_names
+            try:
+                sb.table("bngc_comp_registrations").insert(_reg_row).execute()
+            except Exception:
+                _reg_row.pop("member_names", None)  # pre-migration safe
+                sb.table("bngc_comp_registrations").insert(_reg_row).execute()
         except Exception as e:
             # unique violation = same message processed twice (retry)
             print(f"[comp] reg insert failed: {e}")
@@ -3034,19 +3296,18 @@ async def leaderboard_cmd(interaction: discord.Interaction, stat: str = "kills",
     lines = []
     for i, r in enumerate(rows, 1):
         name = r.get("discord_username") or r.get("game_username") or "?"
+        did = r.get("discord_id")
+        who = f"{_comp_mention(did)} **{name}**" if did else f"**{name}**"
         kills = r.get("kills") or 0
         deaths = r.get("deaths") or 0
         wins = r.get("wins") or 0
-        defeats = r.get("defeats") or 0
         if stat == "wins":
-            total = wins + defeats
-            wr = f"{(wins / total * 100):.1f}% WR" if total else "—"
-            val = f"{wins} wins ({wr})"
+            val = f"{wins} wins"
         else:
             kd = f"{(kills / deaths):.2f} K/D" if deaths else (f"{kills} K/D" if kills else "—")
             val = f"{kills} kills ({kd})"
         prefix = medals[i - 1] if i <= 3 else f"{i}."
-        lines.append(f"{prefix} **{name}** — {val}")
+        lines.append(f"{prefix} {who} — {val}")
     e.description = "\n".join(lines)[:4000]
     await interaction.followup.send(embed=e)
 

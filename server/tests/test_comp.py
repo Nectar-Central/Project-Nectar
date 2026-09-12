@@ -3,6 +3,7 @@ from server.routes.comp import (
     _next_version,
     _valid_table,
     aggregate_standings,
+    apply_adjustments,
     compute_match_points,
     derive_status,
     group_standings_by_team,
@@ -139,3 +140,29 @@ def test_group_duo_label_and_unregistered():
     assert by_name["Champs"]["member_ids"] == ["a", "b"]
     assert by_name["Ghost"]["team"] is False  # played, never registered: stands alone
     assert group_standings_by_team([], []) == []
+
+
+def test_tied_p1_shares_win_bonus():
+    evs = [
+        {"etype": "kill", "discord_id": "a", "actor_name": "A"},
+        {"etype": "kill", "discord_id": "a", "actor_name": "A"},
+        {"etype": "alv", "discord_id": "a", "actor_name": "A", "alive": False},
+        {"etype": "alv", "discord_id": "b", "actor_name": "B", "alive": False},
+    ]
+    rows = compute_match_points(evs, None, None, {"a": 1, "b": 1})
+    by = {r["discord_id"]: r for r in rows}
+    assert by["a"]["won"] and by["b"]["won"]
+    assert by["a"]["points"] == 2 + 3 + 10
+    assert by["b"]["points"] == 0 + 3 + 10
+
+
+def test_single_p1_keeps_solo_win():
+    evs = [
+        {"etype": "alv", "discord_id": "a", "actor_name": "A", "alive": False},
+        {"etype": "alv", "discord_id": "b", "actor_name": "B", "alive": False},
+    ]
+    rows = compute_match_points(evs, None, None, {"a": 1, "b": 2})
+    by = {r["discord_id"]: r for r in rows}
+    assert by["a"]["won"] and not by["b"]["won"]
+    assert by["a"]["points"] == 3 + 10
+    assert by["b"]["points"] == 7

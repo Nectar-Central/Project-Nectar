@@ -5,13 +5,13 @@
  * — never committed, never logged.
  * Uploads:
  *   cdn/nectar-companion.latest.user.js   (stable reinstall + @updateURL target)
- *   cdn/nectar-companion.v2.21.0.user.js  (immutable per-release copy)
+ *   cdn/nectar-companion.v2.22.0.user.js  (immutable per-release copy)
  */
 const fs = require("fs");
 const path = require("path");
 
 const ROOT = path.join(__dirname, "..", "..");
-const VERSION = "2.21.0";
+const VERSION = "2.22.0";
 
 function loadEnv(p) {
   const env = {};
@@ -59,7 +59,7 @@ function loadEnv(p) {
   const chk = await fetch(pub);
   const txt = await chk.text();
   console.log("public GET:", chk.status, `(${txt.length} chars)`);
-  if (chk.status !== 200 || !txt.includes("==UserScript==") || !txt.includes("@version      2.21.0")) {
+  if (chk.status !== 200 || !txt.includes("==UserScript==") || !txt.includes("@version      2.22.0")) {
     throw new Error("public file verification failed");
   }
   console.log("INSTALL LINK:", pub);

@@ -591,7 +591,7 @@ def test_hosting_only_host_not_counted_but_seals(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Duo defeat deferral: _team_alive_for_me + _write_defeat edge cases
+# Duo team liveness: _team_alive_for_me edge cases (wins-only, no defeats)
 # ---------------------------------------------------------------------------
 
 def _duo_room(gv="duo"):
@@ -638,78 +638,7 @@ def test_team_alive_returns_false_when_whole_team_dead():
     assert proc._team_alive_for_me(r, None, "Alice") is False
 
 
-# --- _write_defeat cross-version guard ---
-
-def _fake_supabase_for_defeat(monkeypatch, fake):
-    monkeypatch.setattr(proc, "supabase", fake)
-
-
-def test_write_defeat_skips_when_win_at_higher_version(monkeypatch):
-    """Win recorded at version N+1 suppresses defeat attempted at version N."""
-    fake = _FakeDB()
-    _fake_supabase_for_defeat(monkeypatch, fake)
-    r = _duo_room()
-    r.last_win_version = 2  # win recorded at N+1
-    user = {"defeats": 0}
-    result = proc._write_defeat("D1", "sess1", user, "zw_lg", "r-duo", "DUO01", 1, r)
-    assert result == 0  # defeat NOT written
-    assert user["defeats"] == 0  # unchanged
-
-
-def test_write_defeat_skips_when_win_at_same_version(monkeypatch):
-    """Win recorded at version N suppresses defeat at version N."""
-    fake = _FakeDB()
-    _fake_supabase_for_defeat(monkeypatch, fake)
-    r = _duo_room()
-    r.last_win_version = 1  # win at same version
-    user = {"defeats": 0}
-    result = proc._write_defeat("D1", "sess1", user, "zw_lg", "r-duo", "DUO01", 1, r)
-    assert result == 0
-
-
-def test_write_defeat_proceeds_when_no_win(monkeypatch):
-    """No win recorded → defeat goes through."""
-    fake = _FakeDB()
-    _fake_supabase_for_defeat(monkeypatch, fake)
-    r = _duo_room()
-    r.last_win_version = -1  # no win
-    user = {"defeats": 0}
-    result = proc._write_defeat("D1", "sess1", user, "zw_lg", "r-duo", "DUO01", 1, r)
-    assert result == 1
-    assert user["defeats"] == 1
-
-
-# --- Killfeed path deferral for duo with empty teams ---
-
-def test_killfeed_defer_duo_when_teams_empty(monkeypatch):
-    """Killfeed death in duo room with empty teams → defeat deferred, not written."""
-    fake = _FakeDB()
-    _fake_supabase_for_defeat(monkeypatch, fake)
-    r = _duo_room()
-    r.match_version = 3
-
-    # Simulate the killfeed path logic inline
-    me_name = "Alice"
-    eff_gm = "zw_lg"
-    death_room = r
-    _tstat = proc._team_alive_for_me(death_room, None, me_name)
-
-    # _tstat is None (no team data), is_duo is True → defer
-    assert _tstat is None
-    assert death_room.is_duo
-
-    # The fixed code should defer, not write
-    if _tstat is True or (_tstat is None and death_room is not None and death_room.is_duo):
-        if death_room is not None and death_room.last_defeat_version != death_room.match_version:
-            death_room.last_defeat_version = death_room.match_version
-        deferred = True
-    else:
-        proc._write_defeat("D1", "sess1", {"defeats": 0}, eff_gm, "r-duo", "DUO01", death_room.match_version, death_room)
-        deferred = False
-
-    assert deferred is True
-    assert death_room.last_defeat_version == 3  # marker set, no DB write
-
+# --- Wins-only: no defeat guard, no deferral (deleted with _write_defeat) ---
 
 def test_aligned_match_version_continuity():
     # fresh Photon room (v0) with seals behind it continues past them so the

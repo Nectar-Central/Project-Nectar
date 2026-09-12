@@ -19,7 +19,7 @@ def sessions_overview_embed(sessions: list[dict]) -> discord.Embed:
         gm_label = ", ".join(fmt.format_game_mode(g) for g in gms[:2]) or "Unknown"
         # Prefer last_played over created_at
         ts = fmt.fmt_date(s.get("last_played") or s.get("created_at"))
-        stats = f"K:{s.get('kills',0)} D:{s.get('deaths',0)} W:{s.get('wins',0)} L:{s.get('defeats',0)}"
+        stats = f"K:{s.get('kills',0)} D:{s.get('deaths',0)} W:{s.get('wins',0)}"
         if s.get("match_count"):
             stats += f" · {s['match_count']} match{'es' if s['match_count']!=1 else ''}"
         # No raw IDs — show human session label
@@ -81,7 +81,7 @@ def matches_in_session_embed(session_id: str, events: list[dict], session_meta: 
 def recent_matches_embed(matches: list[dict]) -> discord.Embed:
     """Flat list of recent individual matches (room + version) across sessions.
 
-    Each item: {session_short, room_short, ts, gm, kills, deaths, win, defeat}.
+    Each item: {session_short, room_short, ts, gm, kills, deaths, win}.
     """
     e = discord.Embed(title="Recent Matches", color=0x7C3AED)
     if not matches:
@@ -90,7 +90,7 @@ def recent_matches_embed(matches: list[dict]) -> discord.Embed:
     for i, m in enumerate(matches[:10], 1):
         gm_label = fmt.format_game_mode(m.get("gm")) if m.get("gm") else "Match"
         ts = fmt.fmt_date(m.get("ts"))
-        result = "Victory" if m.get("win") else ("Defeat" if m.get("defeat") else "—")
+        result = "Victory" if m.get("win") else "—"
         stats = f"K:{m.get('kills',0)} D:{m.get('deaths',0)} · {result}"
         e.add_field(name=f"{i}. {ts} — {gm_label}", value=f"{stats} · `{m.get('room_short','?')}`", inline=False)
     e.set_footer(text="Use /replay <session> or /killfeed <session> with the session id from /sessions")
@@ -119,7 +119,6 @@ def match_detail_embed(session_id: str, events: list[dict], room_id: str | None 
     kills = [ev for ev in events if ev.get("event_type") == "killfeed" and (ev.get("event_data") or {}).get("kill_type") == "killed"]
     knocks = [ev for ev in events if ev.get("event_type") == "killfeed" and (ev.get("event_data") or {}).get("kill_type") == "knocked"]
     wins = any(ev.get("event_type") == "win" for ev in events)
-    defeats = any(ev.get("event_type") == "defeat" for ev in events)
     zone_changes = sum(1 for ev in events if ev.get("event_type") == "zone_change")
     title = "Match Details" if not room_id else "Match Details"
     e = discord.Embed(title=title, color=0x7C3AED)
@@ -128,7 +127,7 @@ def match_detail_embed(session_id: str, events: list[dict], room_id: str | None 
     e.add_field(name="Knocks", value=str(len(knocks)), inline=True)
     if zone_changes:
         e.add_field(name="Zone changes", value=str(zone_changes), inline=True)
-    result = "Victory" if wins else ("Defeat" if defeats else "—")
+    result = "Victory" if wins else "—"
     e.add_field(name="Result", value=result, inline=True)
     e.add_field(name="Events", value=f"{len(events)} total", inline=True)
     # Time range
@@ -220,9 +219,6 @@ def replay_lines_for_events(events: list[dict], room_id: str | None = None) -> l
         elif et == "win":
             gm = fmt.format_game_mode(gd.get("gm", ""))
             lines.append(f"`{ts}` **Victory** — {gm}")
-        elif et == "defeat":
-            gm = fmt.format_game_mode(gd.get("gm", ""))
-            lines.append(f"`{ts}` Defeat — {gm}")
         elif et == "kill":
             victim = gd.get("victim", "?")
             lines.append(f"`{ts}` You eliminated {victim}")
