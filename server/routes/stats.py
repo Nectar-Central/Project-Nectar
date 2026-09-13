@@ -51,6 +51,59 @@ router = APIRouter()
 # Last logged ranked verdict per discord_id: (sig, ts) for log sampling.
 _stats_ranked_sig: dict = {}
 
+# Bandwidth guards: drawer polls every 2-4s per client; each poll was
+# 1x Upstash GET (10-60KB) + ~7 Supabase RTs. Cache full responses 8s
+# and rank counts 60s so 3-4 polls share one backend fan-out.
+_STATS_CACHE: dict = {}  # key -> (expiry_ts, payload_dict)
+_STATS_TTL_S = 8.0
+_RANK_CACHE: dict = {}  # kills_bucket_key -> (expiry_ts, rank_dict)
+_RANK_TTL_S = 60.0
+
+# Explicit column list: select("*") ships every new column forever.
+_USER_COLS = (
+    "discord_id,discord_username,game_username,game_id,skin,pickaxe,"
+    "kills,deaths,wins,play_points,playtime_global,playtime_per_gm,"
+    "daily_streak,win_streak,best_win_streak,best_match_kills,last_daily_claim,"
+    "is_dev,is_locked,lobby_music_url,lobby_music_volume,tourney_pr"
+)
+
+
+def _cache_bypassed() -> bool:
+    """Never serve stale cross-test data under pytest."""
+    try:
+        import os as _os
+        import sys as _sys
+        if _os.getenv("PYTEST_CURRENT_TEST"):
+            return True
+        return "pytest" in _sys.modules
+    except Exception:
+        return False
+
+
+def _stats_cache_get(key: str):
+    try:
+        if _cache_bypassed():
+            return None
+        hit = _STATS_CACHE.get(key)
+        if hit and _time.time() < hit[0]:
+            return hit[1]
+        if hit:
+            _STATS_CACHE.pop(key, None)
+    except Exception:
+        pass
+    return None
+
+
+def _stats_cache_set(key: str, payload: dict):
+    try:
+        if _cache_bypassed():
+            return
+        if len(_STATS_CACHE) > 2000:
+            _STATS_CACHE.clear()
+        _STATS_CACHE[key] = (_time.time() + _STATS_TTL_S, payload)
+    except Exception:
+        pass
+
 
 def better_than_pct(total: int, above: int) -> int:
     """Percentile for the 'better than X% of players' drawer line.
@@ -117,6 +170,19 @@ async def get_stats(request: Request):
     qp = request.query_params
     session_id = qp.get("session_id") or qp.get("sid")
     discord_id = qp.get("discord_id") or qp.get("did")
+    # Fast-path cache: same poll params within TTL share one backend fan-out.
+    # Key on raw identifiers only (no DB lookup needed to check).
+    try:
+        _ck = f"sid:{session_id}" if session_id else (f"did:{str(discord_id).lower()}" if discord_id else None)
+        if _ck:
+            _hit = _stats_cache_get(_ck)
+            if _hit is not None:
+                _resp = JSONResponse(_hit)
+                _resp.headers["Cache-Control"] = "public, max-age=8"
+                _resp.headers["X-Cache"] = "HIT"
+                return _resp
+    except Exception:
+        _ck = None
     # Allow POST body fallback
     if not session_id and not discord_id:
         try:
@@ -183,7 +249,7 @@ async def get_stats(request: Request):
         return JSONResponse({"error": "Server not configured"}, status_code=500)
 
     try:
-        res = await db_io(lambda: supabase.table("bngc_users").select("*").eq("discord_id", discord_id).single().execute())
+        res = await db_io(lambda: supabase.table("bngc_users").select(_USER_COLS).eq("discord_id", discord_id).single().execute())
         user = res.data
     except Exception as e:
         if "PGRST116" in str(e):
@@ -325,14 +391,26 @@ async def get_stats(request: Request):
 
     # kills percentile for the drawer's "better than X% of players" line.
     # Lightweight exact counts (no row data); hidden when unavailable.
+    # Cached 60s globally: 2 count scans per poll x every 2s was pure egress.
     rank = {"by": "kills", "pct": 0, "rank": 0, "total": 0}
     try:
-        t = await db_io(lambda: supabase.table("bngc_users").select("discord_id", count="exact").execute())
-        total = t.count or 0
-        a = await db_io(lambda: supabase.table("bngc_users").select("discord_id", count="exact").gt("kills", kills).execute())
-        above = a.count or 0
-        rank = {"by": "kills", "pct": better_than_pct(total, above),
-                "rank": above + 1 if total else 0, "total": total or 0}
+        _rk_key = f"k:{kills}"
+        _rk_hit = None if _cache_bypassed() else _RANK_CACHE.get(_rk_key)
+        if _rk_hit and _time.time() < _rk_hit[0]:
+            rank = _rk_hit[1]
+        else:
+            t = await db_io(lambda: supabase.table("bngc_users").select("discord_id", count="exact").execute())
+            total = t.count or 0
+            a = await db_io(lambda: supabase.table("bngc_users").select("discord_id", count="exact").gt("kills", kills).execute())
+            above = a.count or 0
+            rank = {"by": "kills", "pct": better_than_pct(total, above),
+                    "rank": above + 1 if total else 0, "total": total or 0}
+            try:
+                if len(_RANK_CACHE) > 500:
+                    _RANK_CACHE.clear()
+                _RANK_CACHE[_rk_key] = (_time.time() + _RANK_TTL_S, rank)
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -520,7 +598,7 @@ async def get_stats(request: Request):
     except Exception:
         pr_delta_pct = None
 
-    return JSONResponse({
+    payload = {
         "discord_id": user.get("discord_id"),
         "discord_username": user.get("discord_username"),
         "game_username": user.get("game_username"),
@@ -548,4 +626,13 @@ async def get_stats(request: Request):
         "lobby_music_volume": user.get("lobby_music_volume", 0.5),
         "session": session_out,
         "ranked": ranked_out,
-    })
+    }
+    try:
+        if _ck:
+            _stats_cache_set(_ck, payload)
+    except Exception:
+        pass
+    _out = JSONResponse(payload)
+    _out.headers["Cache-Control"] = "public, max-age=8"
+    _out.headers["X-Cache"] = "MISS"
+    return _out

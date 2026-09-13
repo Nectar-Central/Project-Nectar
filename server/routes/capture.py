@@ -26,6 +26,40 @@ engine = Engine()
 # Once-per-worker flag for the missing-Upstash warning (else it spams every batch)
 _logged_no_upstash = False
 
+# Bandwidth guard: ranked room lookup per capture batch was a Supabase
+# RT every few seconds per player. Cache 30s per short_code.
+_ranked_room_cache: dict = {}
+_RANKED_ROOM_TTL_S = 30.0
+
+
+def _cached_ranked_room(code_r):
+    try:
+        import sys as _sys
+        if "pytest" not in _sys.modules:
+            import time as _t
+            now = _t.time()
+            hit = _ranked_room_cache.get(str(code_r).upper())
+            if hit and now < hit[0]:
+                return hit[1]
+        else:
+            import time as _t
+            now = _t.time()
+        from server.lib import ranked as ranked_mod
+        room_data = ranked_mod.get_ranked_room(code_r)
+        try:
+            if len(_ranked_room_cache) > 500:
+                _ranked_room_cache.clear()
+            _ranked_room_cache[str(code_r).upper()] = (now + _RANKED_ROOM_TTL_S, room_data)
+        except Exception:
+            pass
+        return room_data
+    except Exception:
+        try:
+            from server.lib import ranked as ranked_mod
+            return ranked_mod.get_ranked_room(code_r)
+        except Exception:
+            return None
+
 @router.post("/api/capture")
 async def capture_handler(request: Request, background_tasks: BackgroundTasks):
     body = await request.json()
@@ -225,11 +259,10 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
     # polls ranked endpoints. No point rules: both sides hardcode 8/50/-5.
     if view and discord_id:
         try:
-            from server.lib import ranked as ranked_mod
             for room_id_r, room_r in view.rooms.items():
                 code_r = getattr(room_r, "short_code", None)
                 if code_r and room_r.state.value == "match":
-                    room_data = ranked_mod.get_ranked_room(code_r)
+                    room_data = _cached_ranked_room(code_r)
                     if room_data and room_data.get("status") in ("lobby", "live"):
                         resp["ranked_room"] = {
                             "code": code_r,

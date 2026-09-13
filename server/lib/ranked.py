@@ -206,21 +206,60 @@ def _norm_code(short_code: Any) -> str:
         return ""
 
 
+_ROOM_CACHE: dict[str, tuple[float, Any]] = {}
+_ROOM_TTL_S = 30.0
+_ROOM_COLS = "id,short_code,status,host_discord_id,match_version,roster,updated_at"
+
+
+def _room_cache_bypassed() -> bool:
+    try:
+        import os as _os
+        import sys as _sys
+        if _os.getenv("PYTEST_CURRENT_TEST"):
+            return True
+        return "pytest" in _sys.modules
+    except Exception:
+        return False
+
+
 def get_ranked_room(short_code: Any) -> dict[str, Any] | None:
-    """Open (live preferred, then lobby) room for a 5-char code. None if not ranked."""
+    """Open (live preferred, then lobby) room for a 5-char code. None if not ranked.
+
+    Cached 30s per code: capture + stats poll this every few seconds per
+    player; each miss was 1-2 Supabase RTs of Service-Initiated egress.
+    """
     if ranked_sleeping():
         return None
     code = _norm_code(short_code)
     if not code:
         return None
+    try:
+        if not _room_cache_bypassed():
+            hit = _ROOM_CACHE.get(code)
+            if hit and time.time() < hit[0]:
+                return hit[1]
+    except Exception:
+        pass
     sb = _sb()
     if not sb:
         return None
     try:
         for status in ("live", "lobby"):
-            r = sb.table("ranked_rooms").select("*").eq("short_code", code).eq("status", status).limit(1).execute()
+            r = sb.table("ranked_rooms").select(_ROOM_COLS).eq("short_code", code).eq("status", status).limit(1).execute()
             if r.data:
+                try:
+                    if len(_ROOM_CACHE) > 500:
+                        _ROOM_CACHE.clear()
+                    _ROOM_CACHE[code] = (time.time() + _ROOM_TTL_S, r.data[0])
+                except Exception:
+                    pass
                 return r.data[0]
+        try:
+            if len(_ROOM_CACHE) > 500:
+                _ROOM_CACHE.clear()
+            _ROOM_CACHE[code] = (time.time() + _ROOM_TTL_S, None)
+        except Exception:
+            pass
     except Exception as exc:
         log_ranked(f"[ranked] room lookup failed {code}: {exc}")
     return None

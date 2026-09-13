@@ -41,14 +41,20 @@ async def get_session_state(session_id: str):
         }
     """
 
+    from fastapi.responses import JSONResponse
+
     view = capture_engine.get_session(session_id)
 
     if view:
-        return view.to_dict()
+        resp = JSONResponse(view.to_dict())
+        resp.headers["Cache-Control"] = "public, max-age=3"
+        return resp
 
     # Fallback: Upstash persisted state (any lambda can read it)
     cached = await cache.get_session_state(session_id)
     if cached:
-        return cached
+        resp = JSONResponse(cached)
+        resp.headers["Cache-Control"] = "public, max-age=3"
+        return resp
 
     raise HTTPException(status_code=404, detail="session not found — no packets fed yet")
