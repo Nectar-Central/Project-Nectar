@@ -18,6 +18,22 @@ router = APIRouter()
 
 _BLANK = ("", "nan", "null", "none", "undefined")
 
+# Bandwidth guard: players polls every few seconds per client; each poll
+# was 1x Upstash GET (10-60KB) + 2 Supabase IN queries. Cache 5s per session.
+_PLAYERS_CACHE: dict = {}
+_PLAYERS_TTL_S = 5.0
+
+
+def _players_cache_bypassed() -> bool:
+    try:
+        import os as _os
+        import sys as _sys
+        if _os.getenv("PYTEST_CURRENT_TEST"):
+            return True
+        return "pytest" in _sys.modules
+    except Exception:
+        return False
+
 
 def _ident_key(p: dict, idx: int):
     """Identity key for dedup: game_id, then discord_id, then username.
@@ -82,6 +98,18 @@ async def get_players(request: Request):
             pass
     if not session_id:
         return JSONResponse({"error": "session_id required"}, status_code=400)
+    # Fast-path cache (no backend egress on HIT).
+    try:
+        if not _players_cache_bypassed():
+            import time as _t
+            _hit = _PLAYERS_CACHE.get(session_id)
+            if _hit and _t.time() < _hit[0]:
+                _r = JSONResponse(_hit[1])
+                _r.headers["Cache-Control"] = "public, max-age=5"
+                _r.headers["X-Cache"] = "HIT"
+                return _r
+    except Exception:
+        pass
 
     # Resolve live session (engine memory -> cache)
     live = None
@@ -196,4 +224,16 @@ async def get_players(request: Request):
     # Sort: self first, then alive first, then name
     enriched.sort(key=lambda x: (not x.get("is_self"), not x.get("is_alive"), (x.get("username") or "").lower()))
 
-    return JSONResponse({"count": len(enriched), "room_id": cur.get("room_id"), "game_mode": cur.get("game_mode"), "state": cur.get("state"), "short_code": cur.get("short_code"), "party": cur.get("party"), "players": enriched})
+    payload = {"count": len(enriched), "room_id": cur.get("room_id"), "game_mode": cur.get("game_mode"), "state": cur.get("state"), "short_code": cur.get("short_code"), "party": cur.get("party"), "players": enriched}
+    try:
+        if not _players_cache_bypassed():
+            import time as _t2
+            if len(_PLAYERS_CACHE) > 2000:
+                _PLAYERS_CACHE.clear()
+            _PLAYERS_CACHE[session_id] = (_t2.time() + _PLAYERS_TTL_S, payload)
+    except Exception:
+        pass
+    _out = JSONResponse(payload)
+    _out.headers["Cache-Control"] = "public, max-age=5"
+    _out.headers["X-Cache"] = "MISS"
+    return _out

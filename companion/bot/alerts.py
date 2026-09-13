@@ -14,7 +14,12 @@ async def fetch_unnotified(limit: int = 20):
     if not db.USE_SUPABASE or not db.supabase:
         return []
     try:
-        r = db.supabase.table("bngc_alerts").select("*").eq("notified", False).order("created_at", desc=False).limit(limit).execute()
+        # Explicit columns only: select("*") ships every new column on every
+        # poll (Service-Initiated egress 24/7). These are all build_embed needs.
+        r = db.supabase.table("bngc_alerts").select(
+            "id,discord_id,alert_type,discord_username,game_username,game_id,"
+            "country,details,created_at,notified"
+        ).eq("notified", False).order("created_at", desc=False).limit(limit).execute()
         return r.data or []
     except Exception as e:
         print(f"[alerts] fetch failed: {e}")
@@ -95,13 +100,17 @@ async def send_alert(bot: discord.Client, a: dict):
 
 async def alert_loop(bot: discord.Client):
     await bot.wait_until_ready()
-    print("[alerts] loop started — polling bngc_alerts every 15s")
+    print("[alerts] loop started — polling bngc_alerts every 60s (idle) / 15s (active)")
+    _idle = 0
     while not bot.is_closed():
         try:
             rows = await fetch_unnotified(limit=20)
             for a in rows:
                 await send_alert(bot, a)
                 await asyncio.sleep(0.5)
+            # Back off when empty: alerts are rare, polling every 15s 24/7
+            # is ~5760 Supabase reads/day for mostly-empty responses.
+            _idle = _idle + 1 if not rows else 0
         except Exception as e:
             print(f"[alerts] loop error: {e}")
-        await asyncio.sleep(15)
+        await asyncio.sleep(60 if _idle >= 2 else 15)

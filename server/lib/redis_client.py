@@ -33,6 +33,41 @@ def _upstash_cfg():
         return url, token
     return None, None
 
+
+# --- Bandwidth guards: keep-alive pool + write throttling ---
+# Upstash REST over public internet counts as Render Service-Initiated
+# egress (TLS + payload each call). Two savings:
+# 1. Reuse one pooled HTTP client (no fresh TLS handshake per batch).
+# 2. Skip redundant SETs: same payload or <PERSIST_MIN_INTERVAL_S apart.
+_http_client = None
+_last_set: dict[str, tuple[str, float]] = {}  # key -> (payload_hash, ts)
+PERSIST_MIN_INTERVAL_S = 10.0
+RAW_MIN_INTERVAL_S = 30.0
+
+
+def _get_http():
+    """Pooled sync HTTP client (keep-alive). Falls back to None -> urllib."""
+    global _http_client
+    try:
+        if _http_client is not None:
+            return _http_client
+        import httpx as _httpx
+        _http_client = _httpx.Client(
+            limits=_httpx.Limits(max_connections=20, max_keepalive_connections=20),
+            timeout=_httpx.Timeout(5.0, connect=3.0),
+        )
+        return _http_client
+    except Exception:
+        return None
+
+
+def _payload_hash(s: str) -> str:
+    try:
+        import hashlib as _hl
+        return _hl.md5(s.encode()[:65536]).hexdigest() + f":{len(s)}"
+    except Exception:
+        return str(len(s))
+
 def _get_redis():
     """Get Redis client if configured, else None."""
 
@@ -48,11 +83,24 @@ def _get_redis():
     return None
 
 async def _upstash_get(key: str) -> str | None:
-    import urllib.request, urllib.error
     url, token = _upstash_cfg()
     if not url:
         return None
+    # Pooled client first (keep-alive, no fresh TLS per call).
     try:
+        client = _get_http()
+        if client is not None:
+            r = client.get(f"{url}/get/{key}", headers={"Authorization": f"Bearer {token}"})
+            if r.status_code != 200:
+                return None
+            try:
+                return r.json().get("result")
+            except Exception:
+                return None
+    except Exception:
+        pass
+    try:
+        import urllib.request
         req = urllib.request.Request(f"{url}/get/{key}", headers={"Authorization": f"Bearer {token}"})
         with urllib.request.urlopen(req, timeout=3) as r:
             body = r.read().decode()
@@ -63,7 +111,6 @@ async def _upstash_get(key: str) -> str | None:
         return None
 
 async def _upstash_set(key: str, value: str, ttl: int = 3600) -> bool:
-    import urllib.request, urllib.error, urllib.parse
     url, token = _upstash_cfg()
     if not url:
         return False
@@ -71,6 +118,20 @@ async def _upstash_set(key: str, value: str, ttl: int = 3600) -> bool:
     # (GET-style /set/<key>/<value> fails past ~8KB with URI Too Long).
     # Upstash REST accepts a JSON command array: ["SET", key, value, "EX", ttl].
     try:
+        body = _json.dumps(["SET", key, value] + (["EX", int(ttl)] if ttl else [])).encode()
+        client = _get_http()
+        if client is not None:
+            r = client.post(url, content=body, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+            if r.status_code != 200:
+                return False
+            try:
+                return r.json().get("result") == "OK"
+            except Exception:
+                return True
+    except Exception:
+        pass
+    try:
+        import urllib.request
         body = _json.dumps(["SET", key, value] + (["EX", int(ttl)] if ttl else [])).encode()
         req = urllib.request.Request(url, data=body, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=5) as r:
@@ -86,11 +147,18 @@ async def _upstash_set(key: str, value: str, ttl: int = 3600) -> bool:
 
 async def _upstash_ping(timeout: int = 3) -> bool:
     """Cheap reachability check (GET /ping) — False when unconfigured or unreachable."""
-    import urllib.request, urllib.error
     url, token = _upstash_cfg()
     if not url:
         return False
     try:
+        client = _get_http()
+        if client is not None:
+            r = client.get(f"{url}/ping", headers={"Authorization": f"Bearer {token}"})
+            return r.status_code == 200
+    except Exception:
+        pass
+    try:
+        import urllib.request
         req = urllib.request.Request(f"{url}/ping", headers={"Authorization": f"Bearer {token}"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status == 200
@@ -219,6 +287,10 @@ class Cache:
         """Persist SessionView.to_dict() to Upstash + memory (survives lambda cold start).
 
         Returns True when Upstash accepted it (False = memory-only, lost across lambdas).
+        Bandwidth guard: always updates memory, but skips the Upstash POST when
+        the payload is unchanged or the last persist was <PERSIST_MIN_INTERVAL_S
+        ago (capture batches every 2-5s; 10-60KB each). Returns True on skip so
+        callers don't log a failure.
         """
         if not session_id or not state:
             return False
@@ -226,9 +298,23 @@ class Cache:
             payload = _json.dumps(state, separators=(",", ":"))
         except Exception:
             return False
-        # memory
+        # memory (always fresh — local reads never hit network)
         _memory_state[session_id] = (payload, time.time() + ttl)
-        # upstash
+        # throttle Upstash egress (disabled under pytest for determinism)
+        try:
+            import sys as _sys
+            if "pytest" not in _sys.modules:
+                h = _payload_hash(payload)
+                now = time.time()
+                last = _last_set.get(f"bnc:state:{session_id}")
+                if last and (last[0] == h or now - last[1] < PERSIST_MIN_INTERVAL_S):
+                    return True  # skip: unchanged or too soon
+            ok = await _upstash_set(f"bnc:state:{session_id}", payload, ttl=ttl)
+            if ok:
+                _last_set[f"bnc:state:{session_id}"] = (h, now)
+            return ok
+        except Exception:
+            pass
         return await _upstash_set(f"bnc:state:{session_id}", payload, ttl=ttl)
 
     @staticmethod
@@ -275,10 +361,26 @@ class Cache:
 
     @staticmethod
     async def set_raw(key: str, value: str, ttl: int = 3600) -> bool:
-        """Generic small-value write (memory + Upstash). For gauges/snapshots."""
+        """Generic small-value write (memory + Upstash). For gauges/snapshots.
+
+        Throttled like session state (precision snapshots on every health
+        poll would otherwise POST continuously).
+        """
         if not key or value is None:
             return False
         _memory_state[key] = (value, time.time() + ttl)
+        try:
+            h = _payload_hash(value if isinstance(value, str) else str(value))
+            now = time.time()
+            last = _last_set.get(key)
+            if last and (last[0] == h or now - last[1] < RAW_MIN_INTERVAL_S):
+                return True
+            ok = await _upstash_set(key, value, ttl=ttl)
+            if ok:
+                _last_set[key] = (h, now)
+            return ok
+        except Exception:
+            pass
         return await _upstash_set(key, value, ttl=ttl)
 
     @staticmethod

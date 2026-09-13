@@ -5222,9 +5222,12 @@ async def ranked_loop():
             print(f"[ranked] seal-watch seeded (skipping already-sealed): {_seal_seen}")
     except Exception as e:
         print(f"[ranked] seal-watch seed failed: {e}")
+    _idle_cycles = 0
     while not bot.is_closed():
+        _active = False
         try:
             for room in ranked_mod.list_due_starts():
+                _active = True
                 try:
                     ok, msg = await _start_ranked_room(room, via="countdown")
                     print(f"[ranked] countdown start {room.get('id')}: {msg}")
@@ -5237,6 +5240,8 @@ async def ranked_loop():
             except Exception as e:
                 print(f"[ranked] live list failed: {e}")
                 live = []
+            if live or _pending_end:
+                _active = True
             live_ids = set()
             for room in live:
                 try:
@@ -5248,6 +5253,8 @@ async def ranked_loop():
                     fresh = sorted(
                         [s for s in seals if int(s.get("match_version") or 0) > known],
                         key=lambda s: int(s.get("match_version") or 0))
+                    if fresh:
+                        _active = True
                     for seal in fresh:
                         try:
                             await _post_match_board(room, seal)
@@ -5282,7 +5289,15 @@ async def ranked_loop():
                     print(f"[ranked] auto-end check failed for {rid}: {e}")
         except Exception as e:
             print(f"[ranked] loop failed: {e}")
-        await asyncio.sleep(30)
+        # Idle backoff: no live/due/pending rooms most of the day — 90s
+        # instead of 30s cuts baseline Supabase polls 3x with zero UX cost.
+        # Any activity resets to 30s immediately.
+        if _active:
+            _idle_cycles = 0
+            await asyncio.sleep(30)
+        else:
+            _idle_cycles += 1
+            await asyncio.sleep(90 if _idle_cycles >= 2 else 30)
 
 
 if __name__ == "__main__":

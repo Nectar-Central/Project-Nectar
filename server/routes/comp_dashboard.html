@@ -1122,9 +1122,9 @@ try {
     _rn.disabled = false;
   };
 } catch {}
-setInterval(refreshTracker, 4000);
+setInterval(refreshTracker, 10000);
 // live match view: re-pull board + killfeed while the picked match is open
-setInterval(() => { try { if (_matchLive && selTid != null && editMatchId != null) refreshMatch(); } catch {} }, 4000);
+setInterval(() => { try { if (_matchLive && selTid != null && editMatchId != null) refreshMatch(); } catch {} }, 10000);
 refreshAll();
 </script>
 </body>
