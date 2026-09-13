@@ -15,7 +15,7 @@ from server.lib.photon_engine.models import (
     SessionView,
     Team,
 )
-from server.scripts.processor import _phase_end_result, _self_death_evidence
+from server.scripts.processor import _phase_end_debug, _phase_end_result, _self_death_evidence
 
 
 def _room(me_name="me", teammates=(), dead=(), feed_killed_me=False,
@@ -95,3 +95,26 @@ def test_no_info_at_all_falls_back_to_win():
     assert _phase_end_result(r, v, "me") == "win"
     assert _phase_end_result(r, v, None) is None
     assert _phase_end_result(None, v, "me") is None
+
+
+def test_debug_names_deny_reason():
+    r, v = _room(dead=("me",))
+    assert _phase_end_result(r, v, "me") is None
+    d = _phase_end_debug(r, v, "me")
+    assert "death_ev=True" in d
+    assert "alive_in_roster=False" in d
+
+
+def test_debug_no_identity():
+    r, v = _room()
+    assert _phase_end_debug(r, v, None) == "no-identity(view.me null + game_username null)"
+    assert _phase_end_debug(None, v, "me") == "no-room"
+
+
+def test_debug_leaver_shape():
+    r, v = _room(players=False)
+    r.recent_kills.append(KillInfo(instigator="me", instigated="",
+                                   event_type="left"))
+    assert _phase_end_result(r, v, "me") is None
+    d = _phase_end_debug(r, v, "me")
+    assert "left_row=True" in d
