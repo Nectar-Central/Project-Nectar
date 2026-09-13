@@ -333,3 +333,22 @@ test('coded join clears public state', async () => {
   t.handle(null, stg(1));
   assert.ok(t.status().open);
 });
+
+test('same-room rejoin after lobby hop clears public state', async () => {
+  // host backout: ABCDE -> pid-less lobby -> same ABCDE. Tracking must resume
+  // without a reload (publicRoom stuck true used to suppress opens forever).
+  const sink = codedSink('ABCDE');
+  const t = comp.createTracker({ sink, log: () => {} });
+  await t.setTourney(4);
+  t.handle({ dir: 'out' }, joinRoomPid('ABCDE'));
+  t.handle(null, stg(1));
+  assert.ok(t.status().open);
+  await t.sealManual();
+  assert.equal(sink.saved.length, 1);
+  t.handle({ dir: 'out' }, joinRandomRoomNoPid());
+  assert.equal(t.status().public, true);
+  t.handle({ dir: 'out' }, joinRoomPid('ABCDE'));
+  assert.equal(t.status().public, false);
+  t.handle(null, stg(1));
+  assert.ok(t.status().open);
+});

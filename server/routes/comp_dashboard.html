@@ -692,6 +692,16 @@ function optSub(did, pts) {
     _sortBoard();
   } catch {}
 }
+function optAdd(did, pts) {
+  // optimistic manual award (match level); reconcile corrects on fetch.
+  try {
+    const b = matchCache.board || (matchCache.board = []);
+    let r = b.find((x) => String(x.discord_id) === String(did));
+    if (!r) { r = { discord_id: String(did), name: nameOfDid(did), kills: 0, placement: null, won: false, points: 0 }; b.push(r); }
+    r.points = Math.max(0, (Number(r.points) || 0) + pts);
+    _sortBoard();
+  } catch {}
+}
 function winnerNameOf(did) {
   if (!did) return null;
   try {
@@ -760,10 +770,13 @@ function renderMatchPanel() {
     return `<div style="margin:4px 0"><b title="${esc(did)}">${nm}</b> <span class="dim">${p.kills || 0}K${p.placement ? ' · ' + ord(p.placement) : ''}</span><br>` +
       `<button data-k="${esc(did)}">+ kill</button> ` +
       `<button data-w="${esc(did)}">+ win</button> ` +
+      `<input size="3" id="add-${esc(did)}" placeholder="+pts" inputmode="numeric" title="Manual points (match level)"> <button data-add="${esc(did)}" title="Add manual points (match level)">+pts</button> ` +
       `<input size="3" id="sub-${esc(did)}" placeholder="pts" inputmode="numeric" title="Points to remove"> <button data-sub="${esc(did)}" title="Remove points (ledger, stable across reconcile)">−pts</button><br>` +
       `<span class="dim">Place:</span> ` +
       [1, 2, 3, 4, 5].map((n) => `<button class="placebtn" data-p="${esc(did)}:${n}">${ord(n)}</button>`).join(' ') +
-      ` <button class="tiebtn" data-t1="${esc(did)}" title="Toggle P1 tie (shared P1, full WIN each)">T1</button></div>`;
+      ` <button class="tiebtn" data-t1="${esc(did)}" title="Toggle P1 tie (shared P1, full WIN each)">T1</button> ` +
+      `<button data-reset="${esc(did)}" title="Reset this player in the match (clears manual rows, placement, awards)">Reset</button> ` +
+      `<button data-remove="${esc(did)}" title="Remove from match roster (ignored in placements)">Remove</button></div>`;
   }).join('') || '<span class="dim">No players.</span>';
   const canSeal = (m.status === 'open' || m.status === 'manual');
   // winner dropdown options: names with dids as labels
@@ -784,7 +797,8 @@ function renderMatchPanel() {
     `<div class="gap"><input size="14" list="mWinnerList" placeholder="winner name or id" id="mWinner" value="${esc(wv)}"> ` +
     `<datalist id="mWinnerList">${dlOpts}</datalist>` +
     `<button id="mWinGo">Set winner</button> ` +
-    (canSeal ? `<button id="mSealGo" class="primary">Seal match</button> <button id="mTieGo" title="Tie top-2 at P1 (both keep full WIN)">Tie top-2</button>` : '') + `</div>` +
+    (canSeal ? `<button id="mSealGo" class="primary">Seal match</button> <button id="mTieGo" title="Tie top-2 at P1 (both keep full WIN)">Tie top-2</button>` : '') +
+    ` <button id="mResetGo" title="Reset whole match (clears placements, awards, all event rows)">Reset match</button> <button id="mDelGo" class="danger" title="Delete this match and its events">Delete match</button></div>` +
     `<div class="muted" style="margin:6px 0 2px">SCORE</div>` + plist;
   try { if (_fId) { const n = document.getElementById(_fId); if (n && 'value' in n) n.value = _fVal; } } catch {}
     const wgo = $('mWinGo');
@@ -807,6 +821,23 @@ function renderMatchPanel() {
       mutMatch(tgo, () => optTie(top2),
         () => api('/api/comp/match/tie', post({ match_id: editMatchId, discord_ids: top2 })),
         'tied P1 ' + top2.map(nameOfDid).join(' & '), true);
+    };
+    const rgo = $('mResetGo');
+    if (rgo) rgo.onclick = () => {
+      if (!confirm('Reset whole match? Clears placements, awards and ALL event rows.')) return;
+      mutMatch(rgo, () => {},
+        () => api('/api/comp/match/reset', post({ match_id: editMatchId, hard: true })), 'reset match ' + editMatchId, true);
+    };
+    const dgo = $('mDelGo');
+    if (dgo) dgo.onclick = () => {
+      if (!confirm('Delete this match and all its events? Cannot be undone.')) return;
+      dgo.disabled = true;
+      api('/api/comp/match/delete', post({ match_id: editMatchId })).then(() => {
+        log('deleted match ' + editMatchId);
+        editMatchId = null;
+        refreshTourneyLite();
+        refreshMatch();
+      }).catch((e) => { log('delete: ' + e.message, true); dgo.disabled = false; });
     };
     left.querySelectorAll('[data-t1]').forEach((b) => {
       b.onclick = () => {
@@ -859,6 +890,34 @@ function renderMatchPanel() {
           '−' + pts + 'pts ' + nameOfDid(did), true);
       };
     });
+    left.querySelectorAll('[data-add]').forEach((b) => {
+      b.onclick = () => {
+        const did = b.dataset.add;
+        let inp = null;
+        try { inp = left.querySelector(`[id="add-${did}"]`); } catch {}
+        if (!inp) { try { inp = document.getElementById('add-' + did); } catch {} }
+        const pts = Number(inp && inp.value);
+        if (!Number.isFinite(pts) || pts <= 0) { log('add points: enter points > 0 first', true); return; }
+        if (pts > 500) { log('add points: capped at 500pts', true); return; }
+        mutMatch(b, () => optAdd(did, pts),
+          () => api('/api/comp/match/points', post({ match_id: editMatchId, discord_id: did, delta: pts })),
+          '+' + pts + 'pts ' + nameOfDid(did), true);
+      };
+    });
+    left.querySelectorAll('[data-reset]').forEach((b) => {
+      b.onclick = () => {
+        const did = b.dataset.reset;
+        if (!confirm(`Reset ${nameOfDid(did)} in this match? Clears placement, awards and event rows.`)) return;
+        mutMatch(b, () => {},
+          () => api('/api/comp/match/reset', post({ match_id: editMatchId, discord_id: did, hard: true })),
+          'reset ' + nameOfDid(did), true);
+      };
+    });
+    left.querySelectorAll('[data-remove]').forEach((b) => {
+      b.onclick = () => mutMatch(b, () => {},
+        () => api('/api/comp/match/remove', post({ match_id: editMatchId, discord_id: b.dataset.remove })),
+        'removed ' + nameOfDid(b.dataset.remove), true);
+    });
     left.querySelectorAll('[data-addback]').forEach((b) => {
       b.onclick = () => mutMatch(b, () => {},
         () => api('/api/comp/match/add-back', post({ match_id: editMatchId, discord_id: b.dataset.addback })),
@@ -879,11 +938,18 @@ function renderMatchPanel() {
     try {
       if (m.started_at) bookends.push(`<div>🟢 <b>Match Started</b> <span class="dim">${esc(new Date(m.started_at).toLocaleTimeString())}</span></div>`);
     } catch {}
-    const body = kills.map(line).join('');
     try {
       if (m.sealed_at) bookends.push(`<div>🏁 <b>Match Ended</b> <span class="dim">${esc(new Date(m.sealed_at).toLocaleTimeString())}</span></div>`);
     } catch {}
-    feed.innerHTML = (bookends.length && body ? bookends[0] + body + (bookends[1] || '') : bookends.join('') + body) || '<span class="dim">No events yet.</span>';
+    const isKill = (e) => e.etype === 'kill' || e.etype === 'knock';
+    const isLeave = (e) => e.etype === 'leave';
+    const isAlv = (e) => e.etype === 'alv' && e.alive === false;
+    const sec = (title, rows) =>
+      `<div class="muted" style="margin:6px 0 2px">${title} (${rows.length})</div>` +
+      bookends.join('') +
+      (rows.length ? rows.map(line).join('') : '<span class="dim">—</span>') +
+      (bookends.length > 1 ? bookends[1] : '');
+    feed.innerHTML = sec('🔪 KILLS', kills.filter(isKill)) + sec('🚪 LEAVES', kills.filter(isLeave)) + sec('💀 ELIMINATIONS', kills.filter(isAlv)) || '<span class="dim">No events yet.</span>';
     try { feed.scrollTop = sc; } catch {}
 }
 function wireMatchList(matches) {

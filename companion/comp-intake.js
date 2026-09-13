@@ -114,11 +114,22 @@ function createTracker(opts) {
   function setRoom(room) {
     try {
       room = room ? String(room) : null;
-      if (room && room !== st.room) {
+      if (!room) return;
+      // a real pid join ALWAYS ends public state — even rejoining the same
+      // room (host backout to lobby + rejoin with the same code). Otherwise
+      // a pid-less JoinRandomRoom in between poisons tracking forever until
+      // reload (open/seal suppressed, stale drops).
+      st.publicRoom = false;
+      if (room !== st.room) {
         st.room = room;
-        st.publicRoom = false; // a real join ends public state
         st.roster = new Map();
         log(`comp room -> ${room.slice(0, 8)}`);
+      } else {
+        log(`comp room rejoin -> ${room.slice(0, 8)} (tracking kept)`);
+      }
+      // (re)validate the tourney binding on every pid join: a backout may
+      // have happened while Supabase was unreachable, or the code may have
+      // been retagged since. Never clears a live openMatch.
         // auto-tourney: an open tourney tagged with this room code takes
         // over tracking — no COMP_TOURNEY_ID needed per night. Only when the
         // code maps to exactly one open tourney; manual Track always wins
@@ -135,7 +146,6 @@ function createTracker(opts) {
             })
             .catch(() => {});
         }
-      }
     } catch {}
   }
 

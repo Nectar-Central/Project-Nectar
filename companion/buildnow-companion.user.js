@@ -991,8 +991,9 @@
   // this menu on Backquote — kid-simple on Windows AND Mac (60% boards have
   // Backquote but no F-keys), dodging the Alt+Shift layout-switch trap plus
   // every Ctrl+Shift browser reservation. Stored binds always win, so
-  // changing defaults only affects fresh installs. F1/F3/F5/F11/F12 stay
-  // off-limits (browser takes them — see bindWarning).
+  // changing defaults only affects fresh installs. F1/F3/F5 stay
+  // off-limits (browser takes them — see bindWarning). F11/F12 are host
+  // panels (rebindable; bare presses may lose to fullscreen/DevTools).
   const BNC_BINDS=[
     {id:'keys', label:'Shortcuts menu', key:'bnc_bind_keys', dev:false, def:{ctrl:false,shift:false,alt:false,meta:false,key:'`'}, run:()=>toggleKeybinds()},
     {id:'collect', label:'Collect toggle', key:'bnc_bind_collect', dev:false, def:{ctrl:false,shift:true,alt:true,meta:false,key:'C'}, run:()=>toggleCollectMode()},
@@ -1004,6 +1005,8 @@
     {id:'drawer', label:'Player info', key:'bnc_drawer_keybind', dev:false, def:{ctrl:false,shift:false,alt:false,meta:false,key:'F2'}, run:()=>toggleInfoPanel()},
     {id:'ranked', label:'Ranked panel', key:'bnc_ranked_keybind', dev:false, def:{ctrl:false,shift:false,alt:false,meta:false,key:'F9'}, run:()=>toggleRankedPanel()},
     {id:'leaderboard', label:'Leaderboard', key:'bnc_lb_keybind', dev:false, def:{ctrl:false,shift:false,alt:false,meta:false,key:'F4'}, run:()=>toggleLbPanel()},
+    {id:'host11', label:'Host roster (F11)', key:'bnc_host11_keybind', dev:false, def:{ctrl:false,shift:false,alt:false,meta:false,key:'F11'}, run:()=>toggleHost11Panel()},
+    {id:'host12', label:'Host controls (F12)', key:'bnc_host12_keybind', dev:false, def:{ctrl:false,shift:false,alt:false,meta:false,key:'F12'}, run:()=>toggleHost12Panel()},
   ];
   // Combos the browser takes before the page (per registration order they
   // can't be intercepted no matter the capture phase). Capture warns instead
@@ -1021,7 +1024,7 @@
       'ctrl+shift+N':'incognito window', 'ctrl+shift+O':'bookmark manager', 'ctrl+shift+B':'bookmark bar',
       'ctrl+shift+D':'bookmark tabs', 'ctrl+shift+Q':'quit browser', 'ctrl+shift+DELETE':'clear browsing data',
       'ctrl+shift+G':'find previous', 'ctrl+shift+M':'switch profile', 'ctrl+shift+K':'keybinds menu',
-      'F5':'reload', 'F11':'fullscreen', 'F12':'DevTools', 'F1':'help', 'F3':'find next',
+      'F5':'reload', 'F1':'help', 'F3':'find next',
     };
     if(reserved[sig]) return `Browser takes ${formatKeybind(kb)} (${reserved[sig]}) — pick another.`;
     for(const b of BNC_BINDS){
@@ -1423,7 +1426,7 @@
       const ae=document.activeElement;
       if(!ae) return false;
       if(ae.tagName==='INPUT'||ae.tagName==='TEXTAREA'||ae.isContentEditable) return true;
-      if(ae.closest && ae.closest('#bnc-lb-card,#bnc-drawer,#bnc-ranked,#bnc-keys')) return true;
+      if(ae.closest && ae.closest('#bnc-lb-card,#bnc-drawer,#bnc-ranked,#bnc-keys,#bnc-host11,#bnc-host12')) return true;
       return false;
     }catch{ return false; }
   }
@@ -2653,6 +2656,22 @@
   function isRankedKeybind(e){
     return bindMatches(e, getRankedKeybind());
   }
+  function getHost11Keybind(){
+    try{
+      const raw=GMGet('bnc_host11_keybind', null);
+      if(raw && typeof raw==='object' && raw.key) return raw;
+    }catch{}
+    return {ctrl:false, shift:false, alt:false, meta:false, key:'F11'};
+  }
+  function isHost11Keybind(e){ return bindMatches(e, getHost11Keybind()); }
+  function getHost12Keybind(){
+    try{
+      const raw=GMGet('bnc_host12_keybind', null);
+      if(raw && typeof raw==='object' && raw.key) return raw;
+    }catch{}
+    return {ctrl:false, shift:false, alt:false, meta:false, key:'F12'};
+  }
+  function isHost12Keybind(e){ return bindMatches(e, getHost12Keybind()); }
 
   // --- RANKED PANEL (Phase 8): F9 — milestones map + ranked leaderboard ---
   const RANKED_ASSETS='https://mnpwvwjqawmuqmickteu.supabase.co/storage/v1/object/public/assets';
@@ -2862,6 +2881,148 @@
     });
   }
 
+  // --- HOST PANELS: F11 roster + F12 controls (tourney room only) ---
+  // Same card pattern as the ranked/LB panels. Host-gating is contextual:
+  // panels open inside a tracked tourney room (_inCompRoom); the comp
+  // endpoints carry no auth (same as the dashboard), so this gate only
+  // keeps non-hosts from firing host actions by accident.
+  let host11Panel=null, host12Panel=null, _hostFadeT=null;
+  let _hostTourneyCache=null, _hostPrCache=null;
+  function hostTourneyId(){
+    try{ if(_compRoom && _compRoom.id!=null) return Number(_compRoom.id); }catch{}
+    try{ const t=(statsCache||{}).comp_tourney; if(t && t.tourney_id!=null) return Number(t.tourney_id); }catch{}
+    return null;
+  }
+  function hostPanelsAllowed(){
+    try{ if(typeof _inCompRoom==='function' && _inCompRoom()) return true; }catch{}
+    try{ const r=(statsCache||{}).ranked; if(r && r.is_host) return true; }catch{}
+    try{ if(hostTourneyId()!=null) return true; }catch{}
+    return false;
+  }
+  function hostApiPost(path, body, cb){
+    let base=''; try{ base=resolveApiBase(); }catch{}
+    if(!base){ try{cb(null);}catch{} return; }
+    const url=base+path;
+    const done=(ok,txt)=>{ let j=null; try{ j=(ok&&txt)?JSON.parse(txt):null; }catch{ j=null; } try{cb(j);}catch{} };
+    const payload=JSON.stringify(body||{});
+    try{
+      const GM=typeof GM_xmlhttpRequest!=='undefined' ? GM_xmlhttpRequest : (typeof unsafeWindow!=='undefined' && unsafeWindow.GM_xmlhttpRequest) || null;
+      if(GM){ GM({method:'POST', url, data:payload, headers:{'Content-Type':'application/json'}, timeout:10000, onload:r=>done(r.status>=200&&r.status<300, r.responseText), onerror:()=>done(false,''), ontimeout:()=>done(false,'')}); return; }
+    }catch{}
+    fetch(url,{method:'POST', headers:{'Content-Type':'application/json'}, body:payload}).then(r=>r.text().then(t=>done(r.ok,t)).catch(()=>done(false,''))).catch(()=>done(false,''));
+  }
+  function hostOpenMatch(){
+    try{
+      const ms=((_hostTourneyCache||{}).matches)||[];
+      const live=ms.filter(m=>m && (m.status==='open'||m.status==='manual'));
+      live.sort((a,b)=>(b.version||0)-(a.version||0));
+      return live[0]||null;
+    }catch{ return null; }
+  }
+  function createHost11Panel(){
+    if(document.getElementById('bnc-host11')){ host11Panel=document.getElementById('bnc-host11'); return; }
+    const ov=document.createElement('div');
+    ov.id='bnc-host11';
+    Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483646', background:'rgba(0,0,0,0.64)', display:'none', opacity:'0', transition:'opacity 180ms ease-out', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif'});
+    ov.innerHTML=`<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:14px;width:640px;max-width:94vw;height:480px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden"><div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.08)"><div><b style="font-size:16px;color:#fff">Host roster</b><div id="bnc-host11-sub" style="font-size:11px;color:#9ca3af;margin-top:2px">—</div></div><div><button id="bnc-host11-refresh" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px;margin-right:6px">Refresh</button><button id="bnc-host11-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px">Close</button></div></div><div id="bnc-host11-body" style="flex:1;overflow:auto;padding:16px 18px;font-size:13px;color:#e5e7eb"></div></div>`;
+    (document.body||document.documentElement).appendChild(ov);
+    ov.addEventListener('click', (e)=>{ if(e.target===ov) toggleHost11Panel(false); });
+    ov.querySelector('#bnc-host11-close').onclick=()=> toggleHost11Panel(false);
+    ov.querySelector('#bnc-host11-refresh').onclick=()=> fetchHostTourney();
+    host11Panel=ov;
+  }
+  function fetchHostTourney(){
+    const tid=hostTourneyId();
+    const body=document.getElementById('bnc-host11-body');
+    if(tid==null){ if(body) body.innerHTML='<span style="color:#9ca3af">No tourney context — join the tourney room first.</span>'; return; }
+    if(body) body.innerHTML='<span style="color:#9ca3af">Loading…</span>';
+    rankedApiGet('/api/comp/tourney?id='+encodeURIComponent(tid), (j)=>{
+      _hostTourneyCache=j||null;
+      rankedApiGet('/api/leaderboard?sort=pr&limit=100', (lb)=>{
+        try{
+          const rows=((lb||{}).results)||[]; _hostPrCache={};
+          rows.forEach(r=>{ if(r&&r.discord_id!=null&&r.tourney_pr!=null) _hostPrCache[String(r.discord_id)]=r.tourney_pr; });
+        }catch{}
+        renderHost11Panel();
+      });
+    });
+  }
+  function renderHost11Panel(){
+    const body=document.getElementById('bnc-host11-body'); if(!body) return;
+    const t=(_hostTourneyCache||{}).tourney||{};
+    const sub=document.getElementById('bnc-host11-sub');
+    if(sub) sub.textContent=(t.name||'Tourney')+' · '+(t.status||'');
+    const st=(_hostTourneyCache||{}).standings||[];
+    if(!st.length){ body.innerHTML='<span style="color:#9ca3af">No sealed matches yet.</span>'; return; }
+    const prm=_hostPrCache||{};
+    let h='<table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="color:#9ca3af;text-align:left"><th>#</th><th>Player</th><th>Pts</th><th>K</th><th>W</th><th>Avg</th><th>PR</th></tr>';
+    st.forEach((r,i)=>{
+      const nm=(r&&r.name)||'?'; const did=String((r&&r.discord_id)||'');
+      const pr=prm[did];
+      h+=`<tr style="border-top:1px solid rgba(255,255,255,0.06)"><td>${i+1}</td><td><b style="color:#fff">${String(nm).replace(/</g,'&lt;')}</b></td><td>${r.points||0}</td><td>${r.kills||0}</td><td>${r.wins||0}</td><td>${r.avg_placement!=null?r.avg_placement:'—'}</td><td>${pr!=null?pr:'—'}</td></tr>`;
+    });
+    body.innerHTML=h+'</table>';
+  }
+  function toggleHost11Panel(force){
+    createHost11Panel();
+    const isHidden=host11Panel.style.display==='none'||!host11Panel.style.display;
+    const show=typeof force==='boolean'?force:isHidden;
+    if(show && !hostPanelsAllowed()){ showToast('Host roster needs a tourney room', true); return; }
+    try{ clearTimeout(_hostFadeT); }catch{}
+    if(show){ host11Panel.style.display='flex'; requestAnimationFrame(()=>{ requestAnimationFrame(()=>{ try{ host11Panel.style.opacity='1'; }catch{} }); }); fetchHostTourney(); }
+    else { try{ host11Panel.style.opacity='0'; }catch{} _hostFadeT=setTimeout(()=>{ try{ host11Panel.style.display='none'; }catch{} }, 180); }
+  }
+  function createHost12Panel(){
+    if(document.getElementById('bnc-host12')){ host12Panel=document.getElementById('bnc-host12'); return; }
+    const ov=document.createElement('div');
+    ov.id='bnc-host12';
+    Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483646', background:'rgba(0,0,0,0.64)', display:'none', opacity:'0', transition:'opacity 180ms ease-out', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif'});
+    ov.innerHTML=`<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:14px;width:560px;max-width:94vw;max-height:90vh;display:flex;flex-direction:column;overflow:hidden"><div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.08)"><div><b style="font-size:16px;color:#fff">Host controls</b><div id="bnc-host12-sub" style="font-size:11px;color:#9ca3af;margin-top:2px">—</div></div><button id="bnc-host12-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px">Close</button></div><div id="bnc-host12-body" style="padding:16px 18px;font-size:13px;color:#e5e7eb;overflow:auto"></div><div id="bnc-host12-status" style="padding:8px 18px;font-size:12px;color:#9ca3af;border-top:1px solid rgba(255,255,255,0.08)"></div></div>`;
+    (document.body||document.documentElement).appendChild(ov);
+    ov.addEventListener('click', (e)=>{ if(e.target===ov) toggleHost12Panel(false); });
+    ov.querySelector('#bnc-host12-close').onclick=()=> toggleHost12Panel(false);
+    host12Panel=ov;
+  }
+  function host12Say(t, bad){ try{ const el=document.getElementById('bnc-host12-status'); if(el){ el.textContent=t; el.style.color=bad?'#f87171':'#9ca3af'; } }catch{} }
+  function renderHost12Panel(){
+    const body=document.getElementById('bnc-host12-body'); if(!body) return;
+    const t=(_hostTourneyCache||{}).tourney||{};
+    const sub=document.getElementById('bnc-host12-sub');
+    const m=hostOpenMatch();
+    if(sub) sub.textContent=(t.name||'Tourney')+(m?(' · match v'+m.version+' ('+m.status+')'):' · no open match');
+    const inp=(id,ph)=>`<input id="${id}" placeholder="${ph}" style="background:#1f2937;color:#fff;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:6px 8px;font-size:12px;width:170px">`;
+    const btn=(id,label)=>`<button id="${id}" style="background:#7c3aed;color:#fff;border:0;border-radius:6px;padding:6px 10px;cursor:pointer;font-size:12px;margin-left:6px">${label}</button>`;
+    body.innerHTML=
+      `<div style="margin-bottom:10px">${inp('h12-winner','winner name or id')}${btn('h12-winGo','Set winner')}</div>`+
+      `<div style="margin-bottom:10px">${btn('h12-sealGo','Seal match')}${btn('h12-openGo','Open blank match')}</div>`+
+      `<div style="margin-bottom:10px">${inp('h12-rm','player name or id')}${btn('h12-rmGo','Remove')}${btn('h12-addGo','Add back')}</div>`+
+      `<div style="color:#9ca3af;font-size:12px">Same endpoints as the dashboard. Re-pull F11 to see results.</div>`;
+    const q=(id)=>document.getElementById(id);
+    const needMatch=()=>{ const mm=hostOpenMatch(); if(!mm){ host12Say('No open match in this tourney.', true); return null; } return mm; };
+    const resolveDid=(raw)=>{
+      try{
+        raw=String(raw||'').trim(); if(!raw) return null;
+        const st=((_hostTourneyCache||{}).standings)||[];
+        for(const r of st){ if(String(r.discord_id)===raw) return String(r.discord_id); }
+        const low=raw.toLowerCase();
+        for(const r of st){ if(String(r.name||'').toLowerCase()===low) return String(r.discord_id); }
+      }catch{} return null;
+    };
+    q('h12-winGo').onclick=()=>{ const mm=needMatch(); if(!mm) return; const raw=q('h12-winner').value; const did=raw?resolveDid(raw):null; if(raw&&!did){ host12Say('Unknown player — use the F11 name or id.', true); return; } hostApiPost('/api/comp/match/winner',{match_id:mm.id,winner_discord_id:did},(j)=>{ host12Say(j&&!j.error?('Winner set'+(j.placements?' (+P1)':'')):('Failed: '+((j&&j.error)||'no response')), !(j&&!j.error)); fetchHostTourney(); }); };
+    q('h12-sealGo').onclick=()=>{ const mm=needMatch(); if(!mm) return; hostApiPost('/api/comp/match/seal',{match_id:mm.id},(j)=>{ host12Say(j&&!j.error?'Sealed.':'Failed: '+((j&&j.error)||'no response'), !(j&&!j.error)); fetchHostTourney(); }); };
+    q('h12-openGo').onclick=()=>{ const tid=hostTourneyId(); if(tid==null){ host12Say('No tourney context.', true); return; } hostApiPost('/api/comp/match/open',{tourney_id:tid},(j)=>{ host12Say(j&&!j.error?('Opened v'+j.version+'.'):'Failed: '+((j&&j.error)||'no response'), !(j&&!j.error)); fetchHostTourney(); }); };
+    q('h12-rmGo').onclick=()=>{ const mm=needMatch(); if(!mm) return; const did=resolveDid(q('h12-rm').value); if(!did){ host12Say('Unknown player.', true); return; } hostApiPost('/api/comp/match/remove',{match_id:mm.id,discord_id:did},(j)=>{ host12Say(j&&!j.error?'Removed (ignored in placements).':'Failed: '+((j&&j.error)||'no response'), !(j&&!j.error)); fetchHostTourney(); }); };
+    q('h12-addGo').onclick=()=>{ const mm=needMatch(); if(!mm) return; const did=resolveDid(q('h12-rm').value); if(!did){ host12Say('Unknown player.', true); return; } hostApiPost('/api/comp/match/add-back',{match_id:mm.id,discord_id:did},(j)=>{ host12Say(j&&!j.error?'Added back.':'Failed: '+((j&&j.error)||'no response'), !(j&&!j.error)); fetchHostTourney(); }); };
+  }
+  function toggleHost12Panel(force){
+    createHost12Panel();
+    const isHidden=host12Panel.style.display==='none'||!host12Panel.style.display;
+    const show=typeof force==='boolean'?force:isHidden;
+    if(show && !hostPanelsAllowed()){ showToast('Host controls need a tourney room', true); return; }
+    try{ clearTimeout(_hostFadeT); }catch{}
+    if(show){ host12Panel.style.display='flex'; requestAnimationFrame(()=>{ requestAnimationFrame(()=>{ try{ host12Panel.style.opacity='1'; }catch{} }); }); const tid=hostTourneyId(); if(tid!=null){ rankedApiGet('/api/comp/tourney?id='+encodeURIComponent(tid),(j)=>{ _hostTourneyCache=j||null; renderHost12Panel(); }); } else renderHost12Panel(); }
+    else { try{ host12Panel.style.opacity='0'; }catch{} _hostFadeT=setTimeout(()=>{ try{ host12Panel.style.display='none'; }catch{} }, 180); }
+  }
   // --- LEADERBOARD PANEL: Alt+Shift+L — all players, any time ---
   // Standalone overlay (same card pattern as the ranked panel): sortable
   // columns (points/kills/wins/K-D/playtime), paginated, Esc/backdrop closes.
@@ -4079,9 +4240,13 @@
     if (isModalOrInputFocused() || isTypingKey()) return;
     if((e.key||'')==='Escape' && typeof lbPanel!=='undefined' && lbPanel && lbPanel.style.display!=='none' && lbPanel.style.display){ e.preventDefault(); try{ untrapRelease(); }catch{} toggleLbPanel(false); return; }
     if((e.key||'')==='Escape' && typeof rankedPanel!=='undefined' && rankedPanel && rankedPanel.style.display!=='none' && rankedPanel.style.display){ e.preventDefault(); toggleRankedPanel(false); return; }
+    if((e.key||'')==='Escape' && typeof host11Panel!=='undefined' && host11Panel && host11Panel.style.display!=='none' && host11Panel.style.display){ e.preventDefault(); toggleHost11Panel(false); return; }
+    if((e.key||'')==='Escape' && typeof host12Panel!=='undefined' && host12Panel && host12Panel.style.display!=='none' && host12Panel.style.display){ e.preventDefault(); toggleHost12Panel(false); return; }
     if(isDrawerKeybind(e)){ e.preventDefault(); e.stopPropagation(); toggleInfoPanel(); return; }
     if(isRankedKeybind(e)){ e.preventDefault(); e.stopPropagation(); toggleRankedPanel(); return; }
     if(isLbKeybind(e)){ e.preventDefault(); e.stopPropagation(); toggleLbPanel(); return; }
+    if(isHost11Keybind(e)){ e.preventDefault(); e.stopPropagation(); toggleHost11Panel(); return; }
+    if(isHost12Keybind(e)){ e.preventDefault(); e.stopPropagation(); toggleHost12Panel(); return; }
     if(modKey(e) && e.shiftKey && (e.key||'').toUpperCase()==='K'){ e.preventDefault(); e.stopPropagation(); toggleKeybinds(); }
   }, true);
 

@@ -419,6 +419,54 @@ def _phase_end_result(room, view, me_name) -> str | None:
     return None
 
 
+def _phase_end_debug(room, view, me_name) -> str:
+    """Why did _phase_end_result deny the win? Single-line reason. Pure (logs nothing)."""
+    try:
+        if not room:
+            return "no-room"
+        if not me_name:
+            return "no-identity(view.me null + game_username null)"
+        parts = []
+        try:
+            parts.append(f"ver={getattr(room, 'match_version', '?')}")
+            parts.append(f"lastwin={getattr(room, 'last_win_version', '?')}")
+            parts.append(f"state={getattr(getattr(room, 'state', None), 'value', getattr(room, 'state', '?'))}")
+        except Exception:
+            pass
+        try:
+            alive = any(_names_equal(p.username, me_name) and p.is_alive
+                        for p in room.players.values())
+            parts.append(f"alive_in_roster={alive}")
+        except Exception:
+            parts.append("alive_in_roster=?")
+        try:
+            parts.append(f"team={_team_alive_for_me(room, view, me_name)}")
+        except Exception:
+            parts.append("team=?")
+        try:
+            parts.append(f"death_ev={_self_death_evidence(room, view, me_name)}")
+        except Exception:
+            parts.append("death_ev=?")
+        try:
+            present = any(_names_equal(p.username, me_name) for p in room.players.values())
+            left = False
+            if not present:
+                for k in (getattr(room, "recent_kills", None) or []):
+                    if getattr(k, "event_type", None) == "left" and _names_equal(getattr(k, "instigator", None), me_name):
+                        left = True
+                        break
+            parts.append(f"in_roster={present} left_row={left}")
+        except Exception:
+            parts.append("roster=?")
+        try:
+            parts.append(f"had_self_death={bool(getattr(room, 'had_self_death', False))}")
+        except Exception:
+            pass
+        return " ".join(parts) if parts else "unknown"
+    except Exception:
+        return "debug-failed"
+
+
 def _is_kd_only(gm) -> bool:
     """Respawn modes: K/D tracked, no personal defeat (DF free mode, RvB TDM).
     Wins/defeats in RvB come only from the team-15 race or stG=3 team result.
@@ -1413,40 +1461,41 @@ def seal_comp_match(session_id, discord_id, room, room_id, gm) -> None:
             if mid is None:
                 return
             log_comp(f"open tid={tid} code={code} match={mid} room={str(room_id)[:8]} (stG 1)")
-        # Write kill events. Canonical bngc_comp_events shape
-        # {match_id, etype, actor_nr, actor_name, target_name, discord_id, alive}
-        # (no tourney_id / victim_name columns — matches comp-intake.js).
-        # Deduped per match across batches; names mapped in one query,
-        # unknown/twins stay null for the dashboard /link flow.
+            # Write kill + leave events. Canonical bngc_comp_events shape
+            # {match_id, etype, actor_nr, actor_name, target_name, discord_id, alive}
+            # (no tourney_id / victim_name columns — matches comp-intake.js).
+            # Deduped per match across batches; names mapped in one query,
+            # unknown/twins stay null for the dashboard /link flow.
         try:
             kills = [k for k in (getattr(room, "recent_kills", None) or [])
-                     if getattr(k, "event_type", None) == "killed"]
+                     if getattr(k, "event_type", None) in ("killed", "left")]
             seen = _comp_seen.setdefault(mid, set())
             fresh_kills = []
             for k in kills[-200:]:
                 try:
+                    et = str(getattr(k, "event_type", "") or "")
                     killer = str(getattr(k, "instigator", "") or "")
                     victim = str(getattr(k, "instigated", "") or "")
                     if not killer and not victim:
                         continue
-                    key = (killer, victim)
+                    key = (et, killer, victim)
                     if key in seen:
                         continue
                     seen.add(key)
-                    fresh_kills.append((killer, victim))
+                    fresh_kills.append((et, killer, victim))
                 except Exception:
                     continue
             if fresh_kills:
-                mapping = _comp_map_names([n for pair in fresh_kills for n in pair])
+                mapping = _comp_map_names([n for (_et, killer, victim) in fresh_kills for n in (killer, victim)])
                 batch = [{
                     "match_id": mid,
-                    "etype": "kill",
+                    "etype": "leave" if et == "left" else "kill",
                     "actor_nr": None,
                     "actor_name": killer or victim,
                     "target_name": victim or None,
                     "discord_id": mapping.get(killer),
                     "alive": None,
-                } for killer, victim in fresh_kills]
+                } for et, killer, victim in fresh_kills]
                 try:
                     supabase.table("bngc_comp_events").insert(batch).execute()
                     n_mapped = sum(1 for r in batch if r.get("discord_id"))
@@ -1454,6 +1503,26 @@ def seal_comp_match(session_id, discord_id, room, room_id, gm) -> None:
                 except Exception as exc:
                     if not is_transient_error(exc):
                         log_comp(f"match={mid} event write failed ({str(exc)[:80]})")
+                # auto-remove mapped leavers from the match roster (mirrors
+                # comp-intake leaves[]; host adds back via dashboard/bot)
+                try:
+                    leave_dids = sorted({mapping.get(killer) for (et, killer, _v) in fresh_kills
+                                         if et == "left" and mapping.get(killer)})
+                    if leave_dids:
+                        try:
+                            mres = supabase.table("bngc_comp_matches").select(
+                                "removed_discord_ids").eq("id", mid).limit(1).execute()
+                            cur = list(((mres.data or [{}])[0] or {}).get("removed_discord_ids") or [])
+                        except Exception:
+                            cur = None  # pre-migration: skip silently
+                        if cur is not None:
+                            new = [d for d in leave_dids if d not in cur]
+                            if new:
+                                supabase.table("bngc_comp_matches").update(
+                                    {"removed_discord_ids": cur + new}).eq("id", mid).execute()
+                                log_comp(f"match={mid} auto-removed {len(new)} leaver(s)")
+                except Exception:
+                    pass
         except Exception:
             pass
         # No phase-end handling here: sealing is decided above from last_stg
@@ -2269,6 +2338,16 @@ async def process_batch(
             # through 3): engine bumps match_version and arms stg_is_phase_end only then.
             # Edge-triggered: the arm survives stG moving to 2/1 afterwards, so a batch
             # containing [3,2] still drains. Consumed on write; cleared on MATCH enter.
+            if room.stg_is_phase_end and not room.match_version:
+                # armed but version never bumped: this session missed the real
+                # stG=3 (or the engine never armed it) — wins can never drain.
+                # Log once per room to spot version-stuck sessions.
+                try:
+                    if getattr(room, "_win_ver0_logged", False) is not True:
+                        room._win_ver0_logged = True
+                        log_sys(f"PROCESSOR WIN arm-no-version room={str(room_id or '')[:8]} state={getattr(getattr(room, 'state', None), 'value', '?')} — session missed stG=3, wins blocked")
+                except Exception:
+                    pass
             if room.stg_is_phase_end and room.match_version > 0:
                 # Match just ended — check who's alive to determine winner.
                 # _phase_end_result matches the live rules (tracked alive, else
@@ -2294,6 +2373,16 @@ async def process_batch(
                         await db_io(_write_win, discord_id, session_id, user, gm, room_id, room.short_code, room.match_version, winner, room, ev_rows, dirty)
                         await db_io(seal_ranked_match, session_id, discord_id, room, room_id, gm)  # host only; no-op otherwise
                         room.stg_is_phase_end = False  # consume arm (version bump re-arms)
+                    else:
+                        # denied: say why (once per version — the arm stays up
+                        # and would otherwise spam every batch)
+                        try:
+                            _dv = (room_id, getattr(room, "match_version", 0))
+                            if getattr(room, "_win_deny_logged", None) != _dv:
+                                room._win_deny_logged = _dv
+                                log_sys(f"PROCESSOR WIN denied me={me_name_local} room={str(room_id or '')[:8]} gm={gm} { _phase_end_debug(room, view, me_name_local)}")
+                        except Exception:
+                            pass
 
                     # Note: defeat is handled by alv/kill/leave logic below
 
