@@ -2958,7 +2958,42 @@ async def tourney_name_cmd(interaction: discord.Interaction, allow: bool):
                     "Database migration pending — ask a host to apply add_comp_v238.sql.", ephemeral=True)
             return await interaction.followup.send("Couldn't save — try again later.", ephemeral=True)
     state = "in ✅ — your server nickname becomes **Display Name [PR]** after each tourney" if allow else "out — your nickname stays untouched"
-    return await interaction.followup.send(f"You opted {state}.", ephemeral=True)
+    extra = ""
+    if allow and interaction.guild is not None:
+        # apply right now (not just at the next calc): current PR + name
+        try:
+            ures = sb.table("bngc_users").select(
+                "game_username,tourney_pr").eq("discord_id", me).limit(1).execute()
+            urow = ((ures.data or [{}])[0] or {})
+            gname = str(urow.get("game_username") or "").strip()
+            pr = urow.get("tourney_pr")
+            if pr is None:
+                try:
+                    hres = sb.table("bngc_comp_pr_history").select("pr").eq(
+                        "discord_id", me).order("computed_at", desc=True).limit(1).execute()
+                    if hres.data:
+                        pr = (hres.data[0] or {}).get("pr")
+                except Exception:
+                    pass
+            if gname and pr is not None:
+                nick = _comp_pr_nick(gname, pr)
+                try:
+                    m = interaction.guild.get_member(int(me))
+                    if m is None:
+                        m = await interaction.guild.fetch_member(int(me))
+                    if m is not None and m.nick != nick:
+                        await m.edit(nick=nick, reason="Comp PR nickname opt-in (immediate)")
+                    extra = f" Nickname set to **{nick}** now."
+                except Exception as e:
+                    print(f"[tourney-name] immediate nick failed: {e}")
+                    extra = " Couldn't set nickname now (bot needs Manage Nicknames + a higher role) — it applies at the next tourney."
+            elif not gname:
+                extra = " No comp profile yet, so no nickname to set — it applies once you register."
+            else:
+                extra = " No PR yet — nickname applies after your first rated tourney."
+        except Exception as e:
+            print(f"[tourney-name] immediate apply failed: {e}")
+    return await interaction.followup.send(f"You opted {state}.{extra}", ephemeral=True)
 
 
 def _comp_pr_nick(game_name: str, pr) -> str:
@@ -3042,6 +3077,46 @@ async def _comp_apply_pr_nicknames(guild, pr_board) -> int:
     except Exception as e:
         print(f"[comp] apply nicknames failed: {e}")
         return 0
+
+
+@bot.tree.command(name="tourney-pr-set", description="Host: manually set or clear a player's tourney PR")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)", user="Player", pr="PR value 0-999 (omit to clear manual PR)")
+async def tourney_pr_set_cmd(interaction: discord.Interaction, tourney_id: int, user: discord.User, pr: float | None = None):
+    await interaction.response.defer(ephemeral=True)
+    sb, me = await _comp_require_manager(interaction, tourney_id)
+    if sb is None:
+        return
+    try:
+        _st, body = await _api_post("/api/comp/tourney/pr-override", {
+            "tourney_id": int(tourney_id), "discord_id": str(user.id), "pr": pr})
+    except Exception:
+        _st, body = 0, {}
+    if not (body or {}).get("ok"):
+        return await interaction.followup.send(
+            f"Couldn't set PR: {(body or {}).get('error') or 'server unreachable'}.", ephemeral=True)
+    if pr is None:
+        return await interaction.followup.send(
+            f"Cleared manual PR for {user.mention} in tourney **#{tourney_id}**.", ephemeral=True)
+    return await interaction.followup.send(
+        f"Set PR for {user.mention} to **{pr}** in tourney **#{tourney_id}** (manual, kept on recompute).", ephemeral=True)
+
+
+@bot.tree.command(name="tourney-pr-reset", description="Host: delete a tourney's PR so it recomputes fresh")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)")
+async def tourney_pr_reset_cmd(interaction: discord.Interaction, tourney_id: int):
+    await interaction.response.defer(ephemeral=True)
+    sb, me = await _comp_require_manager(interaction, tourney_id)
+    if sb is None:
+        return
+    try:
+        _st, body = await _api_post("/api/comp/tourney/pr-reset", {"tourney_id": int(tourney_id)})
+    except Exception:
+        _st, body = 0, {}
+    if not (body or {}).get("ok"):
+        return await interaction.followup.send(
+            f"Couldn't reset PR: {(body or {}).get('error') or 'server unreachable'}.", ephemeral=True)
+    return await interaction.followup.send(
+        f"Deleted {(body or {}).get('deleted', 0)} PR rows for tourney **#{tourney_id}** — next stop/PR call recomputes fresh.", ephemeral=True)
 
 
 @bot.tree.command(name="tourney-pr", description="Tourney PR board (computed rating)")
@@ -3609,6 +3684,7 @@ class _GameNameModal(discord.ui.Modal):
         try:
             sb = _comp_sb()
             if sb is None:
+                print("[comp] mark_signup: no supabase")
                 return
             me = str(interaction.user.id)
             rres = sb.table("bngc_comp_registrations").select(
@@ -3623,6 +3699,7 @@ class _GameNameModal(discord.ui.Modal):
                 except Exception:
                     continue
             if not hit or interaction.guild is None:
+                print(f"[comp] mark_signup: no row/guild me={me} tid={self.tourney_id}")
                 return
             for ch in interaction.guild.text_channels:
                 try:
@@ -3631,21 +3708,28 @@ class _GameNameModal(discord.ui.Modal):
                     continue
                 try:
                     if ok:
-                        me_m = interaction.guild.me
+                        try:
+                            me_m = interaction.guild.me
+                            if me_m is None and bot.user is not None:
+                                me_m = await ch.guild.fetch_member(bot.user.id)
+                        except Exception as e:
+                            print(f"[comp] mark_signup: bot member lookup failed: {e}")
+                            me_m = None
                         for r in (getattr(msg, "reactions", None) or []):
                             try:
                                 if str(getattr(r.emoji, "name", r.emoji)) == "❓" and me_m is not None:
                                     await msg.remove_reaction("❓", me_m)
-                            except Exception:
+                            except Exception as e:
+                                print(f"[comp] mark_signup: remove ❓ failed: {e}")
                                 continue
                         await msg.add_reaction((hit or {}).get("team_color") or "✅")
                     else:
                         await msg.add_reaction("❌")
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[comp] mark_signup: react failed: {e}")
                 break
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[comp] mark_signup failed: {e}")
 
 
 class _CompPlayersView(discord.ui.View):

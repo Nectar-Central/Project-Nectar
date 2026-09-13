@@ -1413,40 +1413,41 @@ def seal_comp_match(session_id, discord_id, room, room_id, gm) -> None:
             if mid is None:
                 return
             log_comp(f"open tid={tid} code={code} match={mid} room={str(room_id)[:8]} (stG 1)")
-        # Write kill events. Canonical bngc_comp_events shape
-        # {match_id, etype, actor_nr, actor_name, target_name, discord_id, alive}
-        # (no tourney_id / victim_name columns — matches comp-intake.js).
-        # Deduped per match across batches; names mapped in one query,
-        # unknown/twins stay null for the dashboard /link flow.
+            # Write kill + leave events. Canonical bngc_comp_events shape
+            # {match_id, etype, actor_nr, actor_name, target_name, discord_id, alive}
+            # (no tourney_id / victim_name columns — matches comp-intake.js).
+            # Deduped per match across batches; names mapped in one query,
+            # unknown/twins stay null for the dashboard /link flow.
         try:
             kills = [k for k in (getattr(room, "recent_kills", None) or [])
-                     if getattr(k, "event_type", None) == "killed"]
+                     if getattr(k, "event_type", None) in ("killed", "left")]
             seen = _comp_seen.setdefault(mid, set())
             fresh_kills = []
             for k in kills[-200:]:
                 try:
+                    et = str(getattr(k, "event_type", "") or "")
                     killer = str(getattr(k, "instigator", "") or "")
                     victim = str(getattr(k, "instigated", "") or "")
                     if not killer and not victim:
                         continue
-                    key = (killer, victim)
+                    key = (et, killer, victim)
                     if key in seen:
                         continue
                     seen.add(key)
-                    fresh_kills.append((killer, victim))
+                    fresh_kills.append((et, killer, victim))
                 except Exception:
                     continue
             if fresh_kills:
-                mapping = _comp_map_names([n for pair in fresh_kills for n in pair])
+                mapping = _comp_map_names([n for (_et, killer, victim) in fresh_kills for n in (killer, victim)])
                 batch = [{
                     "match_id": mid,
-                    "etype": "kill",
+                    "etype": "leave" if et == "left" else "kill",
                     "actor_nr": None,
                     "actor_name": killer or victim,
                     "target_name": victim or None,
                     "discord_id": mapping.get(killer),
                     "alive": None,
-                } for killer, victim in fresh_kills]
+                } for et, killer, victim in fresh_kills]
                 try:
                     supabase.table("bngc_comp_events").insert(batch).execute()
                     n_mapped = sum(1 for r in batch if r.get("discord_id"))
@@ -1454,6 +1455,26 @@ def seal_comp_match(session_id, discord_id, room, room_id, gm) -> None:
                 except Exception as exc:
                     if not is_transient_error(exc):
                         log_comp(f"match={mid} event write failed ({str(exc)[:80]})")
+                # auto-remove mapped leavers from the match roster (mirrors
+                # comp-intake leaves[]; host adds back via dashboard/bot)
+                try:
+                    leave_dids = sorted({mapping.get(killer) for (et, killer, _v) in fresh_kills
+                                         if et == "left" and mapping.get(killer)})
+                    if leave_dids:
+                        try:
+                            mres = supabase.table("bngc_comp_matches").select(
+                                "removed_discord_ids").eq("id", mid).limit(1).execute()
+                            cur = list(((mres.data or [{}])[0] or {}).get("removed_discord_ids") or [])
+                        except Exception:
+                            cur = None  # pre-migration: skip silently
+                        if cur is not None:
+                            new = [d for d in leave_dids if d not in cur]
+                            if new:
+                                supabase.table("bngc_comp_matches").update(
+                                    {"removed_discord_ids": cur + new}).eq("id", mid).execute()
+                                log_comp(f"match={mid} auto-removed {len(new)} leaver(s)")
+                except Exception:
+                    pass
         except Exception:
             pass
         # No phase-end handling here: sealing is decided above from last_stg
