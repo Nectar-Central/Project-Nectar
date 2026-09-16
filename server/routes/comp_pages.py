@@ -117,6 +117,14 @@ async def ranked_dashboard():
     """Ranked dashboard (same comp UI copy as /comp/dashboard)."""
     return _serve("ranked-dashboard.html")
 
+@router.get("/ranked/rooms", response_class=HTMLResponse)
+async def ranked_rooms_admin():
+    """Ranked ROOMS admin page (seal browser + repair tools).
+
+    Read-only without an admin id; every write goes through the
+    /api/ranked/admin/* allowlist gate in ranked_rooms.py."""
+    return _serve("ranked-rooms.html")
+
 
 @router.get("/comp/", response_class=HTMLResponse)
 async def comp_dashboard_alias():
