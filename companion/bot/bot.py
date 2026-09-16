@@ -15,6 +15,7 @@ import formatters as fmt
 import views
 import alerts as alert_mod
 import ranked as ranked_mod
+import ranked_tourney as rt_mod
 try:
     import aiohttp
 except: aiohttp = None
@@ -308,6 +309,11 @@ async def on_ready():
         bot.loop.create_task(ranked_loop())
     except Exception as e:
         print(f"[ranked] failed to start loop: {e}")
+    # ranked leaderboard poster (every 3 days, channel history is the clock)
+    try:
+        bot.loop.create_task(ranked_leaderboard_loop())
+    except Exception as e:
+        print(f"[ranked] failed to start board loop: {e}")
 
 
 @bot.tree.command(name="register", description="Get a login token and optionally publish your game profile")
@@ -478,13 +484,17 @@ async def fix_empty_cmd(interaction: discord.Interaction, game_username: app_com
         ephemeral=True)
 
 
-@bot.tree.command(name="comp-change-user", description="Change your comp profile game name when you rename in-game")
-@app_commands.describe(game_username="Your new in-game name, exactly as it appears in-game")
-async def comp_change_user_cmd(interaction: discord.Interaction, game_username: app_commands.Range[str, 1, 32]):
-    """Update bngc_users.game_username so future comp matches attribute.
 
-    Same validation + duplicate guard as profile creation; past matches are
-    not backfilled."""
+
+@bot.tree.command(name="change-user", description="Change your in-game name (comp + ranked + stats)")
+@app_commands.describe(game_username="Your new in-game name, exactly as it appears in-game")
+async def change_user_cmd(interaction: discord.Interaction, game_username: app_commands.Range[str, 1, 32]):
+    """Rename the one shared game_username used for detection everywhere.
+
+    Comp, ranked and stats tracking all resolve kills/wins off this single
+    name. Same validation + duplicate guard as profile creation; past
+    matches are not backfilled. Never raises beyond followups.
+    """
     await interaction.response.defer(ephemeral=True)
     sb = _comp_sb()
     if sb is None:
@@ -498,7 +508,7 @@ async def comp_change_user_cmd(interaction: discord.Interaction, game_username: 
         cur = ""
     if not cur:
         return await interaction.followup.send(
-            "No comp profile yet — sign up for a tourney (@yourself) and press **Create comp profile** first.", ephemeral=True)
+            "No game name linked yet — use **/register** first.", ephemeral=True)
     raw, err = _comp_valid_game_name(game_username)
     if err:
         return await interaction.followup.send(f"❌ {err}", ephemeral=True)
@@ -506,6 +516,12 @@ async def comp_change_user_cmd(interaction: discord.Interaction, game_username: 
     if _norm_game(cur) == norm:
         return await interaction.followup.send(
             f"Already set — you are known as **{cur}**.", ephemeral=True)
+    try:
+        if await _ranked_name_locked(sb, me):
+            return await interaction.followup.send(
+                "🔒 This identity is locked — ask a host to unlock it before renaming.", ephemeral=True)
+    except Exception:
+        pass
     try:
         dup = sb.table("bngc_users").select(
             "discord_id,game_username").ilike("game_username", raw).limit(25).execute()
@@ -523,10 +539,10 @@ async def comp_change_user_cmd(interaction: discord.Interaction, game_username: 
     try:
         sb.table("bngc_users").update({"game_username": raw}).eq("discord_id", me).execute()
     except Exception as e:
-        print(f"[comp-change-user] save failed: {e}")
+        print(f"[change-user] save failed: {e}")
         return await interaction.followup.send("Couldn't save — try again later.", ephemeral=True)
     return await interaction.followup.send(
-        f"Updated — **{cur}** → **{raw}**. Future comp matches attribute to the new name (past matches are not backfilled).", ephemeral=True)
+        f"Updated — **{cur}** → **{raw}**. Future comp, ranked and tracked matches attribute to the new name (past matches are not backfilled).", ephemeral=True)
 
 
 @bot.tree.command(name="ping", description="Check if the bot is online")
@@ -1721,7 +1737,7 @@ async def _announce_comp_profile(interaction: discord.Interaction, raw: str) -> 
         mention = getattr(interaction.user, "mention", str(interaction.user.id))
         await ch.send(
             f"{mention} comp profile created as **{raw}** ✅ — if you change your "
-            f"name in-game, run **/comp-change-user** so the system keeps catching "
+            f"name in-game, run **/change-user** so the system keeps catching "
             f"your kills and wins.")
     except Exception as e:
         print(f"[comp] profile announce failed: {e}")
@@ -2996,6 +3012,263 @@ async def tourney_name_cmd(interaction: discord.Interaction, allow: bool):
     return await interaction.followup.send(f"You opted {state}.{extra}", ephemeral=True)
 
 
+async def _ranked_name_locked(sb, did: str) -> bool:
+    """True when the identity row is lock-guarded against renames.
+
+    Pre-migration DBs (no ranked_link_locked): False. Never raises."""
+    try:
+        if sb is None or not did:
+            return False
+        r = sb.table("bngc_users").select("ranked_link_locked").eq(
+            "discord_id", str(did)).limit(1).execute()
+        rows = r.data or []
+        return bool(((rows[0] or {}).get("ranked_link_locked"))) if rows else False
+    except Exception:
+        return False
+
+
+def _ranked_milestone_nick(game_name: str, milestone) -> str:
+    """Display Name [Milestone] nickname (32-char Discord cap). Pure."""
+    try:
+        suffix = f" [{str(milestone or '').strip()}]"
+        if suffix.strip() in ("[]", ""):
+            suffix = ""
+    except Exception:
+        suffix = ""
+    try:
+        base = str(game_name or "").strip()[:max(0, 32 - len(suffix))]
+        return f"{base}{suffix}".strip()[:32]
+    except Exception:
+        return ""
+
+
+def _comp_nick_for(sb, did: str):
+    """(nick|None, game_name). Current PR nickname for a user. Never raises
+    (None when no name/PR yet or DB down)."""
+    try:
+        if sb is None or not did:
+            return None, ""
+        ures = sb.table("bngc_users").select(
+            "game_username,tourney_pr").eq("discord_id", str(did)).limit(1).execute()
+        urow = ((ures.data or [{}])[0] or {})
+        gname = str(urow.get("game_username") or "").strip()
+        pr = urow.get("tourney_pr")
+        if pr is None:
+            try:
+                hres = sb.table("bngc_comp_pr_history").select("pr").eq(
+                    "discord_id", str(did)).order("computed_at", desc=True).limit(1).execute()
+                if hres.data:
+                    pr = (hres.data[0] or {}).get("pr")
+            except Exception:
+                pass
+        if not gname or pr is None:
+            return None, gname
+        return _comp_pr_nick(gname, pr), gname
+    except Exception:
+        return None, ""
+
+
+def _ranked_nick_for(sb, did: str):
+    """(nick|None, game_name, milestone). Current milestone nickname.
+    Never raises (None when no name yet or DB down)."""
+    try:
+        if sb is None or not did:
+            return None, "", None
+        ures = sb.table("bngc_users").select(
+            "game_username").eq("discord_id", str(did)).limit(1).execute()
+        urow = ((ures.data or [{}])[0] or {})
+        gname = str(urow.get("game_username") or "").strip()
+        if not gname:
+            return None, "", None
+        pts = ranked_mod.get_points(str(did))
+        milestone, _fee = ranked_mod.milestone_for(pts)
+        return _ranked_milestone_nick(gname, milestone), gname, milestone
+    except Exception:
+        return None, "", None
+
+
+async def _edit_nick_if_different(guild, did: str, nick: str, reason: str) -> bool:
+    """Set a member nickname when it differs. True if attempted-ok. Never raises."""
+    try:
+        if guild is None or not did or not nick:
+            return False
+        try:
+            m = guild.get_member(int(did))
+        except Exception:
+            m = None
+        if m is None:
+            try:
+                m = await guild.fetch_member(int(did))
+            except Exception:
+                return False
+        if m is None:
+            return False
+        if m.nick != nick:
+            await m.edit(nick=nick, reason=reason)
+        return True
+    except Exception:
+        return False
+
+
+async def _ranked_sync_milestone_nicknames(seal: dict) -> int:
+    """Set opted-in members' nicks to Name [Milestone] after a seal.
+
+    Reads fresh totals (deltas in the seal row are not enough), computes the
+    milestone per player, edits only when the nick differs. Pre-migration DBs
+    (no ranked_name_optin): no-op, 0. Never raises.
+    """
+    try:
+        pts_map = (seal or {}).get("points") or {}
+        dids = sorted({str(d) for d in pts_map if str(d or "").strip()})[:200]
+        if not dids:
+            return 0
+        sb = _comp_sb()
+        if sb is None:
+            return 0
+        try:
+            ures = sb.table("bngc_users").select(
+                "discord_id,game_username,ranked_name_optin").in_("discord_id", dids).execute()
+        except Exception as e:
+            if "ranked_name_optin" in str(e):
+                print("[ranked] nicknames skipped: apply add_ranked_v242.sql")
+            return 0
+        umap = {str((u or {}).get("discord_id")): (u or {}) for u in (ures.data or [])}
+        try:
+            totals = await asyncio.to_thread(ranked_mod.get_points_many, dids)
+        except Exception:
+            totals = {}
+        done = 0
+        for did in dids:
+            try:
+                u = umap.get(did) or {}
+                if not u.get("ranked_name_optin"):
+                    continue
+                gname = str(u.get("game_username") or "").strip()
+                if not gname:
+                    continue
+                try:
+                    total = int((totals or {}).get(did, 0))
+                except Exception:
+                    total = 0
+                milestone, _fee = ranked_mod.milestone_for(total)
+                nick = _ranked_milestone_nick(gname, milestone)
+                if not nick:
+                    continue
+                for guild in (bot.guilds or []):
+                    try:
+                        if await _edit_nick_if_different(
+                                guild, did, nick, "Ranked milestone nickname (seal)"):
+                            done += 1
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return done
+    except Exception as e:
+        print(f"[ranked] milestone nicknames failed: {e}")
+        return 0
+
+
+@bot.tree.command(name="ranked-name", description="Opt in/out of the [Milestone] server nickname (Name [Gold])")
+@app_commands.describe(allow="True to opt in, False to opt out")
+async def ranked_name_cmd(interaction: discord.Interaction, allow: bool):
+    await interaction.response.defer(ephemeral=True)
+    sb = _comp_sb()
+    if sb is None:
+        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+    me = str(interaction.user.id)
+    try:
+        upd = sb.table("bngc_users").update(
+            {"ranked_name_optin": bool(allow)}).eq("discord_id", me).execute()
+        wrote = bool(upd.data)
+    except Exception as e:
+        if "ranked_name_optin" in str(e):
+            return await interaction.followup.send(
+                "Database migration pending — ask a host to apply add_ranked_v242.sql.", ephemeral=True)
+        print(f"[ranked-name] save failed: {e}")
+        return await interaction.followup.send("Couldn't save — try again later.", ephemeral=True)
+    if not wrote:
+        try:
+            sb.table("bngc_users").insert({
+                "discord_id": me,
+                "discord_username": getattr(interaction.user, "display_name", None) or str(interaction.user),
+                "ranked_name_optin": bool(allow),
+                "token": gen_token(),
+            }).execute()
+        except Exception as e:
+            if "ranked_name_optin" in str(e):
+                return await interaction.followup.send(
+                    "Database migration pending — ask a host to apply add_ranked_v242.sql.", ephemeral=True)
+            return await interaction.followup.send("Couldn't save — try again later.", ephemeral=True)
+    state = "in ✅ — your server nickname becomes **Display Name [Milestone]** and tracks your tier" if allow else "out — your nickname stays untouched"
+    extra = ""
+    if allow and interaction.guild is not None:
+        try:
+            nick, gname, milestone = _ranked_nick_for(sb, me)
+            if nick:
+                ok = await _edit_nick_if_different(
+                    interaction.guild, me, nick, "Ranked milestone nickname opt-in (immediate)")
+                extra = (f" Nickname set to **{nick}** now." if ok
+                         else " Couldn't set nickname now (bot needs Manage Nicknames + a higher role) — it applies after your next seal.")
+            elif not gname:
+                extra = " No ranked profile yet — link a name with **/register** first."
+        except Exception as e:
+            print(f"[ranked-name] immediate apply failed: {e}")
+    return await interaction.followup.send(f"You opted {state}.{extra}", ephemeral=True)
+
+
+@bot.tree.command(name="comp-name", description="Opt in/out of the [PR] server nickname (Display Name [150])")
+@app_commands.describe(allow="True to opt in, False to opt out")
+async def comp_name_cmd(interaction: discord.Interaction, allow: bool):
+    """Same flag as /tourney-name (shared opt-in), plus immediate apply."""
+    await interaction.response.defer(ephemeral=True)
+    sb = _comp_sb()
+    if sb is None:
+        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+    me = str(interaction.user.id)
+    try:
+        upd = sb.table("bngc_users").update(
+            {"tourney_name_optin": bool(allow)}).eq("discord_id", me).execute()
+        wrote = bool(upd.data)
+    except Exception as e:
+        if "tourney_name_optin" in str(e):
+            return await interaction.followup.send(
+                "Database migration pending — ask a host to apply add_comp_v238.sql.", ephemeral=True)
+        print(f"[comp-name] save failed: {e}")
+        return await interaction.followup.send("Couldn't save — try again later.", ephemeral=True)
+    if not wrote:
+        try:
+            sb.table("bngc_users").insert({
+                "discord_id": me,
+                "discord_username": getattr(interaction.user, "display_name", None) or str(interaction.user),
+                "tourney_name_optin": bool(allow),
+                "token": gen_token(),
+            }).execute()
+        except Exception as e:
+            if "tourney_name_optin" in str(e):
+                return await interaction.followup.send(
+                    "Database migration pending — ask a host to apply add_comp_v238.sql.", ephemeral=True)
+            return await interaction.followup.send("Couldn't save — try again later.", ephemeral=True)
+    state = "in ✅ — your server nickname becomes **Display Name [PR]** after each tourney" if allow else "out — your nickname stays untouched"
+    extra = ""
+    if allow and interaction.guild is not None:
+        try:
+            nick, gname = _comp_nick_for(sb, me)
+            if nick:
+                ok = await _edit_nick_if_different(
+                    interaction.guild, me, nick, "Comp PR nickname opt-in (immediate)")
+                extra = (f" Nickname set to **{nick}** now." if ok
+                         else " Couldn't set nickname now (bot needs Manage Nicknames + a higher role) — it applies at the next tourney.")
+            elif not gname:
+                extra = " No comp profile yet, so no nickname to set — it applies once you register."
+            else:
+                extra = " No PR yet — nickname applies after your first rated tourney."
+        except Exception as e:
+            print(f"[comp-name] immediate apply failed: {e}")
+    return await interaction.followup.send(f"You opted {state}.{extra}", ephemeral=True)
+
+
 def _comp_pr_nick(game_name: str, pr) -> str:
     """Display Name [PR] nickname (32-char Discord cap). Pure."""
     try:
@@ -3273,6 +3546,408 @@ async def comp_account_cmd(interaction: discord.Interaction, user: discord.User 
                      f"**Kills:** {kills} · **Wins:** {wins} · **Matches:** {matches}\n"
                      f"**Avg placement:** {avg if avg is not None else '—'}"))
     return await interaction.followup.send(embed=e)
+
+
+@bot.tree.command(name="ranked-account", description="See your ranked stats (points, milestone, wins, placements)")
+@app_commands.describe(user="Player to look up (default: you)")
+async def ranked_account_cmd(interaction: discord.Interaction, user: discord.User | None = None):
+    """Ranked career line from the comp-merge seal data. Never raises beyond
+    the followup."""
+    await interaction.response.defer(ephemeral=False)
+    sb = _comp_sb()
+    if sb is None:
+        return await interaction.followup.send("Supabase not configured.")
+    target = user or interaction.user
+    did = str(target.id)
+    try:
+        ures = sb.table("bngc_users").select(
+            "discord_id,game_username,discord_username").eq(
+            "discord_id", did).limit(1).execute()
+        urow = ((ures.data or [{}])[0] or {})
+    except Exception:
+        urow = {}
+    gname = (urow.get("game_username") or "").strip()
+    if not gname:
+        return await interaction.followup.send(
+            f"{getattr(target, 'mention', 'That user')} has no ranked profile yet — link a game name with **/register**.")
+    pts = ranked_mod.get_points(did)
+    milestone, _fee = ranked_mod.milestone_for(pts)
+    kills, match_keys = 0, set()
+    try:
+        eres = sb.table("bngc_ranked_events").select(
+            "room_id,match_version,etype").eq(
+            "discord_id", did).limit(5000).execute()
+        for e in (eres.data or []):
+            try:
+                if (e or {}).get("etype") == "kill":
+                    kills += 1
+                if (e or {}).get("room_id") is not None:
+                    match_keys.add((str((e or {}).get("room_id")),
+                                    int((e or {}).get("match_version") or 0)))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    wins, places = 0, []
+    try:
+        rres = sb.table("ranked_results").select(
+            "room_id,match_version,winner_discord_id,kills,placements").order(
+            "match_version", desc=True).limit(1000).execute()
+        for m in (rres.data or []):
+            try:
+                key = (str((m or {}).get("room_id")),
+                       int((m or {}).get("match_version") or 0))
+                mk = (m or {}).get("kills") or {}
+                pl = ((m or {}).get("placements") or {}).get(did)
+                if key in match_keys or did in mk or pl is not None:
+                    match_keys.add(key)
+                    if str((m or {}).get("winner_discord_id") or "") == did:
+                        wins += 1
+                    if pl is not None:
+                        places.append(int(pl))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    matches = len(match_keys)
+    avg = round(sum(places) / len(places), 1) if places else None
+    rate = f"{round(100 * wins / matches)}%" if matches else "—"
+    e = discord.Embed(
+        title=f"👑 Ranked account — {gname}", color=0xFFD700,
+        description=(f"{getattr(target, 'mention', '')}\n"
+                     f"**Points:** {pts} · **{milestone}**\n"
+                     f"**Kills:** {kills} · **Wins:** {wins} · **Matches:** {matches} · **Win rate:** {rate}\n"
+                     f"**Avg placement:** {avg if avg is not None else '—'}"))
+    try:
+        e.set_thumbnail(url=ranked_mod.milestone_icon(milestone))
+    except Exception:
+        pass
+    return await interaction.followup.send(embed=e)
+
+
+@bot.tree.command(name="rank", description="Your ranked card (points, milestone, leaderboard position)")
+@app_commands.describe(user="Player to look up (default: you)")
+async def rank_cmd(interaction: discord.Interaction, user: discord.User | None = None):
+    """Rank card with tier icon. Never raises beyond the followup."""
+    await interaction.response.defer(ephemeral=False)
+    try:
+        target = user or interaction.user
+        did = str(target.id)
+        pts = ranked_mod.get_points(did)
+        milestone, _fee = ranked_mod.milestone_for(pts)
+        try:
+            board = ranked_mod.top_points(1000) or []
+        except Exception:
+            board = []
+        pos = next((i + 1 for i, (d, _p) in enumerate(board) if str(d) == did), None)
+        total = len(board)
+        try:
+            nxt = min((t for t, _n, _f in ranked_mod.MILESTONE_FEES if t > pts), default=None)
+        except Exception:
+            nxt = None
+        if nxt is None:
+            prog = "Max rank 👑"
+        else:
+            try:
+                _nn = next(n for t, n, _f in ranked_mod.MILESTONE_FEES if t == nxt)
+            except Exception:
+                _nn = "?"
+            prog = f"{nxt - pts} pts to **{_nn}**"
+        e = discord.Embed(
+            title=f"👑 Rank — {getattr(target, 'display_name', None) or getattr(target, 'name', '?')}",
+            color=0xFFD700,
+            description=(f"{getattr(target, 'mention', '')}\n"
+                         f"**{milestone}** · **{pts}** pts\n"
+                         f"Leaderboard: **#{pos}** of {total}\n"
+                         f"{prog}"))
+        try:
+            e.set_thumbnail(url=ranked_mod.milestone_icon(milestone))
+        except Exception:
+            pass
+        return await interaction.followup.send(embed=e)
+    except Exception as e:
+        print(f"[rank] failed: {e}")
+        return await interaction.followup.send("Couldn't load rank — try again later.")
+
+
+async def _ranked_sync_member_roles(guild, did: str, milestone: str):
+    """Grant the tier role, strip other tier roles. (ok, role|reason).
+
+    Unconfigured tier (no env id): no-op False. Best-effort per role
+    (perms/hierarchy failures skipped). Never raises.
+    """
+    try:
+        if guild is None or not did:
+            return False, "no guild"
+        want = ranked_mod.tier_role_id(milestone)
+        try:
+            m = guild.get_member(int(did))
+        except Exception:
+            m = None
+        if m is None:
+            try:
+                m = await guild.fetch_member(int(did))
+            except Exception:
+                return False, "member not found"
+        if m is None:
+            return False, "member not found"
+        try:
+            have_ids = {int(r.id) for r in (m.roles or [])}
+        except Exception:
+            have_ids = set()
+        try:
+            tier_ids = {int(i) for i in ranked_mod.MILESTONE_ROLE_IDS.values() if i}
+        except Exception:
+            tier_ids = set()
+        for rid in tier_ids:
+            if rid != (want or 0) and rid in have_ids:
+                try:
+                    r = guild.get_role(rid)
+                    if r is not None:
+                        await m.remove_roles(r, reason="Ranked tier sync")
+                except Exception:
+                    continue
+        if not want:
+            return False, f"no role configured for {milestone} (set RANKED_ROLE_{str(milestone or '').upper()})"
+        if int(want) in have_ids:
+            return True, str(milestone)
+        try:
+            r = guild.get_role(int(want))
+            if r is None:
+                return False, "role missing from this server"
+            await m.add_roles(r, reason="Ranked tier sync")
+            return True, str(milestone)
+        except discord.errors.Forbidden:
+            return False, "bot needs Manage Roles + a higher role"
+        except Exception as e:
+            return False, str(e)[:80]
+    except Exception as e:
+        return False, str(e)[:80]
+
+
+async def _ranked_sync_room_roles(room: dict) -> int:
+    """Sync tier roles for a room's roster. Guild via thread, else lobby
+    channel. Returns synced count. Never raises."""
+    try:
+        guild = None
+        try:
+            tid = room.get("thread_id")
+            if tid:
+                th = bot.get_channel(int(tid))
+                if th is None:
+                    th = await bot.fetch_channel(int(tid))
+                guild = getattr(th, "guild", None)
+        except Exception:
+            pass
+        if guild is None:
+            try:
+                cid = room.get("lobby_channel_id")
+                if cid:
+                    ch = bot.get_channel(int(cid))
+                    if ch is None:
+                        ch = await bot.fetch_channel(int(cid))
+                    guild = getattr(ch, "guild", None)
+            except Exception:
+                pass
+        if guild is None:
+            print(f"[ranked] room role sync skipped (no guild) for {room.get('id')}")
+            return 0
+        try:
+            dids = [str(d) for d in ranked_mod.roster_ids(room)]
+        except Exception:
+            return 0
+        if not dids:
+            return 0
+        try:
+            totals = ranked_mod.get_points_many(dids)
+        except Exception:
+            totals = {}
+        done = 0
+        for did in dids:
+            try:
+                ms, _fee = ranked_mod.milestone_for(int((totals or {}).get(did, 0)))
+            except Exception:
+                ms = "Unranked"
+            try:
+                ok, _why = await _ranked_sync_member_roles(guild, did, ms)
+                if ok:
+                    done += 1
+            except Exception:
+                continue
+        return done
+    except Exception as e:
+        print(f"[ranked] room role sync failed: {e}")
+        return 0
+
+
+@bot.tree.command(name="rank-sync", description="Sync your tier role (admins can sync others)")
+@app_commands.describe(user="Player to sync (default: you, admins only for others)")
+async def rank_sync_cmd(interaction: discord.Interaction, user: discord.User | None = None):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        target = user or interaction.user
+        if target.id != interaction.user.id:
+            try:
+                admin = bool(interaction.guild and interaction.user.guild_permissions.administrator)
+            except Exception:
+                admin = False
+            if not admin:
+                return await interaction.followup.send("Only admins can sync other players.", ephemeral=True)
+        did = str(target.id)
+        pts = ranked_mod.get_points(did)
+        milestone, _fee = ranked_mod.milestone_for(pts)
+        ok, why = await _ranked_sync_member_roles(interaction.guild, did, milestone)
+        if ok:
+            return await interaction.followup.send(
+                f"✅ {getattr(target, 'mention', '')} synced to **{why}** ({pts} pts).", ephemeral=True)
+        return await interaction.followup.send(f"Couldn't sync: {why}.", ephemeral=True)
+    except Exception as e:
+        print(f"[rank-sync] failed: {e}")
+        return await interaction.followup.send("Couldn't sync — try again later.", ephemeral=True)
+
+
+def _is_guild_admin(interaction: discord.Interaction) -> bool:
+    """Administrator check for privileged rank commands. Never raises."""
+    try:
+        return bool(interaction.guild and interaction.user.guild_permissions.administrator)
+    except Exception:
+        return False
+
+
+@bot.tree.command(name="rank-sync-all", description="Sync tier roles for every ranked player (admin)")
+async def rank_sync_all_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if not _is_guild_admin(interaction):
+        return await interaction.followup.send("Admins only.", ephemeral=True)
+    try:
+        board = ranked_mod.top_points(10000) or []
+    except Exception:
+        board = []
+    if not board:
+        return await interaction.followup.send("No ranked points yet — nothing to sync.", ephemeral=True)
+    ok, fail, skipped = 0, 0, 0
+    total = len(board)
+    for i, (did, pts) in enumerate(board):
+        try:
+            milestone, _fee = ranked_mod.milestone_for(int(pts))
+        except Exception:
+            milestone = "Unranked"
+        try:
+            good, _why = await _ranked_sync_member_roles(interaction.guild, str(did), milestone)
+            if good:
+                ok += 1
+            else:
+                skipped += 1
+        except Exception:
+            fail += 1
+        if (i + 1) % 20 == 0:
+            try:
+                await asyncio.sleep(1)  # breathe for rate limits on big rosters
+            except Exception:
+                pass
+    return await interaction.followup.send(
+        f"👑 Rank sync all: **{ok}/{total}** synced"
+        f"{f', {skipped} skipped (left, locked roles, or unconfigured tiers)' if skipped else ''}"
+        f"{f', {fail} failed' if fail else ''}.", ephemeral=True)
+
+
+@bot.tree.command(name="rank-reset", description="Zero ALL ranked points and resync roles (admin, irreversible)")
+@app_commands.describe(confirm="Must be True — wipes every player's points")
+async def rank_reset_cmd(interaction: discord.Interaction, confirm: bool):
+    await interaction.response.defer(ephemeral=True)
+    if not _is_guild_admin(interaction):
+        return await interaction.followup.send("Admins only.", ephemeral=True)
+    if not confirm:
+        return await interaction.followup.send(
+            "⚠️ This zeroes **every** player's ranked points. Re-run with `confirm: True` if you mean it.",
+            ephemeral=True)
+    try:
+        try:
+            board = ranked_mod.top_points(10000) or []
+        except Exception:
+            board = []
+        dids = [str(d) for d, _p in board if str(d or "").strip()]
+        removed = ranked_mod.reset_points_all()
+        # everyone is Unranked now: strip old tiers, grant Unranked
+        synced, failed = 0, 0
+        for did in dids:
+            try:
+                good, _why = await _ranked_sync_member_roles(interaction.guild, did, "Unranked")
+                if good:
+                    synced += 1
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+        return await interaction.followup.send(
+            f"🧹 Rank reset: **{removed}** point row(s) wiped, **{synced}/{len(dids)}** synced to Unranked"
+            f"{f', {failed} failed' if failed else ''}. Leaderboards update on next read (server cache ≤60s).",
+            ephemeral=True)
+    except Exception as e:
+        print(f"[rank-reset] failed: {e}")
+        return await interaction.followup.send("Reset failed partway — check points before retrying.", ephemeral=True)
+
+
+async def _ranked_board_rows(limit: int = 50):
+    """Top holders [(did, pts, name, milestone)] with display names. Never raises."""
+    try:
+        board = ranked_mod.top_points(max(1, min(int(limit or 50), 200))) or []
+    except Exception:
+        return []
+    dids = [str(d) for d, _p in board if str(d or "").strip()]
+    names: dict = {}
+    try:
+        sb = _comp_sb()
+        if sb is not None and dids:
+            ures = sb.table("bngc_users").select(
+                "discord_id,game_username,discord_username").in_("discord_id", dids[:200]).execute()
+            for u in (ures.data or []):
+                try:
+                    if (u or {}).get("discord_id"):
+                        names[str((u or {}).get("discord_id"))] = str(
+                            (u or {}).get("game_username") or (u or {}).get("discord_username")
+                            or (u or {}).get("discord_id"))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    out = []
+    for did, pts in board:
+        try:
+            milestone, _fee = ranked_mod.milestone_for(int(pts))
+        except Exception:
+            milestone = "Unranked"
+        out.append((str(did), int(pts), names.get(str(did), str(did)[:6]), milestone))
+    return out
+
+
+def _ranked_board_lines(rows, offset: int = 0) -> list:
+    """Text lines for a board slice (shared by command + scheduler). Pure."""
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    try:
+        for i, (did, pts, nm, ms) in enumerate(rows, 1):
+            n = offset + i
+            prefix = medals[n - 1] if n <= 3 else f"{n}."
+            lines.append(f"{prefix} {_comp_mention(did)} **{nm}** — {pts} pts ({ms})")
+    except Exception:
+        pass
+    return lines
+
+
+@bot.tree.command(name="ranked-board", description="Ranked points leaderboard (paginated)")
+@app_commands.describe(limit="Rows to show (default 25)")
+async def ranked_board_cmd(interaction: discord.Interaction, limit: int = 25):
+    await interaction.response.defer(ephemeral=False)
+    try:
+        limit = max(1, min(int(limit or 25), 50))
+    except Exception:
+        limit = 25
+    rows = await _ranked_board_rows(limit)
+    if not rows:
+        return await interaction.followup.send("No ranked points yet — play a ranked match first.")
+    return await _send_paginated(interaction, "👑 Ranked Leaderboard", 0xFFD700,
+                                 _ranked_board_lines(rows))
 
 
 @bot.tree.command(name="tourney-list", description="List comp tourneys (id, status, matches)")
@@ -4317,7 +4992,7 @@ async def announce_update_cmd(interaction: discord.Interaction,
 
 
 # ---------------------------------------------------------------------------
-# Ranked v1 — host-authored rooms (/ranked create/start/end/...)
+# Ranked v1 rooms: retired (see note below). /rtourney is the series system;
 # v2.19.0 ranked sleep: commands stay registered but reply asleep unless
 # RANKED_ENABLED=1. Canonical API: project-nectar.onrender.com primary,
 # api-compbng.vercel.app fallback (see docs/api.md).
@@ -4325,7 +5000,12 @@ async def announce_update_cmd(interaction: discord.Interaction,
 
 RANKED_ENABLED_BOT = os.getenv("RANKED_ENABLED", "1") == "1"
 
-ranked_group = app_commands.Group(name="ranked", description="Ranked rooms")
+# ---------------------------------------------------------------------------
+# Ranked rooms: retired. /rtourney (series) replaces the room lifecycle;
+# the points/milestone displays (/rank, /ranked-board, /ranked-account,
+# /ranked-name, /rank-sync-all, /rank-reset) stay — ranked_points survives
+# via tourney payouts. Server room endpoints stay for the userscript.
+# ---------------------------------------------------------------------------
 
 
 def _ranked_lobby_embed(room: dict) -> discord.Embed:
@@ -4363,7 +5043,7 @@ class RankedLobbyView(discord.ui.View):
         except Exception:
             row = None
         if not row:
-            return await interaction.followup.send("Registered players only — use **/register** first.", ephemeral=True)
+            return await interaction.followup.send("Link your game name first — **/register**.", ephemeral=True)
         room = ranked_mod.get_room(self.rid)
         if not room or room.get("status") != "lobby":
             return await interaction.followup.send("This lobby is no longer open.", ephemeral=True)
@@ -4389,102 +5069,205 @@ class RankedLobbyView(discord.ui.View):
         if not room or room.get("status") != "lobby":
             return await interaction.followup.send("This lobby is no longer open.", ephemeral=True)
         if did == str(room.get("host_discord_id")):
-            return await interaction.followup.send("Host can't leave — use **/ranked change-host** or **/ranked end**.", ephemeral=True)
+            return await interaction.followup.send("Host can't leave — ask an admin to end the lobby.", ephemeral=True)
         ranked_mod.roster_remove(room, did)
         await self._refresh_embed(interaction)
         await interaction.followup.send(f"You left **{self.rid}**.", ephemeral=True)
 
 
-@ranked_group.command(name="create", description="Host a ranked room")
-@app_commands.describe(short_code="5-char room code from game",
-                       max_players="Roster cap",
-                       max_matches="Matches per session",
-                       min_points="Minimum points to join, 0 = open",
-                       max_points="Maximum points to join, 0 = no cap",
-                       fee="Join fee in points (burned)",
-                       starts_in_min="Auto-start countdown in minutes, 0 = manual start",
-                       host_status="Whether the host plays or just hosts")
-@app_commands.choices(gm=[app_commands.Choice(name="Late Game Zonewars", value="zw_lg"),
-                           app_commands.Choice(name="Free Mode", value="df"),
-                           app_commands.Choice(name="Wild West", value="wwzw")],
-                      host_status=[app_commands.Choice(name="Playing", value="is_host_playing"),
-                                   app_commands.Choice(name="Hosting Only", value="hosting_only")])
-async def ranked_create_cmd(interaction: discord.Interaction, short_code: str, max_players: app_commands.Range[int, 2, 16],
-                            gm: str, max_matches: app_commands.Range[int, 1, 50],
-                            min_points: int = 0, max_points: int = 0,
-                            fee: int = 0, starts_in_min: int = 0,
-                            host_status: str = "is_host_playing"):
-    if not await _defer(interaction):
-        return
-    if not RANKED_ENABLED_BOT:
-        return await interaction.followup.send("Ranked is sleeping in v2.19.0 — streak rewards are live. Back soon.", ephemeral=True)
-    did = str(interaction.user.id)
+
+
+# Seal-watch + auto-end state (module level; the loop owns them).
+_seal_seen: dict = {}      # rid -> max match_version already posted to the thread
+_live_known: set = set()   # rids seen live (detects server-side ended flips)
+_pending_end: set = set()  # ex-live rids awaiting an ended verdict
+_thread_cleaned: set = set()  # rids whose thread is gone
+
+
+async def _finalize_ended_room(room: dict, via: str):
+    """A room the server ended (max matches sealed): final embed, lobby flip,
+    thread close+delete. Idempotent via _thread_cleaned. Never raises."""
     try:
-        row = await db.get_by_discord(did)
-    except Exception:
-        row = None
-    if not row:
-        return await interaction.followup.send("Registered players only — use **/register** first.", ephemeral=True)
-    if ranked_mod.is_banned(did):
-        return await interaction.followup.send("You are banned from ranked.", ephemeral=True)
-    code = (short_code or "").strip().upper()
-    if len(code) != 5 or not code.isalnum():
-        return await interaction.followup.send("Short code must be 5 letters/digits (the code players type in game).", ephemeral=True)
-    if gm not in ranked_mod.ALLOWED_GMS:
-        return await interaction.followup.send("Mode must be zw_lg, df or wwzw.", ephemeral=True)
-    if ranked_mod.get_open_room_by_code(code):
-        return await interaction.followup.send(f"Code **{code}** already has an open ranked room.", ephemeral=True)
-    starts_at = None
-    if starts_in_min and starts_in_min > 0:
-        starts_at = (datetime.now(timezone.utc) + timedelta(minutes=min(starts_in_min, 180))).isoformat()
-    capped_max = max_points if max_points and max_points > 0 else None
-    try:
-        room = ranked_mod.create_room(code=code, host_discord_id=did, gm=gm,
-                                      max_players=max_players, max_matches=max_matches,
-                                      min_points=min_points or 0, max_points=capped_max,
-                                      fee=fee or 0, starts_at=starts_at)
-        hs = host_status if host_status in ("is_host_playing", "hosting_only") else "is_host_playing"
-        if hs != "is_host_playing":
-            ranked_mod.update_room(room["id"], {"host_status": hs})
-            room = ranked_mod.get_room(room["id"])
-    except Exception as exc:
-        print(f"[ranked] create failed: {exc}")
-        return await interaction.followup.send("Couldn't create the room (DB error).", ephemeral=True)
-    print(f"[ranked] room created {room['id']} code={code} gm={gm} host={did} max={max_players}x{max_matches}")
-    # post lobby embed (configured channel, else current channel)
-    target = None
-    try:
-        cid = ranked_mod.CREATE_CHANNEL_ID or (interaction.channel_id)
-        if cid:
-            try:
-                target = interaction.guild.get_channel(cid) if interaction.guild else None
-            except Exception:
-                target = None
-            if target is None:
-                try:
-                    target = await bot.fetch_channel(cid)
-                except Exception:
-                    target = None
-        if target is None:
-            target = interaction.channel
-    except Exception:
-        target = interaction.channel
-    ping = f"<@&{ranked_mod.RANKED_PING_ROLE_ID}>" if ranked_mod.RANKED_PING_ROLE_ID else ""
-    try:
-        msg = await target.send(content=ping or None, embed=_ranked_lobby_embed(room), view=RankedLobbyView(room["id"]))
+        rid = room["id"]
+        if rid in _thread_cleaned:
+            return
+        sealed = ranked_mod.sealed_count(rid)
+        await _post_thread(room, embed=discord.Embed(
+            title="Session ended", color=0xef4444,
+            description=f"**{rid}** closed with {sealed}/{room.get('max_matches')} matches sealed ({via})."))
+        await _set_lobby_embed(room, ranked_mod.ended_embed(room), 0xef4444)
+        # session end: tier roles follow final points (best-effort, logged)
         try:
-            ranked_mod.update_room(room["id"], {"lobby_channel_id": str(getattr(target, 'id', '')), "lobby_message_id": str(msg.id)})
-        except Exception:
-            pass
-    except Exception as exc:
-        print(f"[ranked] lobby post failed: {exc}")
-        return await interaction.followup.send(f"Room **{room['id']}** created, but I couldn't post the lobby — check my channel access.", ephemeral=True)
-    await interaction.followup.send(f"Ranked room **{room['id']}** open — lobby posted. You (host) are on the roster.", ephemeral=True)
+            synced = await _ranked_sync_room_roles(room)
+            print(f"[ranked] auto-end {rid}: {synced} tier role(s) synced")
+        except Exception as e:
+            print(f"[ranked] auto-end role sync failed for {rid}: {e}")
+        if await _close_thread(room):
+            _thread_cleaned.add(rid)
+    except Exception as e:
+        print(f"[ranked] auto-end finalize failed: {e}")
 
 
-bot.tree.add_command(ranked_group)
+async def ranked_leaderboard_loop():
+    """Hourly tick: post the ranked board when the last board post is 3+ days
+    old. Channel history is the clock (no stored state — restarts safe)."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await asyncio.sleep(3600)
+            if not RANKED_ENABLED_BOT:
+                continue
+            try:
+                cid = ranked_mod.LB_CHANNEL_ID
+                channel = bot.get_channel(cid)
+                if channel is None:
+                    channel = await bot.fetch_channel(cid)
+            except Exception as e:
+                print(f"[ranked] board loop: channel unreachable: {e}")
+                continue
+            fresh = False
+            try:
+                async for msg in channel.history(limit=10):
+                    try:
+                        if (msg.author and bot.user and msg.author.id == bot.user.id
+                                and msg.embeds
+                                and "Ranked Leaderboard" in str((msg.embeds[0] or {}).title or "")):
+                            import datetime as _dt
+                            age = (_dt.datetime.now(_dt.timezone.utc) - msg.created_at).total_seconds()
+                            if age < ranked_mod.LB_POST_EVERY_S:
+                                fresh = True
+                            break
+                    except Exception:
+                        continue
+            except Exception as e:
+                print(f"[ranked] board loop: history read failed: {e}")
+                continue
+            if fresh:
+                continue
+            rows = await _ranked_board_rows(20)
+            if not rows:
+                continue
+            lines = _ranked_board_lines(rows)
+            pages = [lines[i:i + 10] for i in range(0, len(lines), 10)] or [[]]
+            if len(pages) == 1:
+                e = discord.Embed(title="👑 Ranked Leaderboard", color=0xFFD700,
+                                  description="\n".join(pages[0])[:4000])
+                e.set_footer(text="Season standings · every 3 days")
+                await channel.send(embed=e)
+            else:
+                view = _LBView("👑 Ranked Leaderboard", 0xFFD700, pages, "",
+                               "Season standings · every 3 days")
+                await channel.send(embed=view._lb_embed(), view=view)
+            print(f"[ranked] scheduled board posted ({len(rows)} rows)")
+        except Exception as e:
+            print(f"[ranked] leaderboard loop failed: {e}")
 
 
+async def ranked_loop():
+    """Every 30s: auto-start countdown lobbies; post per-match boards for new
+    seals in live rooms; finalize rooms the server ended (max matches)."""
+    await bot.wait_until_ready()
+    # seed: pre-existing seals were (presumably) posted before this boot —
+    # only future seals trigger posts. Logged so a gap is visible.
+    try:
+        for room in await asyncio.to_thread(ranked_mod.list_live_rooms):
+            try:
+                seals = await asyncio.to_thread(ranked_mod.room_seals, room["id"])
+                if seals:
+                    _seal_seen[room["id"]] = max(int(s.get("match_version") or 0) for s in seals)
+                _live_known.add(room["id"])
+            except Exception:
+                continue
+        if _seal_seen:
+            print(f"[ranked] seal-watch seeded (skipping already-sealed): {_seal_seen}")
+    except Exception as e:
+        print(f"[ranked] seal-watch seed failed: {e}")
+    _idle_cycles = 0
+    while not bot.is_closed():
+        _active = False
+        try:
+            for room in ranked_mod.list_due_starts():
+                _active = True
+                try:
+                    ok, msg = await _start_ranked_room(room, via="countdown")
+                    print(f"[ranked] countdown start {room.get('id')}: {msg}")
+                except Exception as e:
+                    print(f"[ranked] countdown failed for {room.get('id')}: {e}")
+                await asyncio.sleep(2)  # let interactions interleave between rooms
+            # seal-watch: new sealed versions -> match-only board in the thread
+            try:
+                live = await asyncio.to_thread(ranked_mod.list_live_rooms)
+            except Exception as e:
+                print(f"[ranked] live list failed: {e}")
+                live = []
+            if live or _pending_end:
+                _active = True
+            live_ids = set()
+            for room in live:
+                try:
+                    rid = room["id"]
+                    live_ids.add(rid)
+                    _live_known.add(rid)
+                    seals = await asyncio.to_thread(ranked_mod.room_seals, rid)
+                    known = _seal_seen.get(rid, 0)
+                    fresh = sorted(
+                        [s for s in seals if int(s.get("match_version") or 0) > known],
+                        key=lambda s: int(s.get("match_version") or 0))
+                    if fresh:
+                        _active = True
+                    for seal in fresh:
+                        try:
+                            await _post_match_board(room, seal)
+                            # opted-in milestone nicknames track the new totals
+                            try:
+                                renamed = await _ranked_sync_milestone_nicknames(seal)
+                                if renamed:
+                                    print(f"[ranked] {renamed} milestone nickname(s) updated for {rid}")
+                            except Exception as e:
+                                print(f"[ranked] milestone nicknames failed for {rid}: {e}")
+                        finally:
+                            # mark seen even when the post failed: no 30s retry
+                            # spam, the next seal carries the session forward
+                            # (the /ranked dashboard shows it all)
+                            _seal_seen[rid] = max(_seal_seen.get(rid, 0),
+                                                  int(seal.get("match_version") or 0))
+                except Exception as e:
+                    print(f"[ranked] seal-watch failed for {room.get('id')}: {e}")
+                await asyncio.sleep(1)  # let interactions interleave between rooms
+            # ex-live rooms: server-side ended flip (max matches) -> finalize;
+            # backout-to-lobby just drops out of the pending set (thread stays).
+            for rid in _live_known - live_ids:
+                _pending_end.add(rid)
+            _live_known.intersection_update(live_ids)
+            for rid in list(_pending_end):
+                try:
+                    room = await asyncio.to_thread(ranked_mod.get_room, rid)
+                    if not room or room.get("status") != "ended":
+                        _pending_end.discard(rid)
+                        continue
+                    if rid in _thread_cleaned:
+                        _pending_end.discard(rid)
+                        continue
+                    print(f"[ranked] auto-end finalize {rid}")
+                    await _finalize_ended_room(room, "max matches reached")
+                    if rid in _thread_cleaned:
+                        _pending_end.discard(rid)
+                except Exception as e:
+                    print(f"[ranked] auto-end check failed for {rid}: {e}")
+        except Exception as e:
+            print(f"[ranked] loop failed: {e}")
+        # Idle backoff: no live/due/pending rooms most of the day — 90s
+        # instead of 30s cuts baseline Supabase polls 3x with zero UX cost.
+        # Any activity resets to 30s immediately.
+        if _active:
+            _idle_cycles = 0
+            await asyncio.sleep(30)
+        else:
+            _idle_cycles += 1
+            await asyncio.sleep(90 if _idle_cycles >= 2 else 30)
+
+
+# Restored: shared by ranked loops + /rtourney (room commands retired).
 async def _verify_host_present(code: str, game_username: str | None):
     """Ask the API if the room code is live and the host is in it.
 
@@ -4514,6 +5297,7 @@ async def _verify_host_present(code: str, game_username: str | None):
         return None, "api unreachable"
 
 
+# Restored: shared by ranked loops + /rtourney (room commands retired).
 async def _post_thread_leaderboard(thread, rid: str):
     """Top-10 arena standings in the session thread. Best-effort."""
     try:
@@ -4537,6 +5321,7 @@ async def _post_thread_leaderboard(thread, rid: str):
         print(f"[ranked] thread leaderboard failed: {e}")
 
 
+# Restored: shared by ranked loops + /rtourney (room commands retired).
 async def _set_lobby_embed(room: dict, spec: dict, color: int, buttons: bool = False):
     """Edit the lobby message to a spec embed. Best-effort."""
     try:
@@ -4552,6 +5337,7 @@ async def _set_lobby_embed(room: dict, spec: dict, color: int, buttons: bool = F
         print(f"[ranked] lobby flip failed: {e}")
 
 
+# Restored: shared by ranked loops + /rtourney (room commands retired).
 async def _post_thread(room: dict, content=None, embed=None):
     """Post into the session thread. Returns True on success."""
     try:
@@ -4568,17 +5354,7 @@ async def _post_thread(room: dict, content=None, embed=None):
         return False
 
 
-def _ord(n) -> str:
-    """1 -> 1st, 2 -> 2nd, 3 -> 3rd, 11-13 -> th. Never raises."""
-    try:
-        n = int(n)
-        if 11 <= (n % 100) <= 13:
-            return f"{n}th"
-        return f"{n}{({1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th'))}"
-    except Exception:
-        return str(n)
-
-
+# Restored: shared by ranked loops + /rtourney (room commands retired).
 async def _display_name(did: str) -> str:
     """Game username > discord username > raw did. Never raises."""
     try:
@@ -4588,6 +5364,7 @@ async def _display_name(did: str) -> str:
         return str(did)
 
 
+# Restored: shared by ranked loops + /rtourney (room commands retired).
 async def _post_match_board(room: dict, seal: dict):
     """Match-only leaderboard in the session thread: winner + per-player
     placement/kills/points for THIS sealed match (not global standings).
@@ -4641,6 +5418,7 @@ async def _post_match_board(room: dict, seal: dict):
         print(f"[ranked] match board failed: {e}")
 
 
+# Restored: shared by ranked loops + /rtourney (room commands retired).
 async def _close_thread(room: dict) -> bool:
     """Close (archive+lock) then delete the session thread. The session is
     over — nothing should linger. True when the thread is gone (or was
@@ -4678,6 +5456,7 @@ async def _close_thread(room: dict) -> bool:
         return False
 
 
+# Restored: shared by ranked loops + /rtourney (room commands retired).
 async def _defer(interaction: discord.Interaction) -> bool:
     """Defer an interaction. False = interaction already dead (starved loop),
     caller must abort silently (there is nobody left to answer)."""
@@ -4692,63 +5471,7 @@ async def _defer(interaction: discord.Interaction) -> bool:
         return False
 
 
-def _host_or_admin(interaction: discord.Interaction, room: dict) -> bool:
-    did = str(interaction.user.id)
-    if did == str(room.get("host_discord_id")):
-        return True
-    try:
-        return bool(interaction.guild and interaction.user.guild_permissions.administrator)
-    except Exception:
-        return False
-
-
-async def _resolve_room(interaction: discord.Interaction, rid: str = None):
-    """Resolve a ranked room from multiple sources. Returns (room, error_msg).
-    Resolution order:
-      1. If rid starts with 'R-' → R-ID lookup
-      2. If rid is 5 chars → short_code lookup (open rooms)
-      3. If rid is None → thread context → user's active room
-    Returns (room_dict, None) on success, (None, error_string) on failure.
-    """
-    did = str(interaction.user.id)
-    # 1. Explicit R-ID
-    if rid and rid.strip().upper().startswith("R-"):
-        room = ranked_mod.get_room(rid.strip().upper())
-        if not room:
-            return None, f"No such ranked room: `{rid.strip().upper()}`"
-        return room, None
-    # 2. Explicit short code (5 chars)
-    if rid and len(rid.strip()) == 5 and rid.strip().isalnum():
-        room = ranked_mod.get_open_room_by_code(rid.strip())
-        if not room:
-            return None, f"No open ranked room with code **{rid.strip().upper()}**"
-        # Check if user is on roster
-        ids = ranked_mod.roster_ids(room)
-        if did not in ids and not (interaction.guild and interaction.user.guild_permissions.administrator):
-            return None, f"You're not on the roster for **{room.get('short_code', '?')}**"
-        return room, None
-    # 3. Auto-detect: thread context
-    try:
-        ch = interaction.channel
-        if ch and hasattr(ch, 'id'):
-            room = ranked_mod.get_room_by_thread_id(str(ch.id))
-            if room:
-                return room, None
-    except Exception:
-        pass
-    # 4. Auto-detect: user's active room
-    try:
-        room = ranked_mod.get_user_active_room(did)
-        if room:
-            return room, None
-    except Exception:
-        pass
-    # 5. Nothing found
-    if rid:
-        return None, f"Couldn't find room for `{rid}`. Try the 5-char game code or a room R-ID."
-    return None, "No active ranked room found. Run this in a ranked thread, or pass the game code (e.g. ABC12) or R-ID."
-
-
+# Restored: shared by ranked loops + /rtourney (room commands retired).
 async def _start_ranked_room(room: dict, via: str = "manual"):
     """Shared manual/countdown start. Returns (ok, message). Steps: eligibility
     re-check (drop banned/under-lock), host-in-room verify, fee pass (drop +
@@ -4881,423 +5604,753 @@ async def _start_ranked_room(room: dict, via: str = "manual"):
     await _set_lobby_embed(room, ranked_mod.live_embed(room, thread.id, host_status), 0x10b981)
     return True, f"**{room['id']}** live with {len(roster)} players ({'countdown' if via == 'countdown' else 'manual'} start)."
 
+# ---------------------------------------------------------------------------
+# Ranked onboarding (/ranked register) — minimal ranked identity.
+# The room lifecycle commands are retired; this stays because the lobby
+# buttons, tourney joins and nickname syncs all point here for mobile
+# players (no companion, no stats tracking).
+# ---------------------------------------------------------------------------
 
-@ranked_group.command(name="start", description="Start your ranked room (host)")
-@app_commands.describe(rid="Room code (ABC12), R-ID, or leave blank to auto-detect")
-async def ranked_start_cmd(interaction: discord.Interaction, rid: str = None):
+ranked_register_group = app_commands.Group(name="ranked", description="Ranked onboarding")
+
+
+@ranked_register_group.command(name="register", description="Link your in-game name for ranked (mobile-friendly, no stats tracking)")
+@app_commands.describe(game_username="Your in-game name, exactly as it appears in-game")
+async def ranked_register_cmd(interaction: discord.Interaction, game_username: app_commands.Range[str, 1, 32]):
+    """Minimal ranked identity: {discord_id, game_username} only.
+
+    For mobile players (no companion) and anyone who wants ranked without
+    stats tracking. No login token, no counters/playtime/insights — kills and
+    points count only inside ranked rooms. Existing /register users and comp
+    profiles already satisfy this (same shared game_username); running this
+    with the same name is a no-op confirm. Renames keep flowing through
+    /change-user. Never raises beyond followups.
+    """
     if not await _defer(interaction):
         return
-    room, err = await _resolve_room(interaction, rid)
-    if not room:
-        return await interaction.followup.send(err, ephemeral=True)
-    did = str(interaction.user.id)
-    is_admin = bool(interaction.user.guild_permissions.administrator) if interaction.guild else False
-    if did != str(room.get("host_discord_id")) and not is_admin:
-        return await interaction.followup.send("Only the host (or an admin) can start.", ephemeral=True)
-    ok, msg = await _start_ranked_room(room, via="manual")
-    await interaction.followup.send(msg, ephemeral=True)
-
-
-@ranked_group.command(name="end", description="End the ranked session (host)")
-@app_commands.describe(rid="Room code (ABC12), R-ID, or leave blank to auto-detect")
-async def ranked_end_cmd(interaction: discord.Interaction, rid: str = None):
-    if not await _defer(interaction):
-        return
-    room, err = await _resolve_room(interaction, rid)
-    if not room:
-        return await interaction.followup.send(err, ephemeral=True)
-    if not _host_or_admin(interaction, room):
-        return await interaction.followup.send("Only the host (or an admin) can end.", ephemeral=True)
-    if room.get("status") == "ended":
-        return await interaction.followup.send("Session already ended.", ephemeral=True)
-    print(f"[ranked] end {room['id']} by={interaction.user.id}")
-    ranked_mod.update_room(room["id"], {"status": "ended"})
-    room = ranked_mod.get_room(room["id"])
-    sealed = ranked_mod.sealed_count(room["id"])
-    await _post_thread(room, embed=discord.Embed(
-        title="Session ended", color=0xef4444,
-        description=f"**{room['id']}** closed with {sealed}/{room.get('max_matches')} matches sealed."))
-    await _set_lobby_embed(room, ranked_mod.ended_embed(room), 0xef4444)
-    # session over: close (archive+lock) then delete the private thread
-    closed = await _close_thread(room)
-    if closed:
-        _thread_cleaned.add(room["id"])
-    tail = " Thread closed and deleted." if closed else " Couldn't delete the thread — check my thread perms."
-    await interaction.followup.send(f"**{room['id']}** ended ({sealed} matches sealed).{tail}", ephemeral=True)
-
-
-@ranked_group.command(name="backout", description="Back out to lobby, session continues (host)")
-@app_commands.describe(rid="Room code (ABC12), R-ID, or leave blank to auto-detect", reason="Why (shown to players)")
-async def ranked_backout_cmd(interaction: discord.Interaction, rid: str = None, reason: str = ""):
-    if not await _defer(interaction):
-        return
-    room, err = await _resolve_room(interaction, rid)
-    if not room:
-        return await interaction.followup.send(err, ephemeral=True)
-    if not _host_or_admin(interaction, room):
-        return await interaction.followup.send("Only the host (or an admin) can back out.", ephemeral=True)
-    if room.get("status") != "live":
-        return await interaction.followup.send("Only a live room can back out (this one isn't live).", ephemeral=True)
-    print(f"[ranked] backout {room['id']} by={interaction.user.id} reason={reason!r}")
-    ranked_mod.update_room(room["id"], {"status": "lobby"})
-    room = ranked_mod.get_room(room["id"])
-    sealed = ranked_mod.sealed_count(room["id"])
-    note = f" — {reason}" if reason else ""
-    await _post_thread(room, embed=discord.Embed(
-        title="Backed out to lobby", color=0xf59e0b,
-        description=f"Host called a backout{note}. Sealed matches stand ({sealed}). Rejoin the lobby — the count stays where it was."))
-    for did in ranked_mod.roster_ids(room):
-        try:
-            user = await bot.fetch_user(int(did))
-            await user.send(f"**{room['id']}** backed out to lobby{note}. Sealed matches stand — rejoin when the host restarts.")
-        except Exception:
-            pass
-    await _set_lobby_embed(room, ranked_mod.lobby_embed(room), 0x7c3aed, buttons=True)
-    await interaction.followup.send(f"**{room['id']}** back to lobby — session continues ({sealed} sealed). Sealing is paused until you run `/ranked start` again.", ephemeral=True)
-
-
-@ranked_group.command(name="restart", description="Void the current match and start a fresh one (host)")
-@app_commands.describe(rid="Room code (ABC12), R-ID, or leave blank to auto-detect", reason="Why (shown to players)")
-async def ranked_restart_cmd(interaction: discord.Interaction, rid: str = None, reason: str = ""):
-    if not await _defer(interaction):
-        return
-    room, err = await _resolve_room(interaction, rid)
-    if not room:
-        return await interaction.followup.send(err, ephemeral=True)
-    if not _host_or_admin(interaction, room):
-        return await interaction.followup.send("Only the host (or an admin) can restart.", ephemeral=True)
-    if room.get("status") != "live":
-        return await interaction.followup.send("Only a live room can restart (this one isn't live — use `/ranked start`).", ephemeral=True)
-    if room.get("status") == "ended":
-        return await interaction.followup.send("Session ended — can't restart.", ephemeral=True)
-    print(f"[ranked] restart {room['id']} by={interaction.user.id} reason={reason!r}")
-    sealed = ranked_mod.sealed_count(room["id"])
-    note = f" — {reason}" if reason else ""
-    # back to lobby first (sealed matches stand; the in-progress match is void)
-    ranked_mod.update_room(room["id"], {"status": "lobby"})
-    room = ranked_mod.get_room(room["id"])
-    await _post_thread(room, embed=discord.Embed(
-        title="Match restarted", color=0xf59e0b,
-        description=f"Host restarted the session{note}. The in-progress match is void — sealed matches stand ({sealed}). Starting fresh…"))
-    # fresh start re-runs eligibility + fees (entry is charged again)
-    ok, msg = await _start_ranked_room(room, via="restart")
-    if not ok:
-        await _set_lobby_embed(room, ranked_mod.lobby_embed(ranked_mod.get_room(room["id"])), 0x7c3aed, buttons=True)
-        return await interaction.followup.send(f"Backed out to lobby, but the fresh start failed: {msg} Run `/ranked start` when ready.", ephemeral=True)
-    await interaction.followup.send(f"**{room['id']}** restarted — {msg} (Sealed matches stand; entry fees were charged again.)", ephemeral=True)
-
-
-@ranked_group.command(name="change-code", description="Change the room code (host)")
-@app_commands.describe(rid="Room code (ABC12), R-ID, or leave blank to auto-detect", short_code="New 5-char room code from game")
-async def ranked_chcode_cmd(interaction: discord.Interaction, short_code: str, rid: str = None):
-    if not await _defer(interaction):
-        return
-    room, err = await _resolve_room(interaction, rid)
-    if not room:
-        return await interaction.followup.send(err, ephemeral=True)
-    if not _host_or_admin(interaction, room):
-        return await interaction.followup.send("Only the host (or an admin) can change the code.", ephemeral=True)
-    if room.get("status") == "ended":
-        return await interaction.followup.send("Session ended — code can't change.", ephemeral=True)
-    code = (short_code or "").strip().upper()
-    if len(code) != 5 or not code.isalnum():
-        return await interaction.followup.send("Code must be 5 letters/digits.", ephemeral=True)
-    if code != room.get("short_code") and ranked_mod.get_open_room_by_code(code):
-        return await interaction.followup.send(f"Code **{code}** already has an open ranked room.", ephemeral=True)
-    print(f"[ranked] change-code {room['id']} {room.get('short_code')}->{code} by={interaction.user.id}")
-    ranked_mod.update_room(room["id"], {"short_code": code})
-    room = ranked_mod.get_room(room["id"])
-    await _post_thread(room, embed=discord.Embed(
-        title="Room code changed", color=0xf59e0b,
-        description=f"New code: **{code}**. Host — join the new room, sealing follows your packets."))
-    if room.get("status") == "lobby":
-        await _set_lobby_embed(room, ranked_mod.lobby_embed(room), 0x7c3aed, buttons=True)
-    await interaction.followup.send(f"**{room['id']}** code is now **{code}**.", ephemeral=True)
-
-
-@ranked_group.command(name="change-host", description="Transfer host to another player (host)")
-@app_commands.describe(rid="Room code (ABC12), R-ID, or leave blank to auto-detect", member="New host")
-async def ranked_chhost_cmd(interaction: discord.Interaction, member: discord.Member, rid: str = None):
-    if not await _defer(interaction):
-        return
-    room, err = await _resolve_room(interaction, rid)
-    if not room:
-        return await interaction.followup.send(err, ephemeral=True)
-    if not _host_or_admin(interaction, room):
-        return await interaction.followup.send("Only the host (or an admin) can transfer.", ephemeral=True)
-    if room.get("status") == "ended":
-        return await interaction.followup.send("Session ended — host can't change.", ephemeral=True)
-    ndid = str(member.id)
+    if not RANKED_ENABLED_BOT:
+        return await interaction.followup.send("Ranked is sleeping in v2.19.0 — streak rewards are live. Back soon.", ephemeral=True)
+    sb = _comp_sb()
+    if sb is None:
+        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+    me = str(interaction.user.id)
     try:
-        row = await db.get_by_discord(ndid)
+        ures = sb.table("bngc_users").select(
+            "discord_id,game_username").eq("discord_id", me).limit(1).execute()
+        cur = (((ures.data or [{}])[0] or {}).get("game_username") or "").strip()
+        has_row = bool((ures.data or []))
+    except Exception:
+        cur, has_row = "", False
+    raw, err = _comp_valid_game_name(game_username)
+    if err:
+        return await interaction.followup.send(f"❌ {err}", ephemeral=True)
+    norm = _norm_game(raw)
+    if cur and _norm_game(cur) == norm:
+        return await interaction.followup.send(
+            f"Already set — you are known as **{cur}**.", ephemeral=True)
+    try:
+        dup = sb.table("bngc_users").select(
+            "discord_id,game_username").ilike("game_username", raw).limit(25).execute()
+        for u in ((dup.data if hasattr(dup, "data") else []) or []):
+            try:
+                if str((u or {}).get("discord_id")) == me:
+                    continue
+                if _norm_game((u or {}).get("game_username")) == norm:
+                    return await interaction.followup.send(
+                        f"❌ '{raw}' is already linked to another account — ask an admin to relink it if it's yours.", ephemeral=True)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        if has_row:
+            sb.table("bngc_users").update({"game_username": raw}).eq("discord_id", me).execute()
+        else:
+            sb.table("bngc_users").insert({
+                "discord_id": me,
+                "discord_username": str(interaction.user.name or "")[:32] or me,
+                "game_username": raw,
+                "token": "ranked-" + secrets.token_hex(16),
+            }).execute()
+    except Exception as e:
+        print(f"[ranked-register] save failed: {e}")
+        return await interaction.followup.send("Couldn't save — try again later.", ephemeral=True)
+    return await interaction.followup.send(
+        f"Linked — **{raw}** is now your ranked game name. No stats tracking: your kills and points count only inside ranked rooms.",
+        ephemeral=True)
+
+
+bot.tree.add_command(ranked_register_group)
+
+
+# ---------------------------------------------------------------------------
+# Ranked tourneys (/rtourney create/...) — series play on the
+# bngc_ranked_tourney_* tables. Same embed + Join/Leave + thread UX as
+# ranked rooms; old /ranked room commands and comp /tourney-* untouched.
+# ---------------------------------------------------------------------------
+
+rtourney_group = app_commands.Group(
+    name="rtourney", description="Ranked tourneys (series)")
+
+
+def _rt_lobby_embed(t: dict) -> discord.Embed:
+    spec = rt_mod.lobby_spec(t or {})
+    e = discord.Embed(title=spec["title"], color=0x7c3aed)
+    for name, value, inline in spec["fields"]:
+        e.add_field(name=name, value=value, inline=inline)
+    e.set_footer(text=spec["footer"])
+    return e
+
+
+async def _rt_refresh_lobby(tid: int):
+    """Re-render a ranked-tourney lobby message. Best-effort."""
+    try:
+        t = rt_mod.get_tourney(tid)
+        if not t or not t.get("lobby_channel_id") or not t.get("lobby_message_id"):
+            return
+        ch = bot.get_channel(int(t["lobby_channel_id"]))
+        if ch is None:
+            ch = await bot.fetch_channel(int(t["lobby_channel_id"]))
+        msg = await ch.fetch_message(int(t["lobby_message_id"]))
+        await msg.edit(embed=_rt_lobby_embed(t), view=RTourneyLobbyView(int(tid)))
+    except Exception as e:
+        print(f"[rtourney] lobby refresh failed: {e}")
+
+
+class RTourneyLobbyView(discord.ui.View):
+    """Join/Leave buttons for a ranked tourney lobby (timeout=None)."""
+
+    def __init__(self, tid: int):
+        super().__init__(timeout=None)
+        self.tid = int(tid)
+
+    @discord.ui.button(label="Join", style=discord.ButtonStyle.success, custom_id="rt-join")
+    async def join_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        did = str(interaction.user.id)
+        try:
+            row = await db.get_by_discord(did)
+        except Exception:
+            row = None
+        if not row:
+            return await interaction.followup.send(
+                "Link your game name first — **/register**.",
+                ephemeral=True)
+        t = rt_mod.get_tourney(self.tid)
+        if not t or str(t.get("status")) not in ("created", "scheduled"):
+            return await interaction.followup.send("This tourney is no longer open.", ephemeral=True)
+        try:
+            disp = str(interaction.user.display_name or interaction.user.name or "")
+        except Exception:
+            disp = ""
+        ok, msg = rt_mod.reg_add(self.tid, did, disp)
+        await _rt_refresh_lobby(self.tid)
+        await interaction.followup.send(
+            (f"You're in **#{self.tid}**. " if ok else "") + msg, ephemeral=True)
+
+    @discord.ui.button(label="Leave", style=discord.ButtonStyle.danger, custom_id="rt-leave")
+    async def leave_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        did = str(interaction.user.id)
+        t = rt_mod.get_tourney(self.tid)
+        if not t or str(t.get("status")) not in ("created", "scheduled"):
+            return await interaction.followup.send("This tourney is no longer open.", ephemeral=True)
+        # The creator may leave the roster: they step back to hosting
+        # (still creator, still stops the tourney) without playing.
+        was_host = did == str(t.get("created_by") or "")
+        ok, msg = rt_mod.reg_remove(self.tid, did)
+        await _rt_refresh_lobby(self.tid)
+        if ok and was_host:
+            msg += " You're back to hosting."
+        await interaction.followup.send(msg, ephemeral=True)
+
+
+@rtourney_group.command(name="create", description="Host a ranked tourney (series)")
+@app_commands.describe(name="Tourney name",
+                       series_len="Matches in the series, 0 = open-ended",
+                       mode="Solo or duo",
+                       game_mode="Game mode (flavor only, shown in lobby)",
+                       ping_role="Role pinged when the match goes live")
+@app_commands.choices(mode=[app_commands.Choice(name="Solo", value="solo"),
+                            app_commands.Choice(name="Duo", value="duo")])
+@app_commands.choices(game_mode=[
+    app_commands.Choice(name="Late Game Zonewars", value="zw_lg"),
+    app_commands.Choice(name="Zone Wars", value="zw"),
+    app_commands.Choice(name="Duo Wild West", value="wwzw"),
+    app_commands.Choice(name="Solo Wild West", value="ww"),
+    app_commands.Choice(name="Boxfights", value="bf"),
+    app_commands.Choice(name="Boxfights 2v2", value="BF2V2"),
+    app_commands.Choice(name="V-Arena", value="VA"),
+    app_commands.Choice(name="Red Vs Blue", value="tdm_bvr"),
+    app_commands.Choice(name="Realistic 1v1", value="r_1v1"),
+    app_commands.Choice(name="Free Mode", value="df")])
+async def rtourney_create_cmd(interaction: discord.Interaction, name: str,
+                              series_len: int = 0, mode: str = "solo",
+                              game_mode: str | None = None,
+                              ping_role: discord.Role | None = None):
+    if not await _defer(interaction):
+        return
+    did = str(interaction.user.id)
+    try:
+        row = await db.get_by_discord(did)
     except Exception:
         row = None
     if not row:
-        return await interaction.followup.send(f"{member.mention} isn't registered.", ephemeral=True)
-    if ranked_mod.is_banned(ndid):
-        return await interaction.followup.send(f"{member.mention} is banned from ranked.", ephemeral=True)
-    print(f"[ranked] change-host {room['id']} {room.get('host_discord_id')}->{ndid} by={interaction.user.id}")
-    ranked_mod.update_room(room["id"], {"host_discord_id": ndid})
-    room = ranked_mod.get_room(room["id"])
-    ranked_mod.roster_add(room, ndid)
-    room = ranked_mod.get_room(room["id"])
-    await _post_thread(room, content=f"Host transferred to {member.mention} — sealing now follows their packets.")
-    if room.get("status") == "lobby":
-        await _set_lobby_embed(room, ranked_mod.lobby_embed(room), 0x7c3aed, buttons=True)
-    await interaction.followup.send(f"**{room['id']}** host is now {member.mention}.", ephemeral=True)
+        return await interaction.followup.send(
+            "Link your game name first — **/register**.",
+            ephemeral=True)
+    if ranked_mod.is_banned(did):
+        return await interaction.followup.send("You are banned from ranked.", ephemeral=True)
+    try:
+        series = max(0, int(series_len or 0))
+    except Exception:
+        series = 0
+    try:
+        t = rt_mod.create_tourney(name=name, series_len=series, mode=mode,
+                                  game_mode=game_mode,
+                                  ping_role_id=(str(ping_role.id) if ping_role else None),
+                                  created_by=did)
+    except ValueError as exc:
+        return await interaction.followup.send(str(exc), ephemeral=True)
+    except Exception as exc:
+        print(f"[rtourney] create failed: {exc}")
+        return await interaction.followup.send("Couldn't create the tourney (DB error).", ephemeral=True)
+    print(f"[rtourney] tourney created #{t.get('id')} name={t.get('name')} host={did}")
+    target = None
+    try:
+        cid = ranked_mod.CREATE_CHANNEL_ID or interaction.channel_id
+        if cid:
+            try:
+                target = interaction.guild.get_channel(cid) if interaction.guild else None
+            except Exception:
+                target = None
+            if target is None:
+                try:
+                    target = await bot.fetch_channel(cid)
+                except Exception:
+                    target = None
+        if target is None:
+            target = interaction.channel
+    except Exception:
+        target = interaction.channel
+    try:
+        content = f"<@&{ping_role.id}>" if ping_role else None
+        msg = await target.send(content=content, embed=_rt_lobby_embed(t),
+                                view=RTourneyLobbyView(int(t["id"])))
+        try:
+            rt_mod.update_tourney(int(t["id"]), {
+                "lobby_channel_id": str(getattr(target, "id", "")),
+                "lobby_message_id": str(msg.id)})
+        except Exception:
+            pass
+    except Exception as exc:
+        print(f"[rtourney] lobby post failed: {exc}")
+        return await interaction.followup.send(
+            f"Tourney **#{t.get('id')}** created, but I couldn't post the lobby — check my channel access.",
+            ephemeral=True)
+    await interaction.followup.send(
+        f"Ranked tourney **#{t.get('id')} {t.get('name')}** open — lobby posted. Manage it on the **/ranked** dashboard.",
+        ephemeral=True)
 
 
-@ranked_group.command(name="roster", description="Show the room roster with points")
-@app_commands.describe(rid="Room code (ABC12), R-ID, or leave blank to auto-detect")
-async def ranked_roster_cmd(interaction: discord.Interaction, rid: str = None):
+async def _rt_set_lobby(tid: int, spec: dict, color: int, buttons: bool = False):
+    """Edit a ranked-tourney lobby message (own view, not the room one)."""
+    try:
+        t = rt_mod.get_tourney(tid)
+        if not t or not t.get("lobby_channel_id") or not t.get("lobby_message_id"):
+            return
+        e = discord.Embed(title=spec["title"], color=color)
+        for name, value, inline in spec["fields"]:
+            e.add_field(name=name, value=value, inline=inline)
+        e.set_footer(text=spec["footer"])
+        ch = bot.get_channel(int(t["lobby_channel_id"]))
+        if ch is None:
+            ch = await bot.fetch_channel(int(t["lobby_channel_id"]))
+        msg = await ch.fetch_message(int(t["lobby_message_id"]))
+        await msg.edit(embed=e, view=RTourneyLobbyView(int(tid)) if buttons else None)
+    except Exception as e:
+        print(f"[rtourney] lobby flip failed: {e}")
+
+
+def _rt_host_or_admin(interaction: discord.Interaction, t: dict) -> bool:
+    if rt_mod.is_host_row(t, interaction.user.id):
+        return True
+    try:
+        return bool(interaction.guild and interaction.user.guild_permissions.administrator)
+    except Exception:
+        return False
+
+
+@rtourney_group.command(name="start", description="Start your ranked tourney (host)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)",
+                       code="5-char room code, dispatched to the roster")
+async def rtourney_start_cmd(interaction: discord.Interaction, tourney_id: int, code: str):
     if not await _defer(interaction):
         return
-    room, err = await _resolve_room(interaction, rid)
-    if not room:
-        return await interaction.followup.send(err, ephemeral=True)
+    t = rt_mod.get_tourney(tourney_id)
+    if not t:
+        return await interaction.followup.send("No ranked tourney with that ID.", ephemeral=True)
+    if not _rt_host_or_admin(interaction, t):
+        return await interaction.followup.send("Only the host (or an admin) can start.", ephemeral=True)
+    if str(t.get("status")) == "ended":
+        return await interaction.followup.send("Tourney already ended.", ephemeral=True)
+    if str(t.get("status")) == "started":
+        return await interaction.followup.send("Tourney already started.", ephemeral=True)
+    ok, msg = rt_mod.set_code(int(tourney_id), code)
+    if not ok:
+        return await interaction.followup.send(msg, ephemeral=True)
+    t = rt_mod.get_tourney(tourney_id) or t
+    code = str(t.get("code") or "")
+    rids = rt_mod.roster_ids(int(tourney_id))
+    if len(rids) < 2:
+        return await interaction.followup.send("Need at least 2 players to start.", ephemeral=True)
+    parent = None
+    try:
+        cid = ranked_mod.MATCHES_CHANNEL_ID or ranked_mod.CREATE_CHANNEL_ID
+        if cid:
+            try:
+                parent = bot.get_channel(cid)
+            except Exception:
+                parent = None
+            if parent is None:
+                parent = await bot.fetch_channel(cid)
+    except Exception as e:
+        print(f"[rtourney] parent channel failed: {e}")
+    if parent is None:
+        return await interaction.followup.send(
+            "Matches channel not reachable — check my access.", ephemeral=True)
+    try:
+        thread = await parent.create_thread(
+            name=f"RT #{tourney_id} {str(t.get('name') or '')[:60]}".strip(),
+            type=discord.ChannelType.private_thread)
+        private = True
+    except Exception:
+        try:
+            thread = await parent.create_thread(
+                name=f"RT #{tourney_id} {str(t.get('name') or '')[:60]}".strip(),
+                type=discord.ChannelType.public_thread)
+            private = False
+        except Exception as e:
+            print(f"[rtourney] thread create failed: {e}")
+            return await interaction.followup.send(
+                "Couldn't create the session thread — check my thread perms.", ephemeral=True)
+    if private:
+        for did in rids:
+            try:
+                member = parent.guild.get_member(int(did)) if hasattr(parent, "guild") and parent.guild else None
+                if member is None and hasattr(parent, "guild") and parent.guild:
+                    member = await parent.guild.fetch_member(int(did))
+                if member is not None:
+                    await thread.add_user(member)
+            except Exception:
+                pass
+    code = (t.get("code") or "").strip() if t.get("code") else ""
+    series = t.get("series_len") or 0
+    try:
+        ping_role_id = str(t.get("ping_role_id") or "").strip() or None
+    except Exception:
+        ping_role_id = None
+    mentions = "@here" + (f" <@&{ping_role_id}>" if ping_role_id else "")
+    rules_embed = discord.Embed(
+        title=f"RT #{tourney_id} {t.get('name')} — rules",
+        color=0x7c3aed, description=ranked_mod.RULES_TEXT)
+    rules_embed.set_footer(text=f"rtourney #{tourney_id} · scoring on the /ranked dashboard")
+    code_embed = discord.Embed(
+        title=f"Room code: {code}",
+        color=0x10b981,
+        description=f"**{t.get('name')}** · first to finish {series or '∞'} matches")
+    code_embed.set_footer(text=f"rtourney #{tourney_id} · started")
+    try:
+        await thread.send(content=mentions, embed=rules_embed)
+        await thread.send(embed=code_embed)
+    except Exception as e:
+        print(f"[rtourney] thread post failed: {e}")
+    for did in rids:
+        try:
+            user = await bot.fetch_user(int(did))
+            tag = " (host)" if did == str(t.get("created_by") or "") else ""
+            await user.send(f"**RT #{tourney_id}** is live{tag} — code: **{code}**. Join in game now.")
+        except Exception:
+            pass
+    print(f"[rtourney] tourney live #{tourney_id} players={len(rids)}")
+    from datetime import datetime, timezone
+    rt_mod.update_tourney(int(tourney_id), {
+        "status": "started", "started_at": datetime.now(timezone.utc).isoformat(),
+        "thread_id": str(thread.id)})
+    await _rt_set_lobby(int(tourney_id), rt_mod.live_spec(
+        rt_mod.get_tourney(tourney_id) or t, str(thread.id)), 0x10b981)
+    await interaction.followup.send(
+        f"**RT #{tourney_id}** live with {len(rids)} players.", ephemeral=True)
+
+
+@rtourney_group.command(name="change-code", description="Change the tourney room code (host)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)",
+                       code="New 5-char room code")
+async def rtourney_change_code_cmd(interaction: discord.Interaction, tourney_id: int, code: str):
+    if not await _defer(interaction):
+        return
+    t = rt_mod.get_tourney(tourney_id)
+    if not t:
+        return await interaction.followup.send("No ranked tourney with that ID.", ephemeral=True)
+    if not _rt_host_or_admin(interaction, t):
+        return await interaction.followup.send("Only the host (or an admin) can change the code.", ephemeral=True)
+    if str(t.get("status")) == "ended":
+        return await interaction.followup.send("Tourney already ended.", ephemeral=True)
+    ok, msg = rt_mod.set_code(int(tourney_id), code)
+    if not ok:
+        return await interaction.followup.send(msg, ephemeral=True)
+    await _rt_refresh_lobby(int(tourney_id))
+    await interaction.followup.send(f"**RT #{tourney_id}** — {msg}", ephemeral=True)
+
+
+@rtourney_group.command(name="backout", description="Clear the room code (host)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)")
+async def rtourney_backout_cmd(interaction: discord.Interaction, tourney_id: int):
+    if not await _defer(interaction):
+        return
+    t = rt_mod.get_tourney(tourney_id)
+    if not t:
+        return await interaction.followup.send("No ranked tourney with that ID.", ephemeral=True)
+    if not _rt_host_or_admin(interaction, t):
+        return await interaction.followup.send("Only the host (or an admin) can back out.", ephemeral=True)
+    if str(t.get("status")) == "ended":
+        return await interaction.followup.send("Tourney already ended.", ephemeral=True)
+    if not (t.get("code") or "").strip():
+        return await interaction.followup.send("Code already blank.", ephemeral=True)
+    ok, msg = rt_mod.set_code(int(tourney_id), None)
+    if not ok:
+        return await interaction.followup.send(msg, ephemeral=True)
+    await _rt_refresh_lobby(int(tourney_id))
+    await interaction.followup.send(
+        f"**RT #{tourney_id}** backed out — code cleared (lobby shows Wait for start).",
+        ephemeral=True)
+
+
+@rtourney_group.command(name="board", description="Show ranked tourney standings")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)")
+async def rtourney_board_cmd(interaction: discord.Interaction, tourney_id: int):
+    if not await _defer(interaction):
+        return
+    t = rt_mod.get_tourney(tourney_id)
+    if not t:
+        return await interaction.followup.send("No ranked tourney with that ID.", ephemeral=True)
+    try:
+        if aiohttp is None:
+            raise RuntimeError("no http client")
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{SERVER_URL}/api/ranked/tourney?id={int(tourney_id)}",
+                             timeout=15) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"api {r.status}")
+                j = await r.json()
+    except Exception as e:
+        print(f"[rtourney] board fetch failed: {e}")
+        return await interaction.followup.send(
+            "Couldn't load standings — check the **/ranked** dashboard.", ephemeral=True)
+    rows = (j or {}).get("standings") or []
+    if not rows:
+        return await interaction.followup.send("No sealed matches yet.", ephemeral=True)
     lines = []
-    pts_map = ranked_mod.get_points_many(ranked_mod.roster_ids(room))
-    for did in ranked_mod.roster_ids(room):
-        pts = pts_map.get(did, 0)
-        tier, _f = ranked_mod.milestone_for(pts)
-        tag = " 👑" if did == str(room.get("host_discord_id")) else ""
+    for i, r in enumerate(rows[:10], start=1):
+        nm = r.get("name") or str(r.get("discord_id") or "?")
+        rk = f" · {r.get('rank_pts')} rank" if r.get("rank_pts") is not None else ""
+        lines.append(f"**{i}.** {nm} — {r.get('points')} pts "
+                     f"({r.get('kills')}K/{r.get('wins')}W{rk})")
+    e = discord.Embed(title=f"RT #{tourney_id} {t.get('name')} — standings",
+                      color=0x7c3aed, description="\n".join(lines))
+    e.set_footer(text=f"sealed {(j.get('tourney') or {}).get('sealed', '?')} · /ranked dashboard")
+    await interaction.followup.send(embed=e, ephemeral=True)
+
+
+@rtourney_group.command(name="players", description="List ranked tourney players")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)")
+async def rtourney_players_cmd(interaction: discord.Interaction, tourney_id: int):
+    if not await _defer(interaction):
+        return
+    t = rt_mod.get_tourney(tourney_id)
+    if not t:
+        return await interaction.followup.send("No ranked tourney with that ID.", ephemeral=True)
+    rids = rt_mod.roster_ids(int(tourney_id))
+    if not rids:
+        return await interaction.followup.send("No players yet.", ephemeral=True)
+    elos = rt_mod.rank_map(rids)
+    lines = []
+    for did in rids:
         try:
             row = await db.get_by_discord(did)
             nm = (row or {}).get("game_username") or (row or {}).get("discord_username") or did
         except Exception:
             nm = did
-        lines.append(f"<@{did}> {nm} — {pts} pts ({tier}){tag}")
-    e = discord.Embed(title=f"Roster {room['id']} ({len(lines)}/{room.get('max_players')})",
-                      color=0x7c3aed, description="\n".join(lines) or "Empty.")
-    e.set_footer(text=f"{room['id']} · {room.get('status')}")
+        try:
+            ms, _fee = ranked_mod.milestone_for(int(elos.get(did, 0)))
+        except Exception:
+            ms = "Unranked"
+        lines.append(f"<@{did}> ({nm}) · {elos.get(did, '?')} pts ({ms})")
+    e = discord.Embed(title=f"RT #{tourney_id} {t.get('name')} — players ({len(rids)})",
+                      color=0x7c3aed, description="\n".join(lines[:50]))
     await interaction.followup.send(embed=e, ephemeral=True)
 
 
-@ranked_group.command(name="leaderboard", description="Session standings: points earned per player")
-@app_commands.describe(rid="Room code (ABC12), R-ID, or leave blank to auto-detect")
-async def ranked_leaderboard_cmd(interaction: discord.Interaction, rid: str = None):
+@rtourney_group.command(name="stop", description="End your ranked tourney (host)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)")
+async def rtourney_stop_cmd(interaction: discord.Interaction, tourney_id: int):
     if not await _defer(interaction):
         return
-    room, err = await _resolve_room(interaction, rid)
-    if not room:
-        return await interaction.followup.send(err, ephemeral=True)
-    board, sealed = ranked_mod.session_standings(room["id"])
-    if not board:
+    t = rt_mod.get_tourney(tourney_id)
+    if not t:
+        return await interaction.followup.send("No ranked tourney with that ID.", ephemeral=True)
+    if not _rt_host_or_admin(interaction, t):
+        return await interaction.followup.send("Only the host (or an admin) can stop.", ephemeral=True)
+    if str(t.get("status")) == "ended":
+        return await interaction.followup.send("Tourney already ended.", ephemeral=True)
+    print(f"[rtourney] stop #{tourney_id} by={interaction.user.id}")
+    # Settle first: refresh standings, pay them into ranked_points exactly
+    # once (points_paid flag), THEN flip ended — a payout failure aborts
+    # cleanly and a retry skips the pay but still finalizes.
+    pay_line = ""
+    try:
+        code, _c = await _rt_api("POST", "/api/ranked/calculate",
+                                 {"tourney_id": int(tourney_id),
+                                  "computed_by": "rtourney-stop"})
+        if code != 200:
+            print(f"[rtourney] stop calculate failed #{tourney_id}: {(_c or {}).get('error', code)}")
+        code, det = await _rt_api("GET", f"/api/ranked/tourney?id={int(tourney_id)}")
+        standings = ((det or {}).get("standings") or []) if code == 200 else []
+        deltas = rt_mod.standings_deltas(standings)
+        if deltas and not rt_mod.points_paid(int(tourney_id)):
+            try:
+                totals = await asyncio.to_thread(rt_mod.pay_ranked_points, deltas)
+                rt_mod.mark_points_paid(int(tourney_id))
+                moved = sum(1 for d in deltas if d in (totals or {}))
+                pay_line = f" Paid **{sum(deltas.values())}** ranked pts to **{moved}** players."
+                print(f"[rtourney] stop paid #{tourney_id}: {moved} players, {sum(deltas.values())} pts")
+            except Exception as exc:
+                print(f"[rtourney] stop payout failed #{tourney_id}: {exc}")
+                return await interaction.followup.send(
+                    "Couldn't pay ranked points (DB error) — tourney left running, retry **/rtourney stop**.",
+                    ephemeral=True)
+        elif deltas:
+            pay_line = " Points already paid."
+    except Exception as exc:
+        print(f"[rtourney] stop settle failed #{tourney_id}: {exc}")
         return await interaction.followup.send(
-            f"**{room['id']}** — no sealed matches yet ({sealed}/{room.get('max_matches')} sealed).", ephemeral=True)
-    lines = []
-    for i, (did, (gained, wins, played)) in enumerate(board, start=1):
-        nm = await _display_name(did)
-        tag = " 👑" if did == str(room.get("host_discord_id")) else ""
-        lines.append(f"**{i}.** {nm} — {'+' if gained >= 0 else ''}{gained} pts ({wins}W · {played} match{'es' if played != 1 else ''}){tag}")
-    return await _send_paginated(
-        interaction, f"Session standings {room['id']}", 0x7c3aed, lines,
-        footer=f"{room['id']} · {sealed}/{room.get('max_matches')} sealed · {room.get('status')}",
+            "Couldn't settle points (error) — tourney left running, retry **/rtourney stop**.",
+            ephemeral=True)
+    from datetime import datetime, timezone
+    t = rt_mod.update_tourney(int(tourney_id), {
+        "status": "ended", "ended_at": datetime.now(timezone.utc).isoformat()}) or t
+    sealed = rt_mod.sealed_count(int(tourney_id))
+    await _post_thread(t, embed=discord.Embed(
+        title="Tourney ended", color=0xef4444,
+        description=f"**RT #{tourney_id} {t.get('name')}** closed with {sealed} matches sealed.{pay_line}"))
+    await _rt_set_lobby(int(tourney_id), rt_mod.ended_spec(t), 0xef4444)
+    closed = await _close_thread(t)
+    tail = " Thread closed and deleted." if closed else " Couldn't delete the thread — check my thread perms."
+    try:
+        synced = await _rt_sync_roles(t)
+        if synced:
+            tail += f" {synced} tier role(s) synced."
+    except Exception as e:
+        print(f"[rtourney] stop role sync failed for #{tourney_id}: {e}")
+    try:
+        rids = rt_mod.roster_ids(int(tourney_id))
+        renamed = await _ranked_sync_milestone_nicknames(
+            {"points": {d: 1 for d in rids}}) if rids else 0
+        if renamed:
+            tail += f" {renamed} nickname(s) updated."
+    except Exception as e:
+        print(f"[rtourney] stop nicknames failed for #{tourney_id}: {e}")
+    await interaction.followup.send(
+        f"**RT #{tourney_id}** ended ({sealed} matches sealed).{pay_line}{tail}", ephemeral=True)
+
+
+async def _rt_sync_roles(t: dict) -> int:
+    """Sync tier roles for a tourney roster from fresh ranked totals.
+
+    Mirrors _ranked_sync_room_roles with the roster from the tourney regs.
+    Returns synced count. Never raises."""
+    try:
+        guild = None
+        try:
+            tid = t.get("thread_id")
+            if tid:
+                th = bot.get_channel(int(tid))
+                if th is None:
+                    th = await bot.fetch_channel(int(tid))
+                guild = getattr(th, "guild", None)
+        except Exception:
+            pass
+        if guild is None:
+            try:
+                cid = t.get("lobby_channel_id")
+                if cid:
+                    ch = bot.get_channel(int(cid))
+                    if ch is None:
+                        ch = await bot.fetch_channel(int(cid))
+                    guild = getattr(ch, "guild", None)
+            except Exception:
+                pass
+        if guild is None:
+            print(f"[rtourney] role sync skipped (no guild) for #{t.get('id')}")
+            return 0
+        try:
+            dids = rt_mod.roster_ids(int(t.get("id")))
+        except Exception:
+            return 0
+        if not dids:
+            return 0
+        try:
+            totals = await asyncio.to_thread(ranked_mod.get_points_many, dids)
+        except Exception:
+            totals = {}
+        done = 0
+        for did in dids:
+            try:
+                ms, _fee = ranked_mod.milestone_for(int((totals or {}).get(did, 0)))
+            except Exception:
+                ms = "Unranked"
+            try:
+                ok, _why = await _ranked_sync_member_roles(guild, did, ms)
+                if ok:
+                    done += 1
+            except Exception:
+                continue
+        return done
+    except Exception as e:
+        print(f"[rtourney] role sync failed: {e}")
+        return 0
+
+
+async def _rt_api(method: str, path: str, body: dict | None = None):
+    """Call the ranked-tourney API. Returns (status, json). Never raises."""
+    try:
+        if aiohttp is None:
+            return 0, {"error": "no http client"}
+        async with aiohttp.ClientSession() as s:
+            if (method or "GET").upper() == "POST":
+                async with s.post(f"{SERVER_URL}{path}", json=body or {},
+                                  timeout=20) as r:
+                    try:
+                        j = await r.json()
+                    except Exception:
+                        j = {"error": f"api {r.status}"}
+                    return r.status, j
+            async with s.get(f"{SERVER_URL}{path}", timeout=20) as r:
+                try:
+                    j = await r.json()
+                except Exception:
+                    j = {"error": f"api {r.status}"}
+                return r.status, j
+    except Exception as e:
+        return 0, {"error": str(e)[:100]}
+
+
+@rtourney_group.command(name="open", description="Open a blank match (host)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)")
+async def rtourney_open_cmd(interaction: discord.Interaction, tourney_id: int):
+    if not await _defer(interaction):
+        return
+    t = rt_mod.get_tourney(tourney_id)
+    if not t:
+        return await interaction.followup.send("No ranked tourney with that ID.", ephemeral=True)
+    if not _rt_host_or_admin(interaction, t):
+        return await interaction.followup.send("Only the host (or an admin) can open matches.", ephemeral=True)
+    if str(t.get("status")) == "ended":
+        return await interaction.followup.send("Tourney already ended.", ephemeral=True)
+    code, j = await _rt_api("POST", "/api/ranked/match/open", {"tourney_id": int(tourney_id)})
+    if code != 200:
+        return await interaction.followup.send(
+            f"Open failed: {(j or {}).get('error', code)}", ephemeral=True)
+    await interaction.followup.send(
+        f"Match **v{j.get('version')}** opened for **RT #{tourney_id}** — score it on the /ranked dashboard.",
         ephemeral=True)
 
 
-@ranked_group.command(name="ban", description="Ban a player from ranked (admin)")
-@app_commands.describe(member="Player to ban", reason="Why")
-async def ranked_ban_cmd(interaction: discord.Interaction, member: discord.Member, reason: str = ""):
+@rtourney_group.command(name="seal", description="Seal the live match (host)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)")
+async def rtourney_seal_cmd(interaction: discord.Interaction, tourney_id: int):
     if not await _defer(interaction):
         return
-    if not (interaction.guild and interaction.user.guild_permissions.administrator):
-        return await interaction.followup.send("Admins only.", ephemeral=True)
-    ok = ranked_mod.ban_player(str(member.id), reason, str(interaction.user.id))
-    print(f"[ranked] ban {member.id} reason={reason!r} by={interaction.user.id} ok={ok}")
-    await interaction.followup.send(f"{member.mention} banned from ranked." if ok else "Ban failed (DB error).", ephemeral=True)
+    t = rt_mod.get_tourney(tourney_id)
+    if not t:
+        return await interaction.followup.send("No ranked tourney with that ID.", ephemeral=True)
+    if not _rt_host_or_admin(interaction, t):
+        return await interaction.followup.send("Only the host (or an admin) can seal.", ephemeral=True)
+    code, j = await _rt_api("GET", f"/api/ranked/tourney?id={int(tourney_id)}")
+    if code != 200:
+        return await interaction.followup.send("Couldn't load matches.", ephemeral=True)
+    live = [m for m in ((j or {}).get("matches") or [])
+            if str((m or {}).get("status")) in ("open", "manual")]
+    if not live:
+        return await interaction.followup.send("No live match to seal.", ephemeral=True)
+    mid = live[0].get("id")
+    code, r = await _rt_api("POST", "/api/ranked/match/seal", {"match_id": mid})
+    if code != 200:
+        return await interaction.followup.send(
+            f"Seal failed: {(r or {}).get('error', code)}", ephemeral=True)
+    await interaction.followup.send(
+        f"Match sealed for **RT #{tourney_id}** — calculate on the /ranked dashboard.",
+        ephemeral=True)
 
 
-@ranked_group.command(name="unban", description="Unban a player from ranked (admin)")
-@app_commands.describe(member="Player to unban")
-async def ranked_unban_cmd(interaction: discord.Interaction, member: discord.Member):
+@rtourney_group.command(name="winner", description="Set the match winner (host)")
+@app_commands.describe(tourney_id="Numeric tourney ID (from 0)",
+                       player="Game name or @mention of the winner (blank to clear)")
+async def rtourney_winner_cmd(interaction: discord.Interaction, tourney_id: int, player: str = ""):
     if not await _defer(interaction):
         return
-    if not (interaction.guild and interaction.user.guild_permissions.administrator):
-        return await interaction.followup.send("Admins only.", ephemeral=True)
-    ok = ranked_mod.unban_player(str(member.id))
-    print(f"[ranked] unban {member.id} by={interaction.user.id} ok={ok}")
-    await interaction.followup.send(f"{member.mention} unbanned." if ok else "Unban failed (DB error).", ephemeral=True)
-
-
-@ranked_group.command(name="host-status", description="Toggle host playing or hosting-only (host)")
-@app_commands.describe(rid="Room code (ABC12), R-ID, or leave blank to auto-detect")
-async def ranked_host_status_cmd(interaction: discord.Interaction, rid: str = None):
-    if not await _defer(interaction):
-        return
-    room, err = await _resolve_room(interaction, rid)
-    if not room:
-        return await interaction.followup.send(err, ephemeral=True)
-    if not _host_or_admin(interaction, room):
-        return await interaction.followup.send("Only the host (or an admin) can change host status.", ephemeral=True)
-    if room.get("status") == "ended":
-        return await interaction.followup.send("Session ended — can't change host status.", ephemeral=True)
-    current = (room.get("host_status") or "").strip()
-    if current == "hosting_only":
-        new_status = "is_host_playing"
-    else:
-        new_status = "hosting_only"
-    ranked_mod.update_room(room["id"], {"host_status": new_status})
-    room = ranked_mod.get_room(room["id"])
-    print(f"[ranked] host-status {room['id']} -> {new_status} by={interaction.user.id}")
-    if room.get("status") == "lobby":
-        await _set_lobby_embed(room, ranked_mod.lobby_embed(room), 0x7c3aed, buttons=True)
-    elif room.get("status") == "live":
-        await _set_lobby_embed(room, ranked_mod.live_embed(room, room.get("thread_id")), 0x10b981)
-    label = "Hosting only — your stats won't count" if new_status == "hosting_only" else "Playing — your stats count normally"
-    await interaction.followup.send(f"Host status: **{label}**.", ephemeral=True)
-
-
-@ranked_group.command(name="review", description="Review a ranked room: status, seals, results")
-@app_commands.describe(rid="Room code (ABC12), R-ID, or leave blank to auto-detect")
-async def ranked_review_cmd(interaction: discord.Interaction, rid: str = None):
-    if not await _defer(interaction):
-        return
-    room, err = await _resolve_room(interaction, rid)
-    if not room:
-        return await interaction.followup.send(err, ephemeral=True)
-    sealed = ranked_mod.sealed_count(room["id"])
-    lines = [f"Status **{room.get('status')}** · code **{room.get('short_code')}** · {ranked_mod.gm_name(room.get('gm'))}",
-             f"Host <@{room.get('host_discord_id')}> · {len(ranked_mod.roster_ids(room))}/{room.get('max_players')} players",
-             f"Sealed **{sealed}/{room.get('max_matches')}** · fee {room.get('fee') or 0} · lock {room.get('min_points') or 0}"]
-    try:
-        r = ranked_mod._sb().table("ranked_results").select(
-            "match_version,winner_discord_id,kills,points").eq("room_id", room["id"]).order("match_version").limit(50).execute()
-        for row in (r.data or []):
+    t = rt_mod.get_tourney(tourney_id)
+    if not t:
+        return await interaction.followup.send("No ranked tourney with that ID.", ephemeral=True)
+    if not _rt_host_or_admin(interaction, t):
+        return await interaction.followup.send("Only the host (or an admin) can set the winner.", ephemeral=True)
+    code, j = await _rt_api("GET", f"/api/ranked/tourney?id={int(tourney_id)}")
+    if code != 200:
+        return await interaction.followup.send("Couldn't load matches.", ephemeral=True)
+    matches = (j or {}).get("matches") or []
+    live = [m for m in matches if str((m or {}).get("status")) in ("open", "manual")]
+    target = (live or matches[-1:]) or []
+    if not target:
+        return await interaction.followup.send("No matches yet.", ephemeral=True)
+    mid = target[0].get("id")
+    who = None
+    raw = (player or "").strip()
+    if raw:
+        if raw.startswith("<@"):
             try:
-                wrow = await db.get_by_discord(str(row.get("winner_discord_id") or ""))
-                wnm = (wrow or {}).get("game_username") or row.get("winner_discord_id") or "—"
+                who = str(int("".join(c for c in raw if c.isdigit())))
             except Exception:
-                wnm = row.get("winner_discord_id") or "—"
-            pts = row.get("points") or {}
-            tot = sum(int(v or 0) for v in pts.values()) if isinstance(pts, dict) else 0
-            lines.append(f"v{row.get('match_version')}: winner **{wnm}** · {tot} pts awarded")
-    except Exception as e:
-        lines.append(f"(results lookup failed: {e})")
-    e = discord.Embed(title=f"Review {room['id']}", color=0x7c3aed, description="\n".join(lines))
-    await interaction.followup.send(embed=e, ephemeral=True)
-
-
-# Seal-watch + auto-end state (module level; the loop owns them).
-_seal_seen: dict = {}      # rid -> max match_version already posted to the thread
-_live_known: set = set()   # rids seen live (detects server-side ended flips)
-_pending_end: set = set()  # ex-live rids awaiting an ended verdict
-_thread_cleaned: set = set()  # rids whose thread is gone
-
-
-async def _finalize_ended_room(room: dict, via: str):
-    """A room the server ended (max matches sealed): final embed, lobby flip,
-    thread close+delete. Idempotent via _thread_cleaned. Never raises."""
-    try:
-        rid = room["id"]
-        if rid in _thread_cleaned:
-            return
-        sealed = ranked_mod.sealed_count(rid)
-        await _post_thread(room, embed=discord.Embed(
-            title="Session ended", color=0xef4444,
-            description=f"**{rid}** closed with {sealed}/{room.get('max_matches')} matches sealed ({via})."))
-        await _set_lobby_embed(room, ranked_mod.ended_embed(room), 0xef4444)
-        if await _close_thread(room):
-            _thread_cleaned.add(rid)
-    except Exception as e:
-        print(f"[ranked] auto-end finalize failed: {e}")
-
-
-async def ranked_loop():
-    """Every 30s: auto-start countdown lobbies; post per-match boards for new
-    seals in live rooms; finalize rooms the server ended (max matches)."""
-    await bot.wait_until_ready()
-    # seed: pre-existing seals were (presumably) posted before this boot —
-    # only future seals trigger posts. Logged so a gap is visible.
-    try:
-        for room in await asyncio.to_thread(ranked_mod.list_live_rooms):
-            try:
-                seals = await asyncio.to_thread(ranked_mod.room_seals, room["id"])
-                if seals:
-                    _seal_seen[room["id"]] = max(int(s.get("match_version") or 0) for s in seals)
-                _live_known.add(room["id"])
-            except Exception:
-                continue
-        if _seal_seen:
-            print(f"[ranked] seal-watch seeded (skipping already-sealed): {_seal_seen}")
-    except Exception as e:
-        print(f"[ranked] seal-watch seed failed: {e}")
-    _idle_cycles = 0
-    while not bot.is_closed():
-        _active = False
-        try:
-            for room in ranked_mod.list_due_starts():
-                _active = True
-                try:
-                    ok, msg = await _start_ranked_room(room, via="countdown")
-                    print(f"[ranked] countdown start {room.get('id')}: {msg}")
-                except Exception as e:
-                    print(f"[ranked] countdown failed for {room.get('id')}: {e}")
-                await asyncio.sleep(2)  # let interactions interleave between rooms
-            # seal-watch: new sealed versions -> match-only board in the thread
-            try:
-                live = await asyncio.to_thread(ranked_mod.list_live_rooms)
-            except Exception as e:
-                print(f"[ranked] live list failed: {e}")
-                live = []
-            if live or _pending_end:
-                _active = True
-            live_ids = set()
-            for room in live:
-                try:
-                    rid = room["id"]
-                    live_ids.add(rid)
-                    _live_known.add(rid)
-                    seals = await asyncio.to_thread(ranked_mod.room_seals, rid)
-                    known = _seal_seen.get(rid, 0)
-                    fresh = sorted(
-                        [s for s in seals if int(s.get("match_version") or 0) > known],
-                        key=lambda s: int(s.get("match_version") or 0))
-                    if fresh:
-                        _active = True
-                    for seal in fresh:
-                        try:
-                            await _post_match_board(room, seal)
-                        finally:
-                            # mark seen even when the post failed: no 30s retry
-                            # spam, the next seal carries the session forward
-                            # (and /ranked review|leaderboard show it all)
-                            _seal_seen[rid] = max(_seal_seen.get(rid, 0),
-                                                  int(seal.get("match_version") or 0))
-                except Exception as e:
-                    print(f"[ranked] seal-watch failed for {room.get('id')}: {e}")
-                await asyncio.sleep(1)  # let interactions interleave between rooms
-            # ex-live rooms: server-side ended flip (max matches) -> finalize;
-            # backout-to-lobby just drops out of the pending set (thread stays).
-            for rid in _live_known - live_ids:
-                _pending_end.add(rid)
-            _live_known.intersection_update(live_ids)
-            for rid in list(_pending_end):
-                try:
-                    room = await asyncio.to_thread(ranked_mod.get_room, rid)
-                    if not room or room.get("status") != "ended":
-                        _pending_end.discard(rid)
-                        continue
-                    if rid in _thread_cleaned:
-                        _pending_end.discard(rid)
-                        continue
-                    print(f"[ranked] auto-end finalize {rid}")
-                    await _finalize_ended_room(room, "max matches reached")
-                    if rid in _thread_cleaned:
-                        _pending_end.discard(rid)
-                except Exception as e:
-                    print(f"[ranked] auto-end check failed for {rid}: {e}")
-        except Exception as e:
-            print(f"[ranked] loop failed: {e}")
-        # Idle backoff: no live/due/pending rooms most of the day — 90s
-        # instead of 30s cuts baseline Supabase polls 3x with zero UX cost.
-        # Any activity resets to 30s immediately.
-        if _active:
-            _idle_cycles = 0
-            await asyncio.sleep(30)
+                who = None
         else:
-            _idle_cycles += 1
-            await asyncio.sleep(90 if _idle_cycles >= 2 else 30)
+            try:
+                rids = rt_mod.roster_ids(int(tourney_id))
+                low = raw.lower()
+                for did in rids:
+                    try:
+                        row = await db.get_by_discord(did)
+                        nm = str(((row or {}).get("game_username") or "")).lower()
+                        if nm and (nm == low or low in nm):
+                            who = did
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        if not who:
+            return await interaction.followup.send(
+                "Unknown player — @mention them or type their exact game name.", ephemeral=True)
+    code, r = await _rt_api("POST", "/api/ranked/match/winner",
+                            {"match_id": mid, "winner_discord_id": who})
+    if code != 200:
+        return await interaction.followup.send(
+            f"Winner failed: {(r or {}).get('error', code)}", ephemeral=True)
+    await interaction.followup.send(
+        f"Winner {'cleared' if not who else 'set'} for **RT #{tourney_id}**.", ephemeral=True)
+
+
+
+
+bot.tree.add_command(rtourney_group)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,15 @@ def _load_dash_html() -> str:
         return (_Path(__file__).with_name("comp_dashboard.html")).read_text(encoding="utf-8")
     except Exception:
         return "<html><body>dashboard file missing</body></html>"
+    
+def _load_ranked_html() -> str:
+    # Single-dashboard setup: ranked-dashboard.html is a copy of the comp
+    # dashboard (same UI at /ranked and /comp/dashboard). Ranked rooms are
+    # managed via Discord bot commands + /api/ranked/*.
+    try:
+        return (_Path(__file__).with_name("ranked-dashboard.html")).read_text(encoding="utf-8")
+    except Exception:
+        return "<html><body>dashboard file missing</body></html>"
 
 
 # Copied layout from companion/comp-dashboard.html (same Tahoma / blue
@@ -40,6 +49,23 @@ def _load_dash_html() -> str:
 # GET /comp/status, Track/Open/Seal use POST /api/comp/* (the bridge
 # auto-records by room code).
 _DASH_HTML = _load_dash_html()
+_RANKED_HTML = _load_ranked_html()
+
+
+def _serve(name: str) -> HTMLResponse:
+    """Serve a dashboard file fresh from disk per request.
+
+    Uvicorn --reload only watches .py files, so import-time caching would
+    hide HTML/CSS edits until a manual restart. Reading per request keeps
+    the dashboards instantly editable; on any read error fall back to the
+    import-time copy so the route never 500s."""
+    try:
+        html = (_Path(__file__).with_name(name)).read_text(encoding="utf-8")
+        if html.strip():
+            return HTMLResponse(html)
+    except Exception:
+        pass
+    return HTMLResponse(_DASH_HTML)
 
 
 _ADMIN_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
@@ -84,12 +110,17 @@ $('calc').onclick=async()=>{try{const j=await api('/api/comp/calculate',{method:
 @router.get("/comp/dashboard", response_class=HTMLResponse)
 async def comp_dashboard():
     """Python comp dashboard (same-origin). Replaces Node :8765 /comp/dashboard."""
-    return HTMLResponse(_DASH_HTML)
+    return _serve("comp_dashboard.html")
+
+@router.get("/ranked", response_class=HTMLResponse)
+async def ranked_dashboard():
+    """Ranked dashboard (same comp UI copy as /comp/dashboard)."""
+    return _serve("ranked-dashboard.html")
 
 
 @router.get("/comp/", response_class=HTMLResponse)
 async def comp_dashboard_alias():
-    return HTMLResponse(_DASH_HTML)
+    return _serve("comp_dashboard.html")
 
 
 @router.get("/admin", response_class=HTMLResponse)

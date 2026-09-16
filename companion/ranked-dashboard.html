@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nectar Ranked Dashboard</title>
+<style>
+  :root { --gold1:#FFD700; --gold2:#f59e0b; --gold3:#92400e; }
+  body { margin: 0; background: #faf6ec; color: #1a1a1a; font-family: Tahoma, Verdana, sans-serif; font-size: 12px; }
+  #topbar { background: linear-gradient(135deg, #8a6508, #b8860b 40%, var(--gold2)); color: #fff; padding: 10px 16px; border-bottom: 2px solid var(--gold3); }
+  #topbar b { font-size: 15px; text-shadow: 0 1px 2px rgba(0,0,0,.35); }
+  #topbar .sub { font-size: 11px; color: #fef3c7; margin-top: 2px; }
+  #tabs { background: #f3e8c8; border-bottom: 1px solid #d6b74a; padding: 6px 12px 0; display: flex; gap: 4px; }
+  #tabs button { background: #e7d48a; border: 1px solid #d6b74a; border-bottom: 0; border-radius: 6px 6px 0 0; padding: 7px 18px; font-family: inherit; font-size: 12px; font-weight: bold; color: #5c4a08; cursor: pointer; }
+  #tabs button.on { background: #fffdf4; color: var(--gold3); }
+  #tabs button:disabled { opacity: .5; cursor: not-allowed; }
+  #wrap { max-width: 980px; margin: 0 auto; padding: 14px; }
+  fieldset { border: 1px solid #d6b74a; border-radius: 4px; background: #fffdf4; padding: 12px 14px; margin: 0 0 12px; }
+  legend { font-weight: bold; color: var(--gold3); padding: 0 6px; font-size: 12px; }
+  input, select { font-family: inherit; font-size: 12px; border: 1px solid #d6b74a; border-radius: 2px; padding: 5px 7px; color: #1a1a1a; background: #fff; }
+  button, .btn { font-family: inherit; font-size: 12px; border: 1px solid #a3821f; border-radius: 3px; padding: 5px 12px; cursor: pointer;
+    background: linear-gradient(#fffbe8, #f3e3a1); color: #1a1a1a; }
+  button:hover:not(:disabled) { background: linear-gradient(#fffbe8, #ecd77e); }
+  button.primary { background: linear-gradient(135deg, var(--gold1), var(--gold2)); color: #000; border-color: var(--gold3); font-weight: bold; }
+  button.danger { background: linear-gradient(#c0392b, #96281b); color: #fff; border-color: #6e1b12; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .gap { margin: 6px 0; }
+  .rowline { margin: 5px 0; }
+  table.grid { border-collapse: collapse; width: 100%; font-size: 12px; }
+  table.grid th { background: linear-gradient(135deg, var(--gold1), var(--gold2)); color: #000; padding: 6px; text-align: left; font-weight: bold; }
+  table.grid td { padding: 5px 6px; border-bottom: 1px solid #f0e2b0; }
+  table.grid tr:nth-child(even) td { background: #fdf8e7; }
+  .ok { color: #1e7e34; } .bad { color: #B42318; } .dim { color: #8a7a4a; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 9px; font-size: 11px; font-weight: bold; }
+  .pill.live { background: linear-gradient(135deg, var(--gold1), var(--gold2)); color: #000; border: 1px solid var(--gold3); }
+  .pill.lobby { background: #fef3d8; color: #8a6d00; border: 1px solid #8a6d00; }
+  .pill.end { background: #e8edf3; color: #5b6770; border: 1px solid #9aa5b1; }
+  #log { font-family: Consolas, monospace; font-size: 11px; max-height: 150px; overflow: auto; background: #fff; }
+  #log div { margin: 1px 0; border-bottom: 1px dotted #f0e2b0; padding: 1px 0; }
+  .rlink { color: var(--gold3); text-decoration: underline; cursor: pointer; }
+  .rlink.sel { font-weight: bold; text-decoration: none; color: #000; background: linear-gradient(135deg, var(--gold1), var(--gold2)); border-radius: 3px; padding: 0 4px; }
+  .cols { display: flex; gap: 12px; align-items: flex-start; }
+  .cols > fieldset { flex: 1; min-width: 260px; }
+  .feed { font-family: Consolas, monospace; font-size: 11px; max-height: 420px; overflow: auto; background: #fffdf4; border: 1px solid #f0e2b0; border-radius: 3px; padding: 6px 8px; }
+  .feed div { margin: 2px 0; border-bottom: 1px dotted #f0e2b0; padding: 1px 0; }
+  @media (max-width: 700px) { #wrap { padding: 8px; } fieldset { padding: 8px; } .cols { flex-direction: column; } }
+</style>
+</head>
+<body>
+<div id="topbar" role="banner">
+  <b>👑 Nectar Ranked Dashboard</b>
+  <div class="sub">host console · loopback only · <span id="live">●</span>
+    &nbsp; Server <input id="srv" size="24" value="http://127.0.0.1:8000">
+    <button id="srvSave">Apply</button>
+    <button id="refreshNow" title="Manual refresh (no full reload)">⟳ Refresh</button>
+  </div>
+</div>
+<div id="tabs" role="tablist" aria-label="Dashboard sections">
+  <button id="tab-rooms" class="on" role="tab" aria-selected="true">Rooms</button>
+  <button id="tab-detail" role="tab" aria-selected="false">Detail</button>
+  <button id="tab-log" role="tab" aria-selected="false">Log</button>
+</div>
+<div id="wrap">
+  <div id="pane-rooms" role="tabpanel">
+    <fieldset><legend>Rooms</legend>
+      <div class="rowline">Status
+        <select id="fStatus"><option value="all">all</option><option value="live">live</option><option value="lobby">lobby</option><option value="ended">ended</option></select>
+        <button id="fGo">List</button>
+      </div>
+      <div id="rlist">…</div>
+    </fieldset>
+  </div>
+  <div id="pane-detail" role="tabpanel" hidden>
+    <fieldset><legend>Room</legend><div id="roomhead"><span class="dim">Pick a room.</span></div>
+      <div class="rowline">Host Discord ID <input id="hDid" size="20" placeholder="host discord id">
+        <button id="hBackout">Backout to lobby</button>
+        <button id="hEnd" class="danger">End room</button>
+        <span id="hSay" class="dim"></span>
+      </div>
+    </fieldset>
+    <div class="cols">
+      <fieldset><legend>Roster</legend><div id="roster"><span class="dim">—</span></div></fieldset>
+      <fieldset><legend>Matches</legend><div id="matches"><span class="dim">—</span></div></fieldset>
+    </div>
+    <fieldset><legend>Solo standings</legend><div id="standings"><span class="dim">No sealed matches yet.</span></div></fieldset>
+    <fieldset><legend>Match board</legend><div id="board"><span class="dim">Pick a match.</span></div>
+      <div class="rowline">Winner Discord ID <input id="wDid" size="20" placeholder="omit to clear">
+        <button id="wGo">Set winner</button>
+        <button id="mRecalc" title="Recompute points from banked rows (differential ledger fix)">Recalc</button>
+        <span id="mSay" class="dim"></span>
+      </div>
+      <div class="rowline">Placements JSON <input id="pJson" size="35" placeholder='{"discord_id":1}'>
+        <button id="pGo">Set placements</button>
+        <span class="dim">Removed player ID</span> <input id="rDid" size="18">
+        <button id="rGo">Remove</button><button id="rBack">Add back</button>
+      </div>
+    </fieldset>
+    <fieldset><legend>Killfeed</legend><div id="feed" class="feed"><span class="dim">—</span></div></fieldset>
+    <fieldset><legend>Link unmapped players</legend>
+      <div class="rowline">Game name <input id="linkName" size="20" placeholder="unmapped in-game name">
+        <button id="linkFromBoard" title="Fill with an unmapped name from the current killfeed">⤵ unmapped</button>
+        <button id="linkSearch">Search</button>
+        <button id="linkAuto" title="Link the best candidate when confidence is 85%+">Auto-link best ≥85%</button>
+        <span id="linkSay" class="dim"></span>
+      </div>
+      <div id="linkres"><span class="dim">Search finds Discord identities by fuzzy name. Link adopts the game name (and backfills this match); Lock guards the identity against renames.</span></div>
+    </fieldset>
+  </div>
+  <div id="pane-log" role="tabpanel" hidden>
+    <fieldset><legend>Log</legend><div id="log" aria-live="polite"></div></fieldset>
+  </div>
+</div>
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const esc = (v) => String(v == null ? '—' : v).replace(/</g, '&lt;');
+let SRV = localStorage.getItem('ranked_server') || 'http://127.0.0.1:8000';
+let selRoom = localStorage.getItem('ranked_sel_room') || null;
+let selMatch = null;
+try {
+  const m = Number(localStorage.getItem('ranked_sel_match'));
+  if (Number.isFinite(m)) selMatch = m;
+} catch {}
+function log(t, bad) {
+  try {
+    const d = document.createElement('div');
+    d.innerHTML = `<span class="dim">${new Date().toLocaleTimeString('en-GB', { hour12: false })}</span> ${esc(t)}`;
+    if (bad) d.style.color = '#B42318';
+    $('log').prepend(d);
+    while ($('log').children.length > 200) $('log').lastChild.remove();
+  } catch {}
+}
+async function api(path, opts) {
+  const r = await fetch(SRV + path, opts);
+  const t = await r.text();
+  let j = null;
+  try { j = t ? JSON.parse(t) : null; } catch { j = { _raw: t }; }
+  if (!r.ok) throw new Error((j && j.error) || `HTTP ${r.status}`);
+  return j;
+}
+const post = (body) => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+const GM_LABEL = { zw_lg: 'Late Game Zonewars', zw: 'Zone Wars', wwzw: 'Duo Wild West', ww: 'Solo Wild West', WW: 'Solo Wild West', bf: 'Boxfights', BF: 'Boxfights', bf2v2: 'Boxfights 2v2', BF2V2: 'Boxfights 2v2', va: 'V-Arena', VA: 'V-Arena', tdm_bvr: 'Red Vs Blue', RVB: 'Red Vs Blue', r_1v1: 'Realistic 1v1', R_1V1: 'Realistic 1v1', df: 'Free Mode', DF: 'Free Mode', lobby: 'Lobby' };
+const gmLabel = (gm) => GM_LABEL[String(gm || '')] || String(gm || '—');
+function pill(st) {
+  const c = st === 'live' ? 'live' : st === 'lobby' ? 'lobby' : 'end';
+  return `<span class="pill ${c}">${esc(st)}</span>`;
+}
+async function refreshRooms() {
+  try {
+    const j = await api('/api/ranked/rooms?status=' + encodeURIComponent($('fStatus').value));
+    const rows = (j && j.rooms) || [];
+    if (!rows.length) { $('rlist').innerHTML = '<span class="dim">No rooms.</span>'; return; }
+    let h = '<table class="grid"><tr><th>Code</th><th>Status</th><th>Host</th><th>Mode</th><th>Fee</th><th>Roster</th><th>Series</th></tr>';
+    rows.forEach((r) => {
+      const sel = selRoom === r.id ? ' sel' : '';
+      const hostLabel = `${esc(r.host_name) || esc(r.host_discord_id)} (${esc(r.host_discord_id)})`;
+      h += `<tr><td><span class="rlink${sel}" data-room="${esc(r.id)}"><b>${esc(r.short_code)}</b></span></td>`
+        + `<td>${pill(r.status)}</td><td>${hostLabel}</td><td>${esc(gmLabel(r.gm))}</td>`
+        + `<td>${esc(r.fee)}</td><td>${esc(r.roster)}</td><td>${esc(r.sealed)}/${esc(r.max_matches || '∞')}</td></tr>`;
+    });
+    $('rlist').innerHTML = h + '</table>';
+    $('rlist').querySelectorAll('[data-room]').forEach((el) => {
+      el.onclick = () => { selRoom = el.getAttribute('data-room'); selMatch = null; try { localStorage.setItem('ranked_sel_room', selRoom); localStorage.removeItem('ranked_sel_match'); } catch {} refreshRooms(); refreshDetail(); };
+    });
+  } catch (e) { $('rlist').innerHTML = `<span class="bad">${esc(e.message)}</span>`; log('rooms: ' + e.message, true); }
+}
+async function refreshDetail() {
+  if (!selRoom) return;
+  try {
+    const j = await api('/api/ranked/room?room_id=' + encodeURIComponent(selRoom));
+    const room = j.room || {};
+    const hostLabel = `${esc(room.host_name) || esc(room.host_discord_id)} (${esc(room.host_discord_id)})`;
+    const sess = j.session || {};
+    const hsRaw = String(room.host_status || '');
+    const hsHuman = hsRaw === 'hosting_only' ? 'Hosting only' : hsRaw === 'is_host_playing' ? 'Playing' : (hsRaw || '—');
+    const sealed = Number(j.sealed_count == null ? (j.seals || []).length : j.sealed_count) || 0;
+    const cap = Number(room.max_matches) || 0;
+    const pct = cap ? Math.min(100, Math.round(100 * sealed / cap)) : 0;
+    const series = cap ? `${sealed}/${cap} sealed <span style="display:inline-block;width:110px;height:7px;background:#f0e2b0;border-radius:4px;overflow:hidden"><span style="display:block;width:${pct}%;height:100%;background:var(--gold2)"></span></span>` : `${sealed} sealed · open series`;
+    $('roomhead').innerHTML = `<b style="font-size:14px">👑 ${esc(room.short_code)}</b> ${pill(room.status)}`
+      + ` <span class="dim">${esc(room.id)} · ${esc(gmLabel(room.gm))} · fee ${esc(room.fee)}`
+      + ` · gates ${esc(room.min_points)}–${esc(room.max_points == null ? '∞' : room.max_points)}</span>`
+      + `<div class="dim" style="margin-top:4px">Host: <b style="color:#000">${hostLabel}</b> · ${esc(hsHuman)}</div>`
+      + `<div class="dim" style="margin-top:4px">Session rank: avg <b>${esc(sess.avg_points)} pts (${esc(sess.avg_milestone)})</b> · total ${esc(sess.total_points)} pts</div>`
+      + `<div class="dim" style="margin-top:4px">Series: <b>${series}</b>${j.series_complete ? ' <span class="bad">— series complete · no auto-open</span>' : ''}</div>`;
+    if (!$('hDid').value) $('hDid').value = room.host_discord_id || '';
+    const ros = j.roster || [];
+    $('roster').innerHTML = ros.length
+      ? '<table class="grid"><tr><th>Player</th><th>Pts</th><th>Tier</th></tr>' + ros.map((r) =>
+        `<tr><td><b>${esc(r.name)}</b>${r.display && r.display !== r.name ? `<br><span class="dim">${esc(r.display)} (${esc(r.discord_id)})</span>` : ''}</td><td>${esc(r.points)}</td><td>${esc(r.milestone)}</td></tr>`).join('') + '</table>'
+      : '<span class="dim">Empty roster.</span>';
+    const seals = j.seals || [], open = j.open_versions || [];
+    const standings = j.standings || [];
+    $('standings').innerHTML = standings.length
+      ? '<table class="grid"><tr><th>#</th><th>Player</th><th>Pts</th><th>K</th><th>W</th><th>Matches</th></tr>'
+        + standings.map((r, i) => `<tr><td>${i + 1}</td><td><b>${esc(r.name)}</b></td><td>${esc(r.points)}</td><td>${esc(r.kills)}</td><td>${esc(r.wins)}</td><td>${esc(r.matches)}</td></tr>`).join('') + '</table>'
+      : '<span class="dim">No sealed matches yet.</span>';
+    let mh = '';
+    open.forEach((m) => { mh += `<div><span class="rlink${selMatch === m ? ' sel' : ''}" data-m="${m}">v${m} (live)</span></div>`; });
+    seals.forEach((s) => {
+      mh += `<div><span class="rlink${selMatch === s.match_version ? ' sel' : ''}" data-m="${s.match_version}">v${s.match_version} sealed${s.winner_discord_id ? ' 👑' : ''}</span></div>`;
+    });
+    $('matches').innerHTML = mh || '<span class="dim">No matches yet.</span>';
+    $('matches').querySelectorAll('[data-m]').forEach((el) => {
+      el.onclick = () => { selMatch = Number(el.getAttribute('data-m')); try { localStorage.setItem('ranked_sel_match', String(selMatch)); } catch {} refreshDetail(); };
+    });
+    if (selMatch != null) refreshBoard();
+    else { $('board').innerHTML = '<span class="dim">Pick a match.</span>'; $('feed').innerHTML = '<span class="dim">—</span>'; }
+  } catch (e) { $('roomhead').innerHTML = `<span class="bad">${esc(e.message)}</span>`; log('detail: ' + e.message, true); }
+}
+async function refreshBoard() {
+  if (!selRoom || selMatch == null) return;
+  try {
+    const j = await api('/api/ranked/match?room_id=' + encodeURIComponent(selRoom) + '&match_version=' + encodeURIComponent(selMatch));
+    const board = j.board || [];
+    const pt = j.points_table;
+    const ptLine = pt ? (pt.mode === 'dynamic-v1'
+      ? ` · dynamic K[4–18] W${esc(pt.win)} P[${((pt.placement) || []).join('/')}]`
+      : ` · table K${esc(pt.kill)} W${esc(pt.win)} P[${((pt.placement) || []).join('/')}]`) : '';
+    $('board').innerHTML = board.length
+      ? '<table class="grid"><tr><th>#</th><th>Player</th><th>K</th><th>Plc</th><th>Pts</th></tr>' + board.map((r, i) =>
+        `<tr><td>${i + 1}</td><td><b>${esc(r.name)}</b>${r.won ? ' 👑' : ''}</td><td>${esc(r.kills)}</td><td>${r.placement != null ? esc(r.placement) : '—'}</td><td>${esc(r.points)}</td></tr>`).join('') + '</table>'
+        + `<div class="dim">v${esc(j.match_version)} ${j.sealed ? 'sealed' : 'live'}${j.sealed ? '' : ' · loss applies at seal'}${ptLine}</div>`
+      : '<span class="dim">No banked events yet.</span>';
+    const feed = j.killfeed || [];
+    try {
+      const seen = {};
+      lastUnmapped = [];
+      feed.forEach((e) => {
+        if ((e.etype === 'kill' || e.etype === 'alv' || e.etype === 'leave') && !e.discord_id && e.actor_name && !seen[e.actor_name]) {
+          seen[e.actor_name] = true;
+          lastUnmapped.push(e.actor_name);
+        }
+      });
+    } catch { lastUnmapped = []; }
+    $('feed').innerHTML = feed.length ? feed.map((e) =>
+      `<div>${e.etype === 'kill' ? `⚔️ <b>${esc(e.actor_name)}</b> → ${esc(e.target_name)}` : e.etype === 'alv' ? `💀 ${esc(e.actor_name)} out` : `🚪 ${esc(e.actor_name)} left`}</div>`).join('')
+      : '<span class="dim">—</span>';
+  } catch (e) { $('board').innerHTML = `<span class="bad">${esc(e.message)}</span>`; log('board: ' + e.message, true); }
+}
+async function roomAct(path) {
+  const did = $('hDid').value.trim();
+  if (!selRoom) { $('hSay').textContent = 'Pick a room first.'; return; }
+  if (!did) { $('hSay').textContent = 'Host Discord ID required.'; return; }
+  $('hSay').textContent = '…';
+  try {
+    const j = await api(path, post({ room_id: selRoom, discord_id: did }));
+    $('hSay').textContent = `OK — ${j.status}.`;
+    log(`${path} ${selRoom} -> ${j.status}`);
+    refreshRooms(); refreshDetail();
+  } catch (e) { $('hSay').textContent = 'Failed: ' + e.message; log(path + ': ' + e.message, true); }
+}
+function showTab(name) {
+  ['rooms', 'detail', 'log'].forEach((t) => {
+    $('tab-' + t).classList.toggle('on', t === name);
+    $('tab-' + t).setAttribute('aria-selected', t === name ? 'true' : 'false');
+    $('pane-' + t).hidden = t !== name;
+  });
+  if (name === 'detail') refreshDetail();
+  if (name === 'rooms') refreshRooms();
+}
+$('tab-rooms').onclick = () => showTab('rooms');
+$('tab-detail').onclick = () => showTab('detail');
+$('tab-log').onclick = () => showTab('log');
+$('fGo').onclick = refreshRooms;
+$('refreshNow').onclick = () => { refreshRooms(); if (!$('pane-detail').hidden) refreshDetail(); };
+$('srvSave').onclick = () => { SRV = $('srv').value.trim().replace(/\/$/, '') || SRV; try { localStorage.setItem('ranked_server', SRV); } catch {} log('server -> ' + SRV); refreshRooms(); };
+$('hBackout').onclick = () => roomAct('/api/ranked/room/backout');
+$('hEnd').onclick = () => roomAct('/api/ranked/room/end');
+let linkCands = [];
+let lastUnmapped = [];
+function confBar(c) {
+  const pct = Math.max(2, Math.round((c || 0) * 100));
+  return `<span style="display:inline-block;width:90px;height:8px;background:#f0e2b0;border-radius:4px;overflow:hidden;vertical-align:middle"><span style="display:block;height:8px;width:${pct}%;background:linear-gradient(135deg,var(--gold1),var(--gold2))"></span></span> <b>${pct}%</b>`;
+}
+async function linkSearch() {
+  const q = $('linkName').value.trim();
+  if (q.length < 2) { $('linkSay').textContent = 'Type 2+ chars.'; return; }
+  $('linkSay').textContent = '…';
+  try {
+    const j = await api('/api/ranked/link/search?q=' + encodeURIComponent(q) + '&limit=10');
+    linkCands = (j && j.results) || [];
+    renderLinkRes();
+    $('linkSay').textContent = linkCands.length ? '' : 'No candidates.';
+    log(`link search "${q}" -> ${linkCands.length} candidate(s)`);
+  } catch (e) { $('linkSay').textContent = 'Failed: ' + e.message; log('link search: ' + e.message, true); }
+}
+function renderLinkRes() {
+  if (!linkCands.length) { $('linkres').innerHTML = '<span class="dim">No candidates.</span>'; return; }
+  let h = '<table class="grid"><tr><th>Game name</th><th>Discord</th><th>Confidence</th><th>Status</th><th></th></tr>';
+  linkCands.forEach((r, i) => {
+    const lock = r.locked ? '<span class="pill end">🔒 locked</span>' : (r.linked ? '<span class="pill lobby">linked</span>' : '<span class="pill lobby">unlinked</span>');
+    h += `<tr><td><b>${esc(r.game_username) === '—' ? '<span class="dim">—</span>' : esc(r.game_username)}</b></td>`
+      + `<td>${esc(r.discord_username)}<br><span class="dim">${esc(r.discord_id)}</span></td>`
+      + `<td>${confBar(r.confidence)}</td><td>${lock}</td>`
+      + `<td><button data-link="${i}">Link</button> <button data-lock="${i}">${r.locked ? 'Unlock' : 'Lock'}</button></td></tr>`;
+  });
+  $('linkres').innerHTML = h + '</table>';
+  $('linkres').querySelectorAll('[data-link]').forEach((el) => {
+    el.onclick = () => linkDo(linkCands[Number(el.getAttribute('data-link'))]);
+  });
+  $('linkres').querySelectorAll('[data-lock]').forEach((el) => {
+    el.onclick = () => linkLockDo(linkCands[Number(el.getAttribute('data-lock'))]);
+  });
+}
+async function linkDo(cand) {
+  const name = $('linkName').value.trim();
+  if (!cand || !name) { $('linkSay').textContent = 'Search first.'; return; }
+  if (cand.locked) { $('linkSay').textContent = '🔒 That identity is locked — unlock it first.'; return; }
+  $('linkSay').textContent = '…';
+  try {
+    const body = { discord_id: cand.discord_id, game_username: name };
+    if (selRoom && selMatch != null) { body.room_id = selRoom; body.match_version = selMatch; }
+    const j = await api('/api/ranked/link', post(body));
+    $('linkSay').textContent = `OK — linked. Backfilled ${j.backfilled || 0} row(s); run Recalc to rescore.`;
+    log(`link ${cand.discord_id} -> "${name}" (backfilled ${j.backfilled || 0})`);
+    linkSearch(); refreshBoard();
+  } catch (e) { $('linkSay').textContent = 'Failed: ' + e.message; log('link: ' + e.message, true); }
+}
+async function linkLockDo(cand) {
+  if (!cand) return;
+  $('linkSay').textContent = '…';
+  try {
+    const j = await api('/api/ranked/link/lock', post({ discord_id: cand.discord_id, locked: !cand.locked }));
+    $('linkSay').textContent = j.locked ? '🔒 Locked.' : 'Unlocked.';
+    log(`link ${cand.discord_id} ${j.locked ? 'locked' : 'unlocked'}`);
+    linkSearch();
+  } catch (e) { $('linkSay').textContent = 'Failed: ' + e.message; log('lock: ' + e.message, true); }
+}
+function linkAuto() {
+  const q = $('linkName').value.trim();
+  const top = linkCands[0];
+  if (!top) { $('linkSay').textContent = 'Search first.'; return; }
+  if (top.locked) { $('linkSay').textContent = '🔒 Best candidate is locked.'; return; }
+  const same = (top.game_username || '').toLowerCase() === q.toLowerCase();
+  if ((top.confidence || 0) < 0.85) { $('linkSay').textContent = `Best is only ${Math.round((top.confidence || 0) * 100)}% — link manually.`; return; }
+  if (top.game_username && !same) { $('linkSay').textContent = 'Best candidate already has a different name — link manually.'; return; }
+  linkDo(top);
+}
+$('linkSearch').onclick = linkSearch;
+$('linkFromBoard').onclick = () => {
+  if (!lastUnmapped.length) { $('linkSay').textContent = 'No unmapped names in this killfeed.'; return; }
+  $('linkName').value = lastUnmapped[0];
+  $('linkSay').textContent = lastUnmapped.length > 1 ? `+${lastUnmapped.length - 1} more unmapped` : '';
+  linkSearch();
+};
+$('linkAuto').onclick = linkAuto;
+$('wGo').onclick = async () => {
+  const did = $('hDid').value.trim();
+  if (!selRoom || selMatch == null) { $('mSay').textContent = 'Pick a match first.'; return; }
+  if (!did) { $('mSay').textContent = 'Host Discord ID required.'; return; }
+  const who = $('wDid').value.trim() || null;
+  $('mSay').textContent = '…';
+  try {
+    const j = await api('/api/ranked/match/winner', post({ room_id: selRoom, match_version: selMatch, discord_id: did, winner_discord_id: who }));
+    $('mSay').textContent = `OK — winner ${j.winner_discord_id || 'cleared'}.`;
+    log(`winner ${selRoom} v${selMatch} -> ${j.winner_discord_id}`);
+    refreshBoard(); refreshDetail();
+  } catch (e) { $('mSay').textContent = 'Failed: ' + e.message; log('winner: ' + e.message, true); }
+};
+$('mRecalc').onclick = async () => {
+  const did = $('hDid').value.trim();
+  if (!selRoom || selMatch == null) { $('mSay').textContent = 'Pick a match first.'; return; }
+  if (!did) { $('mSay').textContent = 'Host Discord ID required.'; return; }
+  $('mSay').textContent = '…';
+  try {
+    const j = await api('/api/ranked/match/recalc', post({ room_id: selRoom, match_version: selMatch, discord_id: did }));
+    const d = j.diffs || {};
+    const keys = Object.keys(d);
+    $('mSay').textContent = keys.length ? `OK — ledger moved (${keys.map((k) => `${k}:${d[k] > 0 ? '+' : ''}${d[k]}`).join(', ')}).` : 'OK — no changes.';
+    log(`recalc ${selRoom} v${selMatch} diffs=${JSON.stringify(d)}`);
+    refreshBoard(); refreshDetail();
+  } catch (e) { $('mSay').textContent = 'Failed: ' + e.message; log('recalc: ' + e.message, true); }
+};
+$('pGo').onclick = async () => {
+  const did = $('hDid').value.trim();
+  if (!selRoom || selMatch == null || !did) { $('mSay').textContent = 'Pick a match and enter host Discord ID.'; return; }
+  let placements; try { placements = JSON.parse($('pJson').value || '{}'); } catch { $('mSay').textContent = 'Placements must be JSON.'; return; }
+  try { const j = await api('/api/ranked/match/placements', post({ room_id: selRoom, match_version: selMatch, discord_id: did, placements })); $('mSay').textContent = 'Placements saved.'; log(`placements ${selRoom} v${selMatch}`); refreshBoard(); refreshDetail(); } catch (e) { $('mSay').textContent = 'Failed: ' + e.message; }
+};
+async function setRemoved(remove) {
+  const did = $('hDid').value.trim(), player = $('rDid').value.trim();
+  if (!selRoom || selMatch == null || !did || !player) { $('mSay').textContent = 'Pick a match and enter host/player IDs.'; return; }
+  try { const j = await api('/api/ranked/match/removed', post({ room_id: selRoom, match_version: selMatch, discord_id: did, player_discord_id: player, remove })); $('mSay').textContent = remove ? 'Player removed.' : 'Player added back.'; log(`removed ${selRoom} v${selMatch} ${player}=${remove}`); refreshBoard(); refreshDetail(); } catch (e) { $('mSay').textContent = 'Failed: ' + e.message; }
+}
+$('rGo').onclick = () => setRemoved(true);
+$('rBack').onclick = () => setRemoved(false);
+$('srv').value = SRV;
+refreshRooms();
+if (selRoom) showTab('detail');
+log('ranked dashboard ready');
+</script>
+</body>
+</html>

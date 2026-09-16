@@ -1145,6 +1145,10 @@ _comp_logged_codes: set = set()
 _comp_seen: dict = {}  # mid -> set[(killer, victim)] already banked (dedup across batches)
 _comp_namemap: dict = {}  # game_username -> discord_id | None (process cache; twins stay None)
 
+_rt_logged_codes: set = set()
+_rt_seen: dict = {}  # mid -> set[(etype, killer, victim)] already banked (dedup across batches)
+_rt_host_warned: set = set()  # (session, code) already told they are not host
+
 
 def _comp_map_names(names: list) -> dict:
     """Batch game_username → discord_id. Unknown/twin names → None (never guess)."""
@@ -1191,8 +1195,10 @@ def _comp_bank_alv(tourney, mid, room) -> None:
         if supabase is None or mid is None:
             return
         try:
+            # tracked alv rows only: manual dashboard elim corrections must
+            # not suppress the seal-time snapshot
             chk = supabase.table("bngc_comp_events").select("id").eq(
-                "match_id", mid).eq("etype", "alv").limit(1).execute()
+                "match_id", mid).eq("etype", "alv").neq("manual", True).limit(1).execute()
             if chk.data:
                 return
         except Exception:
@@ -1535,6 +1541,344 @@ def seal_comp_match(session_id, discord_id, room, room_id, gm) -> None:
             pass
 
 
+def _rt_calc(tid, who="bridge"):
+    """Ranked-tourney calculate for non-request callers (bridge auto-calc after
+    every seal, so stored standings never go stale). Sync. Never raises."""
+    try:
+        from server.routes.ranked_tourney import calculate_tourney_sync as _calc
+        return _calc(int(tid), who)
+    except Exception:
+        return []
+
+
+def _rt_series_complete(tid, series_len) -> bool:
+    """True when sealed+manual count reached series_len (0 = open-ended).
+    Auto-opens stop here; dashboard manual blanks still allowed. Never raises."""
+    try:
+        sl = int(series_len or 0)
+    except Exception:
+        return False
+    if sl <= 0 or tid is None:
+        return False
+    try:
+        res = supabase.table("bngc_ranked_tourney_matches").select("id").eq(
+            "tourney_id", int(tid)).in_("status", ["sealed", "manual"]).limit(500).execute()
+        n = len(res.data or [])
+        return n >= sl
+    except Exception:
+        return False
+
+
+def _rt_bank_alv(tourney, mid, room) -> None:
+    """Seal-time alv snapshot for one ranked-tourney match. Never raises.
+
+    Same convention as _comp_bank_alv: one alv row per roster player, dead
+    in chronological kill order first (alive=False), survivors last — the
+    last row reads as the winner. Spectating host (host_playing False) gets
+    no alv row. Skips entirely if alv rows were already banked
+    (seal-retry idempotency).
+    """
+    try:
+        if supabase is None or mid is None:
+            return
+        try:
+            chk = supabase.table("bngc_ranked_tourney_events").select("id").eq(
+                "match_id", mid).eq("etype", "alv").limit(1).execute()
+            if chk.data:
+                return
+        except Exception:
+            pass
+        try:
+            players = list((getattr(room, "players", None) or {}).items())
+        except Exception:
+            players = []
+        if not players:
+            return
+        try:
+            me = getattr(room, "me", None)
+            self_name = str(getattr(me, "username", "") or "")
+        except Exception:
+            self_name = ""
+        try:
+            host_playing = (tourney or {}).get("host_playing", True)
+            host_playing = False if host_playing is False else True
+        except Exception:
+            host_playing = True
+        info: dict = {}
+        for key, p in players:
+            try:
+                nm = str(getattr(p, "username", "") or "")
+                if not nm:
+                    continue
+                try:
+                    nr = getattr(p, "actor_nr", None)
+                    nr = int(nr) if nr is not None else None
+                except Exception:
+                    nr = None
+                if nr is None:
+                    try:
+                        nr = int(key)
+                    except Exception:
+                        nr = None
+                info[nm] = {"nr": nr, "alive": bool(getattr(p, "is_alive", True))}
+            except Exception:
+                continue
+        if not host_playing and self_name and self_name in info:
+            try:
+                del info[self_name]
+            except Exception:
+                pass
+        kill_order: list = []
+        try:
+            for k in (getattr(room, "recent_kills", None) or []):
+                try:
+                    if getattr(k, "event_type", None) != "killed":
+                        continue
+                    v = str(getattr(k, "instigated", "") or "")
+                    if v and v not in kill_order:
+                        kill_order.append(v)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        ordered = [n for n in kill_order if n in info and not info[n]["alive"]]
+        ordered += [n for n in kill_order if n in info and info[n]["alive"] and n not in ordered]
+        ordered += [n for n, d in info.items() if n not in ordered and not d["alive"]]
+        ordered += [n for n, d in info.items() if n not in ordered and d["alive"]]
+        if not ordered:
+            return
+        mapping = _comp_map_names(ordered)
+        rows = [{
+            "match_id": mid,
+            "etype": "alv",
+            "actor_nr": info[n]["nr"],
+            "actor_name": n,
+            "target_name": None,
+            "discord_id": mapping.get(n),
+            "alive": False,
+        } for n in ordered]
+        try:
+            supabase.table("bngc_ranked_tourney_events").insert(rows).execute()
+            log_comp(f"rt match={mid} +{len(rows)} alv")
+        except Exception as exc:
+            if not is_transient_error(exc):
+                log_comp(f"rt match={mid} alv write failed ({str(exc)[:80]})")
+    except Exception:
+        pass
+
+
+def seal_ranked_tourney_match(session_id, discord_id, room, room_id, gm) -> None:
+    """Auto open/seal ranked-tourney matches from the HOST capture. Never raises.
+
+    Ranked tourneys are comp tourneys with dynamic points. Match lifecycle is
+    stG-delimited, mirroring seal_comp_match exactly:
+      stG == 1  -> open a blank match, enable writes
+      stG == 3  -> seal the open match, close writes, auto-calculate
+      stG == 2  -> transition noise: ignored (no open / seal / write action)
+
+    The delimiter is room.last_stg + the open row itself (no version math,
+    no phase-end flag):
+      open row + last_stg == 1  -> current life: write kills here
+      open row + last_stg in (2, 3) -> life ended: seal it, ignore writes
+      open row + last_stg None  -> unknown: touch nothing
+      no row + last_stg == 1    -> create blank match (version = per-tourney
+                                   max+1), then write
+      no row + otherwise        -> ignore (writes closed until next stG 1)
+
+    Only the tourney host's session writes (hosts[] / created_by): with N
+    clients capturing the same room, one writer means no duplicate
+    killfeeds. Other sessions run their normal job untouched. Dashboard
+    manual rows are never auto-sealed. At seal, one alv row per roster
+    player is banked (dead in kill order, survivors last) so placements
+    and winner resolve with no manual override. Twin names stay null —
+    never guess (dashboard /link resolves).
+    """
+    try:
+        code = str(getattr(room, "short_code", None) or "").strip().upper()
+        if len(code) != 5 or not code.isalnum():
+            return
+        if supabase is None:
+            return
+        try:
+            last_stg = getattr(room, "last_stg", None)
+            last_stg = int(float(last_stg)) if last_stg is not None else None
+        except Exception:
+            last_stg = None
+        try:
+            tres = supabase.table("bngc_ranked_tourneys").select(
+                "id,code,status,hosts,created_by,host_playing,series_len").eq("code", code).neq(
+                "status", "ended").limit(2).execute()
+            rows = tres.data or []
+        except Exception as exc:
+            if is_transient_error(exc):
+                return  # pool blip — next batch retries
+            if code not in _rt_logged_codes:
+                _rt_logged_codes.add(code)
+                log_comp(f"rt by-code={code} lookup failed ({str(exc)[:60]})")
+            return
+        if len(rows) != 1:
+            if code not in _rt_logged_codes:
+                _rt_logged_codes.add(code)
+                log_comp(f"rt by-code={code} rows={len(rows)} -> null (ambiguous or none)")
+            return
+        t = rows[0]
+        tid = t.get("id")
+        # Host-only writes (created_by always counts as host).
+        try:
+            hosts = {str(h) for h in (t.get("hosts") or []) if h}
+            if t.get("created_by"):
+                hosts.add(str(t.get("created_by")))
+        except Exception:
+            hosts = set()
+        if not discord_id or str(discord_id) not in hosts:
+            try:
+                key = (str(session_id or "")[:13], code)
+                if key not in _rt_host_warned:
+                    _rt_host_warned.add(key)
+                    log_comp(f"rt tid={tid} code={code} non-host session — ranked writes skipped")
+            except Exception:
+                pass
+            return
+        # Current auto-managed open row for this room (dashboard manual rows
+        # are owned by the dashboard: never auto-sealed, never written here).
+        mid = None
+        try:
+            mres = supabase.table("bngc_ranked_tourney_matches").select("id").eq(
+                "tourney_id", tid).eq("room_id", room_id).eq(
+                "status", "open").order("id", desc=True).limit(1).execute()
+            mrows = mres.data or []
+            if mrows:
+                mid = mrows[0].get("id")
+        except Exception:
+            mid = None
+        if mid is not None and last_stg in (2, 3):
+            # stG == 3 (or the 2 that follows it): bank the alv snapshot,
+            # then seal and close writes.
+            try:
+                _rt_bank_alv(t, mid, room)
+            except Exception:
+                pass
+            try:
+                from datetime import datetime, timezone as _tz
+                sres = supabase.table("bngc_ranked_tourney_matches").update(
+                    {"status": "sealed",
+                     "sealed_at": datetime.now(_tz.utc).isoformat()}
+                ).eq("id", mid).eq("status", "open").execute()
+                if sres.data:
+                    log_comp(f"rt sealed match={mid} tid={tid} code={code} (stG {last_stg})")
+                    try:
+                        _board = _rt_calc(int(tid), "bridge")
+                        log_comp(f"rt match={mid} auto-calculated {len(_board or [])} rows")
+                    except Exception:
+                        pass
+            except Exception as exc:
+                if not is_transient_error(exc):
+                    log_comp(f"rt seal failed match={mid} ({str(exc)[:60]})")
+            try:
+                _rt_seen.pop(mid, None)
+            except Exception:
+                pass
+            return  # writes closed until the next stG 1
+        if mid is None and last_stg != 1:
+            # stG 2/3 window (or pre-join): no row to write to, and only
+            # stG 1 may create one. Ignore.
+            return
+        if mid is None:
+            # Series complete: no new auto-opens (manual dashboard blanks
+            # still allowed — they bypass the bridge entirely).
+            try:
+                if _rt_series_complete(tid, (t or {}).get("series_len")):
+                    log_comp(f"rt tid={tid} code={code} series complete — auto-open ignored")
+                    return
+            except Exception:
+                pass
+            # stG == 1: open a blank match, enable writes. Version is the
+            # per-tourney max+1 (rooms share the counter, so engine versions
+            # can't be reused across rooms). A lost insert race re-reads the
+            # winner's row instead of duplicating.
+            try:
+                vres = supabase.table("bngc_ranked_tourney_matches").select("version").eq(
+                    "tourney_id", int(tid)).order("version", desc=True).limit(1).execute()
+                vrows = vres.data or []
+                ver = int(vrows[0].get("version", -1)) + 1 if vrows else 0
+            except Exception:
+                ver = 0
+            try:
+                ires = supabase.table("bngc_ranked_tourney_matches").insert({
+                    "tourney_id": tid, "version": ver,
+                    "room_id": room_id, "status": "open",
+                }).execute()
+                irows = ires.data or []
+                mid = (irows[0].get("id") if irows else None)
+            except Exception as exc:
+                if not is_transient_error(exc):
+                    try:
+                        rres = supabase.table("bngc_ranked_tourney_matches").select("id").eq(
+                            "tourney_id", tid).eq("room_id", room_id).eq(
+                            "status", "open").order("id", desc=True).limit(1).execute()
+                        rrows = rres.data or []
+                        mid = rrows[0].get("id") if rrows else None
+                    except Exception:
+                        mid = None
+                    if mid is None:
+                        log_comp(f"rt open failed tid={tid} ({str(exc)[:60]})")
+                        return
+                else:
+                    return
+            if mid is None:
+                return
+            log_comp(f"rt open tid={tid} code={code} match={mid} room={str(room_id)[:8]} (stG 1)")
+            # Write kill + leave events. Canonical bngc_ranked_tourney_events shape
+            # {match_id, etype, actor_nr, actor_name, target_name, discord_id, alive}.
+            # Deduped per match across batches; names mapped in one query,
+            # unknown/twins stay null for the dashboard /link flow.
+        try:
+            kills = [k for k in (getattr(room, "recent_kills", None) or [])
+                     if getattr(k, "event_type", None) in ("killed", "left")]
+            seen = _rt_seen.setdefault(mid, set())
+            fresh_kills = []
+            for k in kills[-200:]:
+                try:
+                    et = str(getattr(k, "event_type", "") or "")
+                    killer = str(getattr(k, "instigator", "") or "")
+                    victim = str(getattr(k, "instigated", "") or "")
+                    if not killer and not victim:
+                        continue
+                    key = (et, killer, victim)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    fresh_kills.append((et, killer, victim))
+                except Exception:
+                    continue
+            if fresh_kills:
+                mapping = _comp_map_names([n for (_et, killer, victim) in fresh_kills for n in (killer, victim)])
+                batch = [{
+                    "match_id": mid,
+                    "etype": "leave" if et == "left" else "kill",
+                    "actor_nr": None,
+                    "actor_name": killer or victim,
+                    "target_name": victim or None,
+                    "discord_id": mapping.get(killer),
+                    "alive": None,
+                } for et, killer, victim in fresh_kills]
+                try:
+                    supabase.table("bngc_ranked_tourney_events").insert(batch).execute()
+                    n_mapped = sum(1 for r in batch if r.get("discord_id"))
+                    log_comp(f"rt match={mid} +{len(batch)} events ({n_mapped} mapped)")
+                except Exception as exc:
+                    if not is_transient_error(exc):
+                        log_comp(f"rt match={mid} event write failed ({str(exc)[:80]})")
+        except Exception:
+            pass
+        # No phase-end handling here: sealing is decided above from last_stg.
+    except Exception as exc:
+        try:
+            log_comp(f"rt bridge failed ({str(exc)[:60]})")
+        except Exception:
+            pass
+
+
 def seal_ranked_match(session_id, discord_id, room, room_id, gm) -> None:
     """Seal one ranked match from the host session. Never raises.
 
@@ -1659,16 +2003,186 @@ def seal_ranked_match(session_id, discord_id, room, room_id, gm) -> None:
         # the flat loss — zone, unknown, and killed alike.
         winner = alive[0] if alive else (dead_order[0] if dead_order else None)
         deaths = {did: None for did in roster if did not in skip and did != winner}
+        # placements from THIS room view (reverse death recency, winner
+        # first) so boards always agree with the crown even in a zone
+        # double-KO. The winner always places P1; the dead place only when
+        # their game name resolves to a verified identity (bngc_users via
+        # _comp_map_names - the same stable mapping the dashboard shows).
+        # Session-gossip name2did alone is not identity enough to place.
+        placements: dict = {}
+        try:
+            order = []
+            if winner:
+                order.append(winner)
+            dead_names = [by_did_nm for by_did_nm in
+                          (name2did or {}).items()]
+            did_to_name = {str(d): nm for nm, d in dead_names if d}
+            cand = list(reversed(dead_order)) + [d for d in (deaths or {})
+                                                 if d not in dead_order]
+            verified = _comp_map_names([did_to_name[str(d)]
+                                        for d in cand
+                                        if str(d) in did_to_name])
+            for d in reversed(dead_order):
+                nm = did_to_name.get(str(d))
+                if (d != winner and d not in order
+                        and nm and verified.get(nm) and
+                        str(verified.get(nm)) == str(d)):
+                    order.append(d)
+            # zone-dead roster dids (no killfeed entry) place after the
+            # killfeed-dead when verified-mapped; order among them is
+            # roster order - deterministic enough for the purse.
+            for d in (deaths or {}):
+                nm = did_to_name.get(str(d))
+                if (d != winner and d not in order
+                        and nm and verified.get(nm) and
+                        str(verified.get(nm)) == str(d)):
+                    order.append(d)
+            placements = {did: i + 1 for i, did in enumerate(order)}
+        except Exception:
+            placements = {}
         res = ranked_mod.seal_match(rid=rid, match_version=mver, gm=gm or room_data.get("gm") or "zw_lg",
                                     winner_discord_id=winner, kills=kills_count,
+                                    placements=placements or None,
                                     kill_events=kill_events or None,
                                     death_killers=deaths or None)
         if not res.get("ok"):
             log_ranked(f"[ranked] seal failed {rid} v{mver}: {res.get('error')}")
             return
+        # Bank the comp-style evidence rows for this seal (the host tracker
+        # may also bank; the alv pre-check inside keeps the engine side
+        # idempotent on retries and dual-writer races). Never breaks the seal.
+        _ranked_bank_events(rid, mver, room, name2did, roster, skip, winner,
+                            dead_order)
         log_ranked(f"[ranked] sealed {rid} v{mver} winner={winner} points={res.get('points')} kills={kills_count}")
     except Exception as exc:
         log_ranked(f"[ranked] seal_ranked_match failed {exc}")
+
+
+def _ranked_bank_events(rid: str, mver: int, room, name2did: dict,
+                        roster: set, skip: set, winner,
+                        dead_order: list) -> None:
+    """Bank comp-style kill + alv rows for one ranked seal. Never raises.
+
+    Mirror of _comp_bank_alv for ranked rooms: one kill row per roster
+    killfeed event (killer/victim names + killer did) and one alv row per
+    roster player, dead in kill order first, winner last (all alive=False
+    by the comp row convention - the last row reads as the winner).
+    Spectating host (skip) gets no alv row but their killfeed still banks
+    everyone else. Idempotent: skips when alv rows already exist for
+    (rid, mver) - seal retries and dual-writer races never duplicate.
+    Bank failure never breaks the seal (ranked_results stays truth).
+    """
+    try:
+        if supabase is None:
+            return
+        try:
+            chk = supabase.table("bngc_ranked_events").select("id").eq(
+                "room_id", str(rid)).eq("match_version", int(mver)).eq(
+                "etype", "alv").limit(1).execute()
+            if chk.data:
+                return  # already banked (retry / host tracker won the race)
+        except Exception:
+            pass  # pre-v240 DB (missing table): seal proceeds bankless
+        rows: list = []
+        # kill rows: roster killer + mapped victim names, killer did set
+        try:
+            by_did: dict = {}
+            for nm, did in (name2did or {}).items():
+                if did and str(did) not in by_did:
+                    by_did[str(did)] = nm
+            for k in (getattr(room, "recent_kills", None) or []):
+                try:
+                    if getattr(k, "event_type", None) != "killed":
+                        continue
+                    kname = str(getattr(k, "instigator", "") or "")
+                    vname = str(getattr(k, "instigated", "") or "")
+                    if not kname or not vname:
+                        continue
+                    kdid = name2did.get(kname)
+                    if not kdid or kdid not in roster:
+                        continue
+                    # spectating hosts still bank their killfeed (only
+                    # their alv rows are suppressed)
+                    try:
+                        k_actor_nr = next(int(key) for key, p in (
+                            getattr(room, "players", None) or {}).items()
+                            if str(getattr(p, "username", "")) == kname)
+                    except Exception:
+                        k_actor_nr = None
+                    rows.append({
+                        "room_id": str(rid), "match_version": int(mver),
+                        "etype": "kill",
+                        "actor_name": kname, "target_name": vname,
+                        "discord_id": str(kdid),
+                        "actor_nr": k_actor_nr, "alive": None,
+                    })
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        # alv snapshot: dead in kill order first (reverse dead_order =
+        # most-recent -> first-out), then everyone else; winner last.
+        try:
+            info: dict = {}
+            for key, p in ((getattr(room, "players", None) or {}).items()):
+                try:
+                    nm = str(getattr(p, "username", "") or "")
+                    if not nm:
+                        continue
+                    info[nm] = {
+                        "did": None,  # verified mapping fills below
+                        "alive": bool(getattr(p, "is_alive", True)),
+                        "nr": getattr(p, "actor_nr", None),
+                    }
+                except Exception:
+                    continue
+            by_did: dict = {}
+            for nm2, did2 in (name2did or {}).items():
+                if did2 and str(did2) not in by_did:
+                    by_did[str(did2)] = nm2
+            # verified identity mapping (bngc_users; twins stay None)
+            vmap = _comp_map_names(list(info.keys()))
+            for nm, d in info.items():
+                vd = vmap.get(nm)
+                if vd:
+                    d["did"] = str(vd)
+            ordered: list = []
+            for did in reversed(list(dead_order or [])):
+                nm = by_did.get(str(did))
+                if nm and nm in info and nm not in ordered:
+                    ordered.append(nm)
+            for nm in info:
+                if nm not in ordered:
+                    ordered.append(nm)
+            wname = next((nm for nm, d in info.items()
+                          if d.get("did") and str(d["did"]) == str(winner or "")), None)
+            if wname and wname in ordered:
+                ordered.remove(wname)
+                ordered.append(wname)
+            for nm in ordered:
+                d = info.get(nm) or {}
+                did = d.get("did")
+                if did and str(did) in {str(s) for s in (skip or set())}:
+                    continue  # spectating host: no alv row
+                rows.append({
+                    "room_id": str(rid), "match_version": int(mver),
+                    "etype": "alv",
+                    "actor_name": nm, "target_name": None,
+                    "discord_id": did,
+                    "actor_nr": d.get("nr"), "alive": False,
+                })
+        except Exception:
+            pass
+        if not rows:
+            return
+        try:
+            supabase.table("bngc_ranked_events").insert(rows).execute()
+            log_ranked(f"[ranked] banked {rid} v{mver}: +{len(rows)} rows")
+        except Exception as exc:
+            if not is_transient_error(exc):
+                log_ranked(f"[ranked] bank write failed {rid} v{mver} ({str(exc)[:80]})")
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -2485,6 +2999,23 @@ async def process_batch(
                 pass
     except Exception as exc:
         log_comp(f"sweep failed ({exc})")
+
+    # --- Ranked-tourney seal sweep: same stG 1 / stG 3 bridge, ranked tables ---
+    # seal_ranked_tourney_match gates on room short_code → ranked tourney.
+    # Its own by-code lookup returns zero rows for comp codes (and vice versa),
+    # so a room never double-fires. Idempotent; never raises.
+    try:
+        for room_id_r, room_r in list(view.rooms.items()):
+            if getattr(room_r, "room_id", None) == "lobby":
+                continue
+            if not getattr(room_r, "short_code", None):
+                continue
+            try:
+                await db_io(seal_ranked_tourney_match, session_id, discord_id, room_r, room_id_r, gm_val)
+            except Exception:
+                pass
+    except Exception as exc:
+        log_comp(f"rt sweep failed ({exc})")
 
     # --- Competitive sealing (host collab only) ---
     # Only when host_mode is enabled and room is server-created (short_code)

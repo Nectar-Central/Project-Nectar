@@ -48,6 +48,29 @@ try {
   console.log(`[COMP] disabled (${e && e.message})`);
 }
 
+// Ranked intake (host ranked rooms, comp-merge): same guarded require. The
+// tracker owns stG boundaries + comp-style rows into bngc_ranked_events;
+// the server bridge skips banking when rows already exist, so whichever
+// recorder lands first wins (no double awards). Optional RANKED_ROOM_ID to
+// bind immediately instead of auto-binding the next live-room pid join.
+let rankedTracker = null;
+let rankedHandle = null;
+try {
+  const comp = require('./comp-intake');
+  const useSink = !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY);
+  rankedTracker = comp.createRankedTracker({
+    sink: useSink ? comp.createSupabaseSink() : null,
+    rid: process.env.RANKED_ROOM_ID != null && process.env.RANKED_ROOM_ID !== ''
+      ? String(process.env.RANKED_ROOM_ID) : null,
+    log: (m) => { try { console.log(`${ts()} ${TAG.RANKED} ${COL.info(m)}`); } catch {} },
+  });
+  rankedHandle = (rec, msg) => { try { rankedTracker.handle(rec, msg); } catch {} };
+  if (!useSink) console.log('[RANKED] tracker on (no Supabase creds: no auto-bind, set RANKED_ROOM_ID + creds to persist)');
+  else console.log('[RANKED] tracker on (Supabase sink active)');
+} catch (e) {
+  console.log(`[RANKED] disabled (${e && e.message})`);
+}
+
 // ---------------------------------------------------------------------------
 // ANSI — zero-dep, 24-bit, works in PowerShell + Windows Terminal
 // ---------------------------------------------------------------------------
@@ -88,6 +111,7 @@ const TAG = {
   EVT: bg(109, 40, 217, c(255, 255, 255, ' EVT ')),
   OP: bg(194, 65, 12, c(255, 255, 255, ' OP  ')),
   COMP: bg(100, 116, 139, c(255, 255, 255, ' COMP ')),
+  RANKED: bg(245, 158, 11, c(0, 0, 0, ' RANK ')),
 };
 
 function ts() {
@@ -980,6 +1004,8 @@ function handleBatch(parsed, sock) {
     if (msg) updatePresenceFromPacket(r, msg);
     // comp intake (host tourneys): same decoded feed, own try/catch inside
     try { if (msg && compHandle) compHandle(r, msg); } catch {}
+    // ranked intake (host ranked rooms, comp-merge): same decoded feed
+    try { if (msg && rankedHandle) rankedHandle(r, msg); } catch {}
     logPacket(r);
     // attach decoded essential summary to record for file + for server mirror
     const dec = msg ? (msg.req ? { kind: msg.req.opName, code: msg.req.opCode } : msg.ev ? { kind: msg.ev.evName, code: msg.ev.evCode } : null) : null;
@@ -1078,6 +1104,18 @@ const server = http.createServer((req,res)=>{
     }
     return;
   }
+  if (req.method==='GET' && (req.url==='/ranked/' || req.url==='/ranked/dashboard')){
+    // Ranked host console (loopback-only by listen address): rooms, roster,
+    // match boards, killfeed, backout/end. Twin of /comp/dashboard.
+    try {
+      const html = fs.readFileSync(path.join(__dirname, 'ranked-dashboard.html'), 'utf8');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+    } catch (e) {
+      sendJson(res, 500, { error: 'dashboard file missing' });
+    }
+    return;
+  }
   if (req.method==='POST' && req.url==='/comp/manual/open'){
     readBody(req, () => {
       try {
@@ -1103,6 +1141,23 @@ const server = http.createServer((req,res)=>{
       if (id == null || !compTracker) { sendJson(res, 400, { error: 'id required' }); return; }
       Promise.resolve(compTracker.setTourney(Number(id)))
         .then(() => sendJson(res, 200, { ok: true, tourneyId: Number(id) }))
+        .catch((e) => sendJson(res, 500, { error: String((e && e.message) || e) }));
+    });
+    return;
+  }
+  if (req.method==='GET' && req.url==='/ranked/status'){
+    let ranked = { enabled: !!rankedTracker };
+    try { if (rankedTracker) ranked = Object.assign(ranked, rankedTracker.status()); } catch {}
+    sendJson(res,200,{ ok:true, ranked });
+    return;
+  }
+  if (req.method==='POST' && req.url==='/ranked/track'){
+    readBody(req, (body) => {
+      let id = null;
+      try { id = body ? JSON.parse(body.toString()).id : null; } catch {}
+      if (id == null || !rankedTracker) { sendJson(res, 400, { error: 'id required (ranked room id)' }); return; }
+      Promise.resolve(rankedTracker.trackRid(String(id)))
+        .then(() => sendJson(res, 200, { ok: true, rid: String(id) }))
         .catch((e) => sendJson(res, 500, { error: String((e && e.message) || e) }));
     });
     return;

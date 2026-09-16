@@ -380,6 +380,18 @@ async def get_stats(request: Request):
     except Exception:
         comp_tourney = None
 
+    # Ranked-tourney HUD: same passthrough as comp_tourney but for the
+    # ranked-tourney tables. Only queried when comp found nothing, so comp
+    # sessions pay zero extra queries. Never breaks stats.
+    ranked_tourney = None
+    try:
+        _rcode = (session_out or {}).get("short_code") if session_out else None
+        if comp_tourney is None and _rcode and len(str(_rcode)) == 5:
+            from .ranked_tourney import code_tourney_points as _rtp
+            ranked_tourney = await db_io(_rtp, _rcode, discord_id)
+    except Exception:
+        ranked_tourney = None
+
     # playtime_per_gm may be json string
     ppg = user.get("playtime_per_gm")
     if isinstance(ppg, str):
@@ -471,6 +483,19 @@ async def get_stats(request: Request):
                     "match_version": mver,
                     "last_result": last_result,
                 }
+                # Live board (comp-style poll freshness): top rows of the
+                # running match, recomputed per poll while live. Best-effort —
+                # absent (not null) when nothing is banked yet.
+                try:
+                    if rdata.get("status") == "live" and mver > 0:
+                        live = await db_io(
+                            ranked_mod.live_match_board_sync, rid, mver, 5,
+                            ranked_mod.room_roster_ids(rdata))
+                        if live and live.get("board"):
+                            ranked_out["match_board"] = live["board"]
+                            ranked_out["match_sealed"] = bool(live.get("sealed"))
+                except Exception:
+                    pass
     except Exception:
         ranked_out = None
     # Per-poll verdict log, sampled: a BLOCK line only when the verdict
@@ -618,6 +643,7 @@ async def get_stats(request: Request):
         "identity": identity,
         "comp": comp,
         "comp_tourney": comp_tourney,
+        "ranked_tourney": ranked_tourney,
         "rank": rank,
         "is_dev": bool(user.get("is_dev")),
         "arena": arena,

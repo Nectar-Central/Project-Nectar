@@ -32,6 +32,7 @@
   table.grid td { padding: 5px 6px; border-bottom: 1px solid #d4dbe4; }
   table.grid tr:nth-child(even) td { background: #f2f5f9; }
   .ok { color: #1e7e34; } .bad { color: #B42318; } .dim { color: #5b6770; }
+  .muted { color: #5b6770; font-size: 11px; }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 9px; font-size: 11px; font-weight: bold; }
   .pill.run { background: #dff0d8; color: #1e7e34; border: 1px solid #1e7e34; }
   .pill.sched { background: #fef3d8; color: #8a6d00; border: 1px solid #8a6d00; }
@@ -72,7 +73,7 @@
         <input id="tSet" size="6" placeholder="0">
         <button id="tSetGo">Track</button>
         <button id="mOpen">Open match</button>
-        <button id="mSeal" disabled>Seal match</button>
+        <button id="mSeal">Seal match</button>
       </div>
     </fieldset>
   </div>
@@ -166,9 +167,13 @@ $('tab-status').onclick = () => showTab('status');
 $('tab-tourneys').onclick = () => showTab('tourneys');
 $('tab-log').onclick = () => showTab('log');
 function refreshButtons() {
+  // Open/Seal stay clickable: with no live match the handlers log what is
+  // missing instead of leaving a greyed-out button with no explanation.
   try {
     const sealBtn = $('mSeal');
-    if (sealBtn) sealBtn.disabled = !window._trackerOpen;
+    if (sealBtn) sealBtn.disabled = false;
+    const openBtn = $('mOpen');
+    if (openBtn) openBtn.disabled = false;
   } catch {}
 }
 // Python GET /comp/status shape:
@@ -192,7 +197,7 @@ async function refreshTracker() {
 async function refreshList() {
   try {
     const j = await api('/api/comp/tourneys');
-    const cls = { scheduled: 'sched', running: 'run', ended: 'end' };
+    const cls = { created: 'sched', scheduled: 'sched', running: 'run', ended: 'end' };
     $('tlist').innerHTML = ((j && j.tourneys) || []).map((t) =>
       `<div><span class="tlink" data-t="${t.id}"><b>#${t.id} ${esc(t.name)}</b></span> ` +
       `<span class="pill ${cls[t.status] || 'end'}">${esc(t.status)}</span> ` +
@@ -702,6 +707,40 @@ function optAdd(did, pts) {
     _sortBoard();
   } catch {}
 }
+function optSeal() {
+  try { (matchCache.match || {}).status = 'sealed'; _matchLive = false; } catch {}
+}
+function optUnseal() {
+  try { (matchCache.match || {}).status = 'manual'; (matchCache.match || {}).sealed_at = null; _matchLive = true; } catch {}
+}
+function optStart() {
+  try { if (!(matchCache.match || {}).started_at) (matchCache.match || {}).started_at = new Date().toISOString(); } catch {}
+}
+// manual-elim count per player from the killfeed (tracked + manual alv).
+function elimCount(did) {
+  try {
+    const k = String(did);
+    return ((matchCache || {}).killfeed || []).filter((e) => e && e.etype === 'alv' && e.alive === false && String(e.discord_id) === k).length;
+  } catch { return 0; }
+}
+// alive strip: everyone on board/roster minus dead (alv false), minus removed.
+function aliveStrip() {
+  try {
+    const m = (matchCache || {}).match || {};
+    const dead = new Set((((matchCache || {}).killfeed) || [])
+      .filter((e) => e && e.etype === 'alv' && e.alive === false && e.discord_id)
+      .map((e) => String(e.discord_id)));
+    const removed = new Set(((m.removed_discord_ids) || []).map(String));
+    const pool = [...new Set([
+      ...((matchCache.board || []).map((r) => String(r.discord_id))),
+      ...((rosterCache || []).map(String)),
+    ])].filter((d) => d && !removed.has(d));
+    const alive = pool.filter((d) => !dead.has(d));
+    const fmt = (ds) => ds.map(nameOfDid).map(esc).join(', ') || '<span class="dim">—</span>';
+    return `<div class="gap">🟢 <b>ALIVE (${alive.length})</b> ${fmt(alive)}<br>` +
+      `<span class="dim">💀 OUT (${dead.size})</span> ${fmt([...dead])}</div>`;
+  } catch { return ''; }
+}
 function winnerNameOf(did) {
   if (!did) return null;
   try {
@@ -761,14 +800,21 @@ function renderMatchPanel() {
     `<tr><td>${i + 1}</td><td>${esc(r.name)}${r.won ? ' 👑' : ''}</td>` +
     `<td>${r.kills || 0}</td><td>${r.placement != null ? ord(r.placement) : '—'}</td><td><b>${r.points}</b></td></tr>`).join('');
   const roster = (rosterCache && rosterCache.length) ? rosterCache.slice() : [...new Set(board.map((r) => String(r.discord_id)))];
+  const removedSet = new Set(((m.removed_discord_ids) || []).map(String));
   const bmap = {};
   board.forEach((r) => { bmap[String(r.discord_id)] = r; });
   roster.forEach((x) => { if (!bmap[String(x)]) bmap[String(x)] = { discord_id: String(x), name: nameOfDid(String(x)), kills: 0 }; });
   const plist = Object.values(bmap).map((p) => {
     const did = String(p.discord_id);
     const nm = esc(nameOfDid(did));
-    return `<div style="margin:4px 0"><b title="${esc(did)}">${nm}</b> <span class="dim">${p.kills || 0}K${p.placement ? ' · ' + ord(p.placement) : ''}</span><br>` +
-      `<button data-k="${esc(did)}">+ kill</button> ` +
+    const isRem = removedSet.has(did);
+    const elims = elimCount(did);
+    return `<div style="margin:4px 0;${isRem ? 'opacity:.55' : ''}"><b title="${esc(did)}">${nm}</b> ` +
+      `<span class="dim">${p.kills || 0}K · 💀${elims}${p.placement ? ' · ' + ord(p.placement) : ''}${isRem ? ' · removed' : ''}</span><br>` +
+      `<button data-k="${esc(did)}" title="Add a manual kill">+ kill</button> ` +
+      `<button data-kminus="${esc(did)}" title="Remove one manual kill (tracked kills are kept)">− kill</button> ` +
+      `<button data-eplus="${esc(did)}" title="Add a manual elimination (alv)">+ elim</button> ` +
+      `<button data-eminus="${esc(did)}" title="Remove one manual elimination (tracked are kept)">− elim</button> ` +
       `<button data-w="${esc(did)}">+ win</button> ` +
       `<input size="3" id="add-${esc(did)}" placeholder="+pts" inputmode="numeric" title="Manual points (match level)"> <button data-add="${esc(did)}" title="Add manual points (match level)">+pts</button> ` +
       `<input size="3" id="sub-${esc(did)}" placeholder="pts" inputmode="numeric" title="Points to remove"> <button data-sub="${esc(did)}" title="Remove points (ledger, stable across reconcile)">−pts</button><br>` +
@@ -776,9 +822,13 @@ function renderMatchPanel() {
       [1, 2, 3, 4, 5].map((n) => `<button class="placebtn" data-p="${esc(did)}:${n}">${ord(n)}</button>`).join(' ') +
       ` <button class="tiebtn" data-t1="${esc(did)}" title="Toggle P1 tie (shared P1, full WIN each)">T1</button> ` +
       `<button data-reset="${esc(did)}" title="Reset this player in the match (clears manual rows, placement, awards)">Reset</button> ` +
-      `<button data-remove="${esc(did)}" title="Remove from match roster (ignored in placements)">Remove</button></div>`;
+      (isRem
+        ? `<button data-addback="${esc(did)}" title="Add back to the match roster">Add back</button>`
+        : `<button data-remove="${esc(did)}" title="Remove from match roster (ignored in placements, stays global)">Remove</button>`) + `</div>`;
   }).join('') || '<span class="dim">No players.</span>';
-  const canSeal = (m.status === 'open' || m.status === 'manual');
+  const isLive = (m.status === 'open' || m.status === 'manual');
+  const isSealed = (m.status === 'sealed');
+  const canSeal = isLive;
   // winner dropdown options: names with dids as labels
   const cand = {};
   board.forEach((r) => { cand[String(r.discord_id)] = r.name || String(r.discord_id); });
@@ -788,8 +838,9 @@ function renderMatchPanel() {
   left.innerHTML =
     (rows ? `<table class="grid"><tr><th>#</th><th>Player</th><th>K</th><th>Pl</th><th>Pts</th></tr>${rows}</table>`
       : '<span class="dim">No scoring events yet.</span>') +
+    aliveStrip() +
     ((m.removed_discord_ids && m.removed_discord_ids.length)
-      ? `<div class="gap"><span class="muted">REMOVED (left — ignored in placements)</span>` +
+      ? `<div class="gap"><span class="muted">REMOVED (left — ignored in placements, untouched globally)</span>` +
         m.removed_discord_ids.map((did) =>
           `<div style="margin:4px 0"><span class="dim" title="${esc(String(did))}">🚪 ${esc(nameOfDid(String(did)))}</span> ` +
           `<button data-addback="${esc(String(did))}">Add back</button></div>`).join('') + `</div>`
@@ -797,8 +848,12 @@ function renderMatchPanel() {
     `<div class="gap"><input size="14" list="mWinnerList" placeholder="winner name or id" id="mWinner" value="${esc(wv)}"> ` +
     `<datalist id="mWinnerList">${dlOpts}</datalist>` +
     `<button id="mWinGo">Set winner</button> ` +
+    (isLive && !m.started_at ? `<button id="mStartGo" title="Stamp Match Started now">Start match</button> ` : '') +
     (canSeal ? `<button id="mSealGo" class="primary">Seal match</button> <button id="mTieGo" title="Tie top-2 at P1 (both keep full WIN)">Tie top-2</button>` : '') +
+    (isSealed ? `<button id="mUnsealGo" title="Reopen for corrections (back to manual, bridge stays out)">Unseal</button> ` : '') +
     ` <button id="mResetGo" title="Reset whole match (clears placements, awards, all event rows)">Reset match</button> <button id="mDelGo" class="danger" title="Delete this match and its events">Delete match</button></div>` +
+    `<div class="gap"><input size="14" id="mAddPlayer" placeholder="name or discord id" title="Add a player (e.g. a sub) with zero stats"> ` +
+    `<button id="mAddPlayerGo" title="Add the player to this match at 0 pts">Add player</button></div>` +
     `<div class="muted" style="margin:6px 0 2px">SCORE</div>` + plist;
   try { if (_fId) { const n = document.getElementById(_fId); if (n && 'value' in n) n.value = _fVal; } } catch {}
     const wgo = $('mWinGo');
@@ -814,6 +869,25 @@ function renderMatchPanel() {
     const sgo = $('mSealGo');
     if (sgo) sgo.onclick = () => mutMatch(sgo, () => optSeal(),
       () => api('/api/comp/match/seal', post({ match_id: editMatchId })), 'sealed match ' + editMatchId, true);
+    const stgo = $('mStartGo');
+    if (stgo) stgo.onclick = () => mutMatch(stgo, () => optStart(),
+      () => api('/api/comp/match/start', post({ match_id: editMatchId })), 'match started ' + editMatchId);
+    const ugo = $('mUnsealGo');
+    if (ugo) ugo.onclick = () => mutMatch(ugo, () => optUnseal(),
+      () => api('/api/comp/match/unseal', post({ match_id: editMatchId })), 'unsealed match ' + editMatchId, true);
+    const apgo = $('mAddPlayerGo');
+    if (apgo) apgo.onclick = () => {
+      const inp = $('mAddPlayer');
+      const raw = (inp && inp.value.trim()) || '';
+      if (!raw) { log('add player: type a name or discord id first', true); return; }
+      let who = resolveDid(raw);
+      if (!who && /^\d{4,}$/.test(raw)) who = raw;  // raw discord id (sub off-roster)
+      if (!who) { log('add player: unknown — pick a roster name or paste a discord id', true); return; }
+      apgo.disabled = true;
+      api('/api/comp/match/add-player', post({ match_id: editMatchId, discord_id: who }))
+        .then(() => { log('added ' + nameOfDid(who) + ' at 0 pts'); apgo.disabled = false; refreshMatch(); })
+        .catch((e) => { log('add player: ' + e.message, true); apgo.disabled = false; });
+    };
     const tgo = $('mTieGo');
     if (tgo) tgo.onclick = () => {
       const top2 = (matchCache.board || []).slice().sort((a, b) => (b.points || 0) - (a.points || 0)).slice(0, 2).map((r) => String(r.discord_id));
@@ -860,6 +934,18 @@ function renderMatchPanel() {
     left.querySelectorAll('[data-k]').forEach((b) => {
       b.onclick = () => mutMatch(b, () => optKill(b.dataset.k),
         () => api('/api/comp/match/kills', post({ match_id: editMatchId, discord_id: b.dataset.k, delta: 1 })), '+kill ' + b.dataset.k);
+    });
+    left.querySelectorAll('[data-kminus]').forEach((b) => {
+      b.onclick = () => mutMatch(b, () => {},
+        () => api('/api/comp/match/kills', post({ match_id: editMatchId, discord_id: b.dataset.kminus, delta: -1 })), '−kill ' + nameOfDid(b.dataset.kminus));
+    });
+    left.querySelectorAll('[data-eplus]').forEach((b) => {
+      b.onclick = () => mutMatch(b, () => {},
+        () => api('/api/comp/match/elim', post({ match_id: editMatchId, discord_id: b.dataset.eplus, delta: 1 })), '+elim ' + nameOfDid(b.dataset.eplus));
+    });
+    left.querySelectorAll('[data-eminus]').forEach((b) => {
+      b.onclick = () => mutMatch(b, () => {},
+        () => api('/api/comp/match/elim', post({ match_id: editMatchId, discord_id: b.dataset.eminus, delta: -1 })), '−elim ' + nameOfDid(b.dataset.eminus));
     });
     left.querySelectorAll('[data-w]').forEach((b) => {
       b.onclick = () => mutMatch(b, () => optWinner(b.dataset.w),
@@ -926,30 +1012,24 @@ function renderMatchPanel() {
     // RIGHT: killfeed
     const line = (e) => {
       const t = e.created_at ? `<span class="tm">${esc(new Date(e.created_at).toLocaleTimeString())}</span> ` : '';
+      const man = e.manual ? ` <span class="dim" title="Added by hand in this dashboard">~manual</span>` : '';
       const a = `<b>${esc(e.actor_name || '?')}</b>`;
       const v = `<b>${esc(e.target_name || '?')}</b>`;
-      if (e.etype === 'kill') return `<div>${t}🔪 ${a} killed ${v}</div>`;
-      if (e.etype === 'knock') return `<div>${t}💥 ${a} knocked ${v}</div>`;
-      if (e.etype === 'alv' && e.alive === false) return `<div>${t}💀 ${a} is eliminated</div>`;
-      if (e.etype === 'leave') return `<div>${t}🚪 ${a} left</div>`;
+      if (e.etype === 'kill') return `<div>${t}🔪 ${a} killed ${v}${man}</div>`;
+      if (e.etype === 'knock') return `<div>${t}💥 ${a} knocked ${v}${man}</div>`;
+      if (e.etype === 'alv' && e.alive === false) return `<div>${t}💀 ${a} is eliminated${man}</div>`;
+      if (e.etype === 'leave') return `<div>${t}🚪 ${a} left${man}</div>`;
       return '';
     };
-    const bookends = [];
-    try {
-      if (m.started_at) bookends.push(`<div>🟢 <b>Match Started</b> <span class="dim">${esc(new Date(m.started_at).toLocaleTimeString())}</span></div>`);
-    } catch {}
-    try {
-      if (m.sealed_at) bookends.push(`<div>🏁 <b>Match Ended</b> <span class="dim">${esc(new Date(m.sealed_at).toLocaleTimeString())}</span></div>`);
-    } catch {}
+    const bookStart = (() => { try { return m.started_at ? `<div>🟢 <b>Match Started</b> <span class="dim">${esc(new Date(m.started_at).toLocaleTimeString())}</span></div>` : ''; } catch { return ''; } })();
+    const bookEnd = (() => { try { return m.sealed_at ? `<div>🏁 <b>Match Ended</b> <span class="dim">${esc(new Date(m.sealed_at).toLocaleTimeString())}</span></div>` : ''; } catch { return ''; } })();
     const isKill = (e) => e.etype === 'kill' || e.etype === 'knock';
     const isLeave = (e) => e.etype === 'leave';
     const isAlv = (e) => e.etype === 'alv' && e.alive === false;
-    const sec = (title, rows) =>
-      `<div class="muted" style="margin:6px 0 2px">${title} (${rows.length})</div>` +
-      bookends.join('') +
-      (rows.length ? rows.map(line).join('') : '<span class="dim">—</span>') +
-      (bookends.length > 1 ? bookends[1] : '');
-    feed.innerHTML = sec('🔪 KILLS', kills.filter(isKill)) + sec('🚪 LEAVES', kills.filter(isLeave)) + sec('💀 ELIMINATIONS', kills.filter(isAlv)) || '<span class="dim">No events yet.</span>';
+    const sec = (title, rows, bookTop, bookBottom) =>
+      `<div class="muted" style="margin:6px 0 2px">${title} (${rows.length})</div>` + (bookTop || '') +
+      (rows.length ? rows.map(line).join('') : '<span class="dim">—</span>') + (bookBottom || '');
+    feed.innerHTML = sec('🔪 KILLS', kills.filter(isKill), bookStart, '') + sec('🚪 LEAVES', kills.filter(isLeave), '', '') + sec('💀 ELIMINATIONS', kills.filter(isAlv), '', bookEnd) || '<span class="dim">No events yet.</span>';
     try { feed.scrollTop = sc; } catch {}
 }
 function wireMatchList(matches) {
@@ -967,7 +1047,7 @@ function wireMatchList(matches) {
     const sel = m.id === editMatchId ? ' sel' : '';
     const dot = (m.status === 'open' || m.status === 'manual') ? ' 🟢' : '';
     return `<div style="margin:3px 0"><span class="mlink${sel}" data-m="${m.id}">v${m.version}${dot}</span> ` +
-      `<span class="dim">${esc(m.status)}${m.room_id ? ' · ' + esc(m.room_id) : ''} · winner ${esc(m.winner || '—')}</span></div>`;
+      `<span class="dim">${esc(m.status)}${m.room_id ? ' · ' + esc(String(m.room_id).slice(0, 8)) : ''} · winner ${esc(m.winner || '—')}</span></div>`;
   }).join('');
   box.querySelectorAll('[data-m]').forEach((el) => {
     el.onclick = () => {
@@ -998,7 +1078,8 @@ $('tSetGo').onclick = async (e) => {
 // Tourney # box (falls back to the selected tourney).
 $('mOpen').onclick = async (e) => {
   const btn = e.currentTarget; btn.disabled = true;
-  const tid = Number(($('tSet') && $('tSet').value.trim()) || selTid);
+  const _tv = (($('tSet') && $('tSet').value.trim()) || '');
+  const tid = _tv ? Number(_tv) : (selTid != null ? Number(selTid) : NaN);
   if (!Number.isFinite(tid)) { log('open: enter a Tourney # first', true); btn.disabled = false; return; }
   try {
     const r = await api('/api/comp/match/open', post({ tourney_id: tid }));
@@ -1012,7 +1093,8 @@ $('mOpen').onclick = async (e) => {
 // (the Python bridge also auto-seals on phase end).
 $('mSeal').onclick = async (e) => {
   const btn = e.currentTarget; btn.disabled = true;
-  const tid = Number(($('tSet') && $('tSet').value.trim()) || selTid);
+  const _tv = (($('tSet') && $('tSet').value.trim()) || '');
+  const tid = _tv ? Number(_tv) : (selTid != null ? Number(selTid) : NaN);
   if (!Number.isFinite(tid)) { log('seal: enter a Tourney # first', true); btn.disabled = false; return; }
   try {
     const j = await api('/api/comp/tourney?id=' + encodeURIComponent(tid));

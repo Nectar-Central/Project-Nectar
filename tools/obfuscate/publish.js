@@ -1,11 +1,19 @@
 /* Publishes the obfuscated userscript to Supabase Storage (public `cdn` bucket).
  *
- * Usage: node tools/obfuscate/publish.js
+ * Usage: node tools/obfuscate/publish.js [target]
+ *   target = "nectar" (default) | "clippednow" (standalone clipper, obfuscated)
  * Reads credentials from server/.env (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
  * — never committed, never logged.
- * Uploads:
+ * Build first: node tools/obfuscate/build.js (nectar) |
+ *              node tools/obfuscate/build-clippednow.js (clippednow)
+ * Reads credentials from server/.env (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+ * — never committed, never logged.
+ * Uploads (nectar):
  *   cdn/nectar-companion.latest.user.js   (stable reinstall + @updateURL target)
  *   cdn/nectar-companion.v2.22.1.user.js  (immutable per-release copy)
+ * Uploads (clippednow):
+ *   cdn/clippednow.latest.user.js         (stable reinstall + @updateURL target)
+   *   cdn/clippednow.v1.2.6.user.js         (immutable per-release copy)
  */
 const fs = require("fs");
 const path = require("path");
@@ -37,9 +45,17 @@ function loadEnv(p) {
   });
   console.log("bucket create:", mk.status, mk.status === 409 ? "(exists)" : await mk.text().catch(() => ""));
 
-  // 2. upload obfuscated build (latest + versioned)
-  const file = fs.readFileSync(path.join(ROOT, "companion", "buildnow-companion.obfs.user.js"));
-  for (const name of ["nectar-companion.latest.user.js", `nectar-companion.v${VERSION}.user.js`]) {
+  // 2. upload build (latest + versioned)
+  const target = (process.argv[2] || "nectar").toLowerCase();
+  const isClip = target === "clippednow" || target === "clipped" || target === "standalone";
+  const srcFile = isClip ? "clippednow.obfs.user.js" : "buildnow-companion.obfs.user.js";
+  // Version comes from the built obfs header (inherits the source header),
+  // so releases never need a hardcoded bump here.
+  const builtHead = fs.readFileSync(path.join(ROOT, "companion", srcFile), "utf8").slice(0, 2000);
+  const srcVer = isClip ? ((builtHead.match(/@version\s+(\S+)/) || [])[1] || "1.2.6") : VERSION;
+  const prefix = isClip ? "clippednow" : "nectar-companion";
+  const file = fs.readFileSync(path.join(ROOT, "companion", srcFile));
+  for (const name of [`${prefix}.latest.user.js`, `${prefix}.v${srcVer}.user.js`]) {
     const up = await fetch(`${URL}/storage/v1/object/cdn/${name}`, {
       method: "POST",
       headers: {
@@ -55,11 +71,11 @@ function loadEnv(p) {
   }
 
   // 3. verify public reachability
-  const pub = `${URL}/storage/v1/object/public/cdn/nectar-companion.latest.user.js`;
+  const pub = `${URL}/storage/v1/object/public/cdn/${prefix}.latest.user.js`;
   const chk = await fetch(pub);
   const txt = await chk.text();
   console.log("public GET:", chk.status, `(${txt.length} chars)`);
-  if (chk.status !== 200 || !txt.includes("==UserScript==") || !txt.includes("@version      2.22.1")) {
+  if (chk.status !== 200 || !txt.includes("==UserScript==") || !txt.includes(`@version      ${srcVer}`)) {
     throw new Error("public file verification failed");
   }
   console.log("INSTALL LINK:", pub);

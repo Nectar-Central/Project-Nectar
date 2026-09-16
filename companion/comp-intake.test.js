@@ -352,3 +352,236 @@ test('same-room rejoin after lobby hop clears public state', async () => {
   t.handle(null, stg(1));
   assert.ok(t.status().open);
 });
+
+// ---------------------------------------------------------------------------
+// Ranked tracker (comp-merge recorder)
+// ---------------------------------------------------------------------------
+
+comp.rankedListRows = comp.rankedListRows || comp.rankedEventRows;
+
+function memRankedSink(row) {
+  const saved = [];
+  const sealed = {};
+  return {
+    saved, sealed,
+    roomRow: row || { id: 'R-X', short_code: 'ABCDE', host_status: 'is_host_playing' },
+    async rankedRoomByCode(code) { return code === 'ABCDE' ? 'R-X' : null; },
+    async getRankedRoom(rid) { return rid === 'R-X' ? this.roomRow : null; },
+    async nextRankedVersion() { return saved.length; },
+    async sealedRanked(rid, v) { return !!sealed[`${rid}:${v}`]; },
+    async saveRankedMatch(m) { saved.push(m); return m.events.length; },
+  };
+}
+
+function rankedJoinReq(pid, self) {
+  const params = [{ keyName: 'GameProperties', value: { value: { pID: { value: pid } } } }];
+  if (self) params.push({ keyName: 'PlayerProperties', value: { value: { 255: { value: self } } } });
+  return { req: { opName: 'JoinRoom', params } };
+}
+
+test('ranked: stG 1 opens, banks, stG 3 seals with rid+version', async () => {
+  const sink = memRankedSink();
+  const t = comp.createRankedTracker({ sink, log: () => {} });
+  await t.trackRid('R-X');
+  t.handle({ dir: 'out' }, rankedJoinReq('ABCDE', 'Host'));
+  t.handle(null, joinEv(1, 'Host'));
+  t.handle(null, joinEv(2, 'Guest'));
+  t.handle(null, stg(1));
+  assert.ok(t.status().open);
+  t.handle(null, kfEv('Host killed Guest'));
+  t.handle(null, alvEv(2, false));
+  t.handle(null, stg(3));
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(sink.saved.length, 1);
+  const m = sink.saved[0];
+  assert.equal(m.rid, 'R-X');
+  assert.equal(m.version, 0);
+  assert.deepEqual(m.events.map((e) => e.etype), ['kill', 'alv']);
+  assert.equal(t.status().sealed, 1);
+});
+
+test('ranked: room gate suppresses foreign rooms, unbound suppresses all', async () => {
+  const sink = memRankedSink();
+  const t = comp.createRankedTracker({ sink, log: () => {} });
+  t.handle(null, stg(1)); // never bound: no open
+  assert.equal(t.status().open, null);
+  await t.trackRid('R-X');
+  t.handle({ dir: 'out' }, rankedJoinReq('OTHER', 'Host'));
+  t.handle(null, stg(1));
+  assert.equal(t.status().open, null); // bound code ABCDE != OTHER
+  t.handle(null, stg(3));
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(sink.saved.length, 0);
+  t.handle({ dir: 'out' }, rankedJoinReq('ABCDE', 'Host'));
+  t.handle(null, stg(1));
+  assert.ok(t.status().open);
+});
+
+test('ranked: auto-binds a live room by code', async () => {
+  const sink = memRankedSink();
+  const t = comp.createRankedTracker({ sink, log: () => {} });
+  t.handle({ dir: 'out' }, rankedJoinReq('ABCDE', 'Host'));
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(t.status().rid, 'R-X');
+  assert.equal(t.status().code, 'ABCDE');
+});
+
+test('ranked: already-sealed version is dropped, not banked', async () => {
+  const sink = memRankedSink();
+  sink.sealed['R-X:0'] = true;
+  const t = comp.createRankedTracker({ sink, log: () => {} });
+  await t.trackRid('R-X');
+  t.handle({ dir: 'out' }, rankedJoinReq('ABCDE', 'Host'));
+  t.handle(null, stg(1));
+  t.handle(null, kfEv('Host killed Guest'));
+  t.handle(null, stg(3));
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(sink.saved.length, 0);
+  assert.equal(t.status().sealed, 0);
+});
+
+test('ranked: hosting_only host rows skipped, others banked', async () => {
+  const sink = memRankedSink({ id: 'R-X', short_code: 'ABCDE', host_status: 'hosting_only' });
+  const t = comp.createRankedTracker({ sink, log: () => {} });
+  await t.trackRid('R-X');
+  assert.equal(t.status().hostingOnly, true);
+  t.handle({ dir: 'out' }, rankedJoinReq('ABCDE', 'Host'));
+  t.handle(null, joinEv(1, 'Host'));
+  t.handle(null, joinEv(2, 'Guest'));
+  t.handle(null, stg(1));
+  t.handle(null, kfEv('Host killed Guest'));
+  t.handle(null, kfEv('Guest knocked Host'));
+  t.handle(null, alvEv(1, false));
+  t.handle(null, alvEv(2, false));
+  await t.sealManual();
+  assert.equal(sink.saved.length, 1);
+  const kinds = sink.saved[0].events.map((e) => `${e.etype}:${e.actorName}`);
+  // host kill + host alv skipped; guest knock + guest alv kept
+  assert.deepEqual(kinds, ['knock:Guest', 'alv:Guest']);
+});
+
+test('ranked: versions increment per seal', async () => {
+  const sink = memRankedSink();
+  const t = comp.createRankedTracker({ sink, log: () => {} });
+  await t.trackRid('R-X');
+  t.handle({ dir: 'out' }, rankedJoinReq('ABCDE', 'Host'));
+  t.handle(null, stg(1));
+  t.handle(null, stg(3));
+  t.handle(null, stg(1));
+  await t.sealManual();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(sink.saved.length, 2);
+  assert.equal(sink.saved[0].version, 0);
+  assert.equal(sink.saved[1].version, 1);
+});
+
+test('ranked: public room suppresses an automatic seal', async () => {
+  const sink = memRankedSink();
+  const t = comp.createRankedTracker({ sink, log: () => {} });
+  await t.trackRid('R-X');
+  t.handle({ dir: 'out' }, rankedJoinReq('ABCDE', 'Host'));
+  t.handle(null, stg(1));
+  assert.ok(t.status().open);
+  t.handle({ dir: 'out' }, joinRandomRoomNoPid());
+  t.handle(null, stg(3));
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(t.status().public, true);
+  assert.equal(sink.saved.length, 0);
+});
+
+test('ranked: coded rejoin clears public state even when the code is unchanged', async () => {
+  const sink = memRankedSink();
+  const t = comp.createRankedTracker({ sink, log: () => {} });
+  await t.trackRid('R-X');
+  t.handle({ dir: 'out' }, rankedJoinReq('ABCDE', 'Host'));
+  t.handle({ dir: 'out' }, joinRandomRoomNoPid());
+  assert.equal(t.status().public, true);
+  t.handle({ dir: 'out' }, rankedJoinReq('ABCDE', 'Host'));
+  assert.equal(t.status().public, false);
+});
+
+test('ranked: capped series blocks automatic opens but manual bypasses', async () => {
+  const sink = memRankedSink({ id: 'R-X', short_code: 'ABCDE', host_status: 'is_host_playing', max_matches: 1 });
+  const t = comp.createRankedTracker({ sink, log: () => {} });
+  await t.trackRid('R-X');
+  t.handle({ dir: 'out' }, rankedJoinReq('ABCDE', 'Host'));
+  t.handle(null, stg(1)); t.handle(null, stg(3));
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(t.status().seriesSealed, 1);
+  t.handle(null, stg(1));
+  assert.equal(t.status().open, null);
+  assert.ok(t.openManual());
+});
+
+test('ranked: a seal buffers while its bound room is temporarily absent', async () => {
+  const sink = memRankedSink();
+  const t = comp.createRankedTracker({ sink, log: () => {} });
+  await t.trackRid('R-X');
+  t.handle({ dir: 'out' }, rankedJoinReq('ABCDE', 'Host'));
+  t.handle(null, stg(1));
+  await t.trackRid(null);
+  await t.sealManual();
+  assert.equal(t.status().buffered, 1);
+  await t.trackRid('R-X');
+  assert.equal(t.status().buffered, 0);
+  assert.equal(sink.saved.length, 1);
+});
+
+// v250 seal rails: per-seal idempotency keys (seal_id + event_seq) that the
+// partial unique index on bngc_ranked_events absorbs retries with.
+test('ranked: seal rows carry seal_id and sequential event_seq', async () => {
+  const sink = memRankedSink();
+  const t = comp.createRankedTracker({ sink, log: () => {} });
+  await t.trackRid('R-X');
+  t.handle({ dir: 'out' }, rankedJoinReq('ABCDE', 'Host'));
+  t.handle(null, joinEv(1, 'Host'));
+  t.handle(null, joinEv(2, 'Guest'));
+  t.handle(null, stg(1));
+  t.handle(null, kfEv('Host killed Guest'));
+  t.handle(null, alvEv(2, false));
+  t.handle(null, stg(3));
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(sink.saved.length, 1);
+  const m = sink.saved[0];
+  assert.ok(m.sealId, 'seal must carry a sealId');
+  // resolveNames in memSink maps every name -> did:<name>; rows carry the keys
+  const rows = comp.rankedListRows(m);
+  assert.equal(rows.length, m.events.length);
+  rows.forEach((row, i) => {
+    assert.equal(row.match_version, m.version);
+    assert.equal(row.seal_id, m.sealId);
+    assert.equal(row.event_seq, i); // stable position in the immutable array
+  });
+  // distinct sealIds per match: an independent seal never collides with the index
+  const t2 = comp.createRankedTracker({ sink: memRankedSink(), log: () => {} });
+  await t2.trackRid('R-X');
+  t2.handle({ dir: 'out' }, rankedJoinReq('ABCDE', 'Host'));
+  t2.handle(null, stg(1));
+  const firstSealId = t2._state.openMatch && t2._state.openMatch.sealId;
+  assert.ok(firstSealId, 'fresh open carries its own sealId');
+  assert.notEqual(firstSealId, m.sealId);
+});
+
+test('ranked: re-saving the same sealed match replays identical keys', async () => {
+  // Contract for the DB rail: a retry (network blip, host tracker + engine
+  // bridge both sealing) must produce byte-identical (room_id, match_version,
+  // seal_id, event_seq) keys, which is what makes the unique index a no-op
+  // instead of a duplicate.
+  const m = {
+    rid: 'R-X', version: 3, room: 'ABCDE', manual: false,
+    sealId: 'test-seal-1234',
+    events: [
+      { etype: 'kill', actorNr: 1, actorName: 'Host', targetName: 'Guest' },
+      { etype: 'alv', actorNr: 2, actorName: 'Guest', alive: false },
+    ],
+    leaves: [],
+  };
+  const a = comp.rankedListRows(m);
+  const b = comp.rankedListRows(m);
+  assert.deepEqual(a, b);
+  assert.deepEqual(a.map((r) => [r.room_id, r.match_version, r.seal_id, r.event_seq]),
+    [['R-X', 3, 'test-seal-1234', 0], ['R-X', 3, 'test-seal-1234', 1]]);
+  // no sealId -> legacy shape (keys omitted; pre-v250 DBs unaffected)
+  const legacy = comp.rankedListRows({ rid: 'R-Y', version: 1, events: m.events, sealId: null });
+  assert.ok(legacy.every((r) => !('seal_id' in r) && !('event_seq' in r)));
+});

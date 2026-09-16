@@ -62,6 +62,15 @@ class _Q:
         self.filters.append(("gt", col, val))
         return self
 
+    def gte(self, col, val):
+        self.filters.append(("gte", col, val))
+        return self
+
+    def upsert(self, payload, on_conflict=None):
+        self._upsert_payload = payload
+        self._upsert_op = True
+        return self
+
     def in_(self, col, vals):
         self.filters.append(("in", col, list(vals)))
         return self
@@ -93,6 +102,8 @@ class _Q:
             rows = list(getattr(self.fake, "seasons", []))
         elif self.table == "bngc_game_events":
             rows = list(self.fake.events)
+        elif self.table == "bngc_ranked_presence":
+            rows = list(getattr(self.fake, "presence", []))
         else:
             rows = []
         for kind, col, val in self.filters:
@@ -100,6 +111,8 @@ class _Q:
                 rows = [r for r in rows if str(r.get(col)) == str(val)]
             elif kind == "gt":
                 rows = [r for r in rows if (r.get(col) or 0) > val]
+            elif kind == "gte":
+                rows = [r for r in rows if str(r.get(col) or "") >= str(val)]
             elif kind == "in":
                 rows = [r for r in rows if str(r.get(col)) in {str(v) for v in val}]
         if self.order_col:
@@ -110,6 +123,17 @@ class _Q:
         return rows
 
     def execute(self):
+        if getattr(self, "_upsert_op", False):
+            if self.table == "bngc_ranked_presence":
+                if not hasattr(self.fake, "presence"):
+                    self.fake.presence = []
+                payload = dict(self._upsert_payload or {})
+                key = (payload.get("code"), payload.get("discord_id"))
+                self.fake.presence = [p for p in self.fake.presence
+                                      if (p.get("code"), p.get("discord_id")) != key]
+                self.fake.presence.append(payload)
+                return _Res(data=[payload])
+            return _Res(data=[])
         rows = self._rows()
         if self.count_mode == "exact":
             return _Res(data=rows, count=len(rows))
@@ -482,6 +506,81 @@ def test_verify_dc_prefix_tolerant(fakes, monkeypatch):
     fakes.events = [_event("ABCDE", 1, {"killer": "dc: True Jew", "victim": "Bob"})]
     body = _call(disc_mod.ranked_verify, {"code": "ABCDE", "host": "True Jew"})
     assert body["host_in_room"] is True
+
+
+def test_verify_instigator_keys_count(fakes, monkeypatch):
+    # real killfeed schema (instigator/instigated) — the old killer-only scan
+    # missed these rows entirely
+    fakes.events = [_event("ABCDE", 2, {"instigator": "True Jew", "instigated": "Bob"})]
+    body = _call(disc_mod.ranked_verify, {"code": "ABCDE", "host": "True Jew"})
+    assert body["room_active"] is True
+    assert body["host_in_room"] is True
+    assert body["via"] == "name"
+
+
+def test_verify_host_did_feed_evidence(fakes, monkeypatch):
+    # host never appears in a killfeed line, but their own feed stamped this
+    # row (did) for the code — no fight needed
+    fakes.events = [_event("ABCDE", 2, {"instigator": "Bob", "instigated": "Zed"}, did="HOST9")]
+    body = _call(disc_mod.ranked_verify, {"code": "ABCDE", "host": "True Jew", "host_did": "HOST9"})
+    assert body["room_active"] is True
+    assert body["host_in_room"] is True
+    assert body["via"] == "feed"
+
+
+def test_verify_wrong_did_stays_negative(fakes, monkeypatch):
+    fakes.events = [_event("ABCDE", 2, {"instigator": "Bob", "instigated": "Zed"}, did="OTHER9")]
+    body = _call(disc_mod.ranked_verify, {"code": "ABCDE", "host": "True Jew", "host_did": "HOST9"})
+    assert body["room_active"] is True
+    assert body["host_in_room"] is False
+    assert body["via"] is None
+
+
+def _presence_row(code, did, minutes_ago):
+    from datetime import datetime, timezone, timedelta
+    ts = (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+    return {"code": code, "discord_id": did, "seen_at": ts}
+
+
+def test_verify_presence_ping_quiet_lobby(fakes, monkeypatch):
+    # zero game rows at all: host sits silent in the lobby, only the
+    # userscript heartbeat proves presence
+    fakes.events = []
+    fakes.presence = [_presence_row("ABCDE", "HOST9", 1)]
+    body = _call(disc_mod.ranked_verify, {"code": "ABCDE", "host": "True Jew", "host_did": "HOST9"})
+    assert body["room_active"] is False  # no events: room not "active"...
+    assert body["host_in_room"] is True  # ...but the host is provably there
+    assert body["via"] == "ping"
+
+
+def test_verify_stale_ping_ignored(fakes, monkeypatch):
+    fakes.events = []
+    fakes.presence = [_presence_row("ABCDE", "HOST9", 30)]
+    body = _call(disc_mod.ranked_verify, {"code": "ABCDE", "host": "True Jew", "host_did": "HOST9"})
+    assert body["host_in_room"] is False
+    assert body["via"] is None
+
+
+def test_ranked_ping_upserts(fakes, monkeypatch):
+    import asyncio
+    import json
+
+    class _R:
+        def __init__(self, body):
+            self._body = body
+
+        async def json(self):
+            return dict(self._body)
+
+    resp = asyncio.run(disc_mod.ranked_ping(_R({"code": "abcde", "discord_id": "HOST9"})))
+    assert resp.status_code == 200
+    assert json.loads(resp.body.decode()) == {"ok": True, "code": "ABCDE"}
+    assert len(fakes.presence) == 1
+    # second ping refreshes in place (no duplicate rows)
+    asyncio.run(disc_mod.ranked_ping(_R({"code": "ABCDE", "discord_id": "HOST9"})))
+    assert len(fakes.presence) == 1
+    resp = asyncio.run(disc_mod.ranked_ping(_R({"code": "ZZ", "discord_id": "HOST9"})))
+    assert resp.status_code == 400
 
 
 # ---------------------------------------------------------------------------
