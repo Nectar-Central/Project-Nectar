@@ -438,7 +438,10 @@ async def get_stats(request: Request):
         # visible when the capture stopped but the user is still in the room.
         if not code and _stale_short_code:
             code = _stale_short_code
-        if code:
+        # Flag parity: a sleeping server never serves the ranked block,
+        # matching the seal/lookup gate in lib/ranked (UI without a
+        # sealer is exactly the lie this gate prevents).
+        if code and not ranked_mod.ranked_sleeping():
             rdata = await db_io(ranked_mod.get_ranked_room, code)
             if rdata and rdata.get("status") in ("lobby", "live"):
                 pts = await db_io(ranked_mod.get_ranked_points, discord_id)
@@ -482,6 +485,12 @@ async def get_stats(request: Request):
                     "match_id": f"{rid}-{mver}" if rid and mver > 0 else (rid or None),
                     "match_version": mver,
                     "last_result": last_result,
+                    # Honesty: between the version bump and the results
+                    # row landing, the shown total is provisional (the
+                    # client renders it as approximate).
+                    "pending_seal": bool(
+                        mver > 0 and (last_result is None or
+                        int((last_result or {}).get("match_version") or 0) < mver)),
                 }
                 # Live board (comp-style poll freshness): top rows of the
                 # running match, recomputed per poll while live. Best-effort —

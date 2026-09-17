@@ -267,7 +267,7 @@ async def ranked_match_detail(request: Request):
                                                 meta.get("removed_discord_ids"),
                                                 meta.get("point_awards"))
             else:
-                from server.routes.comp import compute_match_points as _cmp
+                from server.lib.scoring import compute_match_points as _cmp
                 rows = _cmp(events, table, winner, pmap,
                             meta.get("removed_discord_ids"),
                             meta.get("point_awards"))
@@ -458,7 +458,7 @@ def _recalc_sync(rid: str, mver: int) -> dict | None:
         _loss_get = lambda did: int(_frozen_loss.get(str(did),
                                                      ranked_mod.LOSS_POINTS))
         try:
-            from server.routes.comp import compute_match_points as _cmp
+            from server.lib.scoring import compute_match_points as _cmp
             events = _banked_events(str(rid), int(mver))
             if not events:
                 events = ([{"etype": "kill", "discord_id": did, "actor_name": None, "alive": None}

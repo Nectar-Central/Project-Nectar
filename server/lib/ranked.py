@@ -768,30 +768,15 @@ def _ranked_rows(events: list, table: dict, winner: str | None,
                  kill_awards: list[dict] | None = None,
                  excluded: set[str] | list[str] | None = None,
                  point_awards: dict | None = None) -> list[dict]:
-    """Use Comp's placement/win engine, then inject ranked kill economics."""
+    """Dynamic economy rows (thin alias: the math lives in
+    lib/scoring.dynamic_rows, shared with the static strategy)."""
     try:
-        from server.routes.comp import compute_match_points as _cmp
-        base = {"kill": 0, "win": int(table.get("win", WIN_POINTS)),
-                "placement": list(table.get("placement") or [])}
-        rows = _cmp(events, base, winner, placements or None, excluded, point_awards)
+        from server.lib.scoring import dynamic_rows as _dynamic_rows
+        return _dynamic_rows(events, table, winner, placements,
+                             kill_awards, excluded, point_awards,
+                             default_win=WIN_POINTS)
     except Exception:
         return []
-    bonus: dict[str, int] = {}
-    try:
-        for award in (kill_awards or []):
-            did = str((award or {}).get("killer") or "").strip()
-            if did:
-                bonus[did] = bonus.get(did, 0) + int((award or {}).get("points") or 0)
-    except Exception:
-        pass
-    for row in rows:
-        try:
-            did = str(row.get("discord_id"))
-            row["points"] = int(row.get("points") or 0) + bonus.get(did, 0)
-        except Exception:
-            continue
-    rows.sort(key=lambda r: (int(r.get("points") or 0), int(r.get("kills") or 0)), reverse=True)
-    return rows
 
 
 def _read_ranked_events(sb, rid: str, match_version: int, limit: int = 500) -> list:
@@ -866,7 +851,7 @@ def live_match_board_sync(rid: str, match_version: int, top_n: int = 5,
                                                table.get("avg_points"))
                 rows = _ranked_rows(events, table, winner, pmap, awards)
             else:
-                from server.routes.comp import compute_match_points as _cmp
+                from server.lib.scoring import compute_match_points as _cmp
                 rows = _cmp(events, table, winner, pmap)
         except Exception:
             return out
@@ -987,7 +972,7 @@ def seal_match(*, rid: str, match_version: int, gm: str,
                               "actor_name": None, "alive": False}
                              for d in (death_killers or {})])
                 pmap = {str(k): int(v) for k, v in (placements or {}).items()}
-            from server.routes.comp import compute_match_points as _cmp
+            from server.lib.scoring import compute_match_points as _cmp
             # Keep Comp's winner/placement semantics as the engine. Dynamic
             # ranked kills are injected below as exact per-event awards.
         except Exception:

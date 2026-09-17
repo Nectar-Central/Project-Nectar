@@ -367,6 +367,44 @@ def test_stats_no_session_null(fakes, monkeypatch):
     assert body["session"] is None and body["ranked"] is None
 
 
+
+# ---------------------------------------------------------------------------
+# Overlay honesty + flag parity
+# ---------------------------------------------------------------------------
+
+
+def test_stats_pending_seal_true_when_result_trails(fakes, monkeypatch):
+    # version bumped to 4, but the newest results row is still v3:
+    # the client must be told the total is provisional
+    fakes.results = [{"room_id": "R-X", "match_version": 3, "winner_discord_id": "H",
+                      "kills": {"D1": 1}, "points": {"D1": 11}}]
+    body = _stats(monkeypatch, session=_live_session(mver=4), room=dict(_ROOM))
+    assert body["ranked"]["pending_seal"] is True
+    assert body["ranked"]["last_result"]["match_version"] == 3
+
+
+def test_stats_pending_seal_false_when_confirmed(fakes, monkeypatch):
+    fakes.results = [{"room_id": "R-X", "match_version": 4, "winner_discord_id": "D1",
+                      "kills": {"D1": 2}, "points": {"D1": 85}}]
+    body = _stats(monkeypatch, session=_live_session(mver=4), room=dict(_ROOM))
+    assert body["ranked"]["pending_seal"] is False
+
+
+def test_stats_pending_seal_true_when_no_result_at_all(fakes, monkeypatch):
+    fakes.results = []
+    body = _stats(monkeypatch, session=_live_session(mver=4), room=dict(_ROOM))
+    assert body["ranked"]["pending_seal"] is True
+
+
+def test_stats_ranked_block_hidden_when_sleeping(fakes, monkeypatch):
+    # server sleeping: no ranked block at all (parity with the seal gate);
+    # the arena flag still tells the client why
+    monkeypatch.setattr(ranked_mod, "RANKED_ENABLED", False)
+    body = _stats(monkeypatch, session=_live_session(), room=dict(_ROOM))
+    assert body["ranked"] is None
+    assert body["arena"]["ranked_sleeping"] is True
+
+
 def test_stats_last_result_win(fakes, monkeypatch):
     fakes.results = [{"room_id": "R-X", "match_version": 3, "winner_discord_id": "D1",
                       "kills": {"D1": 2}, "points": {"D1": 85}, "placements": {"D1": 1}}]

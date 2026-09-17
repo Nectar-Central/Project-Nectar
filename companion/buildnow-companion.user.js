@@ -1174,6 +1174,7 @@
   function liveRanked(){
     try{
       if(typeof _inCompRoom==='function' && _inCompRoom()) return null;
+      if(!rankedEnabled()) return null;
       const sc=statsCache;
       const rk=sc&&sc.ranked?sc.ranked:null;
       if(!rk || !rk.active || !rk.rid) return null;
@@ -1215,6 +1216,31 @@
   // score kill/placement/win through compute_match_points (ranked economy
   // kept). Surfaces are live again.
   const RANKED_SLEEPING = false;
+  // Ranked master switch (server parity): RANKED_ENABLED here must agree
+  // with server/lib/ranked.py's env flag. The server publishes its own
+  // state every stats poll (arena.ranked_sleeping); on disagreement the
+  // SERVER wins (conservative: any sleeping signal mutes ranked UI) and
+  // the console says so once, so a drifted build gets fixed.
+  const RANKED_ENABLED = !RANKED_SLEEPING;
+  let _rankedSleepRemote=null;   // last server-said sleeping state
+  let _rankedParityWarned=false;
+  // Effective gate: local flag on AND server not sleeping. Never throws.
+  function rankedEnabled(){
+    try{
+      const sc=statsCache;
+      const remote=(sc && sc.arena) ? !!sc.arena.ranked_sleeping : null;
+      if(remote!=null && remote!==_rankedSleepRemote){
+        _rankedSleepRemote=remote;
+        if(remote && !_rankedParityWarned && RANKED_ENABLED){
+          _rankedParityWarned=true;
+          try{ logInfo('[RANKED] server says ranked is SLEEPING while local RANKED_ENABLED=true - server wins, ranked UI muted (fix flag parity)'); }catch{}
+        }
+      }
+      if(!RANKED_ENABLED) return false;
+      if(_rankedSleepRemote===true) return false;
+      return true;
+    }catch{ return RANKED_ENABLED !== false; }
+  }
   // Local ranked intent (comp copy): MY last join/create pID + timestamp.
   // 10-min freshness like _compRoom; bridges transient block loss. The
   // server stats `ranked` block is the only confirmer (liveRanked above).
@@ -2346,7 +2372,7 @@
   // Game frame only, pointer-transparent, driven by the stats poll. Like the
   // comp HUD, the point number stays a bare primary counter; Ranked adds its
   // tier as a small second-line badge rather than replacing that counter.
-  let rankedOverlay=null, _lastRankedPts=null, _rankedFlashT=null, rankedActive=false, _lastOvSig='?';
+  let rankedOverlay=null, _lastRankedPts=null, _rankedFlashT=null, rankedActive=false, _lastOvSig='?', _rankedPendingSeal=null;
   function ensureRankedOverlay(){
     if(!IS_GAME_FRAME) return null;
     if(rankedOverlay) return rankedOverlay;
@@ -2368,10 +2394,28 @@
     const _eim=effInMatch();
     const inMatch=_eim===true;
     rankedActive=!!(rk && inMatch);
+    // Pending seal: between the server's match_version bump and the
+    // ranked_results row landing, the shown total is provisional - in
+    // match (overlay) AND out (a dead player back in lobby sees a total
+    // that still excludes the running match). Server publishes
+    // pending_seal; local derivation is the fallback for older servers.
+    // Keyed rid:version so a room change can never leak stale pending.
+    try{
+      if(rk && rk.rid){
+        const v=Number(rk.match_version)||0;
+        const lr=rk.last_result;
+        const key=String(rk.rid)+':'+v;
+        const pend=(rk.pending_seal===true||rk.pending_seal===false)
+          ? rk.pending_seal
+          : (v>0 && !(lr && Number(lr.match_version)===v));
+        if(v>0 && pend){ _rankedPendingSeal=key; }
+        else{ _rankedPendingSeal=null; }
+      }else{ _rankedPendingSeal=null; }
+    }catch{}
     const el=ensureRankedOverlay();
     if(!el) return;
     const shown=(rk?rk.points:'-');
-    const sig=(rk?rk.rid:'-')+'|'+(inMatch?'M':'L')+'|'+shown;
+    const sig=(rk?rk.rid:'-')+'|'+(inMatch?'M':'L')+'|'+shown+'|'+(_rankedPendingSeal?'P':'C');
     if(sig!==_lastOvSig){
       _lastOvSig=sig;
       try{ logInfo(`[RANKED] match-overlay -> ${(rk&&inMatch)?'SHOW':'HIDE'} rid=${rk?rk.rid:'-'} inMatch=${inMatch} pts=${shown}`); }catch{}
@@ -2382,7 +2426,12 @@
     }
     const pts=(rk.points==null ? 0 : rk.points);
     const color=rk.milestone_color || '#fff';
-    el.innerHTML=`<div style="font-size:23px;font-weight:800;color:#fff">${Number(pts).toLocaleString('en-US')}</div>`;
+    // Honesty: a pending seal shows as approximate instead of implying
+    // server-confirmed truth (the number can still move at seal).
+    const pend=!!_rankedPendingSeal;
+    el.innerHTML=pend
+      ? `<div style="font-size:23px;font-weight:800;color:#fff">${Number(pts).toLocaleString('en-US')}</div><div style="font-size:10px;font-weight:700;color:#9ca3af;letter-spacing:0.4px">&#8776; seal pending</div>`
+      : `<div style="font-size:23px;font-weight:800;color:#fff">${Number(pts).toLocaleString('en-US')}</div>`;
     el.style.display='flex';
     if(_lastRankedPts!=null && pts!==_lastRankedPts){
       el.style.borderColor=color;
@@ -2471,11 +2520,12 @@
     const _eim=effInMatch();
     const inMatch=_eim===true;
     const el=ensureRankedLobby();
+    const pend=!!(typeof _rankedPendingSeal!=='undefined' && _rankedPendingSeal);
     if(!el) return;
     // Ranked-session ONLY: arena data alone (casual lobby) never shows the
     // card. A leave hides locally and never re-shows (liveRanked owns that).
     const show=!!(rk && !inMatch && sess);
-    const sig=(rk?`${rk.rid}:${rk.points}/${rk.milestone}`:'-')+'|'+(sess?String(sess.state||'?'):'none')+'|'+(show?'SHOW':'HIDE');
+    const sig=(rk?`${rk.rid}:${rk.points}/${rk.milestone}`:'-')+'|'+(sess?String(sess.state||'?'):'none')+'|'+(show?'SHOW':'HIDE')+'|'+(pend?'P':'C');
     if(sig!==_lastLobbySig){
       _lastLobbySig=sig;
       try{ logInfo(`[RANKED] lobby-card -> ${show?'SHOW':'HIDE'} ranked=${rk?rk.rid+' '+rk.points+'pts/'+rk.milestone:'none'} session=${sess?sess.state:'none'}`); }catch{}
@@ -2485,7 +2535,9 @@
     const icon=rk.milestone_icon_url
       ? `<img src="${String(rk.milestone_icon_url).replace(/"/g,'')}" alt="" style="width:80px;height:80px;object-fit:contain" onerror="this.style.display='none'" />`
       : '';
-    const pts=Number(rk.points||0).toLocaleString('en-US');
+    const ptsRaw=Number(rk.points||0);
+    // Server-confirmed totals; a pending seal shows as approximate.
+    const pts=ptsRaw.toLocaleString('en-US')+(pend?' &#8776;':'');
     const ms=String(rk.milestone||'Unranked').replace(/</g,'&lt;');
     const season=(sc && sc.arena && sc.arena.season!=null) ? `Nectar Ranked Season ${sc.arena.season}` : 'Nectar Ranked';
     const code=String(rk.short_code||'').replace(/</g,'&lt;');
@@ -2495,8 +2547,9 @@
     // Room exists but was never started â€” seals can't fire. Same card plus
     // an unmissable amber prompt for the host.
     const notStarted=String(rk.status||'').toLowerCase()==='lobby';
+    const sleepingNote=rankedEnabled()?'':'<div style="font-size:11px;font-weight:700;color:#f87171;margin-top:2px">RANKED SLEEPING - matches will not seal</div>';
     const startLine=notStarted ? `<div style="font-size:12px;font-weight:800;color:#f59e0b;margin-top:4px">NOT STARTED â€” host: /ranked start</div>` : '';
-    el.innerHTML=`<div style="font-size:13px;font-weight:800;color:#fff">${season}</div>${icon}<div style="font-size:22px;font-weight:800;color:${color}">${pts} (${ms})</div><div style="font-size:11px;color:#9ca3af">${roomLine}</div>${startLine}`;
+    el.innerHTML=`<div style="font-size:13px;font-weight:800;color:#fff">${season}</div>${icon}<div style="font-size:22px;font-weight:800;color:${color}">${pts} (${ms})</div><div style="font-size:11px;color:#9ca3af">${roomLine}</div>${startLine}${sleepingNote}`;
     el.style.display='flex';
   }
 
@@ -2732,7 +2785,7 @@
     }catch{ return false; }
   }
   function toggleRankedPanel(force){
-    if(typeof RANKED_SLEEPING!=='undefined' && RANKED_SLEEPING){ showToast('Ranked is sleeping in v2.19.0 â€” streaks are live', false); try{ logInfo('[RANKED] panel sleeping'); }catch{} return; }
+    if(typeof rankedEnabled==='function' && !rankedEnabled()){ showToast('Ranked is sleeping - streaks are live', false); try{ logInfo('[RANKED] panel sleeping'); }catch{} return; }
     createRankedPanel();
     const isHidden=rankedPanel.style.display==='none' || !rankedPanel.style.display;
     const show=typeof force==='boolean' ? force : isHidden;
