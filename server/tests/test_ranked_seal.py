@@ -11,13 +11,20 @@ import types
 import pytest
 
 from server.lib import ranked as ranked_mod
-from server.lib.photon_engine.models import KillInfo, Player, RoomView
+from server.lib.photon_engine.models import KillInfo, Player, RoomView, Team
 import server.scripts.processor as proc
 
 
 # ---------------------------------------------------------------------------
 # Fake Supabase (chainable stub)
 # ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _static_economy(monkeypatch):
+    """Legacy tests pin the static economy: most seals below were written
+    against flat 8/50/-5 numbers. Dynamic-path tests opt back in with
+    monkeypatch.setattr(ranked_mod, "RANKED_DYNAMIC", True)."""
+    monkeypatch.setattr(ranked_mod, "RANKED_DYNAMIC", False)
 
 class _FakeRes:
     def __init__(self, data):
@@ -40,8 +47,16 @@ class _FakeQ:
         self.filters.append((col, val))
         return self
 
+    def neq(self, col, val):
+        self.filters.append(("neq", col, val))
+        return self
+
     def in_(self, col, vals):
         self.filters.append((col, list(vals)))
+        return self
+
+    def ilike(self, col, pat):
+        self.filters.append(("ilike", col, pat))
         return self
 
     def limit(self, n):
@@ -75,6 +90,7 @@ class _FakeDB:
         self.results = list(results)  # ranked_results rows
         self.points = {}              # ranked_points discord_id -> points
         self.rooms = {}               # ranked_rooms id -> fields
+        self.ranked_events = []       # bngc_ranked_events rows
         self.calls = []
 
     def table(self, name):
@@ -83,19 +99,55 @@ class _FakeDB:
     def _run(self, q):
         self.calls.append((q.table, q.op, q.payload, list(q.filters)))
         if q.table == "bngc_users" and q.op == "select":
-            names = None
-            for col, val in q.filters:
-                if col == "game_username":
-                    names = set(val if isinstance(val, list) else [val])
-            rows = [r for r in self.users if names is None or r.get("game_username") in names]
+            rows = list(self.users)
+            for f in q.filters:
+                if len(f) == 3 and f[0] == "ilike":
+                    _, col, pat = f
+                    sub = str(pat).strip("%").casefold()
+                    rows = [r for r in rows if sub in str(r.get(col) or "").casefold()]
+                elif len(f) == 2:
+                    col, val = f
+                    if isinstance(val, list):
+                        rows = [r for r in rows if str(r.get(col)) in {str(v) for v in val}]
+                    else:
+                        rows = [r for r in rows if str(r.get(col)) == str(val)]
             return _FakeRes(rows)
+        if q.table == "bngc_users" and q.op == "insert":
+            payloads = q.payload if isinstance(q.payload, list) else [q.payload]
+            for p in payloads:
+                self.users.append(dict(p))
+            return _FakeRes(payloads)
+        if q.table == "bngc_users" and q.op == "update":
+            touched = []
+            for row in self.users:
+                ok = True
+                for f in q.filters:
+                    if len(f) == 2:
+                        c, v = f
+                        if isinstance(v, list):
+                            if str(row.get(c)) not in {str(x) for x in v}:
+                                ok = False
+                        elif str(row.get(c)) != str(v):
+                            ok = False
+                if ok:
+                    row.update(dict(q.payload))
+                    touched.append(dict(row))
+            return _FakeRes(touched)
         if q.table == "ranked_results" and q.op == "select":
             rows = self.results
             for col, val in q.filters:
-                rows = [r for r in rows if str(r.get(col)) == str(val)]
+                if isinstance(val, list):
+                    rows = [r for r in rows if str(r.get(col)) in {str(v) for v in val}]
+                else:
+                    rows = [r for r in rows if str(r.get(col)) == str(val)]
             return _FakeRes(rows)
         if q.table == "ranked_results" and q.op in ("upsert", "insert"):
             self.results.append(dict(q.payload))
+            return _FakeRes([q.payload])
+        if q.table == "ranked_results" and q.op == "update":
+            for row in self.results:
+                if all(str(row.get(c)) == str(v) for c, v in q.filters):
+                    row.update(q.payload)
             return _FakeRes([q.payload])
         if q.table == "ranked_points" and q.op == "select":
             rows = [{"discord_id": d, "points": p} for d, p in self.points.items()]
@@ -116,6 +168,39 @@ class _FakeDB:
                 if hit:
                     fields.update(q.payload)
             return _FakeRes([])
+        if q.table == "ranked_rooms" and q.op == "select":
+            rows = list(self.rooms.values())
+            for f in q.filters:
+                if len(f) == 3:
+                    _, col, val = f
+                    rows = [r for r in rows if str(r.get(col)) != str(val)]
+                else:
+                    col, val = f
+                    rows = [r for r in rows if str(r.get(col)) == str(val)]
+            return _FakeRes(rows)
+        if q.table == "bngc_ranked_events" and q.op == "select":
+            rows = list(self.ranked_events)
+            for col, val in q.filters:
+                rows = [r for r in rows if str(r.get(col)) == str(val)]
+            return _FakeRes(rows)
+        if q.table == "bngc_ranked_events" and q.op == "insert":
+            payloads = q.payload if isinstance(q.payload, list) else [q.payload]
+            for p in payloads:
+                self.ranked_events.append(dict(p))
+            return _FakeRes(payloads)
+        if q.table == "bngc_ranked_events" and q.op == "update":
+            touched = []
+            for row in self.ranked_events:
+                ok = True
+                for f in q.filters:
+                    if len(f) == 2:
+                        c, v = f
+                        if str(row.get(c)) != str(v):
+                            ok = False
+                if ok:
+                    row.update(dict(q.payload))
+                    touched.append(dict(row))
+            return _FakeRes(touched)
         return _FakeRes([])
 
 
@@ -132,11 +217,11 @@ def _use_fake_for_ranked(monkeypatch, fake):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("pts,name", [
-    (0, "Unranked"), (199, "Unranked"), (200, "Bronze"), (499, "Bronze"),
-    (500, "Silver"), (999, "Silver"), (1000, "Gold"), (1499, "Gold"),
-    (1500, "Platinum"), (1999, "Platinum"), (2000, "Diamond"), (2999, "Diamond"),
-    (3000, "Emerald"), (3999, "Emerald"), (4000, "Champion"), (4999, "Champion"),
-    (5000, "Master"), (7499, "Master"), (7500, "Grandmaster"), (99999, "Grandmaster"),
+    (0, "Unranked"), (499, "Unranked"), (500, "Bronze"), (1199, "Bronze"),
+    (1200, "Silver"), (2499, "Silver"), (2500, "Gold"), (3999, "Gold"),
+    (4000, "Platinum"), (5999, "Platinum"), (6000, "Diamond"), (8999, "Diamond"),
+    (9000, "Emerald"), (12999, "Emerald"), (13000, "Champion"), (17999, "Champion"),
+    (18000, "Master"), (24999, "Master"), (25000, "Grandmaster"), (99999, "Grandmaster"),
 ])
 def test_tier_boundaries(pts, name):
     assert ranked_mod.milestone_for(pts)["name"] == name
@@ -151,10 +236,10 @@ def test_tier_icons_present():
 
 def test_next_milestone_edges():
     nxt, need, pct = ranked_mod.next_milestone(0)
-    assert (nxt["name"], need, pct) == ("Bronze", 200, 0)
-    assert ranked_mod.next_milestone(7500) == (None, 0, 100)
-    nxt, need, pct = ranked_mod.next_milestone(1000)
-    assert (nxt["name"], need) == ("Platinum", 500)
+    assert (nxt["name"], need, pct) == ("Bronze", 500, 0)
+    assert ranked_mod.next_milestone(25000) == (None, 0, 100)
+    nxt, need, pct = ranked_mod.next_milestone(2500)
+    assert (nxt["name"], need) == ("Platinum", 1500)
 
 
 def test_arena_icon():
@@ -180,10 +265,10 @@ def _load_bot_ranked():
 
 def test_bot_tiers_mirror_server():
     bot_r = _load_bot_ranked()
-    for pts, name in [(0, "Unranked"), (200, "Bronze"), (500, "Silver"),
-                      (1000, "Gold"), (1500, "Platinum"), (2000, "Diamond"),
-                      (3000, "Emerald"), (4000, "Champion"), (5000, "Master"),
-                      (7500, "Grandmaster")]:
+    for pts, name in [(0, "Unranked"), (500, "Bronze"), (1200, "Silver"),
+                      (2500, "Gold"), (4000, "Platinum"), (6000, "Diamond"),
+                      (9000, "Emerald"), (13000, "Champion"), (18000, "Master"),
+                      (25000, "Grandmaster")]:
         assert bot_r.milestone_for(pts)[0] == ranked_mod.milestone_for(pts)["name"]
         assert bot_r.milestone_for(pts)[0] == name
 
@@ -316,13 +401,18 @@ def test_seal_match_kill_events_exact(monkeypatch):
                                 placements={"K": 1, "V": 2},
                                 kill_events=[("K", "V")])
     assert res["ok"] is True
-    # flat: K = 1 kill (8) + win (50) = 58; V = loss (-5)
-    assert res["points"] == {"K": 58, "V": -5}
-    assert fake.points["K"] == 558
-    assert fake.points["V"] == 495
+    # base table (avg 0): K = 1 kill (8) + win (50) + P1 (10) = 68 -> clamp 30;
+    # V = P2 (7) - 5 = 2
+    assert res["points"] == {"K": 30, "V": 2}
+    assert fake.points["K"] == 530
+    assert fake.points["V"] == 502
     row = fake.results[0]
     assert (row["room_id"], row["match_version"], row["winner_discord_id"]) == ("R-X", 2, "K")
     assert row["placements"] == {"K": 1, "V": 2}  # stored for the toast + review
+    assert row["arena_breakdown"]["K"] == {"kills": 8, "win": 50, "placement": 10,
+                                           "loss": 0, "total": 30, "capped": True}
+    assert row["arena_breakdown"]["V"] == {"kills": 0, "win": 0, "placement": 7,
+                                           "loss": -5, "total": 2, "capped": False}
 
 
 def test_seal_match_defeat_minus_lower_killer(monkeypatch):
@@ -337,9 +427,10 @@ def test_seal_match_defeat_minus_lower_killer(monkeypatch):
                                 kill_events=[("K", "V")],
                                 death_killers={"V": "K"})
     assert res["ok"] is True
-    # flat: K = 1 kill (8) + loss (-5) = 3 (not winner); V = win (50)
-    assert res["points"]["K"] == 3
-    assert res["points"]["V"] == 50
+    # static: K = 1 kill (8) + P4 (3) - 5 = 6 (not winner);
+    # V = win (50) + P1 (10) = 60 -> clamp 30
+    assert res["points"]["K"] == 6
+    assert res["points"]["V"] == 30
 
 
 def test_seal_match_defeat_minus_peer_and_zone(monkeypatch):
@@ -354,8 +445,9 @@ def test_seal_match_defeat_minus_peer_and_zone(monkeypatch):
                                 placements={"A": 1, "B": 2, "C": 3, "D": 4},
                                 death_killers={"B": "A", "C": None})
     assert res["ok"] is True
-    # flat: A = 2 kills (16) + win (50) = 66; everyone else -5
-    assert res["points"] == {"A": 66, "B": -5, "C": -5, "D": -5}
+    # static: A = 2 kills (16) + win (50) + P1 (10) = 76 -> clamp 30;
+    # B = P2 (7) - 5 = 2; C = P3 (5) - 5 = 0; D = P4 (3) - 5 = -2
+    assert res["points"] == {"A": 30, "B": 2, "C": 0, "D": -2}
 
 
 def test_seal_match_placements_capped_at_lobby_size(monkeypatch):
@@ -370,11 +462,11 @@ def test_seal_match_placements_capped_at_lobby_size(monkeypatch):
                                 placements={"K": 1, "V": 2, "X": 3},
                                 players_count=2)
     assert res["ok"] is True
-    assert res["points"] == {"K": 50, "V": -5, "X": -5}
+    assert res["points"] == {"K": 30, "V": 2, "X": 0}
 
 
 def test_seal_match_flat_no_scaling_by_avg_points(monkeypatch):
-    """No scaling: winner 50, losers -5, regardless of lobby tier."""
+    """Static branch ignores ratings: same table for equal lobbies."""
     fake = _FakeDB()
     _use_fake_for_ranked(monkeypatch, fake)
     now = time.time()
@@ -384,8 +476,8 @@ def test_seal_match_flat_no_scaling_by_avg_points(monkeypatch):
                                 winner_discord_id="H1", kills={},
                                 placements={"H1": 1, "H2": 2})
     assert res["ok"] is True
-    assert res["points"]["H1"] == 50
-    assert res["points"]["H2"] == -5
+    assert res["points"]["H1"] == 30  # 50 + 10, clamped
+    assert res["points"]["H2"] == 2
 
     fake2 = _FakeDB()
     _use_fake_for_ranked(monkeypatch, fake2)
@@ -395,8 +487,8 @@ def test_seal_match_flat_no_scaling_by_avg_points(monkeypatch):
                                  winner_discord_id="V1", kills={},
                                  placements={"V1": 1, "V2": 2})
     assert res2["ok"] is True
-    assert res2["points"]["V1"] == 50
-    assert res2["points"]["V2"] == -5
+    assert res2["points"]["V1"] == 30  # ratings ignored on the static path
+    assert res2["points"]["V2"] == 2
 
 
 def test_seal_match_duplicate_is_noop(monkeypatch):
@@ -426,10 +518,9 @@ def test_seal_match_bulk_single_read_and_upsert(monkeypatch):
     ups = [c for c in fake.calls if c[0] == "ranked_points" and c[1] == "upsert"]
     assert len(ups) == 1 and isinstance(ups[0][2], list)  # one bulk upsert
     assert {r["discord_id"] for r in ups[0][2]} == {"BK1", "BK2"}
-    # totals applied on top of the snapshot bases
     assert fake.points["BK1"] == 100 + res["points"]["BK1"]
     assert fake.points["BK2"] == 200 + res["points"]["BK2"]
-    assert res["points"] == {"BK1": 58, "BK2": -5}  # kill + win / flat loss
+    assert res["points"] == {"BK1": 30, "BK2": 2}  # kill + win + P1 (clamped) / P2 - loss
 
 
 def test_seal_match_winner_fallback_gets_first(monkeypatch):
@@ -442,7 +533,27 @@ def test_seal_match_winner_fallback_gets_first(monkeypatch):
                                 winner_discord_id="W", kills={},
                                 placements={})
     assert res["ok"] is True
-    assert res["points"] == {"W": 50}
+    assert res["points"] == {"W": 30}  # lone winner: win purse, clamped
+
+
+def test_seal_match_tied_winners_skip_loss(monkeypatch):
+    fake = _FakeDB()
+    _use_fake_for_ranked(monkeypatch, fake)
+    now = time.time()
+    monkeypatch.setitem(ranked_mod._points_cache, "W", (0, now))
+    monkeypatch.setitem(ranked_mod._points_cache, "T", (0, now))
+    monkeypatch.setitem(ranked_mod._points_cache, "L", (0, now))
+    # duo co-winner: full win bonus, no loss; loser pays the flat stake
+    res = ranked_mod.seal_match(rid="R-T", match_version=1, gm="zw_lg",
+                                winner_discord_id="W", kills={},
+                                placements={"W": 1, "T": 1, "L": 2},
+                                death_killers={"T": None, "L": None},
+                                tied_winners=["T"])
+    assert res["ok"] is True
+    assert res["breakdown"]["T"]["loss"] == 0
+    assert res["breakdown"]["T"]["win"] > 0
+    assert res["breakdown"]["L"]["loss"] < 0
+    assert res["points"]["T"] > 0
 
 
 # ---------------------------------------------------------------------------
@@ -532,8 +643,9 @@ def test_happy_path_winner_kills_losses(monkeypatch):
     assert kw["winner_discord_id"] == "K"            # alive roster did
     assert kw["kill_events"] == [("K", "V")]
     assert kw["kills"] == {"K": 1}
-    assert kw["death_killers"] == {"V": None}       # flat loss, no attribution
-    assert "placements" not in kw and "players_count" not in kw
+    assert kw["death_killers"] == {"V": "K"}       # killer-relative loss attribution
+    # no bngc_users rows in this fake: Victim unmapped, winner still cohered P1
+    assert kw["placements"] == {"K": 1}
 
 
 def test_zone_death_takes_flat_loss(monkeypatch):
@@ -562,9 +674,35 @@ def test_nobody_alive_last_to_die_wins(monkeypatch):
     proc.seal_ranked_match("s", "K", r, "r1", "zw_lg")
     assert len(calls) == 1
     kw = calls[0]
-    # most-recent death (Victim) survived longest => winner, not None
-    assert kw["winner_discord_id"] == "V"
-    assert kw["death_killers"] == {"K": None}
+    # double-KO: nobody alive — the last KILLER (K, final blow on V) wins,
+    # not the last victim (K was alive at least until that kill)
+    assert kw["winner_discord_id"] == "K"
+    assert kw["death_killers"] == {"V": "K"}
+
+
+def test_duo_surviving_partner_shares_win(monkeypatch):
+    fake = _FakeDB()
+    monkeypatch.setattr(proc, "supabase", fake)
+    calls = []
+    _patch_ranked(monkeypatch, calls)
+    r = _room()
+    r.gv = "duo"
+    r.teams["t1"] = Team(team_id="t1", members=["Killer", "Partner"])
+    r.players[4] = Player(actor_nr=4, username="Partner", is_alive=True)
+    monkeypatch.setattr(proc, "_resolve_ranked_dids",
+                        lambda names: dict(_NAME2DID, Partner="P"))
+    room_data = dict(_ROOM_DATA, roster=[{"discord_id": "K"}, {"discord_id": "V"},
+                                         {"discord_id": "P"}])
+    monkeypatch.setattr(ranked_mod, "get_ranked_room", lambda code: room_data)
+    proc.seal_ranked_match("s", "K", r, "r1", "zw_lg")
+    assert len(calls) == 1
+    kw = calls[0]
+    # surviving partner shares the crown: P1 tie, no loss, no death row
+    # (V stays unplaced here: no verified identity in this fake, as in solo)
+    assert kw["winner_discord_id"] == "K"
+    assert kw["tied_winners"] == ["P"]
+    assert kw["placements"] == {"K": 1, "P": 1}
+    assert "P" not in kw["death_killers"]
 
 
 def test_hosting_only_host_not_counted_but_seals(monkeypatch):
@@ -649,3 +787,886 @@ def test_aligned_match_version_continuity():
     assert proc._aligned_match_version(3, 2) == 3
     assert proc._aligned_match_version(None, 2) == 2
     assert proc._aligned_match_version("bad", 2) == "bad"  # non-numeric passes through
+
+
+# ---------------------------------------------------------------------------
+# Ranked event bank (comp-style rows per seal)
+# ---------------------------------------------------------------------------
+
+_BANK_USERS = [{"game_username": "Killer", "discord_id": "K"},
+               {"game_username": "Victim", "discord_id": "V"}]
+
+
+def _bank_seal(monkeypatch, fake, room_data=None):
+    """Run a happy-path ranked seal with the real bank + mocked seal_match."""
+    proc._comp_namemap.clear()
+    monkeypatch.setattr(proc, "supabase", fake)
+    monkeypatch.setattr(ranked_mod, "get_ranked_room",
+                        lambda code: dict(room_data or _ROOM_DATA))
+    monkeypatch.setattr(proc, "_resolve_ranked_dids", lambda names: dict(_NAME2DID))
+    calls = []
+    monkeypatch.setattr(ranked_mod, "seal_match",
+                        lambda **kw: calls.append(kw) or {"ok": True})
+    proc.seal_ranked_match("s", "K", _room(), "r1", "zw_lg")
+    return calls
+
+
+def test_ranked_bank_writes_kill_and_alv(monkeypatch):
+    fake = _FakeDB(users=_BANK_USERS)
+    calls = _bank_seal(monkeypatch, fake)
+    assert len(calls) == 1  # seal still ran
+    kills = [e for e in fake.ranked_events if e["etype"] == "kill"]
+    alv = [e for e in fake.ranked_events if e["etype"] == "alv"]
+    assert len(kills) == 1
+    k = kills[0]
+    assert (k["room_id"], k["match_version"]) == ("R-X", 2)
+    assert k["actor_name"] == "Killer" and k["target_name"] == "Victim"
+    assert k["discord_id"] == "K" and k["actor_nr"] == 1
+    # dead in kill order first, survivor (winner) last; all read as dead
+    assert [e["actor_name"] for e in alv] == ["Victim", "Outsider", "Killer"]
+    assert all(e["alive"] is False for e in alv)
+    assert {e["actor_name"]: e["discord_id"] for e in alv} == {
+        "Victim": "V", "Outsider": None, "Killer": "K"}
+
+
+def test_ranked_bank_idempotent(monkeypatch):
+    fake = _FakeDB(users=_BANK_USERS)
+    _bank_seal(monkeypatch, fake)
+    n = len(fake.ranked_events)
+    assert n > 0
+    _bank_seal(monkeypatch, fake)  # retry: no new rows
+    assert len(fake.ranked_events) == n
+
+
+def test_ranked_bank_skips_spectating_host_alv(monkeypatch):
+    fake = _FakeDB(users=_BANK_USERS)
+    data = dict(_ROOM_DATA, host_status="hosting_only")
+    calls = _bank_seal(monkeypatch, fake, room_data=data)
+    assert len(calls) == 1  # feed still seals everyone else
+    alv = [e for e in fake.ranked_events if e["etype"] == "alv"]
+    assert "Killer" not in [e["actor_name"] for e in alv]
+    kills = [e for e in fake.ranked_events if e["etype"] == "kill"]
+    assert len(kills) == 1 and kills[0]["discord_id"] == "K"
+
+
+def test_ranked_bank_failure_never_breaks_seal(monkeypatch):
+    class _BoomDB(_FakeDB):
+        def table(self, name):
+            if name == "bngc_ranked_events":
+                raise RuntimeError("db down")
+            return super().table(name)
+
+    fake = _BoomDB(users=_BANK_USERS)
+    calls = _bank_seal(monkeypatch, fake)
+    assert len(calls) == 1
+    assert fake.ranked_events == []
+
+
+# ---------------------------------------------------------------------------
+# Banked-evidence detection (kills + placements from banked rows)
+# ---------------------------------------------------------------------------
+
+def _evs():
+    return [
+        {"etype": "kill", "actor_name": "Killer", "target_name": "Victim", "discord_id": "K"},
+        {"etype": "kill", "actor_name": "Killer", "target_name": "Outsider", "discord_id": "K"},
+        {"etype": "kill", "actor_name": "Ghost", "target_name": "Victim", "discord_id": None},
+        {"etype": "alv", "actor_name": "Victim", "discord_id": "V", "alive": False},
+        {"etype": "alv", "actor_name": "Outsider", "discord_id": None, "alive": False},
+        {"etype": "alv", "actor_name": "Killer", "discord_id": "K", "alive": False},
+    ]
+
+
+def test_detect_ranked_kills_counts_and_pairs():
+    kills, pairs = ranked_mod.detect_ranked_kills(_evs(), {"K", "V", "O"}, set(), _NAME2DID)
+    assert kills == {"K": 2}                    # unmapped Ghost ignored
+    assert pairs == [("K", "V"), ("K", "O")]    # Out via name2did
+
+
+def test_detect_ranked_kills_victim_falls_back_to_killer():
+    evs = [{"etype": "kill", "actor_name": "Killer", "target_name": "Nobody", "discord_id": "K"}]
+    kills, pairs = ranked_mod.detect_ranked_kills(evs, {"K"}, set(), {})
+    assert pairs == [("K", "K")]
+
+
+def test_detect_ranked_kills_skip_and_non_roster_excluded():
+    evs = [{"etype": "kill", "actor_name": "Killer", "target_name": "V", "discord_id": "K"},
+           {"etype": "kill", "actor_name": "Stranger", "target_name": "V", "discord_id": "S"}]
+    kills, pairs = ranked_mod.detect_ranked_kills(evs, {"K", "V"}, {"K"}, {})
+    assert kills == {} and pairs == []          # skip excluded, S non-roster
+
+
+def test_detect_ranked_placements_winner_cohered_p1():
+    assert ranked_mod.detect_ranked_placements(_evs(), "K", {"K", "V", "O"}) == {"K": 1, "V": 2}
+    # double-KO: snapshot winner (most-recent death) forced P1 even when the
+    # last banked row belongs to a zone death
+    assert ranked_mod.detect_ranked_placements(_evs(), "V", {"K", "V"}) == {"V": 1, "K": 2}
+    # no winner (total wipe): pure alv order
+    assert ranked_mod.detect_ranked_placements(_evs(), None, {"K", "V"}) == {"K": 1, "V": 2}
+    # skip + unmapped never placed
+    assert ranked_mod.detect_ranked_placements(_evs(), "V", {"K", "V"}, {"K"}) == {"V": 1}
+
+
+def test_seal_double_ko_placements_agree_with_crown(monkeypatch):
+    fake = _FakeDB(users=_BANK_USERS)
+    proc._comp_namemap.clear()
+    monkeypatch.setattr(proc, "supabase", fake)
+    monkeypatch.setattr(ranked_mod, "get_ranked_room", lambda code: dict(_ROOM_DATA))
+    monkeypatch.setattr(proc, "_resolve_ranked_dids", lambda names: dict(_NAME2DID))
+    calls = []
+    monkeypatch.setattr(ranked_mod, "seal_match",
+                        lambda **kw: calls.append(kw) or {"ok": True})
+    r = _room()
+    r.players[1].is_alive = False  # zone double-KO: nobody alive
+    proc.seal_ranked_match("s", "K", r, "r1", "zw_lg")
+    # last killer (K) crowned over last victim: placements agree with crown
+    assert calls[0]["winner_discord_id"] == "K"
+    assert calls[0]["placements"] == {"K": 1, "V": 2}
+
+
+# ---------------------------------------------------------------------------
+# Comp-math scoring (banked evidence drives awards, loss preserved)
+# ---------------------------------------------------------------------------
+
+def _seed_banked(fake, rid="R-B2", mver=1):
+    """Banked rows the legacy inputs deliberately disagree with."""
+    fake.ranked_events = [
+        {"room_id": rid, "match_version": mver, "etype": "kill",
+         "actor_name": "Killer", "target_name": "Victim", "discord_id": "K", "alive": None},
+        {"room_id": rid, "match_version": mver, "etype": "kill",
+         "actor_name": "Killer", "target_name": "Victim", "discord_id": "K", "alive": None},
+        {"room_id": rid, "match_version": mver, "etype": "kill",
+         "actor_name": "Victim", "target_name": "Killer", "discord_id": "V", "alive": None},
+        {"room_id": rid, "match_version": mver, "etype": "alv",
+         "actor_name": "Victim", "discord_id": "V", "alive": False},
+        {"room_id": rid, "match_version": mver, "etype": "alv",
+         "actor_name": "Killer", "discord_id": "K", "alive": False},
+    ]
+
+
+def test_seal_banked_kills_drive_awards(monkeypatch):
+    fake = _FakeDB()
+    _seed_banked(fake)
+    _use_fake_for_ranked(monkeypatch, fake)
+    now = time.time()
+    monkeypatch.setitem(ranked_mod._points_cache, "K", (0, now))
+    monkeypatch.setitem(ranked_mod._points_cache, "V", (0, now))
+    # legacy inputs say 0 kills: banked evidence (K x2) must win -> 16 + 50 + P1 (10), clamped
+    res = ranked_mod.seal_match(rid="R-B2", match_version=1, gm="zw_lg",
+                                winner_discord_id="K", kills={},
+                                placements={"K": 1, "V": 2})
+    assert res["ok"] is True
+    assert res["points"]["K"] == 30
+
+
+def test_seal_banked_loser_kill_keeps_flat_loss(monkeypatch):
+    fake = _FakeDB()
+    _seed_banked(fake)
+    _use_fake_for_ranked(monkeypatch, fake)
+    now = time.time()
+    monkeypatch.setitem(ranked_mod._points_cache, "K", (0, now))
+    monkeypatch.setitem(ranked_mod._points_cache, "V", (0, now))
+    res = ranked_mod.seal_match(rid="R-B2", match_version=1, gm="zw_lg",
+                                winner_discord_id="K", kills={},
+                                placements={"K": 1, "V": 2})
+    assert res["ok"] is True
+    # V's banked kill credits 8 + P2 (7), then the -5 non-winner loss
+    assert res["points"]["V"] == 10
+
+
+# ---------------------------------------------------------------------------
+# GET /api/ranked/match (board + killfeed from banked rows)
+# ---------------------------------------------------------------------------
+
+def _call_match(monkeypatch, fake, params):
+    import asyncio
+    import json
+    from server.routes import ranked_api as ra
+    monkeypatch.setattr(ra, "supabase", fake)
+
+    class _R:
+        query_params = dict(params)
+
+    resp = asyncio.run(ra.ranked_match_detail(_R()))
+    assert resp.status_code in (200, 400, 500)
+    return resp.status_code, json.loads(resp.body.decode())
+
+
+_MATCH_USERS = [{"game_username": "Killer", "discord_username": "Killer",
+                 "discord_id": "K"},
+                {"game_username": "Victim", "discord_username": "Victim",
+                 "discord_id": "V"}]
+
+
+def _match_fake(sealed=True):
+    fake = _FakeDB(users=_MATCH_USERS)
+    _seed_banked(fake, rid="R-X", mver=2)
+    if sealed:
+        fake.results = [{"room_id": "R-X", "match_version": 2,
+                         "winner_discord_id": "K",
+                         "placements": {"K": 1, "V": 2},
+                         "kills": {"K": 2, "V": 1},
+                         "points": {"K": 76, "V": 10},
+                         "points_table": {"kill": 8, "win": 50,
+                                          "placement": [10, 7, 5, 3, 1]}}]
+    return fake
+
+
+def test_ranked_match_sealed_board(monkeypatch):
+    code, body = _call_match(monkeypatch, _match_fake(sealed=True),
+                             {"room_id": "R-X", "match_version": "2"})
+    assert code == 200
+    assert body["sealed"] is True and body["winner_discord_id"] == "K"
+    assert body["placements"] == {"K": 1, "V": 2}
+    assert body["points_table"] == {"kill": 8, "win": 50,
+                                    "placement": [10, 7, 5, 3, 1]}
+    assert [(b["discord_id"], b["points"]) for b in body["board"]] == [("K", 76), ("V", 10)]
+    assert [b["name"] for b in body["board"]] == ["Killer", "Victim"]
+    assert len(body["killfeed"]) == 5
+
+
+def test_ranked_match_open_no_loss(monkeypatch):
+    code, body = _call_match(monkeypatch, _match_fake(sealed=False),
+                             {"room_id": "R-X", "match_version": "2"})
+    assert code == 200
+    assert body["sealed"] is False and body["winner_discord_id"] is None
+    # live board crowns the current last-alive (comp-match semantics);
+    # the -5 loss still waits for the seal
+    assert [(b["discord_id"], b["points"]) for b in body["board"]] == [("K", 76), ("V", 15)]
+
+
+def test_ranked_match_empty_and_bad_params(monkeypatch):
+    code, body = _call_match(monkeypatch, _FakeDB(),
+                             {"room_id": "R-Z", "match_version": "9"})
+    assert code == 200
+    assert body["sealed"] is False and body["board"] == [] and body["killfeed"] == []
+    code, body = _call_match(monkeypatch, _FakeDB(), {"room_id": "R-Z"})
+    assert code == 400
+    code, body = _call_match(monkeypatch, _FakeDB(), {"room_id": "", "match_version": "1"})
+    assert code == 400
+
+
+# ---------------------------------------------------------------------------
+# Ranked room lifecycle (host-only backout / end)
+# ---------------------------------------------------------------------------
+
+def _call_room(monkeypatch, fake, path, body):
+    import asyncio
+    import json
+    from server.routes import ranked_api as ra
+    monkeypatch.setattr(ra, "supabase", fake)
+
+    class _R:
+        async def json(self):
+            return dict(body)
+
+    fn = ra.ranked_room_backout if path == "backout" else ra.ranked_room_end
+    resp = asyncio.run(fn(_R()))
+    return resp.status_code, json.loads(resp.body.decode())
+
+
+def _live_room_fake():
+    fake = _FakeDB()
+    fake.rooms = {"R-X": {"id": "R-X", "short_code": "ABCDE",
+                          "status": "live", "host_discord_id": "K"}}
+    return fake
+
+
+def test_ranked_backout_live_to_lobby(monkeypatch):
+    fake = _live_room_fake()
+    code, body = _call_room(monkeypatch, fake, "backout",
+                            {"room_id": "R-X", "discord_id": "K"})
+    assert code == 200 and body["status"] == "lobby"
+    assert fake.rooms["R-X"]["status"] == "lobby"
+
+
+def test_ranked_backout_rejects(monkeypatch):
+    fake = _live_room_fake()
+    code, _ = _call_room(monkeypatch, fake, "backout",
+                         {"room_id": "R-X", "discord_id": "NOTHOST"})
+    assert code == 403
+    code, _ = _call_room(monkeypatch, fake, "backout",
+                         {"room_id": "NOPE", "discord_id": "K"})
+    assert code == 404
+    fake.rooms["R-X"]["status"] = "lobby"
+    code, body = _call_room(monkeypatch, fake, "backout",
+                            {"room_id": "R-X", "discord_id": "K"})
+    assert code == 400  # not live
+
+
+def test_ranked_end_live_and_lobby(monkeypatch):
+    fake = _live_room_fake()
+    code, body = _call_room(monkeypatch, fake, "end",
+                            {"room_id": "R-X", "discord_id": "K"})
+    assert code == 200 and body["status"] == "ended"
+    fake.rooms["R-X"]["status"] = "lobby"
+    code, _ = _call_room(monkeypatch, fake, "end",
+                         {"room_id": "R-X", "discord_id": "K"})
+    assert code == 200
+    code, _ = _call_room(monkeypatch, fake, "end",
+                         {"room_id": "R-X", "discord_id": "K"})
+    assert code == 400  # already ended
+    code, _ = _call_room(monkeypatch, fake, "end",
+                         {"room_id": "R-X", "discord_id": "NOTHOST"})
+    assert code == 403
+
+
+# ---------------------------------------------------------------------------
+# POST /api/ranked/match/recalc + /winner (differential ledger fix)
+# ---------------------------------------------------------------------------
+
+def _call_post(monkeypatch, fake, fn_name, body):
+    import asyncio
+    import json
+    from server.routes import ranked_api as ra
+    monkeypatch.setattr(ra, "supabase", fake)
+    _use_fake_for_ranked(monkeypatch, fake)
+    ranked_mod._points_cache.clear()
+
+    class _R:
+        async def json(self):
+            return dict(body)
+
+    resp = asyncio.run(getattr(ra, fn_name)(_R()))
+    return resp.status_code, json.loads(resp.body.decode())
+
+
+def _recalc_fake():
+    fake = _FakeDB(users=_MATCH_USERS)
+    fake.rooms = {"R-X": {"id": "R-X", "short_code": "ABCDE",
+                          "status": "live", "host_discord_id": "K"}}
+    fake.points = {"K": 500, "V": 500}
+    # stale seal: K credited for 1 kill (8+50=58) but banked 2 -> 66 on recalc
+    fake.results = [{"room_id": "R-X", "match_version": 2,
+                     "winner_discord_id": "K",
+                     "placements": {"K": 1, "V": 2},
+                     "kills": {"K": 1, "V": 1},
+                     "points": {"K": 58, "V": 3}}]
+    _seed_banked(fake, rid="R-X", mver=2)
+    return fake
+
+
+def test_ranked_recalc_pays_diff_only(monkeypatch):
+    fake = _recalc_fake()
+    code, body = _call_post(monkeypatch, fake, "ranked_match_recalc",
+                            {"room_id": "R-X", "match_version": 2,
+                             "discord_id": "K"})
+    assert code == 200 and body["ok"] is True
+    assert body["points"] == {"K": 66, "V": 3}
+    assert body["diffs"] == {"K": 8}           # +8 only, V unchanged
+    assert fake.points == {"K": 508, "V": 500}  # ledger moved by the diff
+    assert fake.results[0]["points"] == {"K": 66, "V": 3}
+    assert fake.results[0]["kills"] == {"K": 2, "V": 1}
+    # second run diffs to zero (never double-pays)
+    code, body = _call_post(monkeypatch, fake, "ranked_match_recalc",
+                            {"room_id": "R-X", "match_version": 2,
+                             "discord_id": "K"})
+    assert code == 200 and body["diffs"] == {}
+    assert fake.points == {"K": 508, "V": 500}
+
+
+def test_ranked_recalc_rejects(monkeypatch):
+    fake = _recalc_fake()
+    code, _ = _call_post(monkeypatch, fake, "ranked_match_recalc",
+                         {"room_id": "R-X", "match_version": 9,
+                          "discord_id": "K"})
+    assert code == 404  # not sealed
+    code, _ = _call_post(monkeypatch, fake, "ranked_match_recalc",
+                         {"room_id": "R-X", "match_version": 2,
+                          "discord_id": "NOTHOST"})
+    assert code == 403
+
+
+def test_ranked_winner_override_flips_crown(monkeypatch):
+    fake = _recalc_fake()
+    code, body = _call_post(monkeypatch, fake, "ranked_match_winner",
+                            {"room_id": "R-X", "match_version": 2,
+                             "discord_id": "K", "winner_discord_id": "V"})
+    assert code == 200 and body["winner_discord_id"] == "V"
+    # legacy row (no stored table): flat recompute - V wins (8 + 50),
+    # K takes the loss (16 - 5)
+    assert body["points"] == {"K": 11, "V": 58}
+    assert fake.results[0]["winner_discord_id"] == "V"
+    assert fake.results[0]["placements"] == {"K": 2, "V": 1}  # crown swapped, order kept
+    code, _ = _call_post(monkeypatch, fake, "ranked_match_winner",
+                         {"room_id": "NOPE", "match_version": 2,
+                          "discord_id": "K", "winner_discord_id": "V"})
+    assert code == 404
+
+
+# ---------------------------------------------------------------------------
+# live_match_board_sync (stats-poll freshness)
+# ---------------------------------------------------------------------------
+
+def _use_fake_sb(monkeypatch, fake):
+    monkeypatch.setattr(ranked_mod, "_sb", lambda: fake)
+
+
+def test_live_board_open_crowns_leader_no_loss(monkeypatch):
+    fake = _FakeDB()
+    _seed_banked(fake, rid="R-X", mver=2)
+    _use_fake_sb(monkeypatch, fake)
+    out = ranked_mod.live_match_board_sync("R-X", 2)
+    assert out["sealed"] is False and out["winner_discord_id"] is None
+    assert [(b["discord_id"], b["points"]) for b in out["board"]] == [("K", 76), ("V", 15)]
+
+
+def test_live_board_sealed_keeps_loss(monkeypatch):
+    fake = _FakeDB()
+    _seed_banked(fake, rid="R-X", mver=2)
+    fake.results = [{"room_id": "R-X", "match_version": 2,
+                     "winner_discord_id": "K", "placements": {"K": 1, "V": 2},
+                     "points_table": {"kill": 8, "win": 50,
+                                      "placement": [10, 7, 5, 3, 1]}}]
+    _use_fake_sb(monkeypatch, fake)
+    out = ranked_mod.live_match_board_sync("R-X", 2)
+    assert out["sealed"] is True and out["winner_discord_id"] == "K"
+    assert [(b["discord_id"], b["points"]) for b in out["board"]] == [("K", 76), ("V", 10)]
+
+
+def test_live_board_legacy_row_recomputes_flat(monkeypatch):
+    # pre-purse seal (no stored table): display matches what was awarded
+    fake = _FakeDB()
+    _seed_banked(fake, rid="R-X", mver=2)
+    fake.results = [{"room_id": "R-X", "match_version": 2,
+                     "winner_discord_id": "K", "placements": {"K": 1, "V": 2}}]
+    _use_fake_sb(monkeypatch, fake)
+    out = ranked_mod.live_match_board_sync("R-X", 2)
+    assert out["sealed"] is True
+    # flat legacy table over 2 banked K-kills: 16 + 50 / 8 - 5
+    assert [(b["discord_id"], b["points"]) for b in out["board"]] == [("K", 66), ("V", 3)]
+
+
+def test_live_board_empty_and_top_n(monkeypatch):
+    fake = _FakeDB()
+    _use_fake_sb(monkeypatch, fake)
+    assert ranked_mod.live_match_board_sync("R-X", 2)["board"] == []
+    assert ranked_mod.live_match_board_sync("", 0)["board"] == []
+    _seed_banked(fake, rid="R-X", mver=2)
+    out = ranked_mod.live_match_board_sync("R-X", 2, top_n=1)
+    assert [b["discord_id"] for b in out["board"]] == ["K"]
+    # no DB at all degrades to empty, never raises
+    monkeypatch.setattr(ranked_mod, "_sb", lambda: None)
+    assert ranked_mod.live_match_board_sync("R-X", 2)["board"] == []
+
+
+# ---------------------------------------------------------------------------
+# Lobby-strength static table (avg-based kill/win/placement values)
+# ---------------------------------------------------------------------------
+
+def test_scaled_table_for():
+    assert ranked_mod.scaled_table_for(0) == {"kill": 8, "win": 50,
+                                              "placement": [10, 7, 5, 3, 1]}
+    assert ranked_mod.scaled_table_for(None) == ranked_mod.scaled_table_for(0)
+    assert ranked_mod.scaled_table_for(-99) == ranked_mod.scaled_table_for(0)
+    # Champion avg (4000): exactly double
+    assert ranked_mod.scaled_table_for(4000) == {"kill": 16, "win": 100,
+                                                 "placement": [20, 14, 10, 6, 2]}
+    t = ranked_mod.scaled_table_for(1000)
+    assert t == {"kill": 10, "win": 62, "placement": [12, 9, 6, 4, 1]}
+
+
+def test_dynamic_ranked_economy_is_bounded():
+    # The feature flag controls rollout; these pure functions pin the new
+    # economy independently of the legacy static-table compatibility path.
+    assert ranked_mod.kill_delta(0, 4000, 0) == 8
+    assert ranked_mod.kill_delta(4000, 0, 0) == 2
+    assert ranked_mod.win_delta(7500, 16) == 20
+    assert ranked_mod.placement_delta(1, 0, 8) <= 22
+    assert ranked_mod.placement_delta(1, 999999, 99) == 22
+    # per-match clamp + killer-relative loss
+    assert ranked_mod.clamp_match_delta(68) == 30
+    assert ranked_mod.clamp_match_delta(-80) == -50
+    assert ranked_mod.loss_vs(26000, 2500) == -48  # GM feeding a Gold
+    assert ranked_mod.loss_vs(26000, 26000) == -32  # peer rate
+    assert ranked_mod.loss_vs(26000, 30000) == -16  # dying up is cheap
+    assert ranked_mod.loss_vs(26000, None) == -32  # unknown killer: flat stake
+
+
+def test_dynamic_seal_freezes_per_kill_awards(monkeypatch):
+    fake = _FakeDB()
+    fake.points = {"K": 0, "V": 4000}
+    _use_fake_for_ranked(monkeypatch, fake)
+    ranked_mod._points_cache.clear()
+    monkeypatch.setattr(ranked_mod, "RANKED_DYNAMIC", True)
+    res = ranked_mod.seal_match(rid="R-D", match_version=1, gm="zw_lg",
+                                winner_discord_id="K", kills={"K": 1},
+                                placements={"K": 1, "V": 2},
+                                kill_events=[("K", "V")], players_count=2)
+    assert res["ok"] is True
+    table = fake.results[0]["points_table"]
+    assert table["mode"] == "dynamic-v1"
+    assert table["kill_awards"] == [{"killer": "K", "victim": "V", "nth": 1, "points": 8}]
+
+
+def test_dynamic_rows_exclude_a_removed_player():
+    table = ranked_mod.dynamic_table_for(0, 3, [
+        {"killer": "K", "victim": "V", "points": 8},
+        {"killer": "L", "victim": "V", "points": 8},
+    ])
+    events = [
+        {"etype": "kill", "discord_id": "K", "actor_name": "K"},
+        {"etype": "kill", "discord_id": "L", "actor_name": "L"},
+        {"etype": "alv", "discord_id": "V", "alive": False},
+    ]
+    rows = ranked_mod._ranked_rows(events, table, "K", {"K": 1, "V": 2},
+                                   table["kill_awards"], {"L"})
+    assert [r["discord_id"] for r in rows] == ["K", "V"]
+
+
+def test_kill_taper_schedule():
+    assert ranked_mod.taper_for(1) == 1.0
+    assert ranked_mod.taper_for(2) == 1.0
+    assert ranked_mod.taper_for(3) == 0.8
+    assert ranked_mod.taper_for(5) == 0.5
+    assert ranked_mod.taper_for(6) == 0.5
+    assert ranked_mod.taper_for(99) == 0.5
+    assert ranked_mod.taper_for(0) == 1.0
+    assert ranked_mod.taper_for(None) == 1.0
+    assert ranked_mod.taper_for("junk") == 1.0
+
+
+def test_kill_awards_taper_within_match():
+    awards = ranked_mod._kill_awards_for(
+        [("K", "V")] * 4, {"K": 0, "V": 0}, 0)
+    assert [a["nth"] for a in awards] == [1, 2, 3, 4]
+    base = ranked_mod.kill_delta(0, 0, 0)
+    assert awards[0]["points"] == base
+    assert awards[1]["points"] == base
+    assert awards[2]["points"] == max(1, round(base * 0.8))
+    assert awards[3]["points"] == max(1, round(base * 0.65))
+    # per-killer counting: a second killer starts at full again
+    mixed = ranked_mod._kill_awards_for(
+        [("K", "V"), ("L", "V"), ("K", "V")], {"K": 0, "L": 0, "V": 0}, 0)
+    assert [a["nth"] for a in mixed] == [1, 1, 2]
+
+
+def test_tier_index_and_scaled_loss():
+    assert ranked_mod.tier_index_for(0) == 0
+    assert ranked_mod.tier_index_for(499) == 0
+    assert ranked_mod.tier_index_for(500) == 1
+    assert ranked_mod.tier_index_for(25000) == 9
+    assert ranked_mod.tier_index_for(99999) == 9
+    assert ranked_mod.tier_index_for(None) == 0
+    assert ranked_mod.loss_for(0) == -5
+    assert ranked_mod.loss_for(499) == -5
+    assert ranked_mod.loss_for(500) == -8
+    assert ranked_mod.loss_for(2500) == -14
+    assert ranked_mod.loss_for(25000) == -32
+    assert ranked_mod.loss_for(99999) == -32
+
+
+def test_dynamic_table_freezes_loss_awards():
+    t = ranked_mod.dynamic_table_for(0, 3, [], {"K": -5, "V": -8})
+    assert t["loss_awards"] == {"K": -5, "V": -8}
+    # default: empty map, legacy readers unaffected
+    assert ranked_mod.dynamic_table_for(0, 3)["loss_awards"] == {}
+
+
+def test_dynamic_seal_freezes_tiered_loss_and_taper(monkeypatch):
+    fake = _FakeDB()
+    fake.points = {"K": 0, "V": 1000}  # Unranked killer, Bronze victim
+    _use_fake_for_ranked(monkeypatch, fake)
+    ranked_mod._points_cache.clear()
+    monkeypatch.setattr(ranked_mod, "RANKED_DYNAMIC", True)
+    res = ranked_mod.seal_match(rid="R-D", match_version=1, gm="zw_lg",
+                                winner_discord_id="K", kills={"K": 3},
+                                placements={"K": 1, "V": 2},
+                                kill_events=[("K", "V")] * 3, players_count=2)
+    assert res["ok"] is True
+    row = fake.results[0]
+    table = row["points_table"]
+    # tier-scaled losses frozen for everyone involved (winner included,
+    # so a later crown swap finds the dethroned loss)
+    assert table["loss_awards"] == {"K": -5, "V": -8}
+    assert [a["nth"] for a in table["kill_awards"]] == [1, 2, 3]
+    base = ranked_mod.kill_delta(0, 1000, 500.0)
+    assert [a["points"] for a in table["kill_awards"]] == [
+        base, base, max(1, round(base * 0.8))]
+    # final ledger: K = tapered kills (8+8+6) + win (8) + P1 (12) = 42 -> clamp 30;
+    # V = P2 (8) + frozen -8 = 0
+    win, place = table["win"], table["placement"]
+    assert row["points"]["K"] == 30
+    assert row["points"]["V"] == place[1] - 8
+    assert row["arena_breakdown"]["K"]["total"] == 30
+    assert row["arena_breakdown"]["K"]["capped"] is True
+
+
+def test_recalc_replays_frozen_loss_and_crown_swap(monkeypatch):
+    fake = _FakeDB()
+    fake.rooms = {"R-X": {"id": "R-X", "short_code": "ABCDE",
+                          "status": "live", "host_discord_id": "K"}}
+    fake.points = {"K": 500, "V": 500}
+    table = {"mode": "dynamic-v1", "avg_points": 500.0, "players": 2,
+             "kill": None, "win": 60, "placement": [15, 10, 7, 4, 2],
+             "kill_awards": [{"killer": "K", "victim": "V", "nth": 1, "points": 12}],
+             "loss_awards": {"K": -5, "V": -20}}
+    fake.results = [{"room_id": "R-X", "match_version": 2,
+                     "winner_discord_id": "K",
+                     "placements": {"K": 1, "V": 2},
+                     "kills": {"K": 1, "V": 0},
+                     "points": {"K": 0, "V": 0},  # stale: forces full recompute
+                     "points_table": dict(table)}]
+    _seed_banked(fake, rid="R-X", mver=2)
+    code, body = _call_post(monkeypatch, fake, "ranked_match_recalc",
+                            {"room_id": "R-X", "match_version": 2,
+                             "discord_id": "K"})
+    assert code == 200
+    # K: 12 (kill) + 60 (win) + 15 (P1), no loss as winner.
+    # V: banked alv death -> P2 (10) + frozen -20.
+    assert body["points"] == {"K": 87, "V": -10}
+    # second recalc diffs to zero (frozen replay, never double-pays)
+    code, body2 = _call_post(monkeypatch, fake, "ranked_match_recalc",
+                             {"room_id": "R-X", "match_version": 2,
+                              "discord_id": "K"})
+    assert code == 200 and body2["diffs"] == {}
+    # crown swap: V wins -> V pays 0 (its banked kill has no frozen award
+    # row, so 0 + win + P1), K pays its frozen -5 on top of P2 + award.
+    code, body3 = _call_post(monkeypatch, fake, "ranked_match_winner",
+                             {"room_id": "R-X", "match_version": 2,
+                              "discord_id": "K", "winner_discord_id": "V"})
+    assert code == 200
+    assert body3["points"]["V"] == 60 + 15
+    assert body3["points"]["K"] == 12 + 10 - 5
+
+
+def test_table_of_result():
+    t = {"kill": 16, "win": 100, "placement": [20, 14, 10, 6, 2]}
+    assert ranked_mod.table_of_result({"points_table": t}) == t
+    # legacy rows (no stored table): flat recompute, no purse
+    assert ranked_mod.table_of_result({}) == {"kill": 8, "win": 50, "placement": []}
+    assert ranked_mod.table_of_result(None) == {"kill": 8, "win": 50, "placement": []}
+    assert ranked_mod.table_of_result({"points_table": "junk"}) == {
+        "kill": 8, "win": 50, "placement": []}
+
+
+def test_lobby_avg_points_sync(monkeypatch):
+    fake = _FakeDB()
+    fake.points = {"K": 750, "V": 100}
+    _use_fake_for_ranked(monkeypatch, fake)
+    ranked_mod._points_cache.clear()
+    assert ranked_mod.lobby_avg_points_sync(["K", "V"]) == 425.0
+    assert ranked_mod.lobby_avg_points_sync([]) == 0.0
+    # no DB and cold cache degrades to 0.0, never raises
+    ranked_mod._points_cache.clear()
+    monkeypatch.setattr(ranked_mod, "_sb", lambda: None)
+    assert ranked_mod.lobby_avg_points_sync(["K"]) == 0.0
+
+
+def test_seal_scaled_by_lobby_avg(monkeypatch):
+    fake = _FakeDB()
+    _use_fake_for_ranked(monkeypatch, fake)
+    now = time.time()
+    monkeypatch.setitem(ranked_mod._points_cache, "K", (0, now))
+    monkeypatch.setitem(ranked_mod._points_cache, "V", (0, now))
+    # Champion lobby (avg 4000): double table -> K = 2 kills (32) + win (100) + P1 (20)
+    res = ranked_mod.seal_match(rid="R-T", match_version=1, gm="zw_lg",
+                                winner_discord_id="K", kills={"K": 2},
+                                placements={"K": 1, "V": 2},
+                                kill_events=[("K", "V"), ("K", "V")],
+                                avg_points=4000)
+    assert res["ok"] is True
+    assert res["points"] == {"K": 30, "V": 9}  # 152-point game, clamped; V untouched
+    row = fake.results[0]
+    assert row["points_table"] == {"kill": 16, "win": 100,
+                                   "placement": [20, 14, 10, 6, 2]}
+
+
+def test_recalc_uses_stored_table(monkeypatch):
+    fake = _FakeDB()
+    fake.rooms = {"R-X": {"id": "R-X", "short_code": "ABCDE",
+                          "status": "live", "host_discord_id": "K"}}
+    fake.points = {"K": 500, "V": 500}
+    # stale seal under a stored double table: recompute honors it, not base
+    fake.results = [{"room_id": "R-X", "match_version": 2,
+                     "winner_discord_id": "K",
+                     "placements": {"K": 1, "V": 2},
+                     "kills": {"K": 1, "V": 1},
+                     "points": {"K": 58, "V": 3},
+                     "points_table": {"kill": 16, "win": 100,
+                                      "placement": [20, 14, 10, 6, 2]}}]
+    _seed_banked(fake, rid="R-X", mver=2)
+    code, body = _call_post(monkeypatch, fake, "ranked_match_recalc",
+                            {"room_id": "R-X", "match_version": 2,
+                             "discord_id": "K"})
+    assert code == 200
+    # K: 2 banked kills (32) + win (100) + P1 (20) = 152; V: 16 + P2 (14) - 5 = 25
+    assert body["points"] == {"K": 152, "V": 25}
+    assert body["diffs"] == {"K": 94, "V": 22}
+    assert fake.points == {"K": 594, "V": 522}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/ranked/table (optimistic client values)
+# ---------------------------------------------------------------------------
+
+def _call_table_get(monkeypatch, fake, fn_name, params):
+    import asyncio
+    import json
+    from server.routes import ranked_api as ra
+    monkeypatch.setattr(ra, "supabase", fake)
+
+    class _R:
+        query_params = dict(params)
+
+    resp = asyncio.run(getattr(ra, fn_name)(_R()))
+    return resp.status_code, json.loads(resp.body.decode())
+
+
+def _table_rooms_fake():
+    fake = _FakeDB(users=_MATCH_USERS)
+    fake.rooms = {
+        "R-X": {"id": "R-X", "short_code": "ABCDE", "status": "live",
+                "host_discord_id": "K",
+                "roster": [{"discord_id": "K"}, {"discord_id": "V"}]},
+    }
+    fake.points = {"K": 750, "V": 100}
+    return fake
+
+
+def test_ranked_table_scaled_by_lobby(monkeypatch):
+    fake = _table_rooms_fake()
+    ranked_mod._points_cache.clear()
+    _use_fake_for_ranked(monkeypatch, fake)
+    code, body = _call_table_get(monkeypatch, fake, "ranked_table",
+                           {"room_id": "R-X"})
+    assert code == 200
+    # roster avg (750 + 100) / 2 = 425 -> factor 1.10625
+    assert body["avg_points"] == 425.0
+    assert body["table"] == {"kill": 9, "win": 55,
+                             "placement": [11, 8, 6, 3, 1]}
+    assert body["loss"] == -5
+    assert body["short_code"] == "ABCDE"
+
+
+def test_ranked_table_missing_and_bad(monkeypatch):
+    code, _ = _call_table_get(monkeypatch, _FakeDB(), "ranked_table",
+                        {"room_id": "NOPE"})
+    assert code == 404
+    code, _ = _call_table_get(monkeypatch, _FakeDB(), "ranked_table", {})
+    assert code == 400
+
+
+# ---------------------------------------------------------------------------
+# GET /api/ranked/room/by-code (join detection)
+# ---------------------------------------------------------------------------
+
+def _bycode_fake():
+    fake = _FakeDB()
+    fake.rooms = {
+        "R-X": {"id": "R-X", "short_code": "ABCDE", "status": "live"},
+        "R-Y": {"id": "R-Y", "short_code": "FGHIJ", "status": "ended"},
+        "R-Z1": {"id": "R-Z1", "short_code": "DUP11", "status": "live"},
+        "R-Z2": {"id": "R-Z2", "short_code": "DUP11", "status": "lobby"},
+    }
+    return fake
+
+
+def test_ranked_room_by_code(monkeypatch):
+    import asyncio
+    import json
+    from server.routes import ranked_api as ra
+    fake = _bycode_fake()
+    monkeypatch.setattr(ra, "supabase", fake)
+
+    class _R:
+        def __init__(self, params):
+            self.query_params = dict(params)
+
+    def _get(params):
+        return json.loads(asyncio.run(ra.ranked_room_by_code(_R(params))).body.decode())
+
+    assert _get({"code": "abcde"}) == {
+        "room": {"id": "R-X", "short_code": "ABCDE", "status": "live"}}
+    assert _get({"code": "NOPE1"}) == {"room": None}   # unknown
+    assert _get({"code": "FGHIJ"}) == {"room": None}   # ended
+    assert _get({"code": "DUP11"}) == {"room": None}   # ambiguous
+    assert _get({"code": "ab"}) == {"room": None}      # malformed
+    assert _get({}) == {"room": None}                  # missing
+
+
+def test_live_board_diagnostics_age_and_unmapped(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    fake = _FakeDB()
+    now = datetime.now(timezone.utc)
+    iso = lambda dt: dt.isoformat()
+    fake.ranked_events = [
+        {"room_id": "R-X", "match_version": 2, "etype": "kill",
+         "actor_name": "Killer", "target_name": "Victim", "discord_id": "K",
+         "alive": None, "created_at": iso(now - timedelta(seconds=45))},
+        {"room_id": "R-X", "match_version": 2, "etype": "kill",
+         "actor_name": "Ghost", "target_name": "Victim", "discord_id": None,
+         "alive": None, "created_at": iso(now - timedelta(seconds=20))},
+        {"room_id": "R-X", "match_version": 2, "etype": "alv",
+         "actor_name": "Ghost", "discord_id": None, "alive": False,
+         "created_at": iso(now - timedelta(seconds=20))},
+        {"room_id": "R-X", "match_version": 2, "etype": "alv",
+         "actor_name": "Killer", "discord_id": "K", "alive": False,
+         "created_at": iso(now - timedelta(seconds=10))},
+    ]
+    _use_fake_sb(monkeypatch, fake)
+    out = ranked_mod.live_match_board_sync("R-X", 2)
+    # newest banked row is ~10s old; unmapped names are {Ghost, Victim}
+    assert out["last_event_age_s"] is not None and 0 <= out["last_event_age_s"] <= 120
+    assert out["unmapped_names"] == 2
+
+
+def test_live_board_diagnostics_degrade_without_timestamps(monkeypatch):
+    fake = _FakeDB()
+    _seed_banked(fake, rid="R-X", mver=2)  # pre-v240 rows: no created_at
+    _use_fake_sb(monkeypatch, fake)
+    out = ranked_mod.live_match_board_sync("R-X", 2)
+    assert out["last_event_age_s"] is None
+    assert out["unmapped_names"] == 0
+
+# ---------------------------------------------------------------------------
+# Room-seal rendezvous (tourney bridge per-seal pay)
+# ---------------------------------------------------------------------------
+
+def test_get_seal_result_reads_stored_row(monkeypatch):
+    fake = _FakeDB(results=[{
+        "room_id": "R-X", "match_version": 2, "winner_discord_id": "K",
+        "kills": {"K": 1}, "points": {"K": 30, "V": 2},
+        "placements": {"K": 1, "V": 2},
+        "arena_breakdown": {"K": {"total": 30, "capped": True}},
+    }])
+    _use_fake_for_ranked(monkeypatch, fake)
+    seal = ranked_mod.get_seal_result("R-X", 2)
+    assert seal["winner"] == "K"
+    assert seal["points"] == {"K": 30, "V": 2}
+    assert seal["kills"] == {"K": 1}
+    assert seal["placements"] == {"K": 1, "V": 2}
+    assert seal["breakdown"]["K"]["capped"] is True
+
+
+def test_get_seal_result_none_when_missing(monkeypatch):
+    fake = _FakeDB()
+    _use_fake_for_ranked(monkeypatch, fake)
+    assert ranked_mod.get_seal_result("R-X", 9) is None
+    assert ranked_mod.get_seal_result("", 2) is None
+    assert ranked_mod.get_seal_result("R-X", 0) is None
+
+
+def test_seal_bundle_for_packs_stored_deltas(monkeypatch):
+    fake = _FakeDB(results=[{
+        "room_id": "R-X", "match_version": 2, "winner_discord_id": "K",
+        "kills": {"K": 1}, "points": {"K": 30, "V": 2},
+        "placements": {"K": 1, "V": 2},
+        "arena_breakdown": {"K": {"total": 30, "capped": True}},
+    }])
+    _use_fake_for_ranked(monkeypatch, fake)
+    b = ranked_mod.seal_bundle_for("R-X", 2)
+    assert b["mode"] == "room-seal-v1"
+    assert (b["rid"], b["room_match_version"], b["winner"]) == ("R-X", 2, "K")
+    assert b["points"] == {"K": 30, "V": 2}
+    assert b["kills"] == {"K": 1}
+
+
+def test_seal_bundle_for_none_without_points(monkeypatch):
+    fake = _FakeDB(results=[{
+        "room_id": "R-X", "match_version": 2, "winner_discord_id": None,
+        "kills": {}, "points": {}, "placements": {},
+    }])
+    _use_fake_for_ranked(monkeypatch, fake)
+    assert ranked_mod.seal_bundle_for("R-X", 2) is None
+    assert ranked_mod.seal_bundle_for("R-X", 99) is None

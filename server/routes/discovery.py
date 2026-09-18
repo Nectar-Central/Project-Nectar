@@ -341,6 +341,7 @@ async def ranked_verify(request: Request):
     qp = request.query_params
     code = (qp.get("code") or "").strip().upper()
     host = (qp.get("host") or "").strip()
+    host_did = (qp.get("host_did") or "").strip()
     if getattr(ranked_mod, "RANKED_ENABLED", True) is False:
         return JSONResponse({"code": code or None, "room_active": False,
                              "host_in_room": False, "players_seen": [],
@@ -372,7 +373,10 @@ async def ranked_verify(request: Request):
                 if age < 0 or age > _VERIFY_WINDOW_S:
                     continue
                 events_seen += 1
-                for key in ("killer", "victim", "winner"):
+                # name keys across every writer schema: legacy killer/victim,
+                # killfeed instigator/instigated, leave player/player_name.
+                for key in ("killer", "victim", "winner", "instigator",
+                            "instigated", "player", "player_name"):
                     v = ed.get(key)
                     if v and str(v).strip():
                         names.add(str(v).strip())
@@ -391,19 +395,91 @@ async def ranked_verify(request: Request):
                 pass
         room_active = events_seen > 0
         host_in_room = False
+        via = None
         if host:
             hn = _strip_dc(host)
             for n in names:
                 if n and (n == host or _strip_dc(n) == hn):
                     host_in_room = True
+                    via = "name"
                     break
+        # feed evidence (no fight needed): the host's own companion stamps
+        # their discord_id on every lobby row it captures (kills, leaves,
+        # deaths) — a did-tagged row for this code proves the host feed is
+        # in the room even when the host never appears in a killfeed line.
+        if not host_in_room and host_did and host_did in dids:
+            host_in_room = True
+            via = "feed"
+        # presence heartbeat (quiet lobby): the userscript pings while it
+        # tracks the code — joins write no event rows, so a silent room has
+        # no other evidence. Fresh ping + matching code = host is there.
+        if not host_in_room and host_did:
+            try:
+                if _presence_seen(code, host_did):
+                    host_in_room = True
+                    via = "ping"
+            except Exception:
+                pass
         return JSONResponse({
             "code": code,
             "room_active": room_active,
             "host_in_room": host_in_room,
+            "via": via,
             "players_seen": sorted(names)[:32],
             "events_seen": events_seen,
         })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+_PRESENCE_FRESH_S = 120
+
+
+def _presence_seen(code: str, discord_id: str) -> bool:
+    """Fresh presence ping for (code, did)? Pre-migration safe (False).
+    Never raises."""
+    try:
+        if supabase is None or not code or not discord_id:
+            return False
+        from datetime import datetime, timezone, timedelta
+        cut = (datetime.now(timezone.utc) - timedelta(seconds=_PRESENCE_FRESH_S)).isoformat()
+        r = supabase.table("bngc_ranked_presence").select("seen_at").eq(
+            "code", str(code).upper()).eq("discord_id", str(discord_id)).gte(
+            "seen_at", cut).limit(1).execute()
+        return bool(r.data)
+    except Exception:
+        return False
+
+
+@router.post("/api/ranked/ping")
+async def ranked_ping(request: Request):
+    """Presence heartbeat from the userscript while tracking a code.
+
+    Body {code, discord_id}. Fire-and-forget (the client never reads the
+    response beyond ok). Lets /api/ranked/verify confirm a host sitting in
+    a quiet lobby, where no event rows exist. Never raises beyond JSON.
+    """
+    if supabase is None:
+        return JSONResponse({"error": "Server not configured"}, status_code=500)
+    try:
+        b = await request.json()
+        b = b if isinstance(b, dict) else {}
+    except Exception:
+        b = {}
+    try:
+        code = str(b.get("code") or "").strip().upper()
+        did = str(b.get("discord_id") or "").strip()
+    except Exception:
+        code, did = "", ""
+    if len(code) != 5 or not code.isalnum() or not did:
+        return JSONResponse({"error": "code (5 alnum) and discord_id required"}, status_code=400)
+    try:
+        from datetime import datetime, timezone
+        supabase.table("bngc_ranked_presence").upsert({
+            "code": code, "discord_id": did,
+            "seen_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="code,discord_id").execute()
+        return JSONResponse({"ok": True, "code": code})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 

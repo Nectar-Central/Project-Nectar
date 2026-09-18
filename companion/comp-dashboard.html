@@ -32,6 +32,7 @@
   table.grid td { padding: 5px 6px; border-bottom: 1px solid #d4dbe4; }
   table.grid tr:nth-child(even) td { background: #f2f5f9; }
   .ok { color: #1e7e34; } .bad { color: #B42318; } .dim { color: #5b6770; }
+  .muted { color: #5b6770; font-size: 11px; }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 9px; font-size: 11px; font-weight: bold; }
   .pill.run { background: #dff0d8; color: #1e7e34; border: 1px solid #1e7e34; }
   .pill.sched { background: #fef3d8; color: #8a6d00; border: 1px solid #8a6d00; }
@@ -72,7 +73,7 @@
         <input id="tSet" size="6" placeholder="0">
         <button id="tSetGo">Track</button>
         <button id="mOpen">Open match</button>
-        <button id="mSeal" disabled>Seal match</button>
+        <button id="mSeal">Seal match</button>
       </div>
     </fieldset>
   </div>
@@ -88,6 +89,8 @@
 'use strict';
 const $ = (id) => document.getElementById(id);
 const esc = (v) => String(v == null ? '—' : v).replace(/</g, '&lt;');
+// Same-origin by default (this Python server, any port); override via the
+// Server box above if the API lives elsewhere.
 let SRV = localStorage.getItem('comp_server') || 'http://127.0.0.1:8000';
 let selTid = null;
 try {
@@ -164,11 +167,17 @@ $('tab-status').onclick = () => showTab('status');
 $('tab-tourneys').onclick = () => showTab('tourneys');
 $('tab-log').onclick = () => showTab('log');
 function refreshButtons() {
+  // Open/Seal stay clickable: with no live match the handlers log what is
+  // missing instead of leaving a greyed-out button with no explanation.
   try {
     const sealBtn = $('mSeal');
-    if (sealBtn) sealBtn.disabled = !window._trackerOpen;
+    if (sealBtn) sealBtn.disabled = false;
+    const openBtn = $('mOpen');
+    if (openBtn) openBtn.disabled = false;
   } catch {}
 }
+// Node decryptor GET /comp/status shape (this file is served by the
+// decryptor on :8765; the Tourneys tab talks to SRV = the Python API).
 async function refreshTracker() {
   try {
     const j = await local('/comp/status');
@@ -190,7 +199,7 @@ async function refreshTracker() {
 async function refreshList() {
   try {
     const j = await api('/api/comp/tourneys');
-    const cls = { scheduled: 'sched', running: 'run', ended: 'end' };
+    const cls = { created: 'sched', scheduled: 'sched', running: 'run', ended: 'end' };
     $('tlist').innerHTML = ((j && j.tourneys) || []).map((t) =>
       `<div><span class="tlink" data-t="${t.id}"><b>#${t.id} ${esc(t.name)}</b></span> ` +
       `<span class="pill ${cls[t.status] || 'end'}">${esc(t.status)}</span> ` +
@@ -323,7 +332,7 @@ async function renderHosts(j) {
       `<button id="hpGo">${hp ? 'Switch to Hosting Only' : 'Switch to Playing'}</button></div>` +
       `<div class="muted" style="margin:4px 0 2px">HOSTS (${rawHosts.length})</div>` +
       (rawHosts.map((d) =>
-        `<div><b>${esc(pmap[d] || String(d).slice(0, 6))}</b> <span class="dim">${esc(d)}</span> ` +
+        `<div><b title="${esc(d)}">${esc(pmap[d] || 'Unknown player')}</b> ` +
         `<button data-unhost="${esc(d)}">Remove</button></div>`).join('') || '<span class="dim">None listed.</span>') +
       `<div class="gap"><input size="14" id="hostAdd" placeholder="discord id"> <button id="hostAddGo">Add host</button></div>` +
       `<div class="dim">The creator always hosts, even if unlisted.</div>`;
@@ -445,19 +454,19 @@ async function refreshRegs(j) {
     const detailPlayers = ((j || detailCache || {}).players || []);
     const nameOf = (did) => {
       const hit = detailPlayers.find((p) => String(p.discord_id) === String(did));
-      return hit && hit.name ? hit.name : String(did).slice(0, 6);
+      return hit && hit.name ? hit.name : 'Unknown player';
     };
     const accDids = [...new Set(accRegs.flatMap((r) => r.member_ids || []))];
     const banDids = [...new Set(banRegs.flatMap((r) => r.member_ids || []))];
     box.innerHTML =
       `<div class="muted" style="margin-bottom:4px">PLAYERS (${accDids.length})</div>` +
       (accDids.length ? accDids.map((d) =>
-        `<div data-reg="${esc(d)}"><b>${esc(nameOf(d))}</b> ` +
+        `<div data-reg="${esc(d)}"><b title="${esc(d)}">${esc(nameOf(d))}</b> ` +
         `<button class="danger" data-ban="${esc(d)}">Ban</button></div>`).join('')
         : '<span class="dim">No players yet.</span>') +
       `<div class="muted" style="margin:8px 0 4px">BANNED (${banDids.length})</div>` +
       (banDids.length ? banDids.map((d) =>
-        `<div data-reg="${esc(d)}"><b>${esc(nameOf(d))}</b> ` +
+        `<div data-reg="${esc(d)}"><b title="${esc(d)}">${esc(nameOf(d))}</b> ` +
         `<button data-unban="${esc(d)}">Unban</button></div>`).join('')
         : '<span class="dim">Nobody banned.</span>');
     const setBan = async (did, ban, btn) => {
@@ -549,7 +558,7 @@ function nameOfDid(did) {
     if (b && b.name) return b.name;
     if (hit && hit.name) return hit.name;
   } catch {}
-  return k.slice(0, 6);
+  return 'Unknown player';
 }
 // typed winner / name or raw did -> discord_id (or null when unknown).
 // Candidates: board + roster + tourney players. Match order: exact did,
@@ -679,9 +688,6 @@ function optTie(dids) {
     m.placements = cur;
   } catch {}
 }
-function optSeal() {
-  try { (matchCache.match || {}).status = 'sealed'; _matchLive = false; } catch {}
-}
 function optSub(did, pts) {
   // optimistic points removal mirrors the ledger (global tourney level);
   // reconcile (match + standings) corrects on fetch.
@@ -692,6 +698,50 @@ function optSub(did, pts) {
     r.points = (Number(r.points) || 0) - pts;
     _sortBoard();
   } catch {}
+}
+function optAdd(did, pts) {
+  // optimistic manual award (match level); reconcile corrects on fetch.
+  try {
+    const b = matchCache.board || (matchCache.board = []);
+    let r = b.find((x) => String(x.discord_id) === String(did));
+    if (!r) { r = { discord_id: String(did), name: nameOfDid(did), kills: 0, placement: null, won: false, points: 0 }; b.push(r); }
+    r.points = Math.max(0, (Number(r.points) || 0) + pts);
+    _sortBoard();
+  } catch {}
+}
+function optSeal() {
+  try { (matchCache.match || {}).status = 'sealed'; _matchLive = false; } catch {}
+}
+function optUnseal() {
+  try { (matchCache.match || {}).status = 'manual'; (matchCache.match || {}).sealed_at = null; _matchLive = true; } catch {}
+}
+function optStart() {
+  try { if (!(matchCache.match || {}).started_at) (matchCache.match || {}).started_at = new Date().toISOString(); } catch {}
+}
+// manual-elim count per player from the killfeed (tracked + manual alv).
+function elimCount(did) {
+  try {
+    const k = String(did);
+    return ((matchCache || {}).killfeed || []).filter((e) => e && e.etype === 'alv' && e.alive === false && String(e.discord_id) === k).length;
+  } catch { return 0; }
+}
+// alive strip: everyone on board/roster minus dead (alv false), minus removed.
+function aliveStrip() {
+  try {
+    const m = (matchCache || {}).match || {};
+    const dead = new Set((((matchCache || {}).killfeed) || [])
+      .filter((e) => e && e.etype === 'alv' && e.alive === false && e.discord_id)
+      .map((e) => String(e.discord_id)));
+    const removed = new Set(((m.removed_discord_ids) || []).map(String));
+    const pool = [...new Set([
+      ...((matchCache.board || []).map((r) => String(r.discord_id))),
+      ...((rosterCache || []).map(String)),
+    ])].filter((d) => d && !removed.has(d));
+    const alive = pool.filter((d) => !dead.has(d));
+    const fmt = (ds) => ds.map(nameOfDid).map(esc).join(', ') || '<span class="dim">—</span>';
+    return `<div class="gap">🟢 <b>ALIVE (${alive.length})</b> ${fmt(alive)}<br>` +
+      `<span class="dim">💀 OUT (${dead.size})</span> ${fmt([...dead])}</div>`;
+  } catch { return ''; }
 }
 function winnerNameOf(did) {
   if (!did) return null;
@@ -752,34 +802,60 @@ function renderMatchPanel() {
     `<tr><td>${i + 1}</td><td>${esc(r.name)}${r.won ? ' 👑' : ''}</td>` +
     `<td>${r.kills || 0}</td><td>${r.placement != null ? ord(r.placement) : '—'}</td><td><b>${r.points}</b></td></tr>`).join('');
   const roster = (rosterCache && rosterCache.length) ? rosterCache.slice() : [...new Set(board.map((r) => String(r.discord_id)))];
+  const removedSet = new Set(((m.removed_discord_ids) || []).map(String));
   const bmap = {};
   board.forEach((r) => { bmap[String(r.discord_id)] = r; });
   roster.forEach((x) => { if (!bmap[String(x)]) bmap[String(x)] = { discord_id: String(x), name: nameOfDid(String(x)), kills: 0 }; });
   const plist = Object.values(bmap).map((p) => {
     const did = String(p.discord_id);
     const nm = esc(nameOfDid(did));
-    return `<div style="margin:4px 0"><b>${nm}</b> <span class="dim">${p.kills || 0}K${p.placement ? ' · ' + ord(p.placement) : ''}</span><br>` +
-      `<button data-k="${esc(did)}">+ kill</button> ` +
+    const isRem = removedSet.has(did);
+    const elims = elimCount(did);
+    return `<div style="margin:4px 0;${isRem ? 'opacity:.55' : ''}"><b title="${esc(did)}">${nm}</b> ` +
+      `<span class="dim">${p.kills || 0}K · 💀${elims}${p.placement ? ' · ' + ord(p.placement) : ''}${isRem ? ' · removed' : ''}</span><br>` +
+      `<button data-k="${esc(did)}" title="Add a manual kill">+ kill</button> ` +
+      `<button data-kminus="${esc(did)}" title="Remove one manual kill (tracked kills are kept)">− kill</button> ` +
+      `<button data-eplus="${esc(did)}" title="Add a manual elimination (alv)">+ elim</button> ` +
+      `<button data-eminus="${esc(did)}" title="Remove one manual elimination (tracked are kept)">− elim</button> ` +
       `<button data-w="${esc(did)}">+ win</button> ` +
+      `<input size="3" id="add-${esc(did)}" placeholder="+pts" inputmode="numeric" title="Manual points (match level)"> <button data-add="${esc(did)}" title="Add manual points (match level)">+pts</button> ` +
       `<input size="3" id="sub-${esc(did)}" placeholder="pts" inputmode="numeric" title="Points to remove"> <button data-sub="${esc(did)}" title="Remove points (ledger, stable across reconcile)">−pts</button><br>` +
       `<span class="dim">Place:</span> ` +
       [1, 2, 3, 4, 5].map((n) => `<button class="placebtn" data-p="${esc(did)}:${n}">${ord(n)}</button>`).join(' ') +
-      ` <button class="tiebtn" data-t1="${esc(did)}" title="Toggle P1 tie (shared P1, full WIN each)">T1</button></div>`;
+      ` <button class="tiebtn" data-t1="${esc(did)}" title="Toggle P1 tie (shared P1, full WIN each)">T1</button> ` +
+      `<button data-reset="${esc(did)}" title="Reset this player in the match (clears manual rows, placement, awards)">Reset</button> ` +
+      (isRem
+        ? `<button data-addback="${esc(did)}" title="Add back to the match roster">Add back</button>`
+        : `<button data-remove="${esc(did)}" title="Remove from match roster (ignored in placements, stays global)">Remove</button>`) + `</div>`;
   }).join('') || '<span class="dim">No players.</span>';
-  const canSeal = (m.status === 'open' || m.status === 'manual');
+  const isLive = (m.status === 'open' || m.status === 'manual');
+  const isSealed = (m.status === 'sealed');
+  const canSeal = isLive;
   // winner dropdown options: names with dids as labels
   const cand = {};
   board.forEach((r) => { cand[String(r.discord_id)] = r.name || String(r.discord_id); });
   roster.forEach((x) => { const k = String(x); if (!cand[k]) cand[k] = nameOfDid(k); });
-  const dlOpts = Object.entries(cand).map(([did, nm]) => `<option value="${esc(nm)}">${esc(did)}</option>`).join('');
+  const dlOpts = Object.entries(cand).map(([did, nm]) => `<option value="${esc(nm)}">${esc(nm)}</option>`).join('');
   const wv = winnerNameOf(m.winner_discord_id) || '';
   left.innerHTML =
     (rows ? `<table class="grid"><tr><th>#</th><th>Player</th><th>K</th><th>Pl</th><th>Pts</th></tr>${rows}</table>`
       : '<span class="dim">No scoring events yet.</span>') +
+    aliveStrip() +
+    ((m.removed_discord_ids && m.removed_discord_ids.length)
+      ? `<div class="gap"><span class="muted">REMOVED (left — ignored in placements, untouched globally)</span>` +
+        m.removed_discord_ids.map((did) =>
+          `<div style="margin:4px 0"><span class="dim" title="${esc(String(did))}">🚪 ${esc(nameOfDid(String(did)))}</span> ` +
+          `<button data-addback="${esc(String(did))}">Add back</button></div>`).join('') + `</div>`
+      : '') +
     `<div class="gap"><input size="14" list="mWinnerList" placeholder="winner name or id" id="mWinner" value="${esc(wv)}"> ` +
     `<datalist id="mWinnerList">${dlOpts}</datalist>` +
     `<button id="mWinGo">Set winner</button> ` +
-    (canSeal ? `<button id="mSealGo" class="primary">Seal match</button> <button id="mTieGo" title="Tie top-2 at P1 (both keep full WIN)">Tie top-2</button>` : '') + `</div>` +
+    (isLive && !m.started_at ? `<button id="mStartGo" title="Stamp Match Started now">Start match</button> ` : '') +
+    (canSeal ? `<button id="mSealGo" class="primary">Seal match</button> <button id="mTieGo" title="Tie top-2 at P1 (both keep full WIN)">Tie top-2</button>` : '') +
+    (isSealed ? `<button id="mUnsealGo" title="Reopen for corrections (back to manual, bridge stays out)">Unseal</button> ` : '') +
+    ` <button id="mResetGo" title="Reset whole match (clears placements, awards, all event rows)">Reset match</button> <button id="mDelGo" class="danger" title="Delete this match and its events">Delete match</button></div>` +
+    `<div class="gap"><input size="14" id="mAddPlayer" placeholder="name or discord id" title="Add a player (e.g. a sub) with zero stats"> ` +
+    `<button id="mAddPlayerGo" title="Add the player to this match at 0 pts">Add player</button></div>` +
     `<div class="muted" style="margin:6px 0 2px">SCORE</div>` + plist;
   try { if (_fId) { const n = document.getElementById(_fId); if (n && 'value' in n) n.value = _fVal; } } catch {}
     const wgo = $('mWinGo');
@@ -795,6 +871,25 @@ function renderMatchPanel() {
     const sgo = $('mSealGo');
     if (sgo) sgo.onclick = () => mutMatch(sgo, () => optSeal(),
       () => api('/api/comp/match/seal', post({ match_id: editMatchId })), 'sealed match ' + editMatchId, true);
+    const stgo = $('mStartGo');
+    if (stgo) stgo.onclick = () => mutMatch(stgo, () => optStart(),
+      () => api('/api/comp/match/start', post({ match_id: editMatchId })), 'match started ' + editMatchId);
+    const ugo = $('mUnsealGo');
+    if (ugo) ugo.onclick = () => mutMatch(ugo, () => optUnseal(),
+      () => api('/api/comp/match/unseal', post({ match_id: editMatchId })), 'unsealed match ' + editMatchId, true);
+    const apgo = $('mAddPlayerGo');
+    if (apgo) apgo.onclick = () => {
+      const inp = $('mAddPlayer');
+      const raw = (inp && inp.value.trim()) || '';
+      if (!raw) { log('add player: type a name or discord id first', true); return; }
+      let who = resolveDid(raw);
+      if (!who && /^\d{4,}$/.test(raw)) who = raw;  // raw discord id (sub off-roster)
+      if (!who) { log('add player: unknown — pick a roster name or paste a discord id', true); return; }
+      apgo.disabled = true;
+      api('/api/comp/match/add-player', post({ match_id: editMatchId, discord_id: who }))
+        .then(() => { log('added ' + nameOfDid(who) + ' at 0 pts'); apgo.disabled = false; refreshMatch(); })
+        .catch((e) => { log('add player: ' + e.message, true); apgo.disabled = false; });
+    };
     const tgo = $('mTieGo');
     if (tgo) tgo.onclick = () => {
       const top2 = (matchCache.board || []).slice().sort((a, b) => (b.points || 0) - (a.points || 0)).slice(0, 2).map((r) => String(r.discord_id));
@@ -802,6 +897,23 @@ function renderMatchPanel() {
       mutMatch(tgo, () => optTie(top2),
         () => api('/api/comp/match/tie', post({ match_id: editMatchId, discord_ids: top2 })),
         'tied P1 ' + top2.map(nameOfDid).join(' & '), true);
+    };
+    const rgo = $('mResetGo');
+    if (rgo) rgo.onclick = () => {
+      if (!confirm('Reset whole match? Clears placements, awards and ALL event rows.')) return;
+      mutMatch(rgo, () => {},
+        () => api('/api/comp/match/reset', post({ match_id: editMatchId, hard: true })), 'reset match ' + editMatchId, true);
+    };
+    const dgo = $('mDelGo');
+    if (dgo) dgo.onclick = () => {
+      if (!confirm('Delete this match and all its events? Cannot be undone.')) return;
+      dgo.disabled = true;
+      api('/api/comp/match/delete', post({ match_id: editMatchId })).then(() => {
+        log('deleted match ' + editMatchId);
+        editMatchId = null;
+        refreshTourneyLite();
+        refreshMatch();
+      }).catch((e) => { log('delete: ' + e.message, true); dgo.disabled = false; });
     };
     left.querySelectorAll('[data-t1]').forEach((b) => {
       b.onclick = () => {
@@ -824,6 +936,18 @@ function renderMatchPanel() {
     left.querySelectorAll('[data-k]').forEach((b) => {
       b.onclick = () => mutMatch(b, () => optKill(b.dataset.k),
         () => api('/api/comp/match/kills', post({ match_id: editMatchId, discord_id: b.dataset.k, delta: 1 })), '+kill ' + b.dataset.k);
+    });
+    left.querySelectorAll('[data-kminus]').forEach((b) => {
+      b.onclick = () => mutMatch(b, () => {},
+        () => api('/api/comp/match/kills', post({ match_id: editMatchId, discord_id: b.dataset.kminus, delta: -1 })), '−kill ' + nameOfDid(b.dataset.kminus));
+    });
+    left.querySelectorAll('[data-eplus]').forEach((b) => {
+      b.onclick = () => mutMatch(b, () => {},
+        () => api('/api/comp/match/elim', post({ match_id: editMatchId, discord_id: b.dataset.eplus, delta: 1 })), '+elim ' + nameOfDid(b.dataset.eplus));
+    });
+    left.querySelectorAll('[data-eminus]').forEach((b) => {
+      b.onclick = () => mutMatch(b, () => {},
+        () => api('/api/comp/match/elim', post({ match_id: editMatchId, discord_id: b.dataset.eminus, delta: -1 })), '−elim ' + nameOfDid(b.dataset.eminus));
     });
     left.querySelectorAll('[data-w]').forEach((b) => {
       b.onclick = () => mutMatch(b, () => optWinner(b.dataset.w),
@@ -854,26 +978,60 @@ function renderMatchPanel() {
           '−' + pts + 'pts ' + nameOfDid(did), true);
       };
     });
+    left.querySelectorAll('[data-add]').forEach((b) => {
+      b.onclick = () => {
+        const did = b.dataset.add;
+        let inp = null;
+        try { inp = left.querySelector(`[id="add-${did}"]`); } catch {}
+        if (!inp) { try { inp = document.getElementById('add-' + did); } catch {} }
+        const pts = Number(inp && inp.value);
+        if (!Number.isFinite(pts) || pts <= 0) { log('add points: enter points > 0 first', true); return; }
+        if (pts > 500) { log('add points: capped at 500pts', true); return; }
+        mutMatch(b, () => optAdd(did, pts),
+          () => api('/api/comp/match/points', post({ match_id: editMatchId, discord_id: did, delta: pts })),
+          '+' + pts + 'pts ' + nameOfDid(did), true);
+      };
+    });
+    left.querySelectorAll('[data-reset]').forEach((b) => {
+      b.onclick = () => {
+        const did = b.dataset.reset;
+        if (!confirm(`Reset ${nameOfDid(did)} in this match? Clears placement, awards and event rows.`)) return;
+        mutMatch(b, () => {},
+          () => api('/api/comp/match/reset', post({ match_id: editMatchId, discord_id: did, hard: true })),
+          'reset ' + nameOfDid(did), true);
+      };
+    });
+    left.querySelectorAll('[data-remove]').forEach((b) => {
+      b.onclick = () => mutMatch(b, () => {},
+        () => api('/api/comp/match/remove', post({ match_id: editMatchId, discord_id: b.dataset.remove })),
+        'removed ' + nameOfDid(b.dataset.remove), true);
+    });
+    left.querySelectorAll('[data-addback]').forEach((b) => {
+      b.onclick = () => mutMatch(b, () => {},
+        () => api('/api/comp/match/add-back', post({ match_id: editMatchId, discord_id: b.dataset.addback })),
+        'added back ' + nameOfDid(b.dataset.addback), true);
+    });
     // RIGHT: killfeed
     const line = (e) => {
       const t = e.created_at ? `<span class="tm">${esc(new Date(e.created_at).toLocaleTimeString())}</span> ` : '';
+      const man = e.manual ? ` <span class="dim" title="Added by hand in this dashboard">~manual</span>` : '';
       const a = `<b>${esc(e.actor_name || '?')}</b>`;
       const v = `<b>${esc(e.target_name || '?')}</b>`;
-      if (e.etype === 'kill') return `<div>${t}🔪 ${a} killed ${v}</div>`;
-      if (e.etype === 'knock') return `<div>${t}💥 ${a} knocked ${v}</div>`;
-      if (e.etype === 'alv' && e.alive === false) return `<div>${t}💀 ${a} is eliminated</div>`;
-      if (e.etype === 'leave') return `<div>${t}🚪 ${a} left</div>`;
+      if (e.etype === 'kill') return `<div>${t}🔪 ${a} killed ${v}${man}</div>`;
+      if (e.etype === 'knock') return `<div>${t}💥 ${a} knocked ${v}${man}</div>`;
+      if (e.etype === 'alv' && e.alive === false) return `<div>${t}💀 ${a} is eliminated${man}</div>`;
+      if (e.etype === 'leave') return `<div>${t}🚪 ${a} left${man}</div>`;
       return '';
     };
-    const bookends = [];
-    try {
-      if (m.started_at) bookends.push(`<div>🟢 <b>Match Started</b> <span class="dim">${esc(new Date(m.started_at).toLocaleTimeString())}</span></div>`);
-    } catch {}
-    const body = kills.map(line).join('');
-    try {
-      if (m.sealed_at) bookends.push(`<div>🏁 <b>Match Ended</b> <span class="dim">${esc(new Date(m.sealed_at).toLocaleTimeString())}</span></div>`);
-    } catch {}
-    feed.innerHTML = (bookends.length && body ? bookends[0] + body + (bookends[1] || '') : bookends.join('') + body) || '<span class="dim">No events yet.</span>';
+    const bookStart = (() => { try { return m.started_at ? `<div>🟢 <b>Match Started</b> <span class="dim">${esc(new Date(m.started_at).toLocaleTimeString())}</span></div>` : ''; } catch { return ''; } })();
+    const bookEnd = (() => { try { return m.sealed_at ? `<div>🏁 <b>Match Ended</b> <span class="dim">${esc(new Date(m.sealed_at).toLocaleTimeString())}</span></div>` : ''; } catch { return ''; } })();
+    const isKill = (e) => e.etype === 'kill' || e.etype === 'knock';
+    const isLeave = (e) => e.etype === 'leave';
+    const isAlv = (e) => e.etype === 'alv' && e.alive === false;
+    const sec = (title, rows, bookTop, bookBottom) =>
+      `<div class="muted" style="margin:6px 0 2px">${title} (${rows.length})</div>` + (bookTop || '') +
+      (rows.length ? rows.map(line).join('') : '<span class="dim">—</span>') + (bookBottom || '');
+    feed.innerHTML = sec('🔪 KILLS', kills.filter(isKill), bookStart, '') + sec('🚪 LEAVES', kills.filter(isLeave), '', '') + sec('💀 ELIMINATIONS', kills.filter(isAlv), '', bookEnd) || '<span class="dim">No events yet.</span>';
     try { feed.scrollTop = sc; } catch {}
 }
 function wireMatchList(matches) {
@@ -891,7 +1049,7 @@ function wireMatchList(matches) {
     const sel = m.id === editMatchId ? ' sel' : '';
     const dot = (m.status === 'open' || m.status === 'manual') ? ' 🟢' : '';
     return `<div style="margin:3px 0"><span class="mlink${sel}" data-m="${m.id}">v${m.version}${dot}</span> ` +
-      `<span class="dim">${esc(m.status)}${m.room_id ? ' · ' + esc(m.room_id) : ''} · winner ${esc(m.winner || '—')}</span></div>`;
+      `<span class="dim">${esc(m.status)}${m.room_id ? ' · ' + esc(String(m.room_id).slice(0, 8)) : ''} · winner ${esc(m.winner || '—')}</span></div>`;
   }).join('');
   box.querySelectorAll('[data-m]').forEach((el) => {
     el.onclick = () => {
@@ -904,6 +1062,10 @@ function wireMatchList(matches) {
 }
 $('srv').value = SRV;
 $('srvSave').onclick = () => { SRV = $('srv').value.trim() || SRV; localStorage.setItem('comp_server', SRV); log('server -> ' + SRV); refreshAll(); };
+// Track/Open/Seal via the Node decryptor (local origin); everything else
+// (Tourneys tab) talks to SRV = the Python API.
+// Track: the Python bridge auto-records by room code, so tracking just
+// selects the tourney here and opens its detail.
 $('tSetGo').onclick = async (e) => {
   const btn = e.currentTarget; btn.disabled = true;
   const v = $('tSet').value.trim();
@@ -936,7 +1098,7 @@ async function refreshUnmapped(t) {
     const roster = [...new Set(((acc && acc.regs) || []).flatMap((r) => r.member_ids || []))];
     const pmap = {};
     ((t && t.players) || []).forEach((p) => { pmap[String(p.discord_id)] = p.name; });
-    roster.forEach((d) => { if (!pmap[d]) pmap[d] = String(d).slice(0, 6); });
+    // no did-prefix fallback: unknown roster members render as Unknown player.
     const normNm = (s) => { try { return String(s || '').replace(/<[^>]*>/g, '').replace(/^dc:\s*/i, '').trim().toLowerCase(); } catch { return String(s || '').toLowerCase(); } };
     // sticky mapping cache per tourney (localStorage): actor -> did survives
     // reloads + new matches. Roster-checked: stale dids (off-roster) never
@@ -953,7 +1115,7 @@ async function refreshUnmapped(t) {
       const cached = cachedFor(actor);
       return roster.map((d) => {
         const sel = (cached && String(d) === cached) || (!cached && normNm(pmap[d]) && normNm(pmap[d]) === normNm(actor)) ? ' selected' : '';
-        return `<option value="${esc(d)}"${sel}>${esc(pmap[d] || d.slice(0, 6))}</option>`;
+        return `<option value="${esc(d)}"${sel}>${esc(pmap[d] || 'Unknown player')}</option>`;
       }).join('');
     };
     const cacheLink = (actor, did) => {
@@ -1021,9 +1183,9 @@ try {
     _rn.disabled = false;
   };
 } catch {}
-setInterval(refreshTracker, 4000);
+setInterval(refreshTracker, 10000);
 // live match view: re-pull board + killfeed while the picked match is open
-setInterval(() => { try { if (_matchLive && selTid != null && editMatchId != null) refreshMatch(); } catch {} }, 4000);
+setInterval(() => { try { if (_matchLive && selTid != null && editMatchId != null) refreshMatch(); } catch {} }, 10000);
 refreshAll();
 </script>
 </body>

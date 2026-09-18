@@ -27,6 +27,10 @@ class _Q:
         self._rows = [r for r in self._rows if str(r.get(c)) == str(v)]
         return self
 
+    def neq(self, c, v):
+        self._rows = [r for r in self._rows if str(r.get(c)) != str(v)]
+        return self
+
     def in_(self, c, vs):
         s = {str(v) for v in vs}
         self._rows = [r for r in self._rows if str(r.get(c)) in s]
@@ -140,3 +144,16 @@ def test_alv_no_players_no_write(monkeypatch):
     sb = _use_sb(monkeypatch, [])
     proc._comp_bank_alv({"host_playing": True}, 9, _room({}, []))
     assert sb.inserts == []
+
+
+def test_alv_manual_rows_do_not_block_snapshot(monkeypatch):
+    # dashboard elim corrections (manual alv) must not suppress the tracked
+    # seal-time snapshot; tracked rows still bank.
+    sb = _use_sb(monkeypatch, [
+        {"id": 7, "match_id": 9, "etype": "alv", "discord_id": "B",
+         "actor_name": "chris7", "alive": False, "manual": True}])
+    proc._comp_bank_alv({"host_playing": True}, 9, ROOM)
+    assert len(sb.inserts) == 1
+    name, rows = sb.inserts[0]
+    assert name == "bngc_comp_events"
+    assert [r["actor_name"] for r in rows] == ["chris7", "third", "cis6led"]

@@ -41,7 +41,12 @@ def _db_err(e: Exception, what: str):
         return JSONResponse({"error": "temporarily unavailable", "retry": True}, status_code=503)
     return JSONResponse({"error": msg}, status_code=500)
 
-DEFAULT_TABLE = {"kill": 1, "win": 3, "placement": [10, 7, 5, 3, 1]}
+# scoring brain lives in lib/scoring.py (one implementation shared by
+# comp and ranked); re-exported here so existing callers and tests
+# that import from this module keep working unchanged
+from ..lib.scoring import (DEFAULT_TABLE, compute_match_points,
+                           group_standings_by_team, aggregate_standings,
+                           compute_tourney_pr)
 
 
 def derive_status(tourney: dict, sealed_count: int) -> str:
@@ -76,307 +81,6 @@ def _table_of(tourney: dict | None) -> dict:
         return {"kill": kill, "win": win, "placement": [int(x) for x in place]}
     except Exception:
         return dict(DEFAULT_TABLE)
-
-
-def compute_match_points(events: list[dict], table: dict | None = None,
-                         winner_override: str | None = None,
-                         placements: dict | None = None,
-                         excluded: set | list | None = None,
-                         awards: dict | None = None) -> list[dict]:
-    """Points for ONE sealed match. Pure, unit-tested.
-
-    events: comp event rows {etype, discord_id, actor_name, alive}.
-    Kills count per mapped discord_id only (twins stay null upstream).
-    excluded: discord IDs removed mid-match (left) — ignored in kills,
-    placement, winner and output rows.
-    awards: manual point awards {did: pts} (dashboard +pts) folded per row.
-    Placement: manual map first ({did: place}), else reverse alv-death order
-    (last alive first). Winner: override, else manual P1, else last alive,
-    else None (kills-only scoring). Row totals floored at 0.
-    Returns [{discord_id, name, kills, placement, won, points}] sorted desc.
-    """
-    table = table or dict(DEFAULT_TABLE)
-    try:
-        place_pts = list(table.get("placement") or [])
-        kill_pts = int(table.get("kill", 1))
-        win_pts = int(table.get("win", 3))
-    except Exception:
-        place_pts, kill_pts, win_pts = list(DEFAULT_TABLE["placement"]), 1, 3
-    kills: dict[str, int] = {}
-    names: dict[str, str] = {}
-    death_order: list[str] = []  # first out -> last out
-    seen_dead: set[str] = set()
-    try:
-        xset = {str(x) for x in (excluded or []) if str(x or "").strip()}
-    except Exception:
-        xset = set()
-    for e in (events or []):
-        try:
-            et = (e or {}).get("etype")
-            did = (e or {}).get("discord_id")
-            if did and str(did) in xset:
-                continue  # removed mid-match: ignored everywhere
-            if et == "kill" and did:
-                kills[did] = kills.get(did, 0) + 1
-                if (e or {}).get("actor_name") and did not in names:
-                    names[did] = str(e["actor_name"])
-            elif et == "alv" and did and (e or {}).get("alive") is False:
-                if did not in seen_dead:
-                    seen_dead.add(did)
-                    death_order.append(did)
-                if (e or {}).get("actor_name") and did not in names:
-                    names[did] = str(e["actor_name"])
-            elif did and (e or {}).get("actor_name") and did not in names:
-                names[did] = str(e["actor_name"])
-        except Exception:
-            continue
-    order = list(reversed(death_order))  # last alive first
-    try:
-        order = [d for d in order if d not in xset]
-    except Exception:
-        pass
-    winner = None
-    try:
-        if winner_override and str(winner_override) not in xset:
-            # host-set winner always counts (even with no kill/alv rows —
-            # manual matches start empty). Falls back to alv order below.
-            winner = str(winner_override)
-        elif order:
-            winner = order[0]
-    except Exception:
-        winner = None
-    placement_of = {did: i + 1 for i, did in enumerate(order)}
-    # Manual placement override (dashboard): exact places beat alv order;
-    # winner falls back to manual P1 when no override is set.
-    try:
-        man = {str(k): int(v) for k, v in (placements or {}).items()
-               if str(k or "").strip() and str(k) not in xset}
-    except Exception:
-        man = {}
-    if man:
-        try:
-            known = set(list(kills) + order + list(man))
-            placement_of = {did: man[did] for did in sorted(man, key=lambda d: man[d]) if did in known}
-            if not winner:
-                first = sorted(man.items(), key=lambda kv: kv[1])
-                if first and first[0][0] in known:
-                    winner = first[0][0]
-        except Exception:
-            pass
-    # Tied P1 shares the win: every manual P1 holder gets the full WIN
-    # bonus (no split). Without manual placements only the winner bonuses.
-    try:
-        p1_tied = {did for did, p in (man or {}).items() if int(p) == 1}
-    except Exception:
-        p1_tied = set()
-    rows = []
-    try:
-        award_map = {str(k): int(v) for k, v in (awards or {}).items()
-                     if str(k or "").strip() and str(k) not in xset}
-    except Exception:
-        award_map = {}
-    universe = set(list(kills) + order + list(man))
-    if winner and winner not in xset:
-        universe.add(winner)
-    universe |= set(award_map)
-    for did in sorted(universe):
-        k = kills.get(did, 0)
-        p = placement_of.get(did)
-        pts = k * kill_pts
-        if (p1_tied and did in p1_tied) or (not p1_tied and winner and did == winner):
-            pts += win_pts
-        if p and p <= len(place_pts):
-            pts += place_pts[p - 1]
-        pts += award_map.get(did, 0)
-        pts = max(0, pts)  # totals never go negative
-        rows.append({"discord_id": did, "name": names.get(did) or did[:6],
-                     "kills": k, "placement": p,
-                     "won": bool((p1_tied and did in p1_tied) or (not p1_tied and winner and did == winner)),
-                     "points": pts})
-    rows.sort(key=lambda r: (r["points"], r["kills"]), reverse=True)
-    return rows
-
-
-def group_standings_by_team(board: list[dict], regs: list[dict] | None,
-                            names: dict | None = None) -> list[dict]:
-    """Fold a per-player series board into team rows. Pure, unit-tested.
-
-    Teams come from accepted regs ({team_label, member_ids}); each team acts
-    as one player sharing summed points/kills/wins. Display name is the
-    label when set, else @a & @b over member display names. Unregistered
-    players (played but never registered) stand alone under their own name.
-    Rows carry member_ids so the dashboard can still resolve individuals.
-    """
-    try:
-        regs = regs or []
-        names = names or {}
-        team_of: dict[str, int] = {}
-        teams: list[dict] = []
-        for r in regs:
-            try:
-                members = [str(x) for x in ((r or {}).get("member_ids") or []) if x]
-            except Exception:
-                members = []
-            if not members:
-                continue
-            label = str((r or {}).get("team_label") or "").strip() or None
-            teams.append({"label": label, "member_ids": members,
-                          "kills": 0, "wins": 0, "points": 0, "matches": 0,
-                          "avg_w": 0.0, "avg_n": 0})
-            idx = len(teams) - 1
-            for m in members:
-                team_of.setdefault(m, idx)
-        solos: dict[str, dict] = {}
-        for row in (board or []):
-            try:
-                did = str((row or {}).get("discord_id") or "")
-                if not did:
-                    continue
-                k = int((row or {}).get("kills") or 0)
-                w = int((row or {}).get("wins") or 0)
-                pts = int((row or {}).get("points") or 0)
-                mt = int((row or {}).get("matches") or 0)
-                nm = (row or {}).get("name") or names.get(did) or did[:6]
-                try:
-                    av = (row or {}).get("avg_placement")
-                    av = float(av) if av is not None else None
-                except Exception:
-                    av = None
-                if did in team_of:
-                    t = teams[team_of[did]]
-                    t["kills"] += k
-                    t["wins"] += w
-                    t["points"] += pts
-                    t["matches"] = max(t["matches"], mt)
-                    if av is not None and mt > 0:
-                        t["avg_w"] += av * mt
-                        t["avg_n"] += mt
-                else:
-                    s = solos.setdefault(did, {"member_ids": [did], "kills": 0,
-                                               "wins": 0, "points": 0, "matches": 0,
-                                               "name": nm, "avg_w": 0.0, "avg_n": 0})
-                    s["kills"] += k
-                    s["wins"] += w
-                    s["points"] += pts
-                    s["matches"] = max(s["matches"], mt)
-                    if av is not None and mt > 0:
-                        s["avg_w"] += av * mt
-                        s["avg_n"] += mt
-            except Exception:
-                continue
-
-        def _avg_of(t) -> float | None:
-            try:
-                n = int(t.get("avg_n") or 0)
-                return round(float(t.get("avg_w") or 0.0) / n, 1) if n > 0 else None
-            except Exception:
-                return None
-
-        out = []
-        for t in teams:
-            try:
-                disp = [str(names.get(m) or m[:6]) for m in t["member_ids"]]
-            except Exception:
-                disp = [str(m)[:6] for m in t["member_ids"]]
-            name = t["label"] or ("@" + " & @".join(disp) if disp else "?")
-            out.append({"team": True, "team_label": t["label"],
-                        "name": name, "member_ids": t["member_ids"],
-                        "kills": t["kills"], "wins": t["wins"],
-                        "points": t["points"], "matches": t["matches"],
-                        "avg_placement": _avg_of(t)})
-        for did, s in solos.items():
-            out.append({"team": False, "discord_id": did, "name": s["name"],
-                        "member_ids": s["member_ids"], "kills": s["kills"],
-                        "wins": s["wins"], "points": s["points"],
-                        "matches": s["matches"], "avg_placement": _avg_of(s)})
-        out.sort(key=lambda r: (r["points"], r["kills"]), reverse=True)
-        return out
-    except Exception:
-        return list(board or [])
-
-
-def aggregate_standings(per_match: list[list[dict]]) -> list[dict]:
-    """Sum match rows into a series board. Pure, unit-tested.
-
-    Adds avg_placement (mean of per-match placements, 1 decimal; None when
-    the player has no placed match, e.g. kills-only scoring).
-    """
-    tot: dict[str, dict] = {}
-    try:
-        for rows in (per_match or []):
-            for r in (rows or []):
-                did = str((r or {}).get("discord_id") or "")
-                if not did:
-                    continue
-                d = tot.setdefault(did, {"discord_id": did, "name": (r or {}).get("name") or did[:6],
-                                         "kills": 0, "wins": 0, "points": 0, "matches": 0,
-                                         "placements": []})
-                d["kills"] += int((r or {}).get("kills") or 0)
-                d["wins"] += 1 if (r or {}).get("won") else 0
-                d["points"] += int((r or {}).get("points") or 0)
-                d["matches"] += 1
-                try:
-                    p = (r or {}).get("placement")
-                    if p is not None:
-                        d["placements"].append(int(p))
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    out = []
-    for d in tot.values():
-        try:
-            pl = d.pop("placements", [])
-            d["avg_placement"] = round(sum(pl) / len(pl), 1) if pl else None
-        except Exception:
-            d["avg_placement"] = None
-        out.append(d)
-    out.sort(key=lambda r: (r["points"], r["kills"]), reverse=True)
-    return out
-
-
-def compute_tourney_pr(board: list[dict], per_match: list[list[dict]] | None = None) -> list[dict]:
-    """Tourney PR per player. Pure, unit-tested.
-
-    Formula: round(2*(kills + 3*wins + max(0, players-avgPlacement+1))/players, 1)
-    players = avg lobby size across sealed matches (mean of per-match roster
-    sizes). avg_placement None (no placed match) -> placement term 0.
-    Returns [{discord_id, name, pr, kills, wins, matches, avg_placement,
-    players}] sorted by pr desc. Empty when no matches/players.
-    """
-    try:
-        sizes = [len(r or []) for r in (per_match or []) if r]
-        players = round(sum(sizes) / len(sizes), 2) if sizes else 0
-    except Exception:
-        players = 0
-    out = []
-    try:
-        if not players:
-            return []
-        for r in (board or []):
-            try:
-                did = str((r or {}).get("discord_id") or "")
-                if not did:
-                    continue
-                kills = int((r or {}).get("kills") or 0)
-                wins = int((r or {}).get("wins") or 0)
-                avg = (r or {}).get("avg_placement")
-                try:
-                    avg_f = float(avg) if avg is not None else None
-                except Exception:
-                    avg_f = None
-                place_term = max(0.0, players - avg_f + 1) if avg_f is not None else 0.0
-                pr = round(2 * (kills + 3 * wins + place_term) / players, 1)
-                out.append({"discord_id": did, "name": (r or {}).get("name") or did[:6],
-                            "pr": pr, "kills": kills, "wins": wins,
-                            "matches": int((r or {}).get("matches") or 0),
-                            "avg_placement": avg_f, "players": players})
-            except Exception:
-                continue
-    except Exception:
-        pass
-    out.sort(key=lambda r: (r.get("pr") or 0), reverse=True)
-    return out
 
 
 def _tourney_adjustments(tid) -> list[dict]:
@@ -801,9 +505,15 @@ async def comp_match_detail(request: Request):
             t = {}
         table = _table_of(t)
         try:
-            eres = supabase.table("bngc_comp_events").select(
-                "id,match_id,etype,actor_nr,actor_name,target_name,discord_id,alive,created_at"
-            ).eq("match_id", mid).order("id").limit(1000).execute()
+            try:
+                eres = supabase.table("bngc_comp_events").select(
+                    "id,match_id,etype,actor_nr,actor_name,target_name,discord_id,alive,manual,created_at"
+                ).eq("match_id", mid).order("id").limit(1000).execute()
+            except Exception:
+                # pre-migration (no manual column): classic shape, manual unknown
+                eres = supabase.table("bngc_comp_events").select(
+                    "id,match_id,etype,actor_nr,actor_name,target_name,discord_id,alive,created_at"
+                ).eq("match_id", mid).order("id").limit(1000).execute()
             events = eres.data or []
         except Exception:
             events = []
@@ -825,6 +535,7 @@ async def comp_match_detail(request: Request):
         feed = [{"id": e.get("id"), "etype": e.get("etype"), "actor_nr": e.get("actor_nr"),
                  "actor_name": e.get("actor_name"), "target_name": e.get("target_name"),
                  "discord_id": e.get("discord_id"), "alive": e.get("alive"),
+                 "manual": bool((e or {}).get("manual")),
                  "created_at": e.get("created_at")} for e in events]
         return JSONResponse({
             "match": {"id": m.get("id"), "tourney_id": m.get("tourney_id"),
@@ -856,7 +567,11 @@ def _next_version(tourney_id: int) -> int:
 
 @router.post("/api/comp/match/open")
 async def comp_match_open(request: Request):
-    """Manual blank match (dashboard). Never raises beyond JSON errors."""
+    """Manual blank match (dashboard). Never raises beyond JSON errors.
+
+    Manual matches start with started_at set (the dashboard Match Started
+    bookend) and status manual — the bridge never auto-seals or writes to
+    manual rows, so hosts own them end to end."""
     err = _need()
     if err:
         return err
@@ -866,11 +581,13 @@ async def comp_match_open(request: Request):
     except Exception:
         return JSONResponse({"error": "tourney_id required"}, status_code=400)
     try:
+        from datetime import datetime, timezone
         ver = _next_version(tid)
         res = supabase.table("bngc_comp_matches").insert({
             "tourney_id": tid, "version": ver,
             "room_id": (str(b.get("room_id") or "").strip() or None),
             "status": "manual",
+            "started_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
         row = (res.data or [{}])[0]
         return JSONResponse({"ok": True, "match_id": row.get("id"), "version": ver})
@@ -903,6 +620,73 @@ async def comp_match_seal(request: Request):
         return JSONResponse({"ok": True, "match_id": mid})
     except Exception as e:
         return _db_err(e, f"seal match={mid}")
+
+
+@router.post("/api/comp/match/start")
+async def comp_match_start(request: Request):
+    """Stamp Match Started on an open/manual match (dashboard).
+
+    Idempotent: a match that already started returns ok with its existing
+    timestamp. Sealed matches are rejected (unseal first). Never raises
+    beyond JSON errors."""
+    err = _need()
+    if err:
+        return err
+    b = await _json(request)
+    try:
+        mid = int(b.get("match_id"))
+    except Exception:
+        return JSONResponse({"error": "match_id required"}, status_code=400)
+    try:
+        from datetime import datetime, timezone
+        mres = supabase.table("bngc_comp_matches").select(
+            "id,status,started_at").eq("id", mid).limit(1).execute()
+        if not mres.data:
+            return JSONResponse({"error": "match not found"}, status_code=404)
+        m = mres.data[0] or {}
+        if (m.get("status") or "") == "sealed":
+            return JSONResponse({"error": "match already sealed (unseal first)"}, status_code=409)
+        if m.get("started_at"):
+            return JSONResponse({"ok": True, "match_id": mid,
+                                 "started_at": m.get("started_at")})
+        now = datetime.now(timezone.utc).isoformat()
+        supabase.table("bngc_comp_matches").update(
+            {"started_at": now}).eq("id", mid).execute()
+        return JSONResponse({"ok": True, "match_id": mid, "started_at": now})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@router.post("/api/comp/match/unseal")
+async def comp_match_unseal(request: Request):
+    """Reopen a sealed match for corrections (dashboard).
+
+    Sealed -> manual (NOT open: the bridge auto-seals open rows, manual rows
+    stay dashboard-owned) with sealed_at cleared. Already-live matches
+    return ok unchanged. Never raises beyond JSON errors."""
+    err = _need()
+    if err:
+        return err
+    b = await _json(request)
+    try:
+        mid = int(b.get("match_id"))
+    except Exception:
+        return JSONResponse({"error": "match_id required"}, status_code=400)
+    try:
+        mres = supabase.table("bngc_comp_matches").select(
+            "id,status").eq("id", mid).limit(1).execute()
+        if not mres.data:
+            return JSONResponse({"error": "match not found"}, status_code=404)
+        if (mres.data[0] or {}).get("status") != "sealed":
+            return JSONResponse({"ok": True, "match_id": mid,
+                                 "status": (mres.data[0] or {}).get("status")})
+        res = supabase.table("bngc_comp_matches").update(
+            {"status": "manual", "sealed_at": None}).eq("id", mid).execute()
+        if not res.data:
+            return JSONResponse({"error": "match not found"}, status_code=404)
+        return JSONResponse({"ok": True, "match_id": mid, "status": "manual"})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @router.post("/api/comp/match/winner")
@@ -1515,6 +1299,68 @@ async def comp_match_kills(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@router.post("/api/comp/match/elim")
+async def comp_match_elim(request: Request):
+    """Hand-adjust a player's eliminations in a match (dashboard elim buttons).
+
+    Positive delta inserts manual alv (alive=False) rows — they join the
+    reverse death order for placement like bridge-banked rows. Negative
+    removes that many of the player's manual alv rows (newest first).
+    Tracked (non-manual) rows are never touched. On bridge-owned open
+    matches prefer the seal-time snapshot (it still banks the full roster);
+    manual elims are meant for manual matches and post-seal corrections.
+    """
+    err = _need()
+    if err:
+        return err
+    b = await _json(request)
+    try:
+        mid = int(b.get("match_id"))
+        did = str(b.get("discord_id") or "").strip()
+        delta = int(b.get("delta") or 0)
+    except Exception:
+        return JSONResponse({"error": "match_id, discord_id and delta required"}, status_code=400)
+    if not did or delta == 0:
+        return JSONResponse({"error": "discord_id and non-zero delta required"}, status_code=400)
+    if abs(delta) > 50:
+        return JSONResponse({"error": "delta capped at ±50"}, status_code=400)
+    try:
+        mres = supabase.table("bngc_comp_matches").select("id").eq("id", mid).limit(1).execute()
+        if not mres.data:
+            return JSONResponse({"error": "match not found"}, status_code=404)
+        if delta > 0:
+            name = _comp_display_name(did)
+            supabase.table("bngc_comp_events").insert([{
+                "match_id": mid, "etype": "alv", "discord_id": did,
+                "actor_name": name, "target_name": None,
+                "alive": False, "manual": True,
+            }] * delta).execute()
+        else:
+            eres = supabase.table("bngc_comp_events").select("id").eq(
+                "match_id", mid).eq("discord_id", did).eq("etype", "alv").eq(
+                "manual", True).order("id", desc=True).limit(abs(delta)).execute()
+            removed = 0
+            for r in (eres.data or []):
+                try:
+                    supabase.table("bngc_comp_events").delete().eq("id", r["id"]).execute()
+                    removed += 1
+                except Exception:
+                    pass
+        cres = supabase.table("bngc_comp_events").select("id,manual,alive").eq(
+            "match_id", mid).eq("discord_id", did).eq("etype", "alv").execute()
+        # death = explicit alive False (same rule as compute_match_points);
+        # the add-player presence row (alive True) is not an elimination.
+        elims = sum(1 for r in (cres.data or []) if (r or {}).get("alive") is False)
+        tracked = sum(1 for r in (cres.data or [])
+                      if (r or {}).get("alive") is False and not (r or {}).get("manual"))
+        return JSONResponse({"ok": True, "match_id": mid, "discord_id": did,
+                             "elims": elims, "tracked_kept": tracked,
+                             "requested": abs(delta) if delta < 0 else delta,
+                             "removed_manual": removed if delta < 0 else delta})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @router.post("/api/comp/match/place")
 async def comp_match_place(request: Request):
     """Set/clear a manual placement for a player in a match (dashboard
@@ -1659,6 +1505,61 @@ async def comp_match_add_back(request: Request):
         supabase.table("bngc_comp_matches").update(
             {"removed_discord_ids": cur}).eq("id", mid).execute()
         return JSONResponse({"ok": True, "match_id": mid, "removed_discord_ids": cur})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@router.post("/api/comp/match/add-player")
+async def comp_match_add_player(request: Request):
+    """Add a player (e.g. a sub off the tourney roster) to a match with zero
+    stats (dashboard Add player box).
+
+    Body: {match_id, discord_id}. Inserts one manual presence row
+    (alv alive=True: not a death, no feed line); scoring boards every mapped
+    participant even at 0 kills, so the player appears at 0 pts and the host
+    can then +kill/+elim/place them. Also clears the did from
+    removed_discord_ids when present. Idempotent: a did with any event row
+    already returns ok/present. Never raises beyond JSON errors."""
+    err = _need()
+    if err:
+        return err
+    b = await _json(request)
+    try:
+        mid = int(b.get("match_id"))
+        did = str(b.get("discord_id") or "").strip()
+    except Exception:
+        return JSONResponse({"error": "match_id and discord_id required"}, status_code=400)
+    if not did:
+        return JSONResponse({"error": "discord_id required"}, status_code=400)
+    try:
+        try:
+            mres = supabase.table("bngc_comp_matches").select(
+                "id,removed_discord_ids").eq("id", mid).limit(1).execute()
+        except Exception:
+            mres = supabase.table("bngc_comp_matches").select(
+                "id").eq("id", mid).limit(1).execute()
+        if not mres.data:
+            return JSONResponse({"error": "match not found"}, status_code=404)
+        eres = supabase.table("bngc_comp_events").select("id").eq(
+            "match_id", mid).eq("discord_id", did).limit(1).execute()
+        if (eres.data or []):
+            return JSONResponse({"ok": True, "match_id": mid,
+                                 "discord_id": did, "present": True})
+        name = _comp_display_name(did)
+        supabase.table("bngc_comp_events").insert({
+            "match_id": mid, "etype": "alv", "discord_id": did,
+            "actor_name": name, "target_name": None,
+            "alive": True, "manual": True,
+        }).execute()
+        try:
+            cur = [x for x in _removed_list((mres.data[0] or {})) if x != did]
+            if len(cur) != len(_removed_list((mres.data[0] or {}))):
+                supabase.table("bngc_comp_matches").update(
+                    {"removed_discord_ids": cur}).eq("id", mid).execute()
+        except Exception:
+            pass
+        return JSONResponse({"ok": True, "match_id": mid,
+                             "discord_id": did, "present": True})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 

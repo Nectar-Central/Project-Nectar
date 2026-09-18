@@ -10,6 +10,7 @@ import pytest
 
 from server.routes import stats as stats_mod
 from server.routes import discovery as disc_mod
+from server.routes import ranked_api as ranked_api_mod
 from server.lib import ranked as ranked_mod
 
 
@@ -62,6 +63,15 @@ class _Q:
         self.filters.append(("gt", col, val))
         return self
 
+    def gte(self, col, val):
+        self.filters.append(("gte", col, val))
+        return self
+
+    def upsert(self, payload, on_conflict=None):
+        self._upsert_payload = payload
+        self._upsert_op = True
+        return self
+
     def in_(self, col, vals):
         self.filters.append(("in", col, list(vals)))
         return self
@@ -93,6 +103,10 @@ class _Q:
             rows = list(getattr(self.fake, "seasons", []))
         elif self.table == "bngc_game_events":
             rows = list(self.fake.events)
+        elif self.table == "bngc_ranked_presence":
+            rows = list(getattr(self.fake, "presence", []))
+        elif self.table == "bngc_ranked_tourney_matches":
+            rows = list(getattr(self.fake, "tourney_matches", []))
         else:
             rows = []
         for kind, col, val in self.filters:
@@ -100,6 +114,8 @@ class _Q:
                 rows = [r for r in rows if str(r.get(col)) == str(val)]
             elif kind == "gt":
                 rows = [r for r in rows if (r.get(col) or 0) > val]
+            elif kind == "gte":
+                rows = [r for r in rows if str(r.get(col) or "") >= str(val)]
             elif kind == "in":
                 rows = [r for r in rows if str(r.get(col)) in {str(v) for v in val}]
         if self.order_col:
@@ -110,6 +126,17 @@ class _Q:
         return rows
 
     def execute(self):
+        if getattr(self, "_upsert_op", False):
+            if self.table == "bngc_ranked_presence":
+                if not hasattr(self.fake, "presence"):
+                    self.fake.presence = []
+                payload = dict(self._upsert_payload or {})
+                key = (payload.get("code"), payload.get("discord_id"))
+                self.fake.presence = [p for p in self.fake.presence
+                                      if (p.get("code"), p.get("discord_id")) != key]
+                self.fake.presence.append(payload)
+                return _Res(data=[payload])
+            return _Res(data=[])
         rows = self._rows()
         if self.count_mode == "exact":
             return _Res(data=rows, count=len(rows))
@@ -195,9 +222,9 @@ def test_stats_ranked_active(fakes, monkeypatch):
     assert rk["active"] is True
     assert rk["rid"] == "R-X" and rk["short_code"] == "ABCDE"
     assert rk["is_host"] is False and rk["status"] == "live"
-    assert rk["points"] == 750 and rk["milestone"] == "Silver"
-    assert rk["milestone_icon_url"].endswith("/silver.png")
-    assert rk["milestone_color"] == "#C0C0C0"
+    assert rk["points"] == 750 and rk["milestone"] == "Bronze"
+    assert rk["milestone_icon_url"].endswith("/bronze.png")
+    assert rk["milestone_color"] == "#CD7F32"
     assert rk["match_id"] == "R-X-3"
     assert rk["match_version"] == 3
     for gone in ("warnings", "host_game_username", "host_skin", "host_playing",
@@ -208,7 +235,7 @@ def test_stats_ranked_active(fakes, monkeypatch):
 
 def test_stats_ranked_tier(fakes, monkeypatch):
     body = _stats(monkeypatch, session=_live_session(), room=dict(_ROOM), points=150)
-    assert body["ranked"]["milestone"] == "Unranked"  # 150 < 200
+    assert body["ranked"]["milestone"] == "Unranked"  # 150 < 500
 
 
 def test_stats_ranked_is_host_true(fakes, monkeypatch):
@@ -217,7 +244,7 @@ def test_stats_ranked_is_host_true(fakes, monkeypatch):
         return _live_session()
     monkeypatch.setattr(stats_mod.cache, "get_session_state", _cached)
     monkeypatch.setattr(ranked_mod, "get_ranked_room", lambda code: dict(_ROOM))
-    monkeypatch.setattr(ranked_mod, "get_ranked_points", lambda did: 1600)
+    monkeypatch.setattr(ranked_mod, "get_ranked_points", lambda did: 4500)
     body = _call(stats_mod.get_stats, {"session_id": "s1", "discord_id": "H"})
     rk = body["ranked"]
     assert rk["is_host"] is True and rk["milestone"] == "Platinum"
@@ -343,12 +370,51 @@ def test_stats_no_session_null(fakes, monkeypatch):
     assert body["session"] is None and body["ranked"] is None
 
 
+
+# ---------------------------------------------------------------------------
+# Overlay honesty + flag parity
+# ---------------------------------------------------------------------------
+
+
+def test_stats_pending_seal_true_when_result_trails(fakes, monkeypatch):
+    # version bumped to 4, but the newest results row is still v3:
+    # the client must be told the total is provisional
+    fakes.results = [{"room_id": "R-X", "match_version": 3, "winner_discord_id": "H",
+                      "kills": {"D1": 1}, "points": {"D1": 11}}]
+    body = _stats(monkeypatch, session=_live_session(mver=4), room=dict(_ROOM))
+    assert body["ranked"]["pending_seal"] is True
+    assert body["ranked"]["last_result"]["match_version"] == 3
+
+
+def test_stats_pending_seal_false_when_confirmed(fakes, monkeypatch):
+    fakes.results = [{"room_id": "R-X", "match_version": 4, "winner_discord_id": "D1",
+                      "kills": {"D1": 2}, "points": {"D1": 85}}]
+    body = _stats(monkeypatch, session=_live_session(mver=4), room=dict(_ROOM))
+    assert body["ranked"]["pending_seal"] is False
+
+
+def test_stats_pending_seal_true_when_no_result_at_all(fakes, monkeypatch):
+    fakes.results = []
+    body = _stats(monkeypatch, session=_live_session(mver=4), room=dict(_ROOM))
+    assert body["ranked"]["pending_seal"] is True
+
+
+def test_stats_ranked_block_hidden_when_sleeping(fakes, monkeypatch):
+    # server sleeping: no ranked block at all (parity with the seal gate);
+    # the arena flag still tells the client why
+    monkeypatch.setattr(ranked_mod, "RANKED_ENABLED", False)
+    body = _stats(monkeypatch, session=_live_session(), room=dict(_ROOM))
+    assert body["ranked"] is None
+    assert body["arena"]["ranked_sleeping"] is True
+
+
 def test_stats_last_result_win(fakes, monkeypatch):
     fakes.results = [{"room_id": "R-X", "match_version": 3, "winner_discord_id": "D1",
                       "kills": {"D1": 2}, "points": {"D1": 85}, "placements": {"D1": 1}}]
     body = _stats(monkeypatch, session=_live_session(), room=dict(_ROOM))
     assert body["ranked"]["last_result"] == {
-        "match_version": 3, "gained": 85, "won": True, "kills": 2}
+        "match_version": 3, "gained": 85, "won": True, "kills": 2,
+        "placement": 1, "breakdown": None}
 
 
 def test_stats_last_result_loss(fakes, monkeypatch):
@@ -356,13 +422,26 @@ def test_stats_last_result_loss(fakes, monkeypatch):
                       "kills": {"D1": 2}, "points": {"D1": 11}}]
     body = _stats(monkeypatch, session=_live_session(), room=dict(_ROOM))
     assert body["ranked"]["last_result"] == {
-        "match_version": 3, "gained": 11, "won": False, "kills": 2}
+        "match_version": 3, "gained": 11, "won": False, "kills": 2,
+        "placement": None, "breakdown": None}
 
 
 def test_stats_last_result_none_when_unsealed(fakes, monkeypatch):
     fakes.results = []
     body = _stats(monkeypatch, session=_live_session(), room=dict(_ROOM))
     assert body["ranked"]["last_result"] is None
+
+
+def test_stats_last_result_carries_breakdown(fakes, monkeypatch):
+    bd = {"kills": 8, "win": 0, "placement": 7, "loss": -5,
+          "total": 10, "capped": False}
+    fakes.results = [{"room_id": "R-X", "match_version": 3, "winner_discord_id": "H",
+                      "kills": {"D1": 1}, "points": {"D1": 10},
+                      "placements": {"D1": 2}, "arena_breakdown": {"D1": bd}}]
+    body = _stats(monkeypatch, session=_live_session(), room=dict(_ROOM))
+    assert body["ranked"]["last_result"] == {
+        "match_version": 3, "gained": 10, "won": False, "kills": 1,
+        "placement": 2, "breakdown": bd}
 
 
 def test_stats_is_dev_defaults_false(fakes, monkeypatch):
@@ -380,16 +459,16 @@ def test_stats_arena_block(fakes, monkeypatch):
     monkeypatch.setattr(ranked_mod, "get_current_season", lambda: (3, "2026-10-01T00:00:00+00:00"))
     body = _stats(monkeypatch, session=None, room=None, points=750)
     a = body["arena"]
-    assert a["points"] == 750 and a["milestone"] == "Silver"
-    assert a["milestone_icon_url"].endswith("/silver.png")
-    assert a["points_to_next"] == 250 and a["next_milestone"] == "Gold"
-    assert a["next_points_pct"] == 50
+    assert a["points"] == 750 and a["milestone"] == "Bronze"
+    assert a["milestone_icon_url"].endswith("/bronze.png")
+    assert a["points_to_next"] == 450 and a["next_milestone"] == "Silver"
+    assert a["next_points_pct"] == 36
     assert a["season"] == 3 and a["reset_at"] == "2026-10-01T00:00:00+00:00"
 
 
 def test_stats_arena_max_rank(fakes, monkeypatch):
     monkeypatch.setattr(ranked_mod, "get_current_season", lambda: (1, None))
-    body = _stats(monkeypatch, session=None, room=None, points=9000)
+    body = _stats(monkeypatch, session=None, room=None, points=26000)
     a = body["arena"]
     assert a["milestone"] == "Grandmaster" and a["next_milestone"] is None
     assert a["points_to_next"] == 0 and a["next_points_pct"] == 100
@@ -484,6 +563,81 @@ def test_verify_dc_prefix_tolerant(fakes, monkeypatch):
     assert body["host_in_room"] is True
 
 
+def test_verify_instigator_keys_count(fakes, monkeypatch):
+    # real killfeed schema (instigator/instigated) — the old killer-only scan
+    # missed these rows entirely
+    fakes.events = [_event("ABCDE", 2, {"instigator": "True Jew", "instigated": "Bob"})]
+    body = _call(disc_mod.ranked_verify, {"code": "ABCDE", "host": "True Jew"})
+    assert body["room_active"] is True
+    assert body["host_in_room"] is True
+    assert body["via"] == "name"
+
+
+def test_verify_host_did_feed_evidence(fakes, monkeypatch):
+    # host never appears in a killfeed line, but their own feed stamped this
+    # row (did) for the code — no fight needed
+    fakes.events = [_event("ABCDE", 2, {"instigator": "Bob", "instigated": "Zed"}, did="HOST9")]
+    body = _call(disc_mod.ranked_verify, {"code": "ABCDE", "host": "True Jew", "host_did": "HOST9"})
+    assert body["room_active"] is True
+    assert body["host_in_room"] is True
+    assert body["via"] == "feed"
+
+
+def test_verify_wrong_did_stays_negative(fakes, monkeypatch):
+    fakes.events = [_event("ABCDE", 2, {"instigator": "Bob", "instigated": "Zed"}, did="OTHER9")]
+    body = _call(disc_mod.ranked_verify, {"code": "ABCDE", "host": "True Jew", "host_did": "HOST9"})
+    assert body["room_active"] is True
+    assert body["host_in_room"] is False
+    assert body["via"] is None
+
+
+def _presence_row(code, did, minutes_ago):
+    from datetime import datetime, timezone, timedelta
+    ts = (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+    return {"code": code, "discord_id": did, "seen_at": ts}
+
+
+def test_verify_presence_ping_quiet_lobby(fakes, monkeypatch):
+    # zero game rows at all: host sits silent in the lobby, only the
+    # userscript heartbeat proves presence
+    fakes.events = []
+    fakes.presence = [_presence_row("ABCDE", "HOST9", 1)]
+    body = _call(disc_mod.ranked_verify, {"code": "ABCDE", "host": "True Jew", "host_did": "HOST9"})
+    assert body["room_active"] is False  # no events: room not "active"...
+    assert body["host_in_room"] is True  # ...but the host is provably there
+    assert body["via"] == "ping"
+
+
+def test_verify_stale_ping_ignored(fakes, monkeypatch):
+    fakes.events = []
+    fakes.presence = [_presence_row("ABCDE", "HOST9", 30)]
+    body = _call(disc_mod.ranked_verify, {"code": "ABCDE", "host": "True Jew", "host_did": "HOST9"})
+    assert body["host_in_room"] is False
+    assert body["via"] is None
+
+
+def test_ranked_ping_upserts(fakes, monkeypatch):
+    import asyncio
+    import json
+
+    class _R:
+        def __init__(self, body):
+            self._body = body
+
+        async def json(self):
+            return dict(self._body)
+
+    resp = asyncio.run(disc_mod.ranked_ping(_R({"code": "abcde", "discord_id": "HOST9"})))
+    assert resp.status_code == 200
+    assert json.loads(resp.body.decode()) == {"ok": True, "code": "ABCDE"}
+    assert len(fakes.presence) == 1
+    # second ping refreshes in place (no duplicate rows)
+    asyncio.run(disc_mod.ranked_ping(_R({"code": "ABCDE", "discord_id": "HOST9"})))
+    assert len(fakes.presence) == 1
+    resp = asyncio.run(disc_mod.ranked_ping(_R({"code": "ZZ", "discord_id": "HOST9"})))
+    assert resp.status_code == 400
+
+
 # ---------------------------------------------------------------------------
 # /api/leaderboard?ranked=true
 # ---------------------------------------------------------------------------
@@ -498,7 +652,7 @@ def test_leaderboard_ranked(fakes, monkeypatch):
     assert body["count"] == 2
     first, second = body["results"]
     assert (first["discord_id"], first["points"], first["rank"]) == ("D1", 750, 1)
-    assert first["milestone"] == "Silver" and first["game_username"] == "Player1"
+    assert first["milestone"] == "Bronze" and first["game_username"] == "Player1"
     assert (second["discord_id"], second["points"], second["rank"]) == ("D2", 100, 2)
     assert second["milestone"] == "Unranked"
 
@@ -520,3 +674,118 @@ def test_leaderboard_ranked_season_static(fakes, monkeypatch):
     body = _call(disc_mod.leaderboard, {"ranked": "true"})
     assert body["season"] == 1
     assert body["reset_at"] is None
+
+# ---------------------------------------------------------------------------
+# Tourney last_result: stored seal bundle replay
+# ---------------------------------------------------------------------------
+
+_TOURNEY_BUNDLE = {
+    "mode": "room-seal-v1", "rid": "R-T", "room_match_version": 5,
+    "winner": "D1",
+    "points": {"D1": 20, "H": -4},
+    "kills": {"D1": 2},
+    "placements": {"D1": 1, "H": 2},
+    "breakdown": {"D1": {"kills": 16, "win": 8, "placement": 12,
+                          "loss": 0, "total": 30, "capped": True},
+                  "H": {"kills": 0, "win": 0, "placement": 8,
+                        "loss": -12, "total": -4, "capped": False}},
+}
+
+
+def _tourney_stats(monkeypatch, fakes, matches, ctx=None):
+    """Drive the tourney presentation branch: no rooms row, patched HUD ctx."""
+    from server.routes import ranked_tourney as _rt_mod
+    fakes.tourney_matches = list(matches)
+    monkeypatch.setattr(_rt_mod, "code_tourney_points",
+                        lambda code, did: dict(ctx or {"tourney_id": 7,
+                                                       "points": 40, "kills": 5,
+                                                       "wins": 1, "rank": 1,
+                                                       "players": 4}))
+    return _stats(monkeypatch, session=_live_session(), room=None)
+
+
+def test_stats_tourney_last_result_from_bundle(fakes, monkeypatch):
+    body = _tourney_stats(monkeypatch, fakes, [
+        {"tourney_id": 7, "version": 2, "status": "sealed",
+         "winner_discord_id": "D1", "points_table": dict(_TOURNEY_BUNDLE)}])
+    rk = body["ranked"]
+    assert rk["tourney_id"] == 7
+    assert rk["last_result"] == {
+        "match_version": 2, "gained": 20, "won": True, "kills": 2,
+        "placement": 1, "breakdown": _TOURNEY_BUNDLE["breakdown"]["D1"]}
+    assert rk["pending_seal"] is False
+
+
+def test_stats_tourney_last_result_none_for_legacy_row(fakes, monkeypatch):
+    body = _tourney_stats(monkeypatch, fakes, [
+        {"tourney_id": 7, "version": 2, "status": "sealed",
+         "winner_discord_id": "D1", "points_table": None}])
+    assert body["ranked"]["last_result"] is None
+
+
+def test_stats_tourney_last_result_none_when_sat_out(fakes, monkeypatch):
+    # D1 took no part in v2 (absent from the seal points): no toast truth
+    body2 = _tourney_stats(monkeypatch, fakes, [
+        {"tourney_id": 7, "version": 2, "status": "sealed",
+         "winner_discord_id": "H",
+         "points_table": dict(_TOURNEY_BUNDLE,
+                              points={"H": 10}, kills={},
+                              placements={"H": 1}, breakdown={})}])
+    assert body2["ranked"]["last_result"] is None
+
+
+def test_stats_tourney_open_newest_sealed_previous(fakes, monkeypatch):
+    body = _tourney_stats(monkeypatch, fakes, [
+        {"tourney_id": 7, "version": 3, "status": "open",
+         "winner_discord_id": None, "points_table": None},
+        {"tourney_id": 7, "version": 2, "status": "sealed",
+         "winner_discord_id": "D1", "points_table": dict(_TOURNEY_BUNDLE)}])
+    rk = body["ranked"]
+    assert rk["pending_seal"] is True  # newest row still open
+    assert rk["last_result"]["match_version"] == 2
+    assert rk["last_result"]["gained"] == 20
+
+
+# ---------------------------------------------------------------------------
+# POST /api/ranked/kill-price (optimistic live counter)
+# ---------------------------------------------------------------------------
+
+def _price_room(monkeypatch):
+    monkeypatch.setattr(ranked_api_mod, "supabase", object())
+    monkeypatch.setattr(ranked_mod, "ranked_sleeping", lambda: False)
+    monkeypatch.setattr(ranked_mod, "get_ranked_room", lambda code: {
+        "id": "R-X", "short_code": "ABCDE", "status": "live",
+        "roster": [{"discord_id": "A"}, {"discord_id": "B"}]})
+    monkeypatch.setattr(ranked_mod, "_game_names_by_discord_sync", lambda dids: {
+        "Alice": "A", "alice": "A", "Bob": "B", "bob": "B"})
+    monkeypatch.setattr(ranked_mod, "_get_points_many",
+                        lambda dids, fresh=False: {"A": 1200, "B": 300})
+    monkeypatch.setattr(ranked_mod, "lobby_avg_points_sync", lambda dids, fresh=False: 750.0)
+
+
+def test_kill_price_room_hit(monkeypatch):
+    _price_room(monkeypatch)
+    out = ranked_api_mod._price_kill_sync("ABCDE", "A", "Alice", "Bob")
+    assert out["ok"] is True and out["mode"] == "room"
+    assert out["award"] == ranked_mod.kill_delta(1200, 300, 750.0)
+    assert out["award"] >= 1
+    assert out["killer"] == "A" and out["victim"] == "B"
+
+
+def test_kill_price_not_your_kill(monkeypatch):
+    _price_room(monkeypatch)
+    out = ranked_api_mod._price_kill_sync("ABCDE", "A", "Bob", "Alice")
+    assert out == {"ok": False}
+
+
+def test_kill_price_unknown_victim_falls_back(monkeypatch):
+    _price_room(monkeypatch)
+    out = ranked_api_mod._price_kill_sync("ABCDE", "A", "Alice", "Some Rando")
+    assert out["ok"] is True
+    assert out["award"] == ranked_mod.kill_delta(1200, 1200, 750.0)
+    assert out["victim"] is None
+
+
+def test_kill_price_bad_code(monkeypatch):
+    _price_room(monkeypatch)
+    assert ranked_api_mod._price_kill_sync("ZZ", "A", "Alice", "Bob") == {"ok": False}

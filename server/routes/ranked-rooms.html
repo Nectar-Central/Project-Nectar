@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ranked Rooms Admin</title>
+<style>
+body{font-family:Tahoma,Geneva,sans-serif;margin:0;background:#0f172a;color:#e2e8f0;font-size:13px}
+header{background:#1e3a5f;padding:10px 16px;border-bottom:2px solid #3b82f6}
+header b{font-size:15px;color:#93c5fd}
+main{max-width:1180px;margin:0 auto;padding:12px}
+fieldset{border:1px solid #334155;border-radius:6px;padding:10px 12px;margin-bottom:12px;background:#111c2f}
+legend{color:#7dd3fc;font-weight:700;padding:0 6px}
+button{background:#2563eb;border:0;border-radius:4px;padding:5px 10px;font-weight:700;cursor:pointer;color:#fff}
+button:hover{background:#3b82f6}
+button.ghost{background:#475569}
+button.warn{background:#b45309}
+button.bad{background:#b91c1c}
+button:disabled{opacity:.45;cursor:default}
+input,select{background:#0b1220;color:#e2e8f0;border:1px solid #475569;border-radius:4px;padding:5px 7px}
+table{border-collapse:collapse;width:100%;font-size:12px}
+th{background:#1e3a5f;padding:5px 7px;text-align:left;color:#93c5fd}
+td{padding:4px 6px;border-bottom:1px solid #1e293b}
+tr.click{cursor:pointer}
+tr.click:hover td{background:#172554}
+.dim{color:#94a3b8}.bad{color:#f87171}.good{color:#4ade80}.warn{color:#fbbf24}
+.pill{display:inline-block;padding:1px 7px;border-radius:9px;font-size:11px;font-weight:700}
+.pill.live{background:#14532d;color:#86efac}
+.pill.lobby{background:#1e3a5f;color:#93c5fd}
+.pill.ended{background:#3f3f46;color:#d4d4d8}
+#log{font-family:Consolas,monospace;font-size:11px;max-height:130px;overflow:auto}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
+.feed{font-family:Consolas,monospace;font-size:11px;max-height:180px;overflow:auto}
+.feed span.k{color:#4ade80}.feed span.a{color:#fbbf24}
+</style>
+</head>
+<body>
+<header><b>Ranked Rooms Admin</b>
+  <span class="dim">repair surface · <a href="/ranked" style="color:#93c5fd">tourney dashboard</a></span>
+</header>
+<main>
+<fieldset><legend>Admin</legend>
+  <div class="row">
+    <label>Your discord_id <input id="admin" size="22" placeholder="paste your discord id"></label>
+    <label>Status <select id="fStatus"><option value="">all</option><option>live</option><option>lobby</option><option>ended</option></select></label>
+    <button id="bRooms">Load rooms</button>
+  </div>
+  <div id="rooms" class="dim">paste your discord_id, then load rooms</div>
+</fieldset>
+
+<fieldset><legend>Room + seals</legend>
+  <div class="row"><span id="roomHead" class="dim">select a room</span></div>
+  <div id="matches" class="dim">—</div>
+</fieldset>
+
+<fieldset id="fSeal" style="display:none"><legend>Seal</legend>
+  <div class="row" id="sealHead"></div>
+  <div class="row" id="sealActions"></div>
+  <div id="board"></div>
+  <div class="row" style="margin-top:8px"><b class="dim">killfeed / evidence</b></div>
+  <div id="feed" class="feed"></div>
+  <div class="row" style="margin-top:8px"><b class="dim">unmapped names</b></div>
+  <div id="unmapped" class="dim">—</div>
+</fieldset>
+
+<fieldset><legend>Log</legend><div id="log"></div></fieldset>
+</main>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+const ADMIN=()=>$('admin').value.trim();
+function log(m,err){const d=document.createElement('div');if(err)d.className='bad';d.textContent=new Date().toLocaleTimeString()+' '+m;$('log').prepend(d);}
+async function api(p,o){const r=await fetch(p,o);const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);return j;}
+const get=p=>api(p+(p.includes('?')?'&':'?')+'discord_id='+encodeURIComponent(ADMIN()));
+const post=(p,b)=>api(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({discord_id:ADMIN()},b))});
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let CUR={room:null,ver:null,match:null};
+
+$('bRooms').onclick=async()=>{
+  if(!ADMIN())return log('enter your discord_id first',1);
+  try{
+    const j=await get('/api/ranked/admin/rooms?status='+$('fStatus').value);
+    if(!(j.rooms||[]).length){$('rooms').innerHTML='<span class=dim>no rooms</span>';return;}
+    $('rooms').innerHTML='<table><tr><th>room</th><th>code</th><th>status</th><th>players</th><th>ver</th><th>host</th><th>updated</th></tr>'+
+      j.rooms.map(r=>'<tr class=click data-rid="'+esc(r.id)+'"><td>'+esc(r.id)+'</td><td>'+esc(r.short_code)+'</td>'+
+        '<td><span class="pill '+esc(r.status)+'">'+esc(r.status)+'</span></td><td>'+r.players+'</td><td>'+(r.match_version??'—')+'</td>'+
+        '<td class=dim>'+esc(r.host_discord_id||'')+'</td><td class=dim>'+esc((r.updated_at||'').slice(0,16))+'</td></tr>').join('')+'</table>';
+  }catch(e){log('rooms: '+e.message,1);}
+};
+$('rooms').addEventListener('click',async e=>{
+  const tr=e.target.closest('tr[data-rid]');if(!tr)return;
+  CUR.room=tr.dataset.rid;CUR.ver=null;CUR.match=null;$('fSeal').style.display='none';
+  try{
+    const j=await get('/api/ranked/admin/room?room_id='+encodeURIComponent(CUR.room));
+    const r=j.room||{};
+    $('roomHead').innerHTML='room <b>'+esc(r.id)+'</b> code <b>'+esc(r.short_code)+'</b> <span class="pill '+esc(r.status)+'">'+esc(r.status)+'</span>'+
+      ' <span class=dim>roster: '+esc((r.roster_view||[]).map(x=>x.name).join(', ')||'—')+'</span>';
+    const ms=j.matches||[];
+    $('matches').innerHTML=ms.length?'<table><tr><th>ver</th><th>status</th><th>started</th><th>sealed</th></tr>'+
+      ms.map(m=>'<tr class=click data-ver="'+m.match_version+'"><td>v'+m.match_version+'</td><td>'+esc(m.status||'')+'</td>'+
+        '<td class=dim>'+esc((m.started_at||'').slice(0,16))+'</td><td class=dim>'+esc((m.sealed_at||'').slice(0,16))+'</td></tr>').join('')+'</table>'
+      :'<span class=dim>no matches recorded</span>';
+  }catch(e){log('room: '+e.message,1);}
+});
+$('matches').addEventListener('click',async e=>{
+  const tr=e.target.closest('tr[data-ver]');if(!tr)return;
+  CUR.ver=Number(tr.dataset.ver);
+  await loadSeal();
+});
+async function loadSeal(){
+  try{
+    const j=await get('/api/ranked/admin/match?room_id='+encodeURIComponent(CUR.room)+'&match_version='+CUR.ver);
+    CUR.match=j;$('fSeal').style.display='';
+    $('sealHead').innerHTML='v'+j.match_version+' '+(j.sealed?'<span class="pill ended">sealed</span>':'<span class="pill lobby">open</span>')+
+      ' winner <b>'+(j.winner_discord_id?esc(j.winner_discord_id):'<span class=dim>none</span>')+'</b>'+
+      ' <span class=dim>placements: '+esc(JSON.stringify(j.placements))+'</span>'+
+      ' <span class=dim>removed: '+esc((j.removed_discord_ids||[]).join(',')||'—')+'</span>';
+    $('sealActions').innerHTML=
+      '<button id="aRecalc" class=ghost>Recalc</button>'+
+      '<button id="aWinner" class=warn>Crown selected</button>'+
+      '<button id="aRemove" class=bad>Remove selected</button>'+
+      '<button id="aBack" class=ghost>Add-back selected</button>'+
+      '<span class=dim>click a board row to select</span>';
+    const rows=j.board||[];
+    $('board').innerHTML=rows.length?'<table><tr><th></th><th>name</th><th>did</th><th>K</th><th>place</th><th>pts</th><th>edit place</th></tr>'+
+      rows.map((b,i)=>'<tr class="click bsel" data-i="'+i+'" data-did="'+esc(b.discord_id)+'">'+
+        '<td><input type=radio name=bsel></td><td>'+esc(b.name)+'</td><td class=dim>'+esc(b.discord_id)+'</td>'+
+        '<td>'+b.kills+'</td><td>'+(b.placement??'—')+'</td><td>'+b.points+'</td>'+
+        '<td><input class="pIn" data-did="'+esc(b.discord_id)+'" size=3 placeholder="'+(b.placement??'-')+'">'+
+        ' <button class="pSet" data-did="'+esc(b.discord_id)+'">set</button></td></tr>').join('')+'</table>'
+      :'<span class=dim>'+(j.sealed?'no board rows':'match not sealed yet')+'</span>';
+    const kf=j.killfeed||[];
+    $('feed').innerHTML=kf.length?kf.map(e=>{
+      if(e.etype==='kill')return '<div><span class=k>kill</span> '+esc(e.actor_name)+' → '+esc(e.target_name)+' <span class=dim>'+(e.discord_id?('['+esc(e.discord_id)+']'):'<span class=bad>[unmapped]</span>')+'</span></div>';
+      if(e.etype==='alv')return '<div><span class=a>alv</span> '+esc(e.actor_name)+' '+(e.alive?'alive':'dead')+' <span class=dim>'+(e.discord_id?('['+esc(e.discord_id)+']'):'<span class=bad>[unmapped]</span>')+'</span></div>';
+      return '<div class=dim>'+esc(e.etype)+' '+esc(e.actor_name||'')+'</div>';}).join('')
+      :'<span class=dim>no banked events</span>';
+    $('aRecalc').onclick=async()=>{try{const r=await post('/api/ranked/admin/match/recalc',{room_id:CUR.room,match_version:CUR.ver});log('recalc diffs: '+JSON.stringify(r.diffs||{}));await loadSeal();}catch(e){log('recalc: '+e.message,1);}};
+    $('aWinner').onclick=async()=>{
+      const sel=document.querySelector('tr.bsel input:checked');
+      if(!sel)return log('select a board row first',1);
+      const did=sel.closest('tr').dataset.did;
+      try{const r=await post('/api/ranked/admin/match/winner',{room_id:CUR.room,match_version:CUR.ver,winner_discord_id:did});log('crowned '+did+' diffs:'+JSON.stringify(r.diffs||{}));await loadSeal();}catch(e){log('winner: '+e.message,1);}};
+    $('aRemove').onclick=async()=>{
+      const sel=document.querySelector('tr.bsel input:checked');
+      if(!sel)return log('select a board row first',1);
+      const did=sel.closest('tr').dataset.did;
+      try{const r=await post('/api/ranked/admin/match/remove',{room_id:CUR.room,match_version:CUR.ver,player_discord_id:did});log('removed '+did+' diffs:'+JSON.stringify(r.recalc?.diffs||r.diffs||{}));await loadSeal();}catch(e){log('remove: '+e.message,1);}};
+    $('aBack').onclick=async()=>{
+      const sel=document.querySelector('tr.bsel input:checked');
+      if(!sel)return log('select a board row first',1);
+      const did=sel.closest('tr').dataset.did;
+      try{const r=await post('/api/ranked/admin/match/add-back',{room_id:CUR.room,match_version:CUR.ver,player_discord_id:did});log('added back '+did);await loadSeal();}catch(e){log('add-back: '+e.message,1);}};
+    document.querySelectorAll('.pSet').forEach(btn=>btn.onclick=async()=>{
+      const did=btn.dataset.did;
+      const inp=document.querySelector('.pIn[data-did="'+did+'"]');
+      const v=inp.value.trim();
+      const place=v===''?null:Number(v);
+      try{const r=await post('/api/ranked/admin/match/place',{room_id:CUR.room,match_version:CUR.ver,player_discord_id:did,place});log('placed '+did+' → '+(place??'cleared'));await loadSeal();}catch(e){log('place: '+e.message,1);}});
+    await loadUnmapped();
+  }catch(e){log('seal: '+e.message,1);}
+}
+async function loadUnmapped(){
+  try{
+    const j=await get('/api/ranked/admin/match/unmapped?room_id='+encodeURIComponent(CUR.room)+'&match_version='+CUR.ver);
+    const u=j.unmapped||[];
+    $('unmapped').innerHTML=u.length?'<table><tr><th>name</th><th>K</th><th>D</th><th>link to discord_id</th></tr>'+
+      u.map(x=>'<tr><td>'+esc(x.name)+'</td><td>'+x.kills+'</td><td>'+x.deaths+'</td>'+
+        '<td><input class="uDid" data-nm="'+esc(x.name)+'" size=22 placeholder="discord id">'+
+        ' <button class="uLink" data-nm="'+esc(x.name)+'">link</button>'+
+        ' <button class="uLinkAll" data-nm="'+esc(x.name)+'">link all seals</button></td></tr>').join('')+'</table>'
+      :'<span class=good>nothing unmapped</span>';
+    document.querySelectorAll('.uLink,.uLinkAll').forEach(btn=>btn.onclick=async()=>{
+      const nm=btn.dataset.nm;
+      const inp=document.querySelector('.uDid[data-nm="'+nm+'"]');
+      const did=inp.value.trim()||null;
+      try{
+        const r=await post('/api/ranked/admin/link',{room_id:CUR.room,match_version:CUR.ver,actor_name:nm,player_discord_id:did,apply_to_all:btn.classList.contains('uLinkAll')});
+        log('linked "'+nm+'" → '+(did||'null')+' rows='+r.linked+' diffs:'+JSON.stringify((r.recalc||{}).diffs||{}));
+        await loadSeal();
+      }catch(e){log('link: '+e.message,1);}});
+  }catch(e){$('unmapped').textContent='unmapped: '+e.message;}
+}
+</script>
+</body>
+</html>
