@@ -740,7 +740,7 @@ def _flush_user_counters(discord_id, pending_user_updates, dirty, user, attempts
                         pass
                 else:
                     try:
-                        log_dbg(f"PROCESSOR flush user {discord_id[:6]} {final_user_update}")
+                        log_sys(f"PROCESSOR flush user {discord_id[:6]} {final_user_update}")
                     except Exception:
                         pass
                 return True
@@ -953,7 +953,7 @@ def _sync_playtime(view, user, discord_id):
             user["play_points_hours_paid"] = hourly_paid
         except Exception:
             pass
-    log_dbg(f"PROCESSOR playtime per_gm={per_gm_add} lobby={lobby_add} total+{total_add}")
+    log_sys(f"PROCESSOR playtime per_gm={per_gm_add} lobby={lobby_add} total+{total_add}")
     # Reset room counters to zero (already flushed to DB)
     for r in view.rooms.values():
         r.match_playtime.total_seconds = 0      # Reset total
@@ -967,6 +967,13 @@ def _sync_playtime(view, user, discord_id):
 
 # ---------------------------------------------------------------------------
 # v2.19.0 streak rewards — daily / win / kill (batch-end, never raises)
+#
+# v1 SHIP SWITCH: streak counters are tracked (drawer display) but NEVER
+# paid into the ladder — seals are the only ladder movers. Set
+# PAY_STREAK_BONUS = True to re-enable post-launch (daily + win + kill
+# threshold bonuses from server.lib.streaks).
+# ---------------------------------------------------------------------------
+PAY_STREAK_BONUS = False
 # ---------------------------------------------------------------------------
 
 def _apply_streaks(user, dirty, ev_rows, view=None) -> int:
@@ -1667,7 +1674,205 @@ def _rt_bank_alv(tourney, mid, room) -> None:
         pass
 
 
-def seal_ranked_tourney_match(session_id, discord_id, room, room_id, gm) -> None:
+def _rt_autotag(session_id, discord_id, room, code) -> None:
+    """Auto-tag the host's codeless session with a room THEY created.
+
+    Removes the manual change-code step in the common case:
+    host creates a game room → pID observed here → their one codeless
+    session gets tagged → next batch binds (negative caches cleared here).
+
+    State-gated codes (announce rules live downstream):
+      - created + codeless → silent start setup (no broadcast anywhere)
+      - live (started) + codeless, e.g. after a backout → retag; the bot
+        watch loop announces it (embed + roster DMs + @here)
+      - ended → never touched (excluded from the lookup outright)
+
+    Strict no-harm rules (manual always wins, never raises):
+      - valid 5-char alnum code + room.created_by_me (never a joined room)
+      - room is the session's CURRENT room (callers gate this: the sweep
+        also visits stale rooms, which must never tag) + live traffic
+        (<=90s, belt-and-braces inside)
+      - discord_id known
+      - host owns EXACTLY ONE non-ended session with no code set
+        (zero → nothing to tag; two+ → ambiguous, stay manual)
+      - no OTHER non-ended session already claims this code (no steals)
+      - never clobbers a code set manually (same or different → hands off)
+    """
+    try:
+        code = str(code or "").strip().upper()
+        if len(code) != 5 or not code.isalnum():
+            return
+        try:
+            if not bool(getattr(room, "created_by_me", False)):
+                return
+        except Exception:
+            return
+        try:
+            import time as _t
+            _lp = float(getattr(room, "last_packet_at", None) or 0)
+            _fresh = bool(_lp) and ((_t.time() - _lp) <= 90)
+        except Exception:
+            _fresh = False
+        if not _fresh:
+            # Stale room snapshot: the sweep iterates every room in the
+            # view, including the previous room (still state=match) after
+            # a fresh create. Tagging from it would bind the session to
+            # the OLD code. Only a room with live traffic may tag.
+            return
+        if supabase is None or not discord_id:
+            return
+        did = str(discord_id)
+        try:
+            q1 = supabase.table("bngc_ranked_tourneys").select(
+                "id,code,status,hosts,created_by").eq(
+                "created_by", did).neq("status", "ended").limit(20).execute()
+            q2 = supabase.table("bngc_ranked_tourneys").select(
+                "id,code,status,hosts,created_by").contains(
+                "hosts", [did]).neq("status", "ended").limit(20).execute()
+        except Exception as exc:
+            if is_transient_error(exc):
+                return  # pool blip — next batch retries
+            return
+        try:
+            seen: dict = {}
+            for _r in ((q1.data or []) + (q2.data or [])):
+                try:
+                    seen[str((_r or {}).get("id"))] = _r
+                except Exception:
+                    continue
+            mine = list(seen.values())
+        except Exception:
+            return
+        # Only CODELESS tourneys count: a tourney that already has a code
+        # isn't waiting for one, so it must not make the choice ambiguous.
+        # (One coded + one codeless + fresh room = tag the codeless one.)
+        try:
+            codeless = [t for t in mine
+                        if not str((t or {}).get("code") or "").strip()]
+        except Exception:
+            return
+        if len(codeless) != 1:
+            if len(codeless) > 1:
+                try:
+                    _k = f"autotag-ambiguous:{did[:6]}"
+                    if _k not in _rt_logged_codes:
+                        _rt_logged_codes.add(_k)
+                        log_comp(f"rt autotag skipped — {len(codeless)} codeless tourneys (stay manual)")
+                except Exception:
+                    pass
+            return
+        t = codeless[0]
+        try:
+            tid = t.get("id")
+            tstatus = str((t or {}).get("status") or "")
+        except Exception:
+            return
+        if tstatus == "ended":
+            return  # belt-and-braces: the lookup already excludes ended
+        try:
+            cres = supabase.table("bngc_ranked_tourneys").select("id").eq(
+                "code", code).neq("status", "ended").limit(2).execute()
+            if cres.data:
+                try:
+                    _k = f"autotag-claimed:{code}"
+                    if _k not in _rt_logged_codes:
+                        _rt_logged_codes.add(_k)
+                        log_comp(f"rt autotag tid={tid} code={code} skipped — claimed by another tourney")
+                except Exception:
+                    pass
+                return
+        except Exception as exc:
+            if is_transient_error(exc):
+                return
+            return
+        try:
+            ures = supabase.table("bngc_ranked_tourneys").update(
+                {"code": code}).eq("id", tid).execute()
+            if not ures.data:
+                return
+        except Exception as exc:
+            if is_transient_error(exc):
+                return  # next batch retries
+            try:
+                log_comp(f"rt autotag tid={tid} write failed ({str(exc)[:60]})")
+            except Exception:
+                pass
+            return
+        try:
+            from server.lib import ranked as _rm
+            _rm._ROOM_CACHE.pop(code, None)
+        except Exception:
+            pass
+        try:
+            from server.routes import capture as _cap
+            _cap._ranked_room_cache.pop(code, None)
+        except Exception:
+            pass
+        try:
+            log_comp(f"rt autotag tid={tid} code={code} status={tstatus} from host room — binds next batch (change-code still wins)")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _rt_attach_room_seal(mid, code, room) -> None:
+    """Store the room seal's ladder deltas on a freshly sealed tourney match.
+
+    The room seal (same sweep, just above) already paid the ladder — it IS
+    the arena pay. The bridge stores its deltas here so the tourney board
+    replays one economy instead of recomputing a second: {mode
+    room-seal-v1, winner, points, kills, placements, breakdown}. When the
+    room seal hasn't landed yet, pending join keys
+    (room-seal-pending-v1) are stored instead and the calculate backfill
+    resolves them. Separate best-effort update: pre-v249 DBs (no
+    points_table column) fail silently into legacy replay. Never raises.
+    """
+    try:
+        if supabase is None or mid is None:
+            return
+        try:
+            mver = int(getattr(room, "match_version", 0) or 0)
+        except Exception:
+            mver = 0
+        try:
+            from server.lib import ranked as ranked_mod
+        except Exception:
+            return
+        try:
+            room_data = ranked_mod.get_ranked_room(code)
+            rid = str((room_data or {}).get("id") or "") or None
+        except Exception:
+            rid = None
+        if not rid or mver <= 0:
+            return  # no join keys: legacy replay, nothing to store
+        try:
+            bundle = ranked_mod.seal_bundle_for(rid, mver)
+        except Exception:
+            bundle = None
+        if isinstance(bundle, dict):
+            patch = {"points_table": bundle}
+            try:
+                n = len(bundle.get("points") or {})
+            except Exception:
+                n = "?"
+            tag = f"seal bundle ({n} players)"
+        else:
+            patch = {"points_table": {"mode": "room-seal-pending-v1", "rid": rid,
+                                      "code": code, "room_match_version": mver}}
+            tag = "pending (room seal not landed yet)"
+        try:
+            supabase.table("bngc_ranked_tourney_matches").update(
+                patch).eq("id", mid).execute()
+            log_comp(f"rt match={mid} {tag}")
+        except Exception:
+            pass  # pre-v249: legacy replay
+    except Exception:
+        pass
+
+
+def seal_ranked_tourney_match(session_id, discord_id, room, room_id, gm,
+                              is_current: bool = True) -> None:
     """Auto open/seal ranked-tourney matches from the HOST capture. Never raises.
 
     Ranked tourneys are comp tourneys with dynamic points. Match lifecycle is
@@ -1717,6 +1922,16 @@ def seal_ranked_tourney_match(session_id, discord_id, room, room_id, gm) -> None
                 log_comp(f"rt by-code={code} lookup failed ({str(exc)[:60]})")
             return
         if len(rows) != 1:
+            if not rows:
+                # Untagged room: try the host auto-tag (created rooms only).
+                # On success the next batch binds (caches cleared in autotag).
+                # Current-room only: the sweep also visits stale rooms, and
+                # tagging from one rebinds the OLD code after a backout.
+                if is_current:
+                    try:
+                        _rt_autotag(session_id, discord_id, room, code)
+                    except Exception:
+                        pass
             if code not in _rt_logged_codes:
                 _rt_logged_codes.add(code)
                 log_comp(f"rt by-code={code} rows={len(rows)} -> null (ambiguous or none)")
@@ -1766,6 +1981,15 @@ def seal_ranked_tourney_match(session_id, discord_id, room, room_id, gm) -> None
                 ).eq("id", mid).eq("status", "open").execute()
                 if sres.data:
                     log_comp(f"rt sealed match={mid} tid={tid} code={code} (stG {last_stg})")
+                    try:
+                        _rt_attach_room_seal(mid, code, room)
+                    except Exception:
+                        pass
+                    try:
+                        from server.routes import ranked_tourney as _rt_mod
+                        _rt_mod.reset_loser_streaks_sync(mid)
+                    except Exception:
+                        pass
                     try:
                         _board = _rt_calc(int(tid), "bridge")
                         log_comp(f"rt match={mid} auto-calculated {len(_board or [])} rows")
@@ -1998,11 +2222,92 @@ def seal_ranked_match(session_id, discord_id, room, room_id, gm) -> None:
                     continue
         except Exception:
             pass
-        # winner: first alive; total wipe => most-recent death survived
-        # longest (zone double-KO fallback). Every other roster did takes
-        # the flat loss — zone, unknown, and killed alike.
-        winner = alive[0] if alive else (dead_order[0] if dead_order else None)
-        deaths = {did: None for did in roster if did not in skip and did != winner}
+        # winner: first alive; total wipe => the last killer survived
+        # longest (they were alive at least until the final blow — crowning
+        # the last *victim* gets it backwards when the killer then dies to
+        # zone); no kills at all => most-recent death. Every other roster
+        # did takes the loss — zone, unknown, and killed alike.
+        # Killfeed is truth for deaths: the host alv flag can still read
+        # alive at seal time for a player the feed already killed (stale
+        # snapshot). Anyone in dead_order is dead, never the winner.
+        try:
+            _dead = set(dead_order or [])
+            if _dead:
+                alive = [d for d in (alive or []) if d not in _dead]
+        except Exception:
+            pass
+        try:
+            _last_killer = None
+            for _kdid, _vdid in reversed(kill_events or []):
+                try:
+                    if str(_kdid or "").strip() and str(_kdid) != str(_vdid):
+                        _last_killer = str(_kdid)
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            _last_killer = None
+        winner = alive[0] if alive else (_last_killer or (dead_order[0] if dead_order else None))
+        # duo: alive teammates of the winner share the crown (P1 tie, no
+        # loss) — otherwise the surviving partner "wins" the game and still
+        # pays a defeat. Dead teammates keep their death placement + loss.
+        tied_winners: list = []
+        try:
+            if winner and getattr(room, "is_duo", False):
+                try:
+                    _by_did = {}
+                    for _nm, _dd in (name2did or {}).items():
+                        if _dd and str(_dd) not in _by_did:
+                            _by_did[str(_dd)] = str(_nm)
+                    _wname = _by_did.get(str(winner))
+                    _wteam = room.get_team(_wname) if _wname else None
+                    if _wteam is None and _wname:
+                        for _t in ((getattr(room, "teams", None)) or {}).values():
+                            try:
+                                if any(_names_equal(_m, _wname) for _m in (getattr(_t, "members", None) or [])):
+                                    _wteam = _t
+                                    break
+                            except Exception:
+                                continue
+                    if _wteam is not None:
+                        _alive_set = set(alive or [])
+                        for _m in (getattr(_wteam, "members", None) or []):
+                            try:
+                                _md = (name2did or {}).get(str(_m))
+                                if (not _md):
+                                    for _nm2, _dd2 in (name2did or {}).items():
+                                        if _names_equal(_nm2, str(_m)):
+                                            _md = _dd2
+                                            break
+                                if (_md and str(_md) in roster and str(_md) not in skip
+                                        and str(_md) != str(winner) and str(_md) in _alive_set
+                                        and str(_md) not in tied_winners):
+                                    tied_winners.append(str(_md))
+                            except Exception:
+                                continue
+                except Exception:
+                    tied_winners = []
+        except Exception:
+            tied_winners = []
+        try:
+            _wset = {str(winner)} | {str(d) for d in (tied_winners or [])} if winner else set()
+        except Exception:
+            _wset = {str(winner)} if winner else set()
+        # victim -> killer for killer-relative loss (grandmaster feeding a
+        # lower tier pays up to -50). Unknown/zone deaths stay None and pay
+        # the flat tier stake. Last kill wins per victim.
+        deaths = {did: None for did in roster if did not in skip and did not in _wset}
+        try:
+            for _kdid, _vdid in (kill_events or []):
+                try:
+                    _vk = str(_vdid or "").strip()
+                    _kk = str(_kdid or "").strip()
+                    if _vk and _vk in deaths and _kk and _vk != _kk:
+                        deaths[_vk] = _kk
+                except Exception:
+                    continue
+        except Exception:
+            pass
         # placements from THIS room view (reverse death recency, winner
         # first) so boards always agree with the crown even in a zone
         # double-KO. The winner always places P1; the dead place only when
@@ -2014,6 +2319,9 @@ def seal_ranked_match(session_id, discord_id, room, room_id, gm) -> None:
             order = []
             if winner:
                 order.append(winner)
+            for _td in (tied_winners or []):
+                if _td not in order:
+                    order.append(_td)
             dead_names = [by_did_nm for by_did_nm in
                           (name2did or {}).items()]
             did_to_name = {str(d): nm for nm, d in dead_names if d}
@@ -2024,7 +2332,7 @@ def seal_ranked_match(session_id, discord_id, room, room_id, gm) -> None:
                                         if str(d) in did_to_name])
             for d in reversed(dead_order):
                 nm = did_to_name.get(str(d))
-                if (d != winner and d not in order
+                if (d not in _wset and d not in order
                         and nm and verified.get(nm) and
                         str(verified.get(nm)) == str(d)):
                     order.append(d)
@@ -2033,18 +2341,31 @@ def seal_ranked_match(session_id, discord_id, room, room_id, gm) -> None:
             # roster order - deterministic enough for the purse.
             for d in (deaths or {}):
                 nm = did_to_name.get(str(d))
-                if (d != winner and d not in order
+                if (d not in _wset and d not in order
                         and nm and verified.get(nm) and
                         str(verified.get(nm)) == str(d)):
                     order.append(d)
-            placements = {did: i + 1 for i, did in enumerate(order)}
+            # co-winners share P1 (engine pays every P1 holder the win
+            # bonus); everyone else places sequentially from P2.
+            try:
+                placements = {}
+                _next = 2
+                for _did in order:
+                    if _did in _wset:
+                        placements[_did] = 1
+                    else:
+                        placements[_did] = _next
+                        _next += 1
+            except Exception:
+                placements = {did: i + 1 for i, did in enumerate(order)}
         except Exception:
             placements = {}
         res = ranked_mod.seal_match(rid=rid, match_version=mver, gm=gm or room_data.get("gm") or "zw_lg",
                                     winner_discord_id=winner, kills=kills_count,
                                     placements=placements or None,
                                     kill_events=kill_events or None,
-                                    death_killers=deaths or None)
+                                    death_killers=deaths or None,
+                                    tied_winners=tied_winners or None)
         if not res.get("ok"):
             log_ranked(f"[ranked] seal failed {rid} v{mver}: {res.get('error')}")
             return
@@ -2266,9 +2587,9 @@ async def process_batch(
         log_err(f"processor: get user failed {discord_id[:6]} {exc}")
         return                        # DB error → abort
 
-    # Log current user stats before processing (debug-gated: every batch)
-    log_dbg(f"PROCESSOR user={discord_id[:6]} kills={user.get('kills',0)} "
-            f"deaths={user.get('deaths',0)} wins={user.get('wins',0)}")
+    # Log current user stats before processing (ALWAYS — every batch)
+    log_sys(f"PROCESSOR CALL session={session_id[:13]} did={discord_id[:6]} n={len(packets)} "
+            f"kills={user.get('kills',0)} deaths={user.get('deaths',0)} wins={user.get('wins',0)}")
 
     # Last-seen heartbeat (drives "last online" display): refresh at most
     # every 5 minutes per player, never let a DB blip break the batch.
@@ -2412,8 +2733,8 @@ async def process_batch(
         pkt_room_gm = pkt.get("room_gm") if isinstance(pkt, dict) else getattr(pkt, "room_gm", None)  # Room's game mode
         eff_gm = _eff_gm(pkt, pkt_room_gm, gm_val)  # Effective game mode (packet → room → session)
 
-        # Log packet details for debugging (debug-gated: every packet)
-        log_dbg(f"PROCESSOR pkt type={pkt_type} ig={instigator} ed={instigated} "
+        # Log EVERY packet (ALWAYS — full visibility)
+        log_sys(f"PROCESSOR pkt type={pkt_type} ig={instigator} ed={instigated} "
                 f"kill={is_kill} knock={is_knock} leave={is_leave} me={me_name} "
                 f"gm={eff_gm} room={str(pkt_room_id or '')[:8]}")
 
@@ -3011,7 +3332,12 @@ async def process_batch(
             if not getattr(room_r, "short_code", None):
                 continue
             try:
-                await db_io(seal_ranked_tourney_match, session_id, discord_id, room_r, room_id_r, gm_val)
+                _cur = getattr(view, "current_room_id", None)
+            except Exception:
+                _cur = None
+            try:
+                await db_io(seal_ranked_tourney_match, session_id, discord_id, room_r, room_id_r, gm_val,
+                            room_id_r == _cur)
             except Exception:
                 pass
     except Exception as exc:
@@ -3059,11 +3385,12 @@ async def process_batch(
         log_err(f"processor competitive outer failed {e}")
 
     # --- v2.19.0 streaks: batch-end accrual (queued into flush) ---
-    # Queues daily/win/kill counter updates + pays bonus into arena
-    # points (ranked_points ledger) best-effort. Never breaks the batch.
+    # Queues daily/win/kill counter updates; the ladder payout is gated by
+    # PAY_STREAK_BONUS (v1: off — seals are the only ladder movers).
+    # Best-effort. Never breaks the batch.
     try:
         _streak_bonus = _apply_streaks(user, dirty, ev_rows, view)
-        if _streak_bonus:
+        if _streak_bonus and PAY_STREAK_BONUS:
             try:
                 from server.lib import ranked as _rk_pay
                 _cur_pts = _rk_pay.get_ranked_points(discord_id)
@@ -3133,11 +3460,11 @@ async def process_batch(
     # Upsert stats table so SELECT * FROM bngc_player_stats is populated
     try:
         await db_io(_upsert_stats, discord_id, user)  # Call helper
-        log_dbg(f"PROCESSOR sync player_stats kills={user.get('kills',0)} defeats={user.get('defeats',0)} wins={user.get('wins',0)}")
+        log_sys(f"PROCESSOR sync player_stats did={discord_id[:6]} kills={user.get('kills',0)} defeats={user.get('defeats',0)} wins={user.get('wins',0)}")
     except Exception as exc:
         log_err(f"processor player_stats sync failed {exc}")
 
 
-    # Log final stats after processing all packets (debug-gated: every batch)
-    log_dbg(f"PROCESSOR DONE session={session_id[:13]} kills={user.get('kills',0)} "
+    # Log final stats after processing all packets (ALWAYS — every batch)
+    log_sys(f"PROCESSOR DONE session={session_id[:13]} kills={user.get('kills',0)} "
             f"deaths={user.get('deaths',0)} wins={user.get('wins',0)} defeats={user.get('defeats',0)}")

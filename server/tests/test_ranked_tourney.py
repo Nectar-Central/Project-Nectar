@@ -251,9 +251,9 @@ def test_tourney_detail_rank_display_and_legacy_replay(monkeypatch):
                         lambda dids, fresh=False: {"A": 1200, "B": 300})
     code, j = _call(monkeypatch, state, rt_mod.tourney_detail, params={"id": "0"})
     assert code == 200, j
-    # rank snapshot from the ladder (Gold avg), not the Elo table
+    # rank snapshot from the ladder (Bronze avg), not the Elo table
     assert j["tourney"]["rank_avg"] == 750.0
-    assert j["tourney"]["rank_milestone"] == "Silver"
+    assert j["tourney"]["rank_milestone"] == "Bronze"
     by = {r["discord_id"]: r for r in j["standings"]}
     assert by["A"]["rank_pts"] == 1200
     assert by["B"]["rank_pts"] == 300
@@ -263,14 +263,32 @@ def test_tourney_detail_rank_display_and_legacy_replay(monkeypatch):
     assert by["B"]["points"] == 7
 
 
-def test_tourney_detail_rank_empty_without_ladder(monkeypatch):
+def test_tourney_detail_rank_zeros_without_ladder_rows(monkeypatch):
+    """Unranked rosters still show an average (0.0 / Unranked), never a dash."""
     state = _state()
     monkeypatch.setattr(rt_mod, "_ladder_points", lambda dids, fresh=False: {})
     code, j = _call(monkeypatch, state, rt_mod.tourney_detail, params={"id": "0"})
     assert code == 200, j
-    assert j["tourney"]["rank_avg"] is None
-    assert j["tourney"]["rank_milestone"] is None
-    assert all("rank_pts" not in r for r in j["standings"])
+    assert j["tourney"]["rank_avg"] == 0.0
+    assert j["tourney"]["rank_milestone"] == "Unranked"
+    by = {r["discord_id"]: r for r in j["standings"]}
+    assert by["A"]["rank_pts"] == 0 and by["B"]["rank_pts"] == 0
+
+
+def test_tourney_detail_hosts_payload(monkeypatch):
+    """The dashboard hosts panel needs creator + hosts + host_playing."""
+    state = _state()
+    state["bngc_ranked_tourneys"][0].update({
+        "created_by": "A", "hosts": ["B"], "host_playing": False})
+    monkeypatch.setattr(rt_mod, "_ladder_points",
+                        lambda dids, fresh=False: {"A": 1200, "B": 300})
+    code, j = _call(monkeypatch, state, rt_mod.tourney_detail, params={"id": "0"})
+    assert code == 200, j
+    t = j["tourney"]
+    assert t["created_by"] == "A" and t["hosts"] == ["B"]
+    assert t["host_playing"] is False
+    # roster ids decide per-host status client-side (A and B both play)
+    assert {p["discord_id"] for p in j["players"]} == {"A", "B"}
 
 
 def test_tourney_create_validation_and_seed(monkeypatch):
@@ -328,11 +346,12 @@ def test_tourney_delta_formulas():
     assert (rt_mod.tourney_kill_delta(500, 500, 500, 12)
             > rt_mod.tourney_kill_delta(500, 500, 500, 2))
     assert rt_mod.tourney_kill_delta(None, None, None, None) == 8
-    # win grows with winner points and lobby size, bounded
+    # win grows with winner points and lobby size, bounded under the clamp
+    # so weak lobbies feel the scale instead of saturating at +30 every win
     assert rt_mod.tourney_win_delta(0, 2) < rt_mod.tourney_win_delta(7500, 16)
-    assert 35 <= rt_mod.tourney_win_delta(0, 2) <= 95
-    assert rt_mod.tourney_win_delta(99999, 99) == 95
-    assert rt_mod.tourney_win_delta(None, None) == 52  # n floors at 1
+    assert 12 <= rt_mod.tourney_win_delta(0, 2) <= 30
+    assert rt_mod.tourney_win_delta(99999, 99) == 30
+    assert rt_mod.tourney_win_delta(None, None) == 19  # n floors at 1
     # placement: better place pays more; stronger player + lobby pay more
     assert rt_mod.tourney_place_delta(1, 0, 0) > rt_mod.tourney_place_delta(5, 0, 0)
     assert (rt_mod.tourney_place_delta(1, 5000, 4000)
@@ -356,11 +375,18 @@ def test_freeze_match_table_from_ladder(monkeypatch):
         "killer": "A", "victim": "B", "nth": 1,
         "points": rt_mod.tourney_kill_delta(1200, 300, 750.0, 2)}]
     assert table["win"] == rt_mod.tourney_win_delta(1200, 2)
-    assert table["placement"][:2] == [
-        rt_mod.tourney_place_delta(1, 1200, 750.0),
-        rt_mod.tourney_place_delta(2, 300, 750.0)]
-    assert table["loss_awards"] == {
-        "A": rt_mod._ladder_loss(1200), "B": rt_mod._ladder_loss(300)}
+    # top-half purse: 2 players -> P1 only, last place pays nothing
+    assert table["placement"] == [
+        rt_mod.tourney_place_delta(1, 1200, 750.0)]
+    # killer-relative losses: B died to a much stronger killer (cheap),
+    # A (winner, unkilled) keeps the flat tier stake
+    assert table["loss_awards"] == {"A": -11, "B": -3}
+    # per-player seal components stored for toasts/embeds (clamped totals)
+    assert set(table["breakdown"]) == {"A", "B"}
+    assert table["breakdown"]["A"]["total"] == 30
+    assert table["breakdown"]["A"]["capped"] is True
+    assert table["breakdown"]["B"] == {"kills": 0, "win": 0, "placement": 0,
+                                       "loss": -3, "total": -3, "capped": False}
     # stored back on the match row
     mrow = next(r for r in state["bngc_ranked_tourney_matches"] if r["id"] == 11)
     assert mrow["points_table"] == table and mrow["avg_points"] == 750.0
@@ -380,8 +406,16 @@ def test_score_replays_frozen_and_legacy():
         "kill_awards": [{"killer": "A", "victim": "B", "nth": 1, "points": 15}],
         "loss_awards": {"A": -14, "B": -8}})
     by = {r["discord_id"]: r for r in rt_mod._score_tourney_match({}, frozen, events)}
-    assert by["A"]["points"] == 68 + 12 + 15 and by["A"]["won"] is True
+    # frozen economy clamps to the ranked per-match clamp (-50/+30, rooms parity)
+    assert by["A"]["points"] == 30 and by["A"]["won"] is True
     assert by["B"]["points"] == 8 - 8 and by["B"]["won"] is False
+    rows, bd = rt_mod._score_frozen_with_breakdown(
+        frozen["points_table"], frozen, events)
+    assert {r["discord_id"]: r["points"] for r in rows} == {"A": 30, "B": 0}
+    assert bd["A"] == {"kills": 15, "win": 68, "placement": 12, "loss": 0,
+                       "total": 30, "capped": True}
+    assert bd["B"] == {"kills": 0, "win": 0, "placement": 8, "loss": -8,
+                       "total": 0, "capped": False}
     # legacy replay (no frozen table): old static math, no loss
     legacy = dict(base, points_table=None)
     t = {"points_table": {"kill": 1, "win": 3, "placement": [10, 7, 5, 3, 1]}}
@@ -390,9 +424,225 @@ def test_score_replays_frozen_and_legacy():
     assert by2["B"]["points"] == 7
 
 
+def test_frozen_loss_and_breakdown_shape():
+    # placement softens the loss; components stay intact for toasts
+    events = [
+        {"etype": "alv", "discord_id": "B", "actor_name": "b", "alive": False},
+        {"etype": "alv", "discord_id": "A", "actor_name": "a", "alive": False},
+    ]
+    m = {"id": 11, "winner_discord_id": "A", "placements": {},
+         "removed_discord_ids": [], "point_awards": {},
+         "points_table": {
+             "mode": "tourney-dynamic-v1", "avg_points": 0.0, "players": 2,
+             "kill": None, "win": 35, "placement": [6, 6, 6, 6, 6],
+             "kill_awards": [], "loss_awards": {"A": -5, "B": -50}}}
+    rows, bd = rt_mod._score_frozen_with_breakdown(m["points_table"], m, events)
+    by = {r["discord_id"]: r for r in rows}
+    assert by["B"]["points"] == -44
+    assert bd["B"] == {"kills": 0, "win": 0, "placement": 6, "loss": -50,
+                       "total": -44, "capped": False}
+    assert bd["A"]["capped"] is True and bd["A"]["total"] == 30
+
+
+def test_frozen_loss_only_victim_boards():
+    # Eliminated victim with no kills and no mapped alv row: no engine
+    # row, but the frozen loss must still board (loss-only) or the death
+    # vanishes — no board, no ladder pay, no toast.
+    events = [
+        {"etype": "kill", "discord_id": "A", "actor_name": "a",
+         "target_name": "b", "alive": None},
+        {"etype": "alv", "discord_id": "A", "actor_name": "a", "alive": False},
+    ]
+    m = {"id": 11, "winner_discord_id": "A", "placements": {},
+         "removed_discord_ids": [], "point_awards": {},
+         "points_table": {
+             "mode": "tourney-dynamic-v1", "avg_points": 0.0, "players": 2,
+             "kill": None, "win": 35, "placement": [6, 6, 6, 6, 6],
+             "kill_awards": [{"killer": "A", "victim": "B", "nth": 1, "points": 5}],
+             "loss_awards": {"A": -5, "B": -32}}}
+    rows, bd = rt_mod._score_frozen_with_breakdown(m["points_table"], m, events)
+    by = {r["discord_id"]: r for r in rows}
+    assert "B" in by, "victim without engine row must still board"
+    assert by["B"]["points"] == -32 and by["B"]["won"] is False
+    assert by["B"]["kills"] == 0 and by["B"]["placement"] is None
+    assert bd["B"] == {"kills": 0, "win": 0, "placement": 0, "loss": -32,
+                       "total": -32, "capped": False}
+    assert by["B"]["breakdown"] == bd["B"]
+
+
+def test_pay_sealed_ladders_dynamic_only(monkeypatch):
+    dyn = {"id": 21, "tourney_id": 0, "version": 3, "status": "sealed",
+           "points_table": {
+               "mode": "tourney-dynamic-v1", "win": 68,
+               "placement": [12, 8, 6, 6, 6], "kill_awards": [],
+               "loss_awards": {},
+               "breakdown": {"A": {"kills": 0, "win": 68, "placement": 12,
+                                   "loss": 0, "total": 30, "capped": True},
+                             "B": {"kills": 0, "win": 0, "placement": 8,
+                                   "loss": -8, "total": 0, "capped": False}}}}
+    bundle = {"id": 22, "tourney_id": 0, "version": 4, "status": "sealed",
+              "points_table": {"mode": "room-seal-v1", "points": {"A": 30}}}
+    manual = {"id": 23, "tourney_id": 0, "version": 5, "status": "manual",
+              "points_table": dict(dyn["points_table"])}
+    state = {"bngc_ranked_tourney_matches": [dyn, bundle, manual]}
+    monkeypatch.setattr(rt_mod, "supabase", _SB(state))
+    monkeypatch.setattr(rt_mod, "_ranked_sleeping", lambda: False)
+    bumped = []
+    monkeypatch.setattr(rt_mod, "_ladder_bump",
+                        lambda d: bumped.append(dict(d)) or {})
+    paid = rt_mod._pay_sealed_ladders([dyn, bundle, manual])
+    assert bumped == [{"A": 30}]
+    assert paid == {21: {"A": 30}}
+    assert dyn["points_table"]["ladder_paid"] == {"A": 30}
+    assert "ladder_paid" not in bundle["points_table"]
+    assert "ladder_paid" not in manual["points_table"]
+    # second run: marker makes it exactly-once
+    assert rt_mod._pay_sealed_ladders([dyn, bundle, manual]) == {}
+    assert len(bumped) == 1
+
+
+def test_pay_sealed_ladders_skipped_when_sleeping(monkeypatch):
+    dyn = {"id": 21, "tourney_id": 0, "version": 3, "status": "sealed",
+           "points_table": {
+               "mode": "tourney-dynamic-v1",
+               "breakdown": {"A": {"kills": 0, "win": 35, "placement": 6,
+                                   "loss": 0, "total": 30, "capped": True}}}}
+    monkeypatch.setattr(rt_mod, "supabase", _SB({"bngc_ranked_tourney_matches": [dyn]}))
+    monkeypatch.setattr(rt_mod, "_ranked_sleeping", lambda: True)
+    bumped = []
+    monkeypatch.setattr(rt_mod, "_ladder_bump",
+                        lambda d: bumped.append(dict(d)) or {})
+    assert rt_mod._pay_sealed_ladders([dyn]) == {}
+    assert bumped == [] and "ladder_paid" not in dyn["points_table"]
+
+
+def test_code_tourney_points_last_result(monkeypatch):
+    state = _state()
+    state["bngc_ranked_tourney_matches"][0].update({
+        "version": 3,
+        "points_table": {
+            "mode": "tourney-dynamic-v1", "win": 68,
+            "placement": [12, 8, 6, 6, 6], "kill_awards": [],
+            "loss_awards": {},
+            "breakdown": {"A": {"kills": 0, "win": 68, "placement": 12,
+                                "loss": 0, "total": 30, "capped": True}}},
+    })
+    monkeypatch.setattr(rt_mod, "supabase", _SB(state))
+    monkeypatch.setattr(rt_mod, "_ladder_points",
+                        lambda dids, fresh=False: {"A": 1200, "B": 300})
+    out = rt_mod.code_tourney_points("ABCDE", "A")
+    assert out["tourney_id"] == 0
+    lr = out["last_result"]
+    assert lr["match_version"] == 3 and lr["gained"] == 30
+    assert lr["breakdown"] == {"kills": 0, "win": 68, "placement": 12,
+                               "loss": 0, "total": 30, "capped": True}
+    assert out["series_len"] == 3 and out["sealed"] == 1
+
+
+def test_match_ladder_paid_states():
+    dyn_paid = {"status": "sealed", "points_table": {
+        "mode": "tourney-dynamic-v1", "ladder_paid": {"A": 30}}}
+    dyn_unpaid = {"status": "sealed", "points_table": {
+        "mode": "tourney-dynamic-v1",
+        "breakdown": {"A": {"total": 30}}}}
+    bundle = {"status": "sealed", "points_table": {"mode": "room-seal-v1"}}
+    legacy = {"status": "sealed", "points_table": None}
+    manual_unpaid = {"status": "manual", "points_table": dict(dyn_paid["points_table"])}
+    assert rt_mod._match_ladder_paid(dyn_paid, {}) is True
+    assert rt_mod._match_ladder_paid(dyn_unpaid, {}) is False
+    assert rt_mod._match_ladder_paid(bundle, {}) is True
+    assert rt_mod._match_ladder_paid(legacy, {}) is False
+    assert rt_mod._match_ladder_paid(manual_unpaid, {}) is False
+    assert rt_mod._match_ladder_paid(manual_unpaid, {"points_paid": True}) is True
+    assert rt_mod._match_ladder_paid(None, None) is False
+
+
+def test_reset_loser_streaks_sync(monkeypatch):
+    state = _state()
+    state["bngc_ranked_tourney_matches"][0].update({
+        "version": 3, "winner_discord_id": "A",
+        "placements": {"A": 1, "B": 2, "C": 3},
+        "removed_discord_ids": ["C"],
+    })
+    state["bngc_users"] = [
+        {"discord_id": "A", "win_streak": 4},
+        {"discord_id": "B", "win_streak": 3},
+        {"discord_id": "C", "win_streak": 9},
+    ]
+    monkeypatch.setattr(rt_mod, "supabase", _SB(state))
+    assert rt_mod.reset_loser_streaks_sync(11) == 1
+    by = {u["discord_id"]: u["win_streak"] for u in state["bngc_users"]}
+    assert by == {"A": 4, "B": 0, "C": 9}  # winner keeps, loser reset, leaver spared
+    # idempotent-ish: nothing left to reset
+    assert rt_mod.reset_loser_streaks_sync(11) == 1
+    assert rt_mod.reset_loser_streaks_sync(999) == 0
+
+
 def test_tourney_create_stores_game_mode(monkeypatch):
     state = {"bngc_ranked_tourneys": []}
     code, j = _call(monkeypatch, state, rt_mod.ranked_tourney_create,
                     {"name": "Cup", "game_mode": "zw_lg"})
     assert code == 200, j
     assert state["bngc_ranked_tourneys"][0]["game_mode"] == "zw_lg"
+
+# ---------------------------------------------------------------------------
+# Per-seal stored deltas: board replays the room seal verbatim
+# ---------------------------------------------------------------------------
+
+_SEAL_FT = {
+    "mode": "room-seal-v1", "rid": "R-X", "room_match_version": 3,
+    "winner": "A",
+    "points": {"A": 20, "B": -3, "C": 0},
+    "kills": {"A": 2},
+    "placements": {"A": 1, "B": 2},
+    "breakdown": {},
+}
+_SEAL_EVENTS = [
+    {"discord_id": "A", "actor_name": "cis6led"},
+    {"discord_id": "B", "actor_name": "chris7"},
+]
+
+
+def test_room_seal_bundle_scores_verbatim():
+    m = {"winner_discord_id": "A", "point_awards": {},
+         "points_table": dict(_SEAL_FT)}
+    rows = rt_mod._score_tourney_match(None, m, list(_SEAL_EVENTS))
+    assert [(r["discord_id"], r["points"], r["kills"], r["won"],
+             r["placement"], r["name"]) for r in rows] == [
+        ("A", 20, 2, True, 1, "cis6led"),
+        ("C", 0, 0, False, None, "C"),
+        ("B", -3, 0, False, 2, "chris7"),
+    ]
+
+
+def test_room_seal_bundle_applies_manual_awards():
+    m = {"winner_discord_id": "A",
+         "point_awards": {"B": 5},
+         "points_table": dict(_SEAL_FT)}
+    rows = rt_mod._score_tourney_match(None, m, list(_SEAL_EVENTS))
+    assert next(r for r in rows if r["discord_id"] == "B")["points"] == 2
+
+
+def test_room_seal_bundle_empty_points_scores_nothing():
+    ft = dict(_SEAL_FT, points={})
+    assert rt_mod._score_tourney_match(
+        None, {"points_table": ft}, list(_SEAL_EVENTS)) == []
+
+
+def test_room_seal_bundle_aggregates_like_ladder():
+    from server.lib.scoring import aggregate_standings
+    m1 = {"winner_discord_id": "A", "point_awards": {},
+          "points_table": dict(_SEAL_FT)}
+    m2 = {"winner_discord_id": "B", "point_awards": {},
+          "points_table": dict(_SEAL_FT, winner="B",
+                               points={"A": -4, "B": 18, "C": 2},
+                               kills={"B": 1},
+                               placements={"B": 1, "C": 2, "A": 3})}
+    board = aggregate_standings([
+        rt_mod._score_tourney_match(None, m1, list(_SEAL_EVENTS)),
+        rt_mod._score_tourney_match(None, m2, list(_SEAL_EVENTS)),
+    ])
+    totals = {r["discord_id"]: r["points"] for r in board}
+    assert totals == {"A": 16, "B": 15, "C": 2}
+    assert next(r for r in board
+                if r["discord_id"] == "A")["matches"] == 2

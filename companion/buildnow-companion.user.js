@@ -1,8 +1,8 @@
-﻿// ==UserScript==
+// ==UserScript==
 // @name         Nectar Buildnow Companion
 // @namespace    https://github.com/Nectar-Central
-// @version      2.23.8
-// @description  Nectar Buildnow Companion v2.23.8 â€” leaderboard panel, insights, friends & chat, play points, clips.
+// @version      2.31.0
+// @description  Nectar Buildnow Companion v2.31.0 — leaderboard panel, insights, friends & chat, graphics filters, Discord rich presence, FPS chip, session refresh modal.
 // @author       Nectar Labs
 // @match        https://buildnow-gg.game-files.crazygames.com/*
 // @match        https://*.crazygames.com/*
@@ -31,7 +31,7 @@
 
 (function () {
   'use strict';
-  const BNC_VERSION = '2.23.8';
+  const BNC_VERSION = '2.31.0';
   const HREF = (() => { try { return location.href; } catch { return ''; } })();
   const IS_GAME_FRAME = HREF.includes('buildnow-gg.game-files.crazygames.com');
   // Loading shell lives inside an intermediate iframe (games.crazygames.com),
@@ -52,7 +52,7 @@
   // Production API default. Override order: stored bnc_api_base (user-set,
   // e.g. http://127.0.0.1:8000 for a local backend) > ?api=local > production.
   // Without the stored override the drawer talks to production even when a
-  // local backend runs â€” everything reads Offline there. Never throws.
+  // local backend runs — everything reads Offline there. Never throws.
   const SERVER_API = 'https://project-nectar-6n70.onrender.com';
   const LOCAL_API  = 'http://127.0.0.1:8000';
   function normalizeApiBase(raw){
@@ -124,10 +124,16 @@
       _revalTimer=setInterval(()=>{ try{ silentRevalidate('periodic'); }catch{} }, 60000);
     }catch{}
   }
-  function silentRevalidate(why){
+  // `opts.cb(ok, transient)` lets a caller follow the refresh: ok=true means a
+  // session came back, transient=true means the API just could not be reached
+  // (we keep retrying). `opts.quiet` suppresses the link prompt - used when the
+  // session-expired modal is already doing the talking.
+  function silentRevalidate(why, opts){
+    const done=(opts && typeof opts.cb==='function') ? opts.cb : null;
+    const quiet=!!(opts && opts.quiet);
     try{
-      if(!loginToken) return;
-      if(sessionId) { try{ stopRevalidate(); }catch{} return; } // already restored
+      if(!loginToken){ if(done) done(false, false); return; }
+      if(sessionId) { try{ stopRevalidate(); }catch{} if(done) done(true, false); return; } // already restored
       apiPost('/api/validate-token', {token: loginToken, _quiet:true}, (ok, txt)=>{
         try{
           if(ok){
@@ -135,7 +141,8 @@
             if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); }
             if(j.game_username) GMSet('bnc_game_username', j.game_username);
             if(j.game_id) GMSet('bnc_game_id', j.game_id);
-            if(j.session_id){ storeSession(j); try{ logInfo(`[AUTH] session restored (${why})`); }catch{} try{ showToast('Session restored', false); }catch{} }
+            if(j.session_id){ storeSession(j); try{ logInfo(`[AUTH] session restored (${why})`); }catch{} try{ showToast('Session restored', false); }catch{} if(done) done(true, false); return; }
+            if(done) done(false, false);
             return;
           }
           let reason=''; try{ reason=(JSON.parse(txt||'{}').error)||''; }catch{}
@@ -143,17 +150,21 @@
           if(rl.includes('locked')){
             try{ showLockedPanel(reason || 'Account locked', 'default'); }catch{}
             try{ stopRevalidate(); }catch{}
+            if(done) done(false, false);
             return;
           }
           const dead=rl.includes('invalid')||rl.includes('expired')||rl.includes('not found')||rl.includes('no account')||rl.includes('incorrect');
           if(dead){
-            // token truly dead: full wipe + prompt (the only path that asks to link)
+            // token truly dead: full wipe (+ the link prompt, unless a caller
+            // is already showing the session-expired modal)
             cleanTokenStorage(); hasWelcomed=false;
             try{ stopRevalidate(); }catch{}
-            setTimeout(()=>{ showTokenPrompt(); showToast('Session expired - enter new token', true); }, 800);
+            if(quiet){ if(done) done(false, false); }
+            else setTimeout(()=>{ showTokenPrompt(); showToast('Session expired - enter new token', true); }, 800);
           } else {
             try{ logInfo(`[AUTH] revalidate failed (${reason||'network'}) - retrying quietly`); }catch{}
             scheduleRevalidate();
+            if(done) done(false, true);
           }
         }catch{}
       });
@@ -175,10 +186,13 @@
   // ==== Loading-screen branding (Nectar rebrand of the CrazyGames loading shell) ====
   // The loading shell lives inside an intermediate CrazyGames iframe (not the
   // top page, not the game iframe). This module runs in ALL CrazyGames frames
-  // and overwrites the shell elements every tick â€” idempotent, safe everywhere.
+  // and overwrites the shell elements every tick — idempotent, safe everywhere.
   const BNC_REBRAND_BANNER = 'https://mnpwvwjqawmuqmickteu.supabase.co/storage/v1/object/public/lobby-music/nectar_banner.png';
   const BNC_REBRAND_TITLE = 'Nectar - Buildnow Enhanced';
-  function bncRebrandOn(){ try{ return GMGet('bnc_loading_rebrand', true) !== false; }catch{ return true; } }
+  // Always on. The toggle that used to gate this was removed, so it is not a
+  // setting any more - and a stale bnc_loading_rebrand=false left behind must
+  // not keep the shell unbranded with no way to turn it back on.
+  function bncRebrandOn(){ return true; }
   function bncRebrandSetText(el,txt){
     if(!el) return false;
     try{
@@ -248,14 +262,10 @@
       if(st==='waiting') bncRebrandLogged=false;
     },800);
   }
-  function bncRebrandStop(){
-    try{ if(bncRebrandTimer){ clearInterval(bncRebrandTimer); } }catch{}
-    bncRebrandTimer=null; bncRebrandLogged=false;
-  }
 
   // ---- CrazyGames frames: brand the loading shell ----
   // The loading shell lives inside an intermediate iframe (games.crazygames.com),
-  // NOT on the top page. Let the rebrand run in every frame â€” it's idempotent.
+  // NOT on the top page. Let the rebrand run in every frame — it's idempotent.
   // Only the full tracker is gated to the game frame.
   try{ bncRebrandBoot(); bncRebrandOnce(); }catch(e){}
 
@@ -264,7 +274,7 @@
 
   // session restore - login required, no guest capture
   if(sessionId && currentReqToken){
-    logInfoEarly(`session restored ${String(sessionId).slice(0,8)}â€¦ counter=${reqCounter}`);
+    logInfoEarly(`session restored ${String(sessionId).slice(0,8)}… counter=${reqCounter}`);
   } else if(loginToken){
     // session-less boot with a kept login token: silent re-validate restores
     // the still-active session (server reuse path) with no prompt. Retries
@@ -317,11 +327,11 @@
         if(ok){
           try{
             const j=JSON.parse(txt);
-            if(j.new_req_token) { storeSession({new_req_token:j.new_req_token, new_counter:j.new_counter}); logInfo(`req_token rotated ${String(j.new_req_token).slice(0,4)}â€¦ counter ${j.new_counter}`); }
+            if(j.new_req_token) { storeSession({new_req_token:j.new_req_token, new_counter:j.new_counter}); logInfo(`req_token rotated ${String(j.new_req_token).slice(0,4)}… counter ${j.new_counter}`); }
             else if(j.initial_token) storeSession(j);
             else if(j.new_counter!=null) { reqCounter=j.new_counter; GMSet('bnc_req_counter', reqCounter); }
-            if(j.game_username){ GMSet('bnc_game_username', j.game_username); logInfo(`game_username updated â†’ ${j.game_username}`); }
-            if(j.game_id){ GMSet('bnc_game_id', j.game_id); logInfo(`game_id updated â†’ ${j.game_id}`); }
+            if(j.game_username){ GMSet('bnc_game_username', j.game_username); logInfo(`game_username updated → ${j.game_username}`); }
+            if(j.game_id){ GMSet('bnc_game_id', j.game_id); logInfo(`game_id updated → ${j.game_id}`); }
           }catch{}
         } else {
           try{
@@ -332,7 +342,7 @@
               logErr(`locked via ${path}: ${j.error}`);
               showLockedPanel(j.error, j.lock_scope);
             } else if(j.error && String(j.error).toLowerCase().includes('replay')){
-              if(j.current) { currentReqToken=j.current; GMSet('bnc_req_token', currentReqToken); logInfo(`replay sync token â†’ ${String(currentReqToken).slice(0,4)}â€¦`); }
+              if(j.current) { currentReqToken=j.current; GMSet('bnc_req_token', currentReqToken); logInfo(`replay sync token → ${String(currentReqToken).slice(0,4)}…`); }
               else if(j.new_req_token) storeSession(j);
               if(!retried){
                 logInfo(`replay detected for ${path} - retry`);
@@ -340,10 +350,16 @@
                 apiBusy = false; setTimeout(processApiQueue, 30); return;
               }
             }
+            // A Nectar session lives 2 days; when it runs out the API says
+            // "Session expired - please re-link" and every call stops working.
+            // Handled in one place, whichever endpoint noticed it first.
+            if(lowerErr.includes('session expired')){
+              try{ onSessionExpired(path); }catch{}
+            }
             if(j.error && String(j.error).toLowerCase().includes('invalid')){
-              if(j.current){ currentReqToken=j.current; GMSet('bnc_req_token', currentReqToken); logInfo(`mismatch sync token â†’ ${String(currentReqToken).slice(0,4)}â€¦`); if(!retried){ logInfo(`mismatch retry ${path}`); apiQueue.unshift({path, body: {...origBody, _retried:true}, cb, retried:true, quiet, noLive, noTok, noWipe}); apiBusy=false; setTimeout(processApiQueue,30); return; } }
+              if(j.current){ currentReqToken=j.current; GMSet('bnc_req_token', currentReqToken); logInfo(`mismatch sync token → ${String(currentReqToken).slice(0,4)}…`); if(!retried){ logInfo(`mismatch retry ${path}`); apiQueue.unshift({path, body: {...origBody, _retried:true}, cb, retried:true, quiet, noLive, noTok, noWipe}); apiBusy=false; setTimeout(processApiQueue,30); return; } }
               // rejected with no resync token: historically wiped the session
-              // on first sight â€” but that fires on transient DB read misses
+              // on first sight — but that fires on transient DB read misses
               // ("Invalid auth session") too. Retry once, then clear the
               // SESSION only (login token kept) and re-validate silently;
               // full wipe + prompt happens only on explicit rejection
@@ -361,19 +377,19 @@
       if(useGM && hasGM){
         try{
           // Captures carry engine feed + full DB processing server-side, so
-          // match-start bursts legitimately take longer â€” give them 30s.
+          // match-start bursts legitimately take longer — give them 30s.
           // A 15s timeout here resends a batch the server is still working
           // on, doubling its load (the timed-out work still completes).
           const postTimeout = String(u).includes('/api/capture') ? 30000 : 15000;
           GM({ method:'POST', url:u, headers:{'Content-Type':'application/json'}, data: JSON.stringify(body), timeout:postTimeout,
-            onload: r=> { const ok=r.status>=200&&r.status<300; const txt=r.responseText||''; const isZone=txt.includes('"zone"'); if(!quiet||!ok){ (ok?logOk:logErr)(`API ${ok?'OK':'ERR'} ${u} â†’ ${r.status} ${String(txt).slice(0, isZone?1200:600)}`); } if(isZone){ try{ const j=JSON.parse(txt); const zps=(j.packets||[]).filter(p=> (p.packet||p.packet_type)==='zone'); if(zps.length){ logGroup(`API zone batch ${zps.length} packets`, ()=>{ zps.forEach(zp=> console.log('zone packet', zp, 'decrypted', zp.decrypted_hex||zp.raw)); }); } }catch{} } wrapOk(ok, r.responseText); },
-            onerror: (e)=>{ wrapFail(`API GM_xhr error â†’ ${u} ${e&&e.error||''}`); },
-            ontimeout: ()=>{ wrapFail(`API timeout (${postTimeout/1000}s) â†’ ${u}`); }});
+            onload: r=> { const ok=r.status>=200&&r.status<300; const txt=r.responseText||''; const isZone=txt.includes('"zone"'); if(!quiet||!ok){ (ok?logOk:logErr)(`API ${ok?'OK':'ERR'} ${u} → ${r.status} ${String(txt).slice(0, isZone?1200:600)}`); } if(isZone){ try{ const j=JSON.parse(txt); const zps=(j.packets||[]).filter(p=> (p.packet||p.packet_type)==='zone'); if(zps.length){ logGroup(`API zone batch ${zps.length} packets`, ()=>{ zps.forEach(zp=> console.log('zone packet', zp, 'decrypted', zp.decrypted_hex||zp.raw)); }); } }catch{} } wrapOk(ok, r.responseText); },
+            onerror: (e)=>{ wrapFail(`API GM_xhr error → ${u} ${e&&e.error||''}`); },
+            ontimeout: ()=>{ wrapFail(`API timeout (${postTimeout/1000}s) → ${u}`); }});
           return true;
         }catch(e){ wrapFail(`API GM throw ${e.message}`); return false; }
       }
       try{
-        fetch(u,{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r=>r.text().then(t=>{ const ok=r.ok; const isZone=t.includes('"zone"'); if(!quiet||!ok){ (ok?logOk:logErr)(`API fetch ${ok?'OK':'ERR'} ${u} â†’ ${r.status} ${t.slice(0, isZone?1200:600)}`); } if(isZone){ try{ const j=JSON.parse(t); const zps=(j.packets||[]).filter(p=> (p.packet||p.packet_type)==='zone'); if(zps.length){ logGroup(`API zone batch ${zps.length} packets`, ()=>{ zps.forEach(zp=> console.log('zone packet', zp, 'decrypted', zp.decrypted_hex||zp.raw)); }); } }catch{} } wrapOk(ok,t); }).catch(()=>wrapFail(`fetch catch ${u}`))).catch((e)=>{ wrapFail(`API fetch fail ${u} ${e.message}`); });
+        fetch(u,{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r=>r.text().then(t=>{ const ok=r.ok; const isZone=t.includes('"zone"'); if(!quiet||!ok){ (ok?logOk:logErr)(`API fetch ${ok?'OK':'ERR'} ${u} → ${r.status} ${t.slice(0, isZone?1200:600)}`); } if(isZone){ try{ const j=JSON.parse(t); const zps=(j.packets||[]).filter(p=> (p.packet||p.packet_type)==='zone'); if(zps.length){ logGroup(`API zone batch ${zps.length} packets`, ()=>{ zps.forEach(zp=> console.log('zone packet', zp, 'decrypted', zp.decrypted_hex||zp.raw)); }); } }catch{} } wrapOk(ok,t); }).catch(()=>wrapFail(`fetch catch ${u}`))).catch((e)=>{ wrapFail(`API fetch fail ${u} ${e.message}`); });
         return true;
       }catch(e){ wrapFail(`API fetch throw ${e.message}`); return false; }
     };
@@ -434,85 +450,6 @@
     const code = sess.short_code || (p && p.code) || null;
     return {isParty, code};
   }
-  // ---- Party join/leave toast: big Scandinavian card, slides in from the left ----
-  // Dark-canvas ladder (near-black surface, white ink rungs, 12% borders),
-  // Inter, sentence case, left-aligned. Joined vs left is carried by shape
-  // (filled vs hollow dot) plus words â€” never by emoji or hue alone.
-  let _partyToastStyle=false;
-  function ensurePartyToastStyle(){
-    if(_partyToastStyle || !document.documentElement) return;
-    _partyToastStyle=true;
-    const st=document.createElement('style');
-    st.id='bnc-party-toast-style';
-    st.textContent=`@keyframes bnc-slide-in-left{from{transform:translateX(-110%);opacity:0}to{transform:translateX(0);opacity:1}}@keyframes bnc-slide-out-left{from{transform:translateX(0);opacity:1}to{transform:translateX(-110%);opacity:0}}.bnc-party-toast{animation:bnc-slide-in-left 260ms cubic-bezier(0.22,1,0.36,1)}`
-      + `.bnc-party-toast.bnc-hide{animation:bnc-slide-out-left 200ms ease-in forwards}`
-      + `@media (prefers-reduced-motion: reduce){.bnc-party-toast,.bnc-party-toast.bnc-hide{animation:none}}`;
-    document.documentElement.appendChild(st);
-  }
-  function showPartyToast(name, isJoin){
-    try{
-      ensurePartyToastStyle();
-      let wrap=document.getElementById('bnc-party-toasts');
-      if(!wrap){
-        wrap=document.createElement('div');
-        wrap.id='bnc-party-toasts';
-        Object.assign(wrap.style,{position:'fixed',left:'24px',top:'50%',transform:'translateY(-50%)',zIndex:'2147483646',display:'flex',flexDirection:'column',gap:'12px',pointerEvents:'none',fontFamily:'Inter, system-ui, sans-serif'});
-        (document.body||document.documentElement).appendChild(wrap);
-      }
-      const el=document.createElement('div');
-      el.className='bnc-party-toast';
-      Object.assign(el.style,{display:'flex',alignItems:'center',gap:'16px',background:'#0A0A0A',border:'1px solid rgb(255 255 255 / 12%)',borderRadius:'12px',padding:'20px 24px',maxWidth:'400px'});
-      const dot=document.createElement('span');
-      if(isJoin){ Object.assign(dot.style,{width:'12px',height:'12px',borderRadius:'50%',background:'#fff',flexShrink:'0'}); }
-      else { Object.assign(dot.style,{width:'8px',height:'8px',borderRadius:'50%',border:'2px solid rgb(255 255 255 / 56%)',flexShrink:'0'}); }
-      const txt=document.createElement('div');
-      Object.assign(txt.style,{fontSize:'18px',lineHeight:'1.4',textAlign:'left',wordBreak:'break-word'});
-      const who=document.createElement('span');
-      who.textContent=String(name||'?').slice(0,28);
-      Object.assign(who.style,{color:'#fff',fontWeight:'600'});
-      const what=document.createElement('span');
-      what.textContent=isJoin?' joined the party':' left the party';
-      Object.assign(what.style,{color:'rgb(255 255 255 / 56%)',fontWeight:'400'});
-      txt.appendChild(who); txt.appendChild(what);
-      el.appendChild(dot); el.appendChild(txt);
-      wrap.appendChild(el);
-      while(wrap.children.length>3) wrap.firstChild.remove();
-      setTimeout(()=>{ try{ el.classList.add('bnc-hide'); setTimeout(()=>{ try{ el.remove(); }catch{} },220); }catch{} },3500);
-    }catch{}
-  }
-  // Toasts only in the party lobby (in party + in lobby). Mid-match movement
-  // stays quiet; the baseline still advances so no burst fires later.
-  function _partyToastAllowed(){
-    try{
-      if(typeof _optimisticState!=='undefined' && _optimisticState.inMatch) return false;
-      const sess=statsCache&&statsCache.session;
-      if(!sess) return false;
-      const pi=getPartyInfo(sess);
-      if(!pi.isParty||!pi.code) return false;
-      if(sess.state && String(sess.state).toLowerCase()==='match') return false;
-      return true;
-    }catch{ return false; }
-  }
-  // diff player lists -> join/leave toasts. Silent on first snapshot or full reset.
-  // Never toasts yourself: your own join populates the list too, and your
-  // own leave/return would spam the card for no information.
-  let _prevPartyNames=null;
-  function detectPartyJoins(pc){
-    try{
-      const cur=((pc&&pc.players)||[]).map(p=>p&&p.username?String(p.username):'').filter(Boolean);
-      const curSet=new Set(cur);
-      if(_prevPartyNames===null){ _prevPartyNames=curSet; return; }
-      const prev=_prevPartyNames;
-      _prevPartyNames=curSet;
-      if(!_partyToastAllowed()) return;
-      let me='';
-      try{ me=String(_normName(GMGet('bnc_game_username','')||((statsCache&&statsCache.game_username)||''))||'').toLowerCase(); }catch{}
-      const isMe=(n)=>{ try{ return !!me && String(_normName(n)||'').toLowerCase()===me; }catch{ return false; } };
-      for(const n of curSet){ if(!prev.has(n)){ if(isMe(n)) continue; showPartyToast(n, true); try{ logInfo(`[PARTY] join ${n}`); }catch{} } }
-      for(const n of prev){ if(!curSet.has(n)){ if(isMe(n)) continue; showPartyToast(n, false); try{ logInfo(`[PARTY] leave ${n}`); }catch{} } }
-    }catch{}
-  }
-  function resetPartyJoins(){ _prevPartyNames=null; }
   function showLockedPanel(reason, scope){
     if(document.getElementById('bnc-locked')) return;
     const isAdmin = String(scope||'').toLowerCase()==='admin';
@@ -523,7 +460,7 @@
     Object.assign(wrap.style,{position:'fixed',inset:'0',zIndex:'2147483647',background:'rgba(0,0,0,0.82)',display:'flex',alignItems:'center',justifyContent:'center',padding:'24px',fontFamily:'Inter, system-ui, sans-serif'});
     const card=document.createElement('div');
     Object.assign(card.style,{background:'#0a0a0a',border:'1px solid #991b1b',borderRadius:'14px',padding:'28px',width:'420px',textAlign:'center',boxShadow:'0 8px 32px rgba(239,68,68,0.25)'});
-    card.innerHTML = `<div style="font-size:44px;margin-bottom:8px">${isAdmin?'â›”':'ðŸ”’'}</div><div style="font-size:18px;font-weight:800;color:#fff;margin-bottom:6px">${title}</div><div style="font-size:13px;color:#fca5a5;margin-bottom:6px;word-break:break-word">${String(reason||'Token reuse or sharing detected - friend account use is blocked.').replace(/</g,'&lt;')}</div><div style="font-size:12px;color:#9ca3af;margin-bottom:16px">${help}</div><div style="display:flex;gap:8px;justify-content:center"><button id="bnc-locked-disable" style="flex:1;height:40px;border:0;border-radius:8px;background:#fff;color:#000;font-weight:700;cursor:pointer">Disable & Reload</button><button id="bnc-locked-retry" style="flex:1;height:40px;border:1px solid #374151;border-radius:8px;background:#1f2937;color:#e5e7eb;font-weight:600;cursor:pointer">Retry</button></div><div style="margin-top:10px;font-size:11px;color:#6b7280">BNC is disabled while locked - no capture or API calls.</div>`;
+    card.innerHTML = `<div style="font-size:44px;margin-bottom:8px">${isAdmin?'⛔':'🔒'}</div><div style="font-size:18px;font-weight:800;color:#fff;margin-bottom:6px">${title}</div><div style="font-size:13px;color:#fca5a5;margin-bottom:6px;word-break:break-word">${String(reason||'Token reuse or sharing detected - friend account use is blocked.').replace(/</g,'&lt;')}</div><div style="font-size:12px;color:#9ca3af;margin-bottom:16px">${help}</div><div style="display:flex;gap:8px;justify-content:center"><button id="bnc-locked-disable" style="flex:1;height:40px;border:0;border-radius:8px;background:#fff;color:#000;font-weight:700;cursor:pointer">Disable & Reload</button><button id="bnc-locked-retry" style="flex:1;height:40px;border:1px solid #374151;border-radius:8px;background:#1f2937;color:#e5e7eb;font-weight:600;cursor:pointer">Retry</button></div><div style="margin-top:10px;font-size:11px;color:#6b7280">BNC is disabled while locked - no capture or API calls.</div>`;
     wrap.appendChild(card);
     // block game input
     wrap.addEventListener('click', e=> e.stopPropagation());
@@ -544,6 +481,126 @@
       ['keydown','keyup','keypress'].forEach(ev=> window.removeEventListener(ev, blocker, true));
       promptReload('Press Ctrl+R to reload the page');
     };
+  }
+  // ---- SESSION EXPIRED -------------------------------------------------
+  // A Nectar session lives 2 days (server: SESSION_TTL_DAYS). When it runs out
+  // the API answers 401 "Session expired - please re-link" and everything the
+  // companion does goes quiet: no stats, no points, no alerts. The saved login
+  // token usually refreshes it silently, so we try that first - and when that
+  // fails the player needs a fresh token, which is exactly what
+  // /refresh-token in the Discord server hands out.
+  const SESSION_INVITE = 'https://discord.gg/GDSW9p39J5';
+  let _sessionFixAt=0, _sessionFixBusy=false;
+  function sessionModalStatus(msg, tone){
+    try{
+      const el=document.getElementById('bnc-session-status');
+      if(!el) return;
+      el.textContent=msg||'';
+      el.style.color = tone==='bad' ? '#fca5a5' : (tone==='ok' ? '#6ee7b7' : '#9ca3af');
+    }catch{}
+  }
+  function hideSessionExpiredModal(){
+    try{ const w=document.getElementById('bnc-session-expired'); if(w && w._bncCleanup) w._bncCleanup(); if(w) w.remove(); }catch{}
+  }
+  function showSessionExpiredModal(){
+    if(document.getElementById('bnc-session-expired')) return;
+    const wrap=document.createElement('div');
+    wrap.id='bnc-session-expired';
+    Object.assign(wrap.style,{position:'fixed',inset:'0',zIndex:'2147483647',background:'rgba(0,0,0,0.82)',display:'flex',alignItems:'center',justifyContent:'center',padding:'24px',fontFamily:'Inter, system-ui, sans-serif'});
+    const card=document.createElement('div');
+    Object.assign(card.style,{background:'#0a0a0a',border:'1px solid rgba(255,255,255,0.16)',borderRadius:'14px',padding:'26px',width:'440px',boxSizing:'border-box',boxShadow:'0 8px 32px rgba(0,0,0,0.55)'});
+    card.innerHTML='<div style="font-size:30px;margin-bottom:6px">🔁</div>'
+      + '<div style="font-size:18px;font-weight:800;color:#fff;margin-bottom:6px">Session expired</div>'
+      + '<div style="font-size:13px;color:#9ca3af;line-height:1.6;margin-bottom:14px">Nectar sessions last 2 days. Until a new one is linked, your stats, points and alerts stop updating.</div>'
+      + '<div style="font-size:12px;color:#e5e7eb;line-height:1.8;margin-bottom:10px">'
+      +   '<div>1. In the Nectar Discord server run <code style="background:#1f2937;border-radius:4px;padding:1px 6px;color:#fff;font-family:monospace">/refresh-token</code> - it DMs you a fresh token.</div>'
+      +   '<div>2. Paste it below and hit <b style="color:#fff">Save &amp; reload</b>.</div>'
+      + '</div>'
+      + '<input id="bnc-session-token" type="text" placeholder="Paste token (A1B2C3D4)" autocomplete="off" spellcheck="false" maxlength="32" style="width:100%;height:40px;padding:0 12px;border:1px solid #374151;border-radius:8px;background:#111;color:#fff;font-size:15px;font-family:monospace;letter-spacing:1.5px;box-sizing:border-box;outline:none">'
+      + '<div style="display:flex;gap:8px;margin-top:12px">'
+      +   '<button id="bnc-session-save" style="flex:1;height:40px;border:0;border-radius:8px;background:#fff;color:#000;font-weight:700;cursor:pointer">Save &amp; reload</button>'
+      +   '<button id="bnc-session-reload" style="flex:1;height:40px;border:1px solid #374151;border-radius:8px;background:#1f2937;color:#e5e7eb;font-weight:600;cursor:pointer">Reload page</button>'
+      + '</div>'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px">'
+      +   '<a href="'+SESSION_INVITE+'" target="_blank" rel="noopener" style="font-size:12px;color:#a5b4fc;text-decoration:none">Open the Nectar Discord server</a>'
+      +   '<button id="bnc-session-later" style="background:none;border:0;color:#6b7280;font-size:12px;cursor:pointer">Not now</button>'
+      + '</div>'
+      + '<div id="bnc-session-status" style="margin-top:10px;font-size:12px;color:#9ca3af;min-height:16px"></div>';
+    wrap.appendChild(card);
+    (document.body||document.documentElement).appendChild(wrap);
+    wrap.addEventListener('click', e=> e.stopPropagation());
+    const input=card.querySelector('#bnc-session-token');
+    // The game installs capture-phase key listeners before we do, so typing in
+    // this box needs the same guard the link prompt uses: kill the event for the
+    // game, but never preventDefault (the input needs every key).
+    const guard=(e)=>{ try{ const ae=document.activeElement; const t=e.target; if(input && (input===t || input.contains(t) || card.contains(t) || (ae && card.contains(ae)))) { e.stopPropagation(); if(e.stopImmediatePropagation) e.stopImmediatePropagation(); } }catch{} };
+    const events=['keydown','keyup','keypress','input','paste','cut','compositionstart','compositionupdate','compositionend'];
+    const targets=[window, document, document.documentElement];
+    try{ if(typeof unsafeWindow!=='undefined' && unsafeWindow!==window) targets.push(unsafeWindow); }catch{}
+    events.forEach(ev=> targets.forEach(t=>{ try{ t.addEventListener(ev, guard, true); }catch{} }));
+    wrap._bncCleanup=()=>{ events.forEach(ev=> targets.forEach(t=>{ try{ t.removeEventListener(ev, guard, true); }catch{} })); };
+    let linking=false;
+    const save=card.querySelector('#bnc-session-save');
+    const submit=()=>{
+      if(linking) return;
+      const tok=String(input && input.value || '').trim().toUpperCase();
+      if(!tok){ sessionModalStatus('Enter the token from /refresh-token', 'bad'); return; }
+      if(tok.length<8){ sessionModalStatus('Token too short', 'bad'); return; }
+      linking=true; save.textContent='Linking…'; sessionModalStatus('Checking the token…');
+      apiPost('/api/validate-token', {token: tok}, (ok, txt)=>{
+        let reason='', scope='default';
+        try{ const j=JSON.parse(txt||'{}'); reason=j.error||''; scope=j.lock_scope||(j.is_admin_locked?'admin':'default'); }catch{}
+        if(!ok && String(reason).toLowerCase().includes('locked')){ hideSessionExpiredModal(); showLockedPanel(reason, scope); return; }
+        if(!ok){ linking=false; save.textContent='Save & reload'; sessionModalStatus('Token incorrect - run /refresh-token again', 'bad'); return; }
+        try{
+          const j=JSON.parse(txt);
+          if(j.discord_username) GMSet('bnc_discord_username', j.discord_username);
+          if(j.game_username) GMSet('bnc_game_username', j.game_username);
+          if(j.session_id || j.initial_token) storeSession(j);
+          else { GMSet('bnc_token', tok); loginToken=tok; }
+        }catch{ GMSet('bnc_token', tok); loginToken=tok; }
+        sessionModalStatus('Linked - reloading…', 'ok');
+        setTimeout(()=>{ try{ location.reload(); }catch{} }, 600);
+      });
+    };
+    if(save) save.onclick=submit;
+    const reload=card.querySelector('#bnc-session-reload');
+    if(reload) reload.onclick=()=>{ try{ location.reload(); }catch{} };
+    const later=card.querySelector('#bnc-session-later');
+    if(later) later.onclick=()=>{ hideSessionExpiredModal(); try{ showToast('Session expired - run /refresh-token to fix it', true); }catch{} };
+    if(input) input.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); submit(); } });
+    setTimeout(()=>{ try{ if(input) input.focus(); }catch{} }, 80);
+  }
+  // One entry point for every "your session is gone" signal (capture 401 or any
+  // other API reply). Tries the silent refresh first, keeps the player informed
+  // through the modal, and never stacks a second modal on top.
+  function onSessionExpired(why){
+    try{
+      const now=Date.now();
+      if(_sessionFixBusy) return;                       // a refresh is already in flight
+      if(document.getElementById('bnc-session-expired') && now-_sessionFixAt<30000) return;
+      _sessionFixAt=now; _sessionFixBusy=true;
+      try{ logInfo(`[AUTH] session expired (${why||'api'}) - refreshing`); }catch{}
+      showSessionExpiredModal();
+      sessionModalStatus('Refreshing automatically…');
+      let had=false;
+      try{ if(sessionId){ clearSessionOnly(); had=true; } }catch{}
+      if(!loginToken){
+        sessionModalStatus('No saved token to refresh with - run /refresh-token above.', 'bad');
+        _sessionFixBusy=false;
+        return;
+      }
+      try{
+        silentRevalidate('expired', {quiet:true, cb:(ok, transient)=>{
+          try{
+            _sessionFixBusy=false;
+            if(ok){ sessionModalStatus(had?'Session refreshed - you can keep playing (reload whenever).':'Session refreshed.', 'ok'); }
+            else if(transient){ sessionModalStatus('Nectar is unreachable right now - still retrying in the background.', null); }
+            else sessionModalStatus('Could not refresh with the saved token - run /refresh-token and paste the new one.', 'bad');
+          }catch{}
+        }});
+      }catch{ _sessionFixBusy=false; }
+    }catch{ _sessionFixBusy=false; }
   }
   function showTokenPrompt(){
     if (loginToken || sessionId) return;
@@ -670,9 +727,9 @@
       if(!tok){ msg.textContent='Enter a token'; return; }
       if(tok.length<8){ msg.textContent='Token too short'; return; }
       linking=true;
-      submitBtn.textContent='Linkingâ€¦';
+      submitBtn.textContent='Linking…';
       submitBtn.style.opacity='0.6';
-      msg.textContent='Checkingâ€¦';
+      msg.textContent='Checking…';
       apiPost('/api/validate-token', {token: tok}, (ok, txt)=>{
           let lockedReason=''; let lockedScope='default'; try{ const _p=JSON.parse(txt||'{}'); lockedReason=_p.error||''; lockedScope=_p.lock_scope||(_p.is_admin_locked?'admin':'default'); }catch{}
         if(!ok && String(lockedReason).toLowerCase().includes('locked')){ document.removeEventListener('keydown', escHandler, true); closeModal(); showLockedPanel(lockedReason, lockedScope); return; }
@@ -723,7 +780,7 @@
   // --- Packet sender only ---
   const APP_ID='30773790-f9fe-487c-92c2-19517c5c39ad';
   const PHOTON_HOSTS=['exitgames.com','photon'];
-  const ESSENTIAL_OPS=new Set([225,226,227,228,230,231]); // 228 = LeaveRoom/queue-cancel candidate (semantics unconfirmed â€” watch op#228 lines in server logs before wiring removal)
+  const ESSENTIAL_OPS=new Set([225,226,227,228,230,231]); // 228 = LeaveRoom/queue-cancel candidate (semantics unconfirmed — watch op#228 lines in server logs before wiring removal)
   const ESSENTIAL_EVS=new Set([101,253,254,255]);
   const DROP_EVS_NOISY=new Set([200,201,202,204,206]);
   const BATCH_MAX=40, FLUSH_MS=250;
@@ -731,21 +788,75 @@
   // ---- OPTIMISTIC STATE ----
   let _optimisticState = {
     curScn: null,        // current scene from last packet
-    inMatch: false,      // derived: true if curScn != MainLobby
+    inMatch: false,      // derived: true if the scene is not a lobby scene
     lastUpdateAt: 0,     // timestamp of last optimistic update
+    // Set whenever the packets declare LOBBY (auth / my leave / MainLobby
+    // scene) and cleared by the next non-lobby scene. While it is up nothing
+    // else may claim match: the captured session state trails the game and
+    // keeps saying 'match' after the player is already back in the lobby, which
+    // is exactly what left the client stuck on "In Match" there.
+    lobbyGuard: false,
   };
   let _curScnFlipAt=0;   // timestamp when curScn flipped to match (3s grace before ranked UI)
+  // Victory-breather hold: match end looks like a lobby scene while the
+  // player is still in the same ranked room (multi-match rooms hit this
+  // every seal). Packet evidence of live match refreshes this; the server
+  // reconcile below may only flip match->lobby once it goes stale, so a
+  // slow seal never swaps the points counter for the lobby card. Leaves
+  // clear it (disableRanked) for an instant flip. Server fallback reads
+  // never stamp it (a trailing server 'match' must not hold itself).
+  let _lastMatchEvidenceAt=0;
+  const BREATHER_HOLD_MS=120000;
+
+  // --- LOBBY <-> MATCH ------------------------------------------------
+  // LOBBY is authoritative from MY Authenticate packets (op 230/231 out - the
+  // login and every re-auth) and MY LeaveRoom packet (op 254 out): those are
+  // the moments the game itself says "no room". Nothing else may claim lobby.
+  // MATCH comes from a curScn (PropertiesChanged) that is not a lobby scene -
+  // and the value is compared normalised, because it arrives as raw bytes and
+  // a stray/echoed scene must never flip a quiet lobby into "in match".
+  // EXCEPTION (between-matches hold, below): a lobby scene while still in the
+  // same coded ranked room is the victory breather, not a leave - multi-match
+  // rooms hit this every match end and the session must survive it.
+  function _normScn(v){ return String(v==null?'':v).trim().toLowerCase(); }
+  function _isLobbyScene(scn){ const s=_normScn(scn); return s==='mainlobby' || s==='lobby'; }
+  function _isSceneLike(scn){ return /[a-z]/i.test(String(scn==null?'':scn).trim()); }
 
   function _applyOptimisticCurScn(curScn, opts) {
-    if (!curScn || curScn === _optimisticState.curScn) return;
+    if (!curScn) return;
+    if (!_isSceneLike(curScn)) { logSys(`[OPTIMISTIC] curScn ignored (not a scene): ${JSON.stringify(String(curScn))}`); return; }
+    const inMatch = !_isLobbyScene(curScn);
+    if (String(curScn) === String(_optimisticState.curScn||'') && inMatch === _optimisticState.inMatch) return;
     const wasInMatch = _optimisticState.inMatch;
+    // Between-matches hold: lobby scene + we never left (still in the same
+    // coded ranked room, proven by liveRanked()'s block+session agreement
+    // right now) = victory breather, not a leave. Leave/auth have their own
+    // paths that clear intent first, so they can never take this branch.
+    // Holding match mode keeps the overlay (with its pending-seal honesty),
+    // music and Discord steady; the 25s server reconcile still flips a
+    // genuinely abandoned victory screen, and the next match scene is a noop.
+    let _holdMatch = false;
+    try{
+      if(!inMatch && wasInMatch && typeof liveRanked==='function' && liveRanked()) _holdMatch = true;
+    }catch{}
     _optimisticState.curScn = curScn;
-    _optimisticState.inMatch = curScn !== 'MainLobby';
+    _optimisticState.inMatch = _holdMatch ? true : inMatch;
     _optimisticState.lastUpdateAt = Date.now();
-    logSys(`[OPTIMISTIC] curScn=${curScn} inMatch=${_optimisticState.inMatch}`);
-    // RANKED-tagged mirror: scene flips are the lobby<->match transition â€”
+    // Live-match evidence (packet scene, hold included: the hold itself is
+    // proof we were in a ranked match moments ago). Lobby scenes never stamp.
+    if(_optimisticState.inMatch){ try{ _lastMatchEvidenceAt=Date.now(); }catch{} }
+    // Lobby is a statement, not a hope: hold it until a real scene change says
+    // match (see effInMatch). Match clears it. Auth/leave stamps land here too
+    // (they call this with 'MainLobby'), so leaving a match is final.
+    // The between-matches hold never raises the guard (nothing was left).
+    _optimisticState.lobbyGuard = _holdMatch ? false : !inMatch;
+    logSys(`[OPTIMISTIC] curScn=${curScn} inMatch=${_optimisticState.inMatch} lobbyGuard=${_optimisticState.lobbyGuard}${_holdMatch?' HOLD':''}`);
+    // Breather = a seal is about to land: poll fast until it does instead
+    // of waiting for the steady 5s cadence.
+    if(_holdMatch){ try{ startSealWatch('breather'); }catch{} }
+    // RANKED-tagged mirror: scene flips are the lobby<->match transition —
     // keep them visible under a [RANKED] console filter too. (This point is
-    // only reached on actual change â€” unchanged scenes return early above.)
+    // only reached on actual change — unchanged scenes return early above.)
     try{ logInfo(`[SCENE] scene -> ${curScn} inMatch=${_optimisticState.inMatch}`); }catch{}
     const silent = opts && opts.silent;
     // Audio rule: pause ONLY on scene flip (lobby<->match). Same-side scene
@@ -788,20 +899,29 @@
   // Server-state reconciliation (enter/exit driver for audio + optimistic state).
   // Derives server in-match from EITHER shape: capture POST (full rooms map) or
   // stats GET (flat current-room fields). Flips optimistic state on disagreement
-  // once optimistic is stale (>OPTIMISTIC_TRUST_MS â€” server trails live packets
+  // once optimistic is stale (>OPTIMISTIC_TRUST_MS — server trails live packets
   // by seconds), which heals stuck flags even when idle (no capture batches
   // flowing). Returns true on flip.
   function _serverInMatch(sess) {
     if(!sess) return null;
     try {
-      // FSM state wins over scene: leaving via leave/auth clears state to lobby while
-      // cur_scn stays stale on the last match scene (no MainLobby packet ever comes).
-      // Trusting stale cur_scn here stuck audio paused forever in the lobby.
-      if(sess.state) return String(sess.state).toLowerCase() === 'match';
       const rooms = sess.rooms;
       const curRoom = rooms ? rooms[sess.current_room_id] : null;
       const serverCurScn = (curRoom && curRoom.cur_scn) || sess.cur_scn || null;
-      if(serverCurScn) return serverCurScn !== 'MainLobby';
+      // A lobby scene is the lobby, whoever put it there last - and it outranks
+      // the session state, which trails the game: leaving via leave/auth clears
+      // state late, so a stale 'match' here is what pinned the client in match
+      // for a whole lobby (and kept the Discord card on "In Match").
+      if(serverCurScn && _isLobbyScene(serverCurScn)) return false;
+      if(sess.state) return String(sess.state).toLowerCase() === 'match';
+      if(!serverCurScn) return null;
+      // A match scene proves nothing without a room to play it in: the stale
+      // match scene parked on the lobby pseudo-room is the classic false
+      // "in match" (the room we are actually in is named 'lobby'), so that
+      // reads as unknown here instead of match.
+      const rid = String((curRoom && curRoom.room_id) || sess.current_room_id || '');
+      if(!rid || _isLobbyScene(rid)) return null;
+      return true;
     } catch(e) {}
     return null;
   }
@@ -809,6 +929,27 @@
     try {
       const serverInMatch = _serverInMatch(sess);
       if(serverInMatch === null || serverInMatch === _optimisticState.inMatch) return false;
+      // A packet-declared lobby is not up for debate: the server trails the
+      // game, so "server says match" while we sit in the lobby is exactly the
+      // stale read that used to flip the client back into match. Only the next
+      // scene change clears the guard.
+      if(serverInMatch === true && _optimisticState.lobbyGuard) {
+        logSys('[OPTIMISTIC] server match ignored (packets said lobby)');
+        return false;
+      }
+      // Victory-breather hold: still in the same ranked room with fresh
+      // match evidence = between matches, not a leave. The seal lands in
+      // seconds; an abandoned screen ages out of the hold and flips.
+      if(serverInMatch === false && _optimisticState.inMatch){
+        try{
+          const _lr=(typeof liveRanked==='function') ? liveRanked() : null;
+          if(_lr && (Date.now()-_lastMatchEvidenceAt)<BREATHER_HOLD_MS){
+            logSys('[OPTIMISTIC] server lobby ignored (victory breather hold)');
+            try{ startSealWatch('breather-hold'); }catch{}
+            return false;
+          }
+        }catch{}
+      }
       const optimisticFresh = (Date.now() - (_optimisticState.lastUpdateAt || 0)) < OPTIMISTIC_TRUST_MS;
       if(optimisticFresh) {
         logSys(`[OPTIMISTIC] server reconcile ignored (fresh optimistic inMatch=${_optimisticState.inMatch}, server=${serverInMatch})`);
@@ -823,18 +964,22 @@
       } catch(e) {}
       _optimisticState.inMatch = serverInMatch;
       _optimisticState.lastUpdateAt = Date.now();
+      // Flip the guard with the flip: a server-confirmed lobby holds like a
+      // packet-stamped one, and a server-confirmed match releases it.
+      _optimisticState.lobbyGuard = !serverInMatch;
       try { updateLobbyMusic(); } catch {}  // enter-match pauses, exit-to-lobby resumes
       return true;
     } catch(e) { return false; }
   }
 
   // Optimistic killfeed dedup: the broadcast + its inbound retransmit arrive
-  // as separate sightings ~0.5s apart â€” without this every kill shows +2
+  // as separate sightings ~0.5s apart — without this every kill shows +2
   // then "flips back" on the next stats poll. Same pair inside 5s bumps once.
   let _optKfLast = { key: '', at: 0 };
   function _applyOptimisticKillfeed(killer, victim) {
     const myName = GMGet('bnc_game_username', '') || '';
     if (!myName) return;
+    try{ _lastMatchEvidenceAt=Date.now(); }catch{}  // killfeed = live match
     const myNorm = _normName(myName);
     const killerNorm = _normName(killer);
     const victimNorm = _normName(victim);
@@ -843,19 +988,28 @@
       const key = `${killerNorm || ''}>${victimNorm || ''}`;
       const now = Date.now();
       if (key && key === _optKfLast.key && now - _optKfLast.at < 5000) {
-        logSys(`[OPTIMISTIC] killfeed dup ignored ${killer}â†’${victim}`);
+        logSys(`[OPTIMISTIC] killfeed dup ignored ${killer}→${victim}`);
         return;
       }
       _optKfLast = { key, at: now };
     } catch {}
     if (myNorm && killerNorm && myNorm === killerNorm) {
       statsCache.kills = (statsCache.kills || 0) + 1;
-      logSys(`[OPTIMISTIC] KILL +1 â†’ ${statsCache.kills} victim=${victim}`);
+      logSys(`[OPTIMISTIC] KILL +1 → ${statsCache.kills} victim=${victim}`);
       try { renderInfoPanel(); } catch {}
+      // Instant counter: ask the server to price this kill at seal-time
+      // economics and layer it over the counter until the seal lands (the
+      // layer is discarded the moment the server total moves — never added
+      // to it). Silent when unresolvable; kill-switch below.
+      try{ _priceOptimisticKill(killer, victim); }catch{}
     } else if (myNorm && victimNorm && myNorm === victimNorm) {
       statsCache.deaths = (statsCache.deaths || 0) + 1;
-      logSys(`[OPTIMISTIC] DEATH +1 â†’ ${statsCache.deaths} killer=${killer}`);
+      logSys(`[OPTIMISTIC] DEATH +1 → ${statsCache.deaths} killer=${killer}`);
       try { renderInfoPanel(); } catch {}
+      // My death usually ends my match (solo) — a seal lands seconds
+      // later but the steady poll only runs every 15-30s, which is the
+      // "toast shows up after the next match started" lag. Chase it.
+      try{ startSealWatch('self-death'); }catch{}
     }
   }
 
@@ -921,7 +1075,7 @@
       showToast('Need valid session to replay', true);
       return;
     }
-    showToast(`Replaying ${collectedPackets.length} packetsâ€¦`, false);
+    showToast(`Replaying ${collectedPackets.length} packets…`, false);
     logSys(`REPLAY start ${collectedPackets.length} packets`);
     const batchSize = 50;
     let sent = 0;
@@ -986,13 +1140,13 @@
   // Defaults use Alt+Shift: Chrome/Edge/Firefox swallow Ctrl+Shift+C/I/J/R/T
   // (DevTools, reload, tabs) before page JS ever sees them, so Ctrl+Shift
   // letter defaults silently never fire. Alt+Shift reaches the page.
-  // Stored binds win over defaults â€” existing users keep what they set.
+  // Stored binds win over defaults — existing users keep what they set.
   // Defaults are single keys (one press, no combos): panels on F2/F4/F9,
-  // this menu on Backquote â€” kid-simple on Windows AND Mac (60% boards have
+  // this menu on Backquote — kid-simple on Windows AND Mac (60% boards have
   // Backquote but no F-keys), dodging the Alt+Shift layout-switch trap plus
   // every Ctrl+Shift browser reservation. Stored binds always win, so
   // changing defaults only affects fresh installs. F1/F3/F5 stay
-  // off-limits (browser takes them â€” see bindWarning). F11/F12 are host
+  // off-limits (browser takes them — see bindWarning). F11/F12 are host
   // panels (rebindable; bare presses may lose to fullscreen/DevTools).
   const BNC_BINDS=[
     {id:'keys', label:'Shortcuts menu', key:'bnc_bind_keys', dev:false, def:{ctrl:false,shift:false,alt:false,meta:false,key:'`'}, run:()=>toggleKeybinds()},
@@ -1005,7 +1159,6 @@
     {id:'drawer', label:'Player info', key:'bnc_drawer_keybind', dev:false, def:{ctrl:false,shift:false,alt:false,meta:false,key:'F2'}, run:()=>toggleInfoPanel()},
     {id:'ranked', label:'Ranked panel', key:'bnc_ranked_keybind', dev:false, def:{ctrl:false,shift:false,alt:false,meta:false,key:'F9'}, run:()=>toggleRankedPanel()},
     {id:'leaderboard', label:'Leaderboard', key:'bnc_lb_keybind', dev:false, def:{ctrl:false,shift:false,alt:false,meta:false,key:'F4'}, run:()=>toggleLbPanel()},
-    {id:'clip', label:'Save clip', key:'bnc_clip_keybind', dev:false, def:{ctrl:false,shift:false,alt:false,meta:false,key:'F8'}, run:()=>{ try{ saveClip('manual'); }catch{} }},
     {id:'host11', label:'Host roster (F11)', key:'bnc_host11_keybind', dev:false, def:{ctrl:false,shift:false,alt:false,meta:false,key:'F11'}, run:()=>toggleHost11Panel()},
     {id:'host12', label:'Host controls (F12)', key:'bnc_host12_keybind', dev:false, def:{ctrl:false,shift:false,alt:false,meta:false,key:'F12'}, run:()=>toggleHost12Panel()},
   ];
@@ -1027,7 +1180,7 @@
       'ctrl+shift+G':'find previous', 'ctrl+shift+M':'switch profile', 'ctrl+shift+K':'keybinds menu',
       'F5':'reload', 'F1':'help', 'F3':'find next',
     };
-    if(reserved[sig]) return `Browser takes ${formatKeybind(kb)} (${reserved[sig]}) â€” pick another.`;
+    if(reserved[sig]) return `Browser takes ${formatKeybind(kb)} (${reserved[sig]}) — pick another.`;
     for(const b of BNC_BINDS){
       if(b.id===selfId) continue;
       const cur=getBindKb(b);
@@ -1036,7 +1189,7 @@
       const ck=String(cur.code||'').toUpperCase(), nk=String(kb.code||'').toUpperCase();
       const sameKey=(ck && nk) ? ck===nk : String(cur.key||'').toUpperCase()===k;
       if(sameKey)
-        return `${formatKeybind(kb)} is already ${b.label} â€” pick another.`;
+        return `${formatKeybind(kb)} is already ${b.label} — pick another.`;
     }
     return null;
   }
@@ -1049,7 +1202,7 @@
   function captureFresh(){ try{ return Date.now()-lastCaptureSentAt<=CAPTURE_FRESH_MS; }catch{ return false; } }
   // WS liveness: stamped on EVERY websocket packet seen by the hook (even
   // non-essential keepalives that never reach /api/capture). An idle lobby
-  // sends almost no essential packets for minutes â€” WS alive + captures
+  // sends almost no essential packets for minutes — WS alive + captures
   // stale = idle, not dead. Only WS dead + captures dead = hook killed.
   let lastWsSeenAt=0;
   const WS_FRESH_MS=120000;
@@ -1061,7 +1214,7 @@
   let _capSnap=null; // {at, inMatch, code, mver}
   const CAP_SNAP_FRESH_MS=45000;
   // Timestamp of the last local flip TO lobby (scene says MainLobby). A
-  // capture response built from packets older than this is a stale echo â€”
+  // capture response built from packets older than this is a stale echo —
   // noteCaptureSnap ignores its inMatch=true so an in-flight batch can't
   // resurrect match UI after a real lobby flip. Cleared on match-ward flips.
   let _lobbyFlipAt=0;
@@ -1087,24 +1240,33 @@
         }catch{}
       }
       _capSnap={at:Date.now(), inMatch:im===true, code, mver};
+      // Live-match evidence for the victory-breather hold (server fallback
+      // reads never stamp — only this packet-derived shadow does).
+      if(im===true){ try{ _lastMatchEvidenceAt=Date.now(); }catch{} }
     }catch{}
   }
   // Local-signal trust window: server trails live packets (~8s observed),
   // so optimistic/capture signals stay authoritative this long before the
   // server is allowed to override them. One constant, three users.
   const OPTIMISTIC_TRUST_MS=25000;
-  // Effective match state, freshest-first: optimistic sniff (<10s) â†’
-  // capture shadow (<15s) â†’ server session. Returns true/false/null
+  // Effective match state, freshest-first: optimistic sniff (<10s) →
+  // capture shadow (<15s) → server session. Returns true/false/null
   // (null = no signal at all). Renderers use this instead of reading
   // statsCache.session directly so flips show in ms, not polls.
+  // A fresh packet-derived LOBBY is an answer too, not just a fresh match:
+  // this used to only be able to say "true", so a stale server 'match' won
+  // every time the player was sitting in the lobby (wrong card, no music).
   function effInMatch(){
     try{
       const now=Date.now();
-      if(_optimisticState.inMatch && now-(_optimisticState.lastUpdateAt||0)<OPTIMISTIC_TRUST_MS) return true;
-      if(_capSnap && now-_capSnap.at<=CAP_SNAP_FRESH_MS && _capSnap.inMatch) return true;
+      // The packets win. A scene/auth/leave stamp is the freshest thing there
+      // is, and a LOBBY stamp holds until a new scene says otherwise - no
+      // 25s window, no capture shadow, no stale server 'match' underneath it.
+      if(_optimisticState.lobbyGuard) return false;
+      if(_optimisticState.inMatch) return true;
+      if(_capSnap && now-_capSnap.at<=CAP_SNAP_FRESH_MS) return !!_capSnap.inMatch;
       const sess=statsCache && statsCache.session;
       if(sess && sess.state) return String(sess.state).toLowerCase()==='match';
-      if(_capSnap && now-_capSnap.at<=CAP_SNAP_FRESH_MS) return !!_capSnap.inMatch;
       return null;
     }catch{ return null; }
   }
@@ -1126,7 +1288,7 @@
           const eff=effInMatch();
           if(srv!==null && eff!==null && srv===eff){
             _burstUntil=0;
-            return; // server confirmed â€” back to normal cadence
+            return; // server confirmed — back to normal cadence
           }
           try{ fetchStats(false); }catch{}
           _burstTimer=setTimeout(tick, 3000);
@@ -1137,6 +1299,144 @@
     }catch{}
   }
   let _lastCapUiAt=0;
+  // Optimistic kill layer: priced kills land on the counter in ~300ms
+  // instead of at the seal (~2-4s). Display-only and disposable: shown =
+  // server_total + pending, and pending resets to zero the moment the
+  // server total moves (seal landed), on room change, or on leave — so a
+  // priced kill the seal never banks can never stick. Kill-switch below.
+  const OPTIMISTIC_KILLS=true;
+  let _optPending=0, _optBase=null, _optRid=null, _optVer=null, _optAt=0, _optN=0;
+  // Priced layer older than this is discarded: a match that never seals
+  // must not leave phantom points on later matches with the same total.
+  const OPT_STALE_MS=120000;
+  function _optServerPts(){
+    try{
+      const rk=(typeof liveRanked==='function') ? liveRanked() : null;
+      if(!rk || rk.points==null) return null;
+      return {rid:String(rk.rid||''), pts:Number(rk.points)||0,
+              ver:Number(rk.match_version)||0};
+    }catch{ return null; }
+  }
+  function _optReset(sv){
+    _optPending=0;
+    _optBase=sv ? sv.pts : null;
+    _optRid=sv ? sv.rid : null;
+    _optVer=sv ? sv.ver : null;
+    _optAt=Date.now();
+  }
+  function _optLive(){
+    // The layer is spendable only while the server total, room and match
+    // version all still match the pricing moment — and only while fresh.
+    try{
+      if(_optBase==null || _optPending<=0) return 0;
+      if(Date.now()-_optAt>OPT_STALE_MS) return 0;
+      const sv=_optServerPts();
+      if(!sv || sv.rid!==_optRid || sv.pts!==_optBase || sv.ver!==_optVer) return 0;
+      return _optPending;
+    }catch{ return 0; }
+  }
+  function _priceOptimisticKill(killer, victim){
+    if(!OPTIMISTIC_KILLS || !IS_GAME_FRAME) return;
+    let rk=null;
+    try{ rk=(typeof liveRanked==='function') ? liveRanked() : null; }catch{}
+    if(!rk) return;
+    try{ if(effInMatch()!==true) return; }catch{ return; }
+    let code=null, did=null;
+    try{ code=(statsCache&&statsCache.session&&statsCache.session.short_code)||null; }catch{}
+    try{ did=myDiscordId(); }catch{}
+    if(!code || !did) return;
+    code=String(code).trim().toUpperCase();
+    if(!/^[A-Z0-9]{5}$/.test(code)) return;
+    // Base captured at request time: a response that arrives after the
+    // server total moved (seal landed mid-flight) is dropped, never stacked.
+    let reqBase=null;
+    try{ reqBase=_optServerPts(); }catch{}
+    if(!reqBase) return;
+    try{
+      apiPostJson('/api/ranked/kill-price',
+        {code, discord_id:String(did), killer_name:String(killer||''), victim_name:String(victim||'')},
+        (j)=>{
+          try{
+            if(!j || j.ok!==true) return;
+            const award=Number(j.award)||0;
+            if(!(award>0)) return;
+            const sv=_optServerPts();
+            if(!sv || sv.rid!==reqBase.rid || sv.pts!==reqBase.pts || sv.ver!==reqBase.ver) return;
+            if(_optBase==null || _optRid==null || sv.rid!==_optRid || sv.pts!==_optBase || sv.ver!==_optVer){ _optReset(sv); }
+            _optPending+=award;
+            try{ _optAt=Date.now(); }catch{}
+            _optN++;
+            try{ logInfo(`[RANKED] opt-kill +${award} (pending=${_optPending})`); }catch{}
+            try{
+              if(typeof MINI_TOASTS!=='undefined' && MINI_TOASTS){
+                queuePtsToast('ELIMINATION', award, {key:`opt:${sv.rid}:${sv.ver}:${_optN}`, noCoalesce:true, dwell:2000});
+              }
+            }catch{}
+            try{ updateRankedOverlay(); }catch{}
+          }catch{}
+        });
+    }catch{}
+  }
+  // Seal-watch: fast stats polling after a match ends until its seal lands.
+  // Seals pay seconds after match end but the steady poll only runs every
+  // 15-30s, which is the "toast shows up after the next match started"
+  // lag. Armed on the victory breather, on self-death (solo: match over
+  // for me), and re-armed per match end; polls every 1.5s for up to 30s
+  // and stops the moment a new seal is observed (either toast path), on
+  // leave, or on timeout. Deliberately NOT on next-match start: a slow
+  // seal (host-gated) can land after stG=1, and quitting there strands
+  // the toast on the 30s steady poll — the exact lag above. Every poll
+  // runs the normal render, so toasts queue the instant the seal is visible.
+  let _sealWatchUntil=0, _sealWatchTimer=null, _sealWatchBase=null;
+  function _sealWatchSnap(){
+    try{
+      const sc=statsCache||{};
+      const rk=sc.ranked||null, rt=sc.ranked_tourney||null;
+      return {
+        rkv: rk ? (Number(rk.match_version)||0) : 0,
+        rlr: (rk && rk.last_result) ? (Number(rk.last_result.match_version)||0) : 0,
+        rpts: rk ? (Number(rk.points)||0) : 0,
+        tlr: (rt && rt.last_result) ? (Number(rt.last_result.match_version)||0) : 0,
+        tpts: rt ? (Number(rt.points)||0) : 0,
+      };
+    }catch{ return {rkv:0, rlr:0, rpts:0, tlr:0, tpts:0}; }
+  }
+  function _sealWatchAdvanced(){
+    try{
+      const b=_sealWatchBase, n=_sealWatchSnap();
+      if(!b) return false;
+      return n.rlr>b.rlr || n.tlr>b.tlr || n.tpts>b.tpts || n.rpts>b.rpts;
+    }catch{ return false; }
+  }
+  function startSealWatch(reason){
+    try{
+      _sealWatchUntil=Date.now()+30000;
+      // Always re-baseline: a re-arm means a newer match just ended, so the
+      // seal awaited is its own, not the previous watch's.
+      try{ _sealWatchBase=_sealWatchSnap(); }catch{ _sealWatchBase=null; }
+      try{ logInfo(`[RANKED] seal-watch start (${reason||'?'})`); }catch{}
+      if(_sealWatchTimer) return;
+      const tick=()=>{
+        try{
+          _sealWatchTimer=null;
+          if(Date.now()>_sealWatchUntil){ _sealWatchBase=null; return; }
+          let stopWhy=null;
+          try{
+            if(typeof liveRanked==='function' && !liveRanked()) stopWhy='leave';
+            else if(_sealWatchAdvanced()) stopWhy='seal';
+          }catch{}
+          if(stopWhy){
+            _sealWatchUntil=0; _sealWatchBase=null;
+            try{ logInfo(`[RANKED] seal-watch stop (${stopWhy})`); }catch{}
+            return;
+          }
+          try{ fetchStats(false); }catch{}
+          _sealWatchTimer=setTimeout(tick, 1500);
+        }catch{}
+      };
+      _sealWatchTimer=setTimeout(tick, 1200);
+    }catch{}
+  }
   // Ranked verdict (comp-copy): local _rankedRoom intent + server stats
   // `ranked` block confirmer (liveRanked). No endpoint polls, no roster
   // checks. Leave guard + dead captures hide locally and never re-show
@@ -1144,7 +1444,7 @@
   // Comp-tourney rooms score manually: every ranked surface (toasts,
   // overlays, lobby card, seal queue) stays dark while holding one. Gates:
   // server comp_tourney block, local _compRoom code match, or tourney/scrim
-  // room tag â€” the same trio the tourney HUD uses. Never throws.
+  // room tag — the same trio the tourney HUD uses. Never throws.
   function _inCompRoom(code){
     try{
       const sess=statsCache&&statsCache.session;
@@ -1253,7 +1553,7 @@
   let _rankedLeaveGuard=false;
   function sniffPid(hex){
     // Photon strings are length-prefixed, so the code may glue to a prefix
-    // byte ("07"+"PBS05") â€” slide a 5-char window over the post-key bytes.
+    // byte ("07"+"PBS05") — slide a 5-char window over the post-key bytes.
     // Trigger-happy by design: the by-code endpoint is authoritative and a
     // wrong guess just resolves to room null (cached 30s).
     try{
@@ -1291,6 +1591,160 @@
       if(t==='69' && d.length>=8) return parseInt(d.slice(0,8),16);
     }catch{}
     return null;
+  }
+  // ---- MY OWN PHOTON ACTOR NUMBER -------------------------------------
+  // Photon answers MY join/create with the actor number it assigned me (param
+  // 254, the first param of that response) and echoes the same number on my own
+  // Join / PropertiesChanged events (PlayerProperties."255" == my game name).
+  // Tracking it makes an inbound Leave event PROOF: a Leave whose ActorNr is
+  // mine IS my own leave — the same statement as my LeaveRoom op — instead of
+  // matching the leaver's name against my username or assuming every 254-in
+  // belongs to somebody else. The number is per-room: cleared on auth (the next
+  // room hands out a fresh one) and on a proven self-leave. Never throws.
+  let _myActor={nr:null, at:0, via:''};
+  function _noteMyActor(nr, via){
+    try{
+      const n=Number(nr);
+      if(!Number.isInteger(n) || n<1 || n>255) return false;
+      const v=String(via||'');
+      if(_myActor.nr!==n || _myActor.via!==v){
+        _myActor.nr=n; _myActor.at=Date.now(); _myActor.via=v;
+        try{ logInfo(`[ACTOR] my actorNr=${n} (${v||'?'})`); }catch{}
+      }
+      return true;
+    }catch{ return false; }
+  }
+  // Drops the pin with the room (auth, proven self-leave). The next join/create
+  // response pins the next number, so forgetting can only lose a stale actor —
+  // never a live one — and it keeps a recycled number from looking like mine.
+  function _clearMyActor(why){
+    try{
+      if(_myActor.nr==null) return;
+      try{ logInfo(`[ACTOR] my actorNr forgotten (${why||'?'})`); }catch{}
+      _myActor.nr=null; _myActor.at=0; _myActor.via='';
+    }catch{}
+  }
+  // True only when the number is the one Photon pinned to ME — the proof the
+  // Leave handler keys on. Unknown on either side is never a match.
+  function isMyActor(nr){
+    try{ return nr!=null && _myActor.nr!=null && Number(nr)===_myActor.nr; }catch{ return false; }
+  }
+  // Minimal GpBinary (LE, minimal-encoded counts) param walker: captures are raw
+  // bytes, and ActorNr rides inside the param list (param 254 of a Leave event,
+  // of a join/create response, of a Join event). Mirrors companion/decryptor.js
+  // and server/lib/gpbinary.py without pulling in the whole parser. Bounds-
+  // checked, depth-capped; a value it cannot follow ends the walk and keeps the
+  // params read so far (ActorNr is the FIRST param of every join/create
+  // response, so a partial read still carries it). Null when nothing could be
+  // read. Never throws.
+  function _gpParams(bytes, type){
+    let out=null;
+    try{
+      if(!bytes || bytes.length<5) return null;
+      if(type!==3 && type!==4) return null;   // 3 = OperationResponse, 4 = EventData
+      let p=3;
+      const u8=()=>{ if(p>=bytes.length) throw 0; return bytes[p++]; };
+      const cnt=()=>{ const v=u8(); return v>=0x80 ? (v | (u8()<<8)) : v; };
+      const skip=n=>{ if(n<0 || p+n>bytes.length) throw 0; p+=n; };
+      const str=()=>{ const n=cnt(); if(p+n>bytes.length) throw 0; let s=''; for(let i=0;i<n;i++) s+=String.fromCharCode(bytes[p+i]); p+=n; return s; };
+      const val=(t,d)=>{
+        if(d>8) throw 0;
+        if(t===2) return u8()!==0;
+        if(t===3) return u8();
+        if(t===4){ const v=u8()|(u8()<<8); return v>0x7fff ? v-0x10000 : v; }
+        if(t===5){ skip(4); return null; }
+        if(t===6){ skip(8); return null; }
+        if(t===7) return str();
+        if(t===8 || t===42) return null;
+        if(t===9 || t===10){ let r=0,s=0,b=0; do{ b=u8(); r|=(b&0x7f)<<s; s+=7; }while((b&0x80) && s<35); return r; }
+        if(t===11) return u8();
+        if(t===12) return -u8();
+        if(t===13) return u8()|(u8()<<8);
+        if(t===14) return -(u8()|(u8()<<8));
+        if(t===15) return u8();
+        if(t===16) return -u8();
+        if(t===17) return u8()|(u8()<<8);
+        if(t===18) return -(u8()|(u8()<<8));
+        if(t>=27 && t<=34) return t===28;   // true / false / type-zero
+        if(t===20){                        // Dictionary
+          const kt=u8(), vt=u8(), n=cnt();
+          if(n>0xffff) throw 0;
+          const o={};
+          for(let i=0;i<n;i++){
+            const k=val((kt===0||kt===42)?u8():kt, d+1);
+            o[String(k)]=val((vt===0||vt===42)?u8():vt, d+1);
+          }
+          return o;
+        }
+        if(t===21){                        // Hashtable
+          const n=cnt();
+          if(n>0xffff) throw 0;
+          const o={};
+          for(let i=0;i<n;i++){ const k=val(u8(), d+1); o[String(k)]=val(u8(), d+1); }
+          return o;
+        }
+        if(t===23){                        // ObjectArray
+          const n=cnt();
+          if(n>0xffff) throw 0;
+          const a=[];
+          for(let i=0;i<n;i++) a.push(val(u8(), d+1));
+          return a;
+        }
+        if(t & 0x40){                      // typed array
+          const elem=t & 0x3f;
+          if(elem===3){ const n=cnt(); skip(n); return null; }   // byte[]
+          let n, eff=elem;
+          if(t===0x40){ n=cnt(); eff=u8(); } else n=cnt();
+          if(n>0xffff) throw 0;
+          const a=[];
+          for(let i=0;i<n;i++) a.push(val(eff, d+1));
+          return a;
+        }
+        throw 0;                           // Custom (19) etc: payload length unknown
+      };
+      // The code byte (b2) is already read for us by the record: an
+      // OperationResponse continues with returnCode(2)+debug, an EventData goes
+      // straight to the param count.
+      if(type===3){ u8(); u8(); const dbg=u8(); if(dbg===7){ const n=cnt(); skip(n); } }
+      const n=cnt();
+      if(n>0xffff) throw 0;
+      out={};
+      for(let i=0;i<n;i++){
+        if(p>=bytes.length) break;
+        const k=u8(), t=u8();
+        out[k]=val(t, 0);
+      }
+      return out;
+    }catch{ return out; }
+  }
+  // ActorNr + player name from one captured message ({actorNr, name}), or null
+  // when the message carries no param list at all. Never throws.
+  function sniffMyActor(bytes, type){
+    try{
+      const params=_gpParams(bytes, type);
+      if(!params) return null;
+      const nr=params[254];
+      if(!Number.isInteger(nr) || nr<1 || nr>255) return {actorNr:null, name:null};
+      // PlayerProperties (249) on a Join event / Properties (251) on a 253 hold
+      // the name under key "255"; on a join RESPONSE 249 is keyed by actor, so no
+      // name shows up there — none is needed, the response is already mine.
+      let name=null;
+      for(const k of [249,251]){
+        const bag=params[k];
+        if(bag && typeof bag==='object' && typeof bag['255']==='string' && bag['255']){ name=bag['255']; break; }
+      }
+      return {actorNr:nr, name};
+    }catch{ return null; }
+  }
+  // My own game username, normalized the way the server normalizes names (color
+  // tags and the "dc:" prefix stripped). Empty mine can never match, so no pin
+  // is ever learned from a name we do not have. Never throws.
+  function _isMyGameName(nm){
+    try{
+      const mine=_normName(GMGet('bnc_game_username','')||'');
+      const his=_normName(nm);
+      return !!(mine && his && mine===his);
+    }catch{ return false; }
   }
   // Track MY join/create carrying a pID (local intent, comp copy). The
   // server stats `ranked` block is the only confirmer — this just records
@@ -1354,6 +1808,8 @@
   function disableRanked(reason){
     try{ _rankedLeaveGuard=true; }catch{}
     try{ _rankedRoom=null; }catch{}
+    try{ _lastMatchEvidenceAt=0; }catch{}  // release any breather hold now
+    try{ _optPending=0; _optBase=null; _optRid=null; _optVer=null; _optAt=0; }catch{}  // drop optimistic layer
     try{ const el=document.getElementById('bnc-ranked-start'); if(el) el.remove(); }catch{}
     try{ _rankedStartTimer=null; }catch{}
     try{ if(typeof rankedPanel!=='undefined' && rankedPanel && rankedPanel.style.display!=='none') toggleRankedPanel(false); }catch{}
@@ -1379,8 +1835,8 @@
     return bindMatches(e, kb);
   }
   // Layout-proof matching: Alt+Shift switches Windows layouts and Ctrl+Alt
-  // composes AltGr chars, so e.key arrives as 'z'/'Ã¥'/etc. instead of 'W'.
-  // e.code is the physical key (KeyW) â€” layout- and modifier-independent.
+  // composes AltGr chars, so e.key arrives as 'z'/'å'/etc. instead of 'W'.
+  // e.code is the physical key (KeyW) — layout- and modifier-independent.
   // Stored binds without a code (saved before this fix) fall back to e.key.
   function bindMatches(e, kb){
     try{
@@ -1392,9 +1848,12 @@
   }
   function matchBind(e){
     for(const b of BNC_BINDS){
-      // drawer + ranked + leaderboard panels have their own dispatcher below
-      // (Esc/panel handling) â€” matching them here too would fire twice.
-      if(b.id==='drawer' || b.id==='ranked' || b.id==='leaderboard') continue;
+      // drawer + ranked + leaderboard + host panels have their own dispatcher
+      // below (Esc/panel handling) — matching them here too would fire twice:
+      // open here, instant close there on the SAME keypress (stopPropagation
+      // does not stop same-node listeners; only stopImmediatePropagation
+      // would, and registration order makes this one run first).
+      if(b.id==='drawer' || b.id==='ranked' || b.id==='leaderboard' || b.id==='host11' || b.id==='host12') continue;
       // Alt+Shift+L is the leaderboard default: when the press matches the
       // leaderboard bind, 'Load file' (same factory default) yields to it.
       try{ if(b.id==='load' && typeof isLbKeybind==='function' && isLbKeybind(e)) continue; }catch{}
@@ -1464,7 +1923,7 @@
 
   function updateCollectBadge(){
     if(collectMode){
-      collectBadge.textContent = `ðŸ”´ COLLECT ${collectedPackets.length}`;
+      collectBadge.textContent = `🔴 COLLECT ${collectedPackets.length}`;
       collectBadge.style.display = 'block';
     }else{
       collectBadge.style.display = 'none';
@@ -1486,7 +1945,7 @@
     display: 'flex', gap: '6px', padding: '2px 6px', background: 'rgba(0,0,0,0.92)', borderTop: '1px solid rgba(255,255,255,0.12)',
     fontFamily: 'monospace', fontSize: '10px', pointerEvents: 'auto'
   });
-  feedBar.innerHTML = `<span style="opacity:0.5">BNC feed - zone/stG/alv full</span><button id="bnc-feed-pause" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:0 6px;cursor:pointer">${feedPaused?'â–¶ Resume':'â¸ Pause'}</button><button id="bnc-feed-expand" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:0 6px;cursor:pointer">â¤¢ Expand</button><span id="bnc-feed-hint" style="opacity:0.5">toggle Â· pause Â· hover to scroll Â· drag top edge to resize</span>`;
+  feedBar.innerHTML = `<span style="opacity:0.5">BNC feed - zone/stG/alv full</span><button id="bnc-feed-pause" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:0 6px;cursor:pointer">${feedPaused?'▶ Resume':'⏸ Pause'}</button><button id="bnc-feed-expand" style="background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:0 6px;cursor:pointer">⤢ Expand</button><span id="bnc-feed-hint" style="opacity:0.5">toggle · pause · hover to scroll · drag top edge to resize</span>`;
   const feedEl = document.createElement('div');
   feedEl.id = 'bnc-log-feed';
   Object.assign(feedEl.style, {
@@ -1496,7 +1955,7 @@
     borderTop: '1px solid rgba(255,255,255,0.08)', backdropFilter: 'blur(2px)', resize: 'vertical'
   });
   feedEl.tabIndex = 0;
-  feedEl.innerHTML = '<div style="opacity:0.5">waitingâ€¦ decrypted hex will show here</div>';
+  feedEl.innerHTML = '<div style="opacity:0.5">waiting… decrypted hex will show here</div>';
   feedWrap.appendChild(feedBar);
   feedWrap.appendChild(feedEl);
   (document.body || document.documentElement).appendChild(feedWrap);
@@ -1518,7 +1977,7 @@
       let s;
       if(typeof v==='object' && v!==null) s = JSON.stringify(v);
       else s = String(v);
-      if(s.length>cap) s = s.slice(0,cap)+' â€¦(+'+(s.length-cap)+' chars)';
+      if(s.length>cap) s = s.slice(0,cap)+' …(+'+(s.length-cap)+' chars)';
       // escape html
       s = s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
       return `${k}=${s}`;
@@ -1541,12 +2000,12 @@
     feedPaused = !feedPaused;
     GMSet('bnc_feed_paused', feedPaused);
     const btn=document.getElementById('bnc-feed-pause');
-    if(btn) btn.textContent = feedPaused ? 'â–¶ Resume' : 'â¸ Pause';
+    if(btn) btn.textContent = feedPaused ? '▶ Resume' : '⏸ Pause';
     feedLog('info', {msg: feedPaused ? 'paused (scrollable)' : 'resumed'});
     showToast(feedPaused ? 'Feed paused' : 'Feed resumed', false);
   }
   // Dev gating: feed UI + dev keybinds exist only when the DB row says so.
-  // Called on every stats render (stats arrive async â€” hidden until then).
+  // Called on every stats render (stats arrive async — hidden until then).
   function syncDevUI(){
     const dev=isDev();
     try{
@@ -1560,7 +2019,7 @@
       const h=document.getElementById('bnc-feed-hint');
       if(h){
         const fb=BNC_BINDS.find(x=>x.id==='feed'), pb=BNC_BINDS.find(x=>x.id==='pause');
-        h.textContent=`${formatKeybind(getBindKb(fb))} toggle Â· ${formatKeybind(getBindKb(pb))} pause Â· hover to scroll Â· drag top edge to resize`;
+        h.textContent=`${formatKeybind(getBindKb(fb))} toggle · ${formatKeybind(getBindKb(pb))} pause · hover to scroll · drag top edge to resize`;
       }
     }catch{}
     try{ if(typeof renderKeybindRows==='function') renderKeybindRows(); }catch{}
@@ -1570,7 +2029,7 @@
     if(btn) btn.onclick=()=>{
       feedPaused = !feedPaused;
       GMSet('bnc_feed_paused', feedPaused);
-      btn.textContent = feedPaused ? 'â–¶ Resume' : 'â¸ Pause';
+      btn.textContent = feedPaused ? '▶ Resume' : '⏸ Pause';
       feedLog('info', {msg: feedPaused ? 'paused' : 'resumed'});
     };
     const exp=document.getElementById('bnc-feed-expand');
@@ -1578,7 +2037,7 @@
       const isBig = feedEl.style.maxHeight==='70vh';
       feedEl.style.maxHeight = isBig ? '38vh' : '70vh';
       feedEl.style.height = isBig ? '38vh' : '70vh';
-      exp.textContent = isBig ? 'â¤¢ Expand' : 'â¤¡ Collapse';
+      exp.textContent = isBig ? '⤢ Expand' : '⤡ Collapse';
       feedLog('info', {msg: isBig ? 'feed collapsed 38vh' : 'feed expanded 70vh'});
     };
   }, 800);
@@ -1589,14 +2048,14 @@
   function fmtPlaytimeDrawer(s){ if(s==null) return '-'; s=Math.max(0,Math.floor(Number(s)||0)); const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), sec=s%60; if(h) return `${h}h ${m}m`; if(m) return `${m}m ${sec}s`; return `${sec}s`; }
   function fmtLastSeen(iso){
     try{
-      if(!iso) return 'â€”';
+      if(!iso) return '—';
       const ms=new Date(String(iso)).getTime()-Date.now();
       const age=Math.max(0, Math.round(-ms/1000));
       if(age<300) return 'Online now';
       if(age<3600) return `${Math.floor(age/60)}m ago`;
       if(age<86400) return `${Math.floor(age/3600)}h ago`;
       return `${Math.floor(age/86400)}d ago`;
-    }catch{ return 'â€”'; }
+    }catch{ return '—'; }
   }
   function skinUrlDrawer(id){ if(!id || id==='-' ) return null; return `https://buildnow-api.netlify.app/skins/${encodeURIComponent(String(id).trim())}.png`; }
   // team number -> diamond color (1 blue, 2 red, 3 green, 4 orange, 5 purple, 6 yellow, 7 cyan, 8 pink)
@@ -1630,7 +2089,7 @@
   let apiOnline=false;
 
   let infoPanel=null, infoUpdateTimer=null, statsCache=null, statsPollTimer=null, drawerBackdrop=null;
-  // Drawer always starts closed on page load (first open) â€” never auto-open from storage.
+  // Drawer always starts closed on page load (first open) — never auto-open from storage.
   let drawerOpen = false;
   try { GMSet('bnc_info_open', false); } catch {}
   // Ranked/host shelved: drop stale ranked session hint + force individualist.
@@ -1645,7 +2104,7 @@
   let lobbyAudio=null;
   let bgLobbyPollTimer=null;
   let _audioPlaying=false;
-  let _audioPlayPending=false; // play() in flight (buffering) â€” blocks duplicate play() calls
+  let _audioPlayPending=false; // play() in flight (buffering) — blocks duplicate play() calls
   let _authCount=0; // outgoing Authenticate packets seen (first = login, never touches audio)
   let _lastPauseReason=null; // reason string of the last _audioPause() call (for STOPPED tracing)
   function ensureLobbyAudio(){
@@ -1660,7 +2119,7 @@
       lobbyAudio.setAttribute('playsinline','');
       lobbyAudio.preload='auto';
       lobbyAudio.crossOrigin='anonymous';
-      // hidden audio tag that auto plays â€” use off-screen instead of display:none (some browsers block display:none audio)
+      // hidden audio tag that auto plays — use off-screen instead of display:none (some browsers block display:none audio)
       lobbyAudio.style.position='fixed';
       lobbyAudio.style.left='-9999px';
       lobbyAudio.style.width='1px';
@@ -1697,12 +2156,12 @@
       }catch{}
       (document.body||document.documentElement).appendChild(lobbyAudio);
       logInfo(`[AUDIO] appended hidden tag vol=${lobbyAudio.volume} loop=${lobbyAudio.loop} autoplay=${lobbyAudio.autoplay}`);
-      // try resume on user gesture (drawer open) â€” only if not already playing and not in match
-      try{ const resume=()=>{ logInfo('[AUDIO] click resume try'); try{ const rs = statsCache && statsCache.session; const rsLobby = !_optimisticState.inMatch && (!rs || String(rs.state||'').toLowerCase()!=='match'); if(lobbyAudio && !_audioPlaying && !_audioPlayPending && rsLobby && lobbyAudio.paused && lobbyAudio.src) { _audioPlayPending=true; lobbyAudio.play().then(()=> logOk('[AUDIO] resume playing')).catch(e=> { _audioPlayPending=false; logErr(`[AUDIO] resume blocked ${e.message||e}`); }); } }catch(e){ logErr(`[AUDIO] resume err ${e.message}`);} }; document.addEventListener('click', resume, {once:true}); }catch{}
+      // try resume on user gesture (drawer open) — only if not already playing and not in match
+      try{ const resume=()=>{ logInfo('[AUDIO] click resume try'); try{ const rs = statsCache && statsCache.session; const rsLobby = effInMatch() !== true; if(lobbyAudio && !_audioPlaying && !_audioPlayPending && rsLobby && lobbyAudio.paused && lobbyAudio.src) { _audioPlayPending=true; lobbyAudio.play().then(()=> logOk('[AUDIO] resume playing')).catch(e=> { _audioPlayPending=false; logErr(`[AUDIO] resume blocked ${e.message||e}`); }); } }catch(e){ logErr(`[AUDIO] resume err ${e.message}`);} }; document.addEventListener('click', resume, {once:true}); }catch{}
     }catch(e){ logErr(`[AUDIO] ensure failed ${e.message}`); }
     return lobbyAudio;
   }
-  // Single choke point for stopping lobby audio â€” records WHY for STOPPED tracing
+  // Single choke point for stopping lobby audio — records WHY for STOPPED tracing
   function _audioPause(reason){
     try{
       const a = lobbyAudio;
@@ -1716,8 +2175,10 @@
     try{
       const sc=statsCache;
       const sess=sc && sc.session;
-      // Use optimistic state for immediate response, fall back to server state
-      const isLobby = !_optimisticState.inMatch && (!sess || String(sess.state||'').toLowerCase()!=='match');
+      // Use the freshest signal there is (packets → capture shadow → server):
+      // "lobby" means nothing claims match, so a stale server 'match' cannot
+      // keep the music paused in the lobby.
+      const isLobby = effInMatch() !== true;
       const rawUrl = sc && sc.lobby_music_url; const url = rawUrl ? (rawUrl.startsWith('http') ? rawUrl : 'https://mnpwvwjqawmuqmickteu.supabase.co/storage/v1/object/public/lobby-music/'+rawUrl.replace(/^music\//,'')).replace(/\?$/,'') : null;
       const audio=ensureLobbyAudio();
       if(!audio){ logErr('[AUDIO] update no audio'); return; }
@@ -1732,7 +2193,7 @@
         _audioPause('in-match');
         return;
       }
-      // Lobby (optimistic): never pause here â€” without a URL there is nothing to start.
+      // Lobby (optimistic): never pause here — without a URL there is nothing to start.
       if(!url){
         logInfo('[AUDIO] no url, nothing to play (no pause)');
         return;
@@ -1749,7 +2210,7 @@
         logInfo('[AUDIO] actually playing, skip everything (no restart)');
         return;
       }
-      // Guard: play() already in flight (buffering) â€” a second play() restarts the track
+      // Guard: play() already in flight (buffering) — a second play() restarts the track
       if(_audioPlayPending){
         logInfo('[AUDIO] play already pending, skip duplicate play()');
         return;
@@ -1767,7 +2228,7 @@
       logInfo(`[AUDIO] play() try vol=${vol} loop=${audio.loop} autoplay=${audio.autoplay} paused=${audio.paused} readyState=${audio.readyState}`);
       _audioPlayPending = true; // mark play in flight before calling
       const p = audio.play();
-      if(p && p.then) p.then(()=> logOk('[AUDIO] play() ok playing')).catch(e=> { _audioPlayPending=false; logErr(`[AUDIO] play() blocked ${e.message||e} â€” need user click on page/drawer`); });
+      if(p && p.then) p.then(()=> logOk('[AUDIO] play() ok playing')).catch(e=> { _audioPlayPending=false; logErr(`[AUDIO] play() blocked ${e.message||e} — need user click on page/drawer`); });
       else if(p && p.catch) p.catch(e=> { _audioPlayPending=false; logErr(`[AUDIO] play() blocked ${e.message||e}`); });
       else { _audioPlayPending=false; logInfo('[AUDIO] play() no promise'); }
     }catch{}
@@ -1813,14 +2274,14 @@
     Object.assign(infoPanel.style,{position:'fixed', left:'0', top:'0', bottom:'0', zIndex:'2147483645', width:'380px', maxWidth:'88vw', background:'#0f0f0f', color:'#e5e7eb', borderRight:'1px solid rgba(255,255,255,0.10)', display:'flex', flexDirection:'column', transform:'translateX(-100%)', transition:'transform 220ms cubic-bezier(0.22,1,0.36,1)', pointerEvents:'auto', fontFamily:'Inter, system-ui, sans-serif', boxShadow:'8px 0 32px rgba(0,0,0,0.45)', overflow:'hidden'});
     infoPanel.innerHTML=`
       <div style="display:flex;align-items:center;justify-content:flex-end;padding:10px 10px 0 10px;flex-shrink:0">
-        <button id="bnc-drawer-close" style="width:28px;height:28px;border:1px solid rgba(255,255,255,0.12);background:#1a1a1a;color:#9ca3af;border-radius:8px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px">âœ•</button>
+        <button id="bnc-drawer-close" style="width:28px;height:28px;border:1px solid rgba(255,255,255,0.12);background:#1a1a1a;color:#9ca3af;border-radius:8px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px">✕</button>
       </div>
       <div id="bnc-drawer-body" style="flex:1;overflow-y:auto;overflow-x:hidden;padding:8px 20px 16px 20px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;text-align:center;scrollbar-width:thin">
-        <div style="opacity:0.7;font-size:12px">Loadingâ€¦</div>
+        <div style="opacity:0.7;font-size:12px">Loading…</div>
       </div>
       <div id="bnc-drawer-footer" style="padding:10px 14px;border-top:1px solid rgba(255,255,255,0.06);display:flex;justify-content:space-between;align-items:center;gap:8px;flex-shrink:0;font-size:11px;color:#6b7280">
         <span id="bnc-drawer-version">v${BNC_VERSION}</span>
-        <span id="bnc-drawer-ranked" style="display:none;cursor:pointer;color:#9ca3af;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45%" title="Click to copy â€” use it to report abuse"></span>
+        <span id="bnc-drawer-ranked" style="display:none;cursor:pointer;color:#9ca3af;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45%" title="Click to copy — use it to report abuse"></span>
         <span id="bnc-drawer-api" style="display:flex;align-items:center;gap:6px"><span id="bnc-drawer-dot" style="width:8px;height:8px;border-radius:50%;background:#6b7280;display:inline-block"></span><span id="bnc-drawer-api-text">Offline</span></span>
       </div>`;
     // non-passthrough: stop game from seeing wheel/keys inside drawer
@@ -1856,13 +2317,13 @@
       try{
         const sc=statsCache;
         const sess=sc && sc.session;
-        const isLobby = !sess || String(sess.state||'').toLowerCase()!=='match';
+        const isLobby = effInMatch() !== true;
         if(isLobby && sc && sc.lobby_music_url){
           const aud=ensureLobbyAudio();
           // Drawer must NEVER restart lobby music: only act when audio is silent, no play
-          // in flight, and we're in lobby (optimistic AND server â€” server trails, so both).
+          // in flight, and we're in lobby (optimistic AND server — server trails, so both).
           // Ground truth = aud.paused.
-          const drawerIsLobby = !_optimisticState.inMatch && (!sess || String(sess.state||'').toLowerCase()!=='match');
+          const drawerIsLobby = effInMatch() !== true;
           if(aud && aud.paused && !_audioPlayPending && drawerIsLobby){
             const rawUrl=sc.lobby_music_url||''; const fullUrl=(rawUrl.startsWith('http')? rawUrl: 'https://mnpwvwjqawmuqmickteu.supabase.co/storage/v1/object/public/lobby-music/'+rawUrl.replace(/^music\//,'')).replace(/\?$/,'');
             if(aud.src !== fullUrl || aud.networkState===3 || (aud.error && aud.error.code)){ try{ aud.src=fullUrl; aud.load(); logInfo(`[AUDIO] drawer open src set ${fullUrl}`); }catch{} }
@@ -1917,7 +2378,6 @@
         try{
           const j=JSON.parse(txt);
           playersCache=j;
-          try{ detectPartyJoins(j); }catch{}
           if(drawerTab==='players') renderInfoPanel();
           else { try{ const _pi=getPartyInfo(statsCache&&statsCache.session); if(_pi.isParty) renderInfoPanel(); }catch{} }
         }catch{ if(forceRender && drawerTab==='players') renderInfoPanel(); }
@@ -1975,10 +2435,11 @@
     const _curRoom = sess && sess.rooms ? sess.rooms[sess.current_room_id] : null;
     const _isDuoRoom = !!(_curRoom && _curRoom.gv && String(_curRoom.gv).toLowerCase() !== 'solo');
     const gmLive = sess && sess.game_mode ? fmtGmDrawer(sess.game_mode, _isDuoRoom) : fmtGmDrawer(gmRaw, _isDuoRoom);
-    // state: Lobby vs In Match - spec says show "In Lobby" when no game mode
+    // state: Lobby vs In Match - spec says show "In Lobby" when no game mode.
+    // Same authority as everywhere else (packets first), so the drawer can never
+    // disagree with the Discord card or the music.
     let stateLabel='In Lobby';
-    if(sess && sess.state){ stateLabel = String(sess.state).toLowerCase()==='match' ? 'In Match' : 'In Lobby'; }
-    else if(sess && sess.cur_scn){ stateLabel = String(sess.cur_scn).toLowerCase().includes('lobby') ? 'In Lobby' : 'In Match'; }
+    try{ if(effInMatch()===true) stateLabel='In Match'; }catch{}
     // per current gm playtime
     let perGmCurrent=null;
     if(sc && sc.playtime_per_gm){
@@ -1990,8 +2451,8 @@
       }
     }
     const skinImg = skinUrl
-      ? `<img src="${skinUrl}" alt="${String(skin).slice(0,24)}" style="width:112px;height:112px;object-fit:contain;background:radial-gradient(140px 90px at 50% 20%, rgba(255,255,255,0.06), transparent 70%), #111;border:1px solid rgba(255,255,255,0.08);border-radius:16px;image-rendering:pixelated;flex-shrink:0" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div style="display:none;width:112px;height:112px;align-items:center;justify-content:center;background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:16px;font-size:32px;flex-shrink:0">â–£</div>`
-      : `<div style="width:112px;height:112px;display:flex;align-items:center;justify-content:center;background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:16px;font-size:32px;flex-shrink:0">â–£</div>`;
+      ? `<img src="${skinUrl}" alt="${String(skin).slice(0,24)}" style="width:112px;height:112px;object-fit:contain;background:radial-gradient(140px 90px at 50% 20%, rgba(255,255,255,0.06), transparent 70%), #111;border:1px solid rgba(255,255,255,0.08);border-radius:16px;image-rendering:pixelated;flex-shrink:0" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" /><div style="display:none;width:112px;height:112px;align-items:center;justify-content:center;background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:16px;font-size:32px;flex-shrink:0">▣</div>`
+      : `<div style="width:112px;height:112px;display:flex;align-items:center;justify-content:center;background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:16px;font-size:32px;flex-shrink:0">▣</div>`;
     const kbLabel = formatKeybind(getDrawerKeybind());
     const row = (label,val)=> `<div style="display:flex;justify-content:space-between;align-items:center;width:100%;max-width:240px;font-size:13px"><span style="color:#9ca3af">${label}</span><span style="font-weight:700;color:#fff">${val==null? '-' : val}</span></div>`;
     const hasGm = gmLive && gmLive !== '-' && gmLive !== '-' && gmLive.toLowerCase() !== 'unknown' && gmLive.toLowerCase() !== 'lobby';
@@ -2002,13 +2463,13 @@
     if(isInParty){
       stateGmLine = hasGm ? `In Party - ${stateLabel} - ${gmLive}` : `In Party - ${stateLabel}`;
     }
-    // No game mode: bare status only ("In Lobby", never "In Lobby - â€¦").
+    // No game mode: bare status only ("In Lobby", never "In Lobby - …").
     if(!hasGm){
       stateGmLine = isInParty ? `In Party - ${stateLabel}` : stateLabel;
     }
     try{ stateGmLine = String(stateGmLine).replace(/\s+-\s*$/, ''); }catch{}
     // ranked overrides party: "In Match - Ranked Match - GM"
-    // liveRanked() also requires fresh captures â€” a ghost block from a dead
+    // liveRanked() also requires fresh captures — a ghost block from a dead
     // session (kick/reload) never renders as ranked.
     const _ranked = liveRanked();
     if(_ranked){
@@ -2056,17 +2517,20 @@
     // Empty account (no game username and no stats yet): placeholder instead of blank rows
     const _gmUname = GMGet('bnc_game_username', null);
     const noStats = (kills==null) && (!_gmUname || _gmUname==='-');
-    const emptyStatsHtml = `<div style="display:flex;flex-direction:column;gap:8px;align-items:center;width:100%;max-width:240px;padding:18px 14px;background:#171717;border:1px dashed rgba(255,255,255,0.16);border-radius:12px;text-align:center"><div style="font-size:26px">ðŸ“Š</div><div style="font-size:14px;font-weight:800;color:#fff">No stats yet</div><div style="font-size:12px;color:#9ca3af;line-height:1.5">Play 1-2 matches to get your account ready.<br>Kills, deaths, wins and skins will show up here.</div></div>`;
+    const emptyStatsHtml = `<div style="display:flex;flex-direction:column;gap:8px;align-items:center;width:100%;max-width:240px;padding:18px 14px;background:#171717;border:1px dashed rgba(255,255,255,0.16);border-radius:12px;text-align:center"><div style="font-size:26px">📊</div><div style="font-size:14px;font-weight:800;color:#fff">No stats yet</div><div style="font-size:12px;color:#9ca3af;line-height:1.5">Play 1-2 matches to get your account ready.<br>Kills, deaths, wins and skins will show up here.</div></div>`;
     // ranked arena rows (below K/D): ranked-session ONLY. Casual lobbies and
-    // matches never show points/tier rows â€” liveRanked() (_ranked above) is
-    // the gate; the session-independent arena block is deliberately unused.
+    // matches never show points/tier rows — liveRanked() (_ranked above) is
+    // the gate; values come from the session-independent arena block (your
+    // current ladder points), NOT the ranked block's tourney points (0 on a
+    // fresh tourney). Never throws.
     const fmtPts = n => n==null ? '-' : Number(n).toLocaleString('en-US');
-    const _arena = _ranked;
+    const _arena = (sc && sc.arena) || null;
+    const _arenaGated = (_ranked && _arena && _arena.points!=null) ? _arena : null;
     // progress-to-next lives on the session-independent arena block now
     // (the ranked block carries points/tier only).
     const _arenaNext = (sc && sc.arena) || null;
     let arenaRowsHtml = '';
-    if(_arena && _arena.points!=null){
+    if(_arenaGated){
       const _msColor = _arena.milestone_color || '#fff';
       const _msIcon = _arena.milestone_icon_url
         ? `<img src="${String(_arena.milestone_icon_url).replace(/"/g,'')}" alt="" style="width:20px;height:20px;object-fit:contain;vertical-align:-3px;margin-right:4px" onerror="this.style.display='none'" />`
@@ -2083,12 +2547,12 @@
       const _st = (_arenaNext && _arenaNext.streaks) || (sc && sc.arena && sc.arena.streaks) || null;
       if(_st && (_st.daily!=null || _st.win!=null)){
         const _esc = s => String(s==null?'':s).replace(/</g,'&lt;');
-        arenaRowsHtml += `<div style="display:flex;justify-content:space-between;width:100%;max-width:240px;font-size:12px;margin-top:4px"><span style="color:#9ca3af">ðŸ”¥ Win streak</span><span style="color:#fff;font-weight:700">x${_esc(_st.win||0)}${_st.best_win?` (best ${_esc(_st.best_win)})`:''}</span></div>`;
-        arenaRowsHtml += `<div style="display:flex;justify-content:space-between;width:100%;max-width:240px;font-size:12px"><span style="color:#9ca3af">ðŸ“… Daily streak</span><span style="color:#fff;font-weight:700">x${_esc(_st.daily||0)}</span></div>`;
-        if(_st.best_match_kills!=null) arenaRowsHtml += `<div style="display:flex;justify-content:space-between;width:100%;max-width:240px;font-size:12px"><span style="color:#9ca3af">ðŸ’€ Best match</span><span style="color:#fff;font-weight:700">${_esc(_st.best_match_kills)} kills</span></div>`;
+        arenaRowsHtml += `<div style="display:flex;justify-content:space-between;width:100%;max-width:240px;font-size:12px;margin-top:4px"><span style="color:#9ca3af">🔥 Win streak</span><span style="color:#fff;font-weight:700">x${_esc(_st.win||0)}${_st.best_win?` (best ${_esc(_st.best_win)})`:''}</span></div>`;
+        arenaRowsHtml += `<div style="display:flex;justify-content:space-between;width:100%;max-width:240px;font-size:12px"><span style="color:#9ca3af">📅 Daily streak</span><span style="color:#fff;font-weight:700">x${_esc(_st.daily||0)}</span></div>`;
+        if(_st.best_match_kills!=null) arenaRowsHtml += `<div style="display:flex;justify-content:space-between;width:100%;max-width:240px;font-size:12px"><span style="color:#9ca3af">💀 Best match</span><span style="color:#fff;font-weight:700">${_esc(_st.best_match_kills)} kills</span></div>`;
       }
     }catch{}
-    // ðŸ† comp rows are "my points in THIS tourney" â€” only while holding the
+    // 🏆 comp rows are "my points in THIS tourney" — only while holding the
     // tourney room. sc.comp is lifetime open-tourney data (server sends it
     // whenever a tourney is open) and would otherwise linger in the drawer
     // long after leaving. Gate mirrors updateTourneyHud: server comp_tourney
@@ -2107,7 +2571,7 @@
           ${row('K/D', kd)}
           ${arenaRowsHtml}
           ${row('Play points', sc && sc.play_points!=null ? fmtPts(sc.play_points) : null)}
-          ${(_inTourneyRoom && sc && sc.comp && sc.comp.length ? sc.comp.map(c=>row('ðŸ† '+String(c.tourney_name!=null?c.tourney_name:('Event #'+c.tourney_id)).replace(/</g,'&lt;'), fmtPts(c.points)+` (${c.wins||0}W)`)).join('') : '')}
+          ${(_inTourneyRoom && sc && sc.comp && sc.comp.length ? sc.comp.map(c=>row('🏆 '+String(c.tourney_name!=null?c.tourney_name:('Event #'+c.tourney_id)).replace(/</g,'&lt;'), fmtPts(c.points)+` (${c.wins||0}W)`)).join('') : '')}
           ${row('Wins', wins)}
           ${row('Tourney PR', tprTxt)}
           ${row('Playtime', pGlobal!=null? fmtPlaytimeDrawer(pGlobal):null)}
@@ -2130,7 +2594,6 @@
     if(isLobbyTab){
       // clean up stale player list when back in lobby (fixes not refreshing)
       if(playersCache){ playersCache=null; }
-      try{ resetPartyJoins(); }catch{}
       if(drawerTab==='players'){
         drawerTab='stats';
         try{ GMSet('bnc_drawer_tab', drawerTab); }catch{}
@@ -2157,13 +2620,12 @@
           <div style="margin-top:10px;width:100%;max-width:240px;display:flex;flex-direction:column;gap:4px;align-items:center">
            <div style="font-size:11px;color:#9ca3af">Lobby Music Volume</div>
            <div style="display:flex;gap:8px;align-items:center;width:100%">
-             <span style="font-size:11px;color:#6b7280">ðŸ”ˆ</span>
+             <span style="font-size:11px;color:#6b7280">🔈</span>
              <input type="range" id="bnc-volume-slider" min="0" max="100" value="${Math.round(Number(GMGet('bnc_lobby_volume',0.5))*100)}" style="flex:1;accent-color:#fff">
              <span id="bnc-volume-label" style="font-size:11px;color:#e5e7eb;min-width:32px;text-align:right">${Math.round(Number(GMGet('bnc_lobby_volume',0.5))*100)}%</span>
-              <span style="font-size:11px;color:#6b7280">ðŸ”Š</span>
+              <span style="font-size:11px;color:#6b7280">🔊</span>
             </div>
           </div>
-          <label style="margin-top:10px;display:flex;align-items:center;gap:6px;font-size:11px;color:#9ca3af;cursor:pointer"><input type="checkbox" id="bnc-rebrand-enabled"${bncRebrandOn()?' checked':''} style="accent-color:#fff"> Nectar loading branding</label>
         </div>
       `;
     // players tab content
@@ -2173,18 +2635,18 @@
       if(!sessionId){
         playersHtml = `<div style="padding:20px 0;color:#9ca3af;font-size:12px">No session - join a match</div>`;
       } else if(!pc){
-        playersHtml = `<div style="padding:20px 0;color:#9ca3af;font-size:12px">Loading playersâ€¦</div>`;
+        playersHtml = `<div style="padding:20px 0;color:#9ca3af;font-size:12px">Loading players…</div>`;
       } else if(!pc.players || pc.players.length===0){
         playersHtml = `<div style="padding:20px 0;color:#9ca3af;font-size:12px">No players in game</div>`;
       } else {
         const count = pc.count || pc.players.length;
         const lateCount = pc.players.filter(p=>p && p.late_join).length;
-        const header = `<div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:8px;text-align:center">Players in Game - ${count}${pc.game_mode? ' Â· '+fmtGmDrawer(pc.game_mode):''}${lateCount? ` Â· <span style="color:#f59e0b">${lateCount} late join${lateCount>1?'s':''}</span>`:''}</div>`;
+        const header = `<div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:8px;text-align:center">Players in Game - ${count}${pc.game_mode? ' · '+fmtGmDrawer(pc.game_mode):''}${lateCount? ` · <span style="color:#f59e0b">${lateCount} late join${lateCount>1?'s':''}</span>`:''}</div>`;
         const rows = pc.players.map(pl=>{
           const skinId = (pl.skin!=null && String(pl.skin).trim()!=='' && String(pl.skin).toLowerCase()!=='nan' && String(pl.skin).toLowerCase()!=='null') ? pl.skin : 'cct_0_default';
           const skinP = skinUrlDrawer(skinId);
           const inDb = !!pl.in_db;
-          const img = `<div style="position:relative;width:36px;height:36px;flex-shrink:0"><img src="${skinP}" style="width:36px;height:36px;object-fit:contain;background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:8px;flex-shrink:0" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div style="display:none;width:36px;height:36px;align-items:center;justify-content:center;background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:8px;font-size:14px;flex-shrink:0">â–£</div><span style="position:absolute;bottom:-2px;right:-2px;width:10px;height:10px;border-radius:50%;background:${inDb?'#10b981':'#4b5563'};border:2px solid #0f0f0f;display:inline-block" title="${inDb?'In DB':'Not in DB'}"></span></div>`;
+          const img = `<div style="position:relative;width:36px;height:36px;flex-shrink:0"><img src="${skinP}" style="width:36px;height:36px;object-fit:contain;background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:8px;flex-shrink:0" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div style="display:none;width:36px;height:36px;align-items:center;justify-content:center;background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:8px;font-size:14px;flex-shrink:0">▣</div><span style="position:absolute;bottom:-2px;right:-2px;width:10px;height:10px;border-radius:50%;background:${inDb?'#10b981':'#4b5563'};border:2px solid #0f0f0f;display:inline-block" title="${inDb?'In DB':'Not in DB'}"></span></div>`;
           const esc=(v)=> String(v).replace(/</g,'&lt;');
           const toNaN=(v)=> (v==null || String(v).trim()==='' || String(v).toLowerCase()==='null' || String(v).toLowerCase()==='undefined') ? 'NaN' : esc(v);
           const titleName = pl.username!=null ? esc(pl.username) : 'NaN';
@@ -2195,7 +2657,7 @@
           const nameLine = `<div style="font-size:13px;font-weight:700;color:#fff;word-break:break-word">${teamDia}${titleName}${lateBadge}</div>`;
           const gidFull = pl.game_id!=null ? String(pl.game_id) : 'NaN';
           const discordVal = pl.discord_username!=null ? String(pl.discord_username) : 'NaN';
-          const detailLine = `Discord: ${toNaN(discordVal)} Â· Game ID: ${toNaN(gidFull)}`;
+          const detailLine = `Discord: ${toNaN(discordVal)} · Game ID: ${toNaN(gidFull)}`;
           const detailDiv = `<div style="font-size:11px;color:#9ca3af;word-break:break-word;white-space:normal;line-height:1.35">${detailLine}</div>`;
           // Add-friend: in-DB players only, never self. Wired after render.
           const _meDid = (typeof myDiscordId==='function' ? myDiscordId() : null);
@@ -2231,11 +2693,11 @@
     if(rkFoot){
       if(_ranked && _ranked.match_id){
         rkFoot.style.display='inline';
-        rkFoot.textContent = _ranked.match_id + ' Â· report abuse';
+        rkFoot.textContent = _ranked.match_id + ' · report abuse';
         rkFoot.onclick=(e)=>{
           try{ if(e) e.stopPropagation(); }catch{}
           const mid=String(_ranked.match_id);
-          const done=()=> showToast('Match ID copied â€” paste it in your abuse report', false);
+          const done=()=> showToast('Match ID copied — paste it in your abuse report', false);
           try{
             if(typeof GM_setClipboard==='function'){ GM_setClipboard(mid); done(); }
             else if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(mid).then(done, done); }
@@ -2259,6 +2721,11 @@
     try{ updateRankedMatchUi(); }catch{}
     // ranked points toast follows every stats render
     try{ updatePtsToast(); }catch{}
+    // ladder-movement mini toast follows every stats render (match AND
+    // breather — seals land while the lobby card is hidden)
+    try{ updateLadderMoveToast(); }catch{}
+    // rank up/down toast follows every stats render
+    try{ updateRankToast(); }catch{}
     // ranked start overlay (first match only)
     try{ updateRankedStart(); }catch{}
     // dev gating follows every stats render (stats arrive async)
@@ -2271,7 +2738,7 @@
         if(_keybindCapturing) return;
         _keybindCapturing=true;
         try{ _keybindCaptureAt=Date.now(); }catch{}
-        kbBtn.textContent='Press new keybindâ€¦';
+        kbBtn.textContent='Press new keybind…';
         if(kbHint) kbHint.textContent='Press any combo (e.g. Ctrl+Shift+K, or Cmd+Shift+K on Mac). Esc to cancel.';
         const handler=(e)=>{
           if(e.key==='Escape'){ _keybindCapturing=false; kbBtn.textContent='Set open keybind: '+formatKeybind(getDrawerKeybind()); if(kbHint) kbHint.textContent='Cancelled.'; document.removeEventListener('keydown', handler, true); return; }
@@ -2280,7 +2747,7 @@
           const nb={ctrl:!!e.ctrlKey, meta:!!e.metaKey, shift:!!e.shiftKey, alt:!!e.altKey, key:String(e.key).toUpperCase(), code:String(e.code||'').toUpperCase()||null};
           if(!nb.key) return;
           const dwarn=bindWarning(nb, 'drawer');
-          if(dwarn){ if(kbHint) kbHint.textContent='âš  '+dwarn; return; }
+          if(dwarn){ if(kbHint) kbHint.textContent='⚠ '+dwarn; return; }
           try{ GMSet('bnc_drawer_keybind', JSON.stringify(nb)); }catch{ GMSet('bnc_drawer_keybind', nb); }
           _keybindCapturing=false;
           kbBtn.textContent='Set open keybind: '+formatKeybind(nb);
@@ -2306,24 +2773,13 @@
       volSlider.oninput=syncVol;
       volSlider.onchange=syncVol;
     }
-    // loading-branding toggle (lives in the stats tab)
-    const bncRebrandEl=document.getElementById('bnc-rebrand-enabled');
-    if(bncRebrandEl){
-      bncRebrandEl.onchange=()=>{
-        GMSet('bnc_loading_rebrand', !!bncRebrandEl.checked);
-        logInfo(`[REBRAND] loading branding ${bncRebrandEl.checked?'on â€” applying now':'off'}`);
-        showToast(bncRebrandEl.checked?'Nectar loading branding on':'Nectar loading branding off', false);
-        if(bncRebrandEl.checked){ try{ bncRebrandBoot(); bncRebrandOnce(); }catch{} renderInfoPanel(); }
-        else{ try{ bncRebrandStop(); }catch{} }
-      };
-    }
     try{ updateLobbyMusic(); }catch(e){ logErr(`[AUDIO] update after render err ${e.message}`); }
     try{ prefetchLobbyMusic(); }catch{}
   }
   function fetchStats(forceRender){
     if(!sessionId && !discordId) { if(forceRender) renderInfoPanel(); return; }
     // Sequence guard: overlapping polls (15s timer, bg poll, transition
-    // bursts) must never paint stale data over fresh â€” a slow older response
+    // bursts) must never paint stale data over fresh — a slow older response
     // arriving last used to flip kills +2 back to +1. Only the newest
     // response for each transport applies. Never throws.
     const mySeq=++_statsSeq;
@@ -2332,17 +2788,20 @@
     const qs = sessionId ? `session_id=${encodeURIComponent(sessionId)}` : `discord_id=${encodeURIComponent(discordId)}`;
     const url = base + '/api/stats?' + qs;
     const GM = typeof GM_xmlhttpRequest!=='undefined' ? GM_xmlhttpRequest : (typeof unsafeWindow!=='undefined' && unsafeWindow.GM_xmlhttpRequest) || null;
+    // Round-trip clock for the Nerds latency rows: stamped per poll, read when
+    // that poll settles (success or not).
+    const _t0=(typeof performance!=='undefined'&&performance.now)?performance.now():Date.now();
     const doFetch = (useGM)=>{
       if(useGM && GM){
         try{
           GM({method:'GET', url, headers:{'Content-Type':'application/json'}, timeout:8000,
-            onload: r=>{ if(!fresh(mySeq)) return; if(r.status>=200&&r.status<300){ try{ const j=JSON.parse(r.responseText); statsCache=j; logInfo(`[AUDIO] stats fetched lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} apiOnline=true; if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } try{ _reconcileServerState(j.session); }catch{} renderInfoPanel(); try{ _hbFails=0; startHeartbeat(); }catch{} try{ const _pi=getPartyInfo(j.session); const _inMatch=j.session&&String(j.session.state||'').toLowerCase()==='match'; if((_pi.isParty&&_pi.code)||_inMatch) fetchPlayers(false); }catch{} }catch(e){ logErr(`[AUDIO] stats parse err ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ updateApiDot(); }catch{} },
-            onerror: ()=>{ if(!fresh(mySeq)) return; apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} },
-            ontimeout: ()=>{ if(!fresh(mySeq)) return; apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} }});
+            onload: r=>{ if(!fresh(mySeq)) return; if(r.status>=200&&r.status<300){ try{ const j=JSON.parse(r.responseText); statsCache=j; logInfo(`[AUDIO] stats fetched lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} apiOnline=true; _apiPing(_t0,true); if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } try{ _reconcileServerState(j.session); }catch{} renderInfoPanel(); try{ _hbFails=0; startHeartbeat(); }catch{} try{ const _pi=getPartyInfo(j.session); const _inMatch=effInMatch()===true; if((_pi.isParty&&_pi.code)||_inMatch) fetchPlayers(false); }catch{} }catch(e){ logErr(`[AUDIO] stats parse err ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ updateApiDot(); }catch{} },
+            onerror: ()=>{ if(!fresh(mySeq)) return; apiOnline=false; _apiPing(_t0,false); if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} },
+            ontimeout: ()=>{ if(!fresh(mySeq)) return; apiOnline=false; _apiPing(_t0,false); if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} }});
           return;
         }catch{}
       }
-      fetch(url, {method:'GET'}).then(r=>r.text().then(t=>{ if(!fresh(mySeq)) return; if(r.ok){ try{ const j=JSON.parse(t); statsCache=j; logInfo(`[AUDIO] stats fetched (fetch) lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats-fetch', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} try{ _reconcileServerState(j.session); }catch{} apiOnline=true; try{ _hbFails=0; startHeartbeat(); }catch{} if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } renderInfoPanel(); try{ const _pi2=getPartyInfo(j.session); const _inMatch2=j.session&&String(j.session.state||'').toLowerCase()==='match'; if((_pi2.isParty&&_pi2.code)||_inMatch2) fetchPlayers(false); }catch{} }catch(e){ logErr(`[AUDIO] stats parse err (fetch) ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ updateApiDot(); }catch{} }).catch(()=>{ if(!fresh(mySeq)) return; apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} })).catch(()=>{ if(!fresh(mySeq)) return; apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} });
+      fetch(url, {method:'GET'}).then(r=>r.text().then(t=>{ if(!fresh(mySeq)) return; if(r.ok){ try{ const j=JSON.parse(t); statsCache=j; logInfo(`[AUDIO] stats fetched (fetch) lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats-fetch', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} try{ _reconcileServerState(j.session); }catch{} apiOnline=true; _apiPing(_t0,true); try{ _hbFails=0; startHeartbeat(); }catch{} if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } renderInfoPanel(); try{ const _pi2=getPartyInfo(j.session); const _inMatch2=effInMatch()===true; if((_pi2.isParty&&_pi2.code)||_inMatch2) fetchPlayers(false); }catch{} }catch(e){ logErr(`[AUDIO] stats parse err (fetch) ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ updateApiDot(); }catch{} }).catch(()=>{ if(!fresh(mySeq)) return; apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} })).catch(()=>{ if(!fresh(mySeq)) return; _apiPing(_t0,false); apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} });
     };
     doFetch(true);
   }
@@ -2355,18 +2814,13 @@
   }
   function stopStatsPoll(){ if(statsPollTimer){ clearInterval(statsPollTimer); statsPollTimer=null; } }
   // auto-create drawer shell immediately so handle is visible + hidden audio tag that auto plays
-  setTimeout(()=>{ ensureLobbyAudio(); createInfoPanel(); renderInfoPanel(); if(drawerOpen){ startStatsPoll(); if(drawerTab==='players') startPlayersPoll(); } if(sessionId){ startBgLobbyPoll(); try{ startHeartbeat(); }catch{} } try{ clipStart(); }catch{} try{ logInfo(`[RANKED] companion v${BNC_VERSION} boot`); }catch{} }, 700);
+  setTimeout(()=>{ ensureLobbyAudio(); createInfoPanel(); renderInfoPanel(); if(drawerOpen){ startStatsPoll(); if(drawerTab==='players') startPlayersPoll(); } if(sessionId){ startBgLobbyPoll(); try{ startHeartbeat(); }catch{} } try{ logInfo(`[RANKED] companion v${BNC_VERSION} boot`); }catch{} }, 700);
   // refresh when session established after login
   const _origStoreSession = storeSession;
   // wrap storeSession to trigger render
   // monkey-patch via interval check on sessionId change
   let _lastSid = sessionId;
-  setInterval(()=>{ if(sessionId!==_lastSid){ _lastSid=sessionId; renderInfoPanel(); if(drawerOpen){ fetchStats(false); if(drawerTab==='players') fetchPlayers(false); } else if(sessionId){ startBgLobbyPoll(); try{ startHeartbeat(); }catch{} fetchStats(false); } try{ clipStart(); }catch{} } }, 1000);
-  setInterval(()=>{ try{
-    if(!_clip.started) clipStart();
-    else if(!_clip.rec && !_clip.finalizing) clipRestart();
-    else if(_clip.started && !_clip.finalizing && !_clip.pendingTimer && clipCanvasChanged()){ try{ logInfo('[CLIPS] canvas resized â€” restarting segment'); }catch{} clipRestart(); }
-  }catch{} }, 15000);
+  setInterval(()=>{ if(sessionId!==_lastSid){ _lastSid=sessionId; renderInfoPanel(); if(drawerOpen){ fetchStats(false); if(drawerTab==='players') fetchPlayers(false); } else if(sessionId){ startBgLobbyPoll(); try{ startHeartbeat(); }catch{} fetchStats(false); } } }, 1000);
 
   // --- RANKED OVERLAY (Phase 5): bottom-left bare counter + tier badge ---
   // Game frame only, pointer-transparent, driven by the stats poll. Like the
@@ -2383,6 +2837,47 @@
     (document.body||document.documentElement).appendChild(el);
     rankedOverlay=el;
     return el;
+  }
+  // Field-test debug chip (game frame only): curScn, match/lobby guess, live
+  // match_version, pending-seal state, points. Opt-in via the DBG button in
+  // the ranked panel (persisted in localStorage); zero cost when off.
+  function rankedDebugEnabled(){ try{ return localStorage.getItem('bnc_ranked_dbg')==='1'; }catch{ return false; } }
+  function ensureRankedDebugChip(){
+    if(!IS_GAME_FRAME) return null;
+    let el=document.getElementById('bnc-ranked-dbg');
+    if(el) return el;
+    el=document.createElement('div');
+    el.id='bnc-ranked-dbg';
+    Object.assign(el.style,{position:'fixed', top:'10px', left:'10px', zIndex:'2147483645', display:'none', flexDirection:'column', gap:'1px', background:'rgba(0,0,0,0.72)', border:'1px solid rgba(147,197,253,0.35)', borderRadius:'8px', padding:'5px 9px', fontFamily:'ui-monospace, Menlo, Consolas, monospace', fontSize:'10px', lineHeight:'1.5', fontWeight:'600', color:'#bfdbfe', pointerEvents:'none', whiteSpace:'pre'});
+    (document.body||document.documentElement).appendChild(el);
+    return el;
+  }
+  function updateRankedDebugChip(){
+    try{
+      if(!rankedDebugEnabled()){ const el0=document.getElementById('bnc-ranked-dbg'); if(el0) el0.style.display='none'; return; }
+      const el=ensureRankedDebugChip(); if(!el) return;
+      const rk=liveRanked();
+      if(!rk){ el.textContent='rk off (no ranked session)'; el.style.display='flex'; return; }
+      const im=effInMatch();
+      const scn=(typeof curScn!=='undefined' && curScn)?String(curScn):'-';
+      const v=Number(rk.match_version)||0;
+      const pend=!!_rankedPendingSeal;
+      const line1=`scn=${scn} ${im===true?'[MATCH]':(im===false?'[LOBBY]':'[..?]')} rk=on`;
+      const line2=`v=${v} seal=${pend?'PENDING':'ok'} pts=${rk.points==null?'-':rk.points}`;
+      // Stuck-seal visibility: ~age of the newest banked event (a live
+      // match that stops aging while seal=PENDING is a stuck seal) and the
+      // open match's unmapped-name count (evidence waiting for a link).
+      let age='?';
+      const ages=rk.last_event_age_s;
+      if(ages!=null && Number(ages)>=0){
+        const s=Number(ages);
+        age='~'+(s<90? s+'s' : s<3600? Math.round(s/60)+'m' : Math.round(s/3600)+'h');
+      }
+      const unm=(rk.unmapped_names==null)?'?':Number(rk.unmapped_names);
+      const line3=`age=${age} unmapped=${unm}${unm>0?' \u26a0':''}`;
+      el.textContent=line1+'\n'+line2+'\n'+line3;
+      el.style.display='flex';
+    }catch{}
   }
   function updateRankedOverlay(){
     const sc=statsCache;
@@ -2424,14 +2919,29 @@
       el.style.display='none';
       return;
     }
-    const pts=(rk.points==null ? 0 : rk.points);
+    const pts0=(rk.points==null ? 0 : rk.points);
     const color=rk.milestone_color || '#fff';
-    // Honesty: a pending seal shows as approximate instead of implying
-    // server-confirmed truth (the number can still move at seal).
-    const pend=!!_rankedPendingSeal;
-    el.innerHTML=pend
-      ? `<div style="font-size:23px;font-weight:800;color:#fff">${Number(pts).toLocaleString('en-US')}</div><div style="font-size:10px;font-weight:700;color:#9ca3af;letter-spacing:0.4px">&#8776; seal pending</div>`
-      : `<div style="font-size:23px;font-weight:800;color:#fff">${Number(pts).toLocaleString('en-US')}</div>`;
+    // Optimistic layer: server_total + priced kills until the seal moves
+    // the total (then the layer resets — never stacked onto the seal).
+    let _optShow=0;
+    try{
+      if(typeof OPTIMISTIC_KILLS!=='undefined' && OPTIMISTIC_KILLS){
+        _optShow=_optLive();
+        if(!_optShow){
+          const _orid=String(rk.rid||''), _osp=Number(rk.points)||0, _over=Number(rk.match_version)||0;
+          if(_osp!==_optBase || _orid!==_optRid || _over!==_optVer){ _optReset({rid:_orid, pts:_osp, ver:_over}); }
+        }
+      }
+    }catch{}
+    const pts=pts0+_optShow;
+    // v1: plain ladder total, no pending marker (the seal-watch refreshes
+    // the number within ~2s of the seal — no honesty footnote needed).
+    // Rank icon rides before the number and re-renders from the same block
+    // every poll, so it flips the instant the milestone does.
+    const iconHtml=(rk.milestone_icon_url
+      ? `<img src="${String(rk.milestone_icon_url).replace(/"/g,'')}" alt="" style="width:30px;height:30px;object-fit:contain" onerror="this.style.display='none'" />`
+      : '');
+    el.innerHTML=`<div style="display:flex;align-items:center;gap:8px;font-size:23px;font-weight:800;color:#fff">${iconHtml}<span>${Number(pts).toLocaleString('en-US')}</span></div>`;
     el.style.display='flex';
     if(_lastRankedPts!=null && pts!==_lastRankedPts){
       el.style.borderColor=color;
@@ -2442,6 +2952,73 @@
     _lastRankedPts=pts;
   }
 
+  // Mini ladder toast: every ladder movement gets one small toast that
+  // matches the counter exactly (seals, streaks, corrections alike) —
+  // gains green, losses red, exactly-once per total. Runs every render
+  // ON PURPOSE outside the lobby card: seals land during the breather
+  // while the hold keeps the card hidden, and a toast gated on visibility
+  // would never fire (the exact v1 bug this replaces).
+  function updateLadderMoveToast(){
+    let rk=null, sc=null;
+    try{ rk=(typeof liveRanked==='function') ? liveRanked() : null; }catch{ return; }
+    try{ sc=statsCache; }catch{}
+    if(!rk) return;
+    if(typeof MINI_TOASTS!=='undefined' && !MINI_TOASTS) return;
+    if(!IS_GAME_FRAME) return;
+    let ptsRaw=null;
+    try{
+      const _ar=sc && sc.arena ? sc.arena : null;
+      ptsRaw=(_ar && _ar.points!=null) ? Number(_ar.points) : Number(rk.points||0);
+    }catch{ return; }
+    if(!Number.isFinite(ptsRaw)) return;
+    try{
+      const _rid=String(rk.rid||'');
+      const _had=Object.prototype.hasOwnProperty.call(_lastLobbyServerPts, _rid);
+      const _prev=_had ? _lastLobbyServerPts[_rid] : null;
+      _lastLobbyServerPts[_rid]=ptsRaw;
+      if(_had && _prev!=null && ptsRaw!==_prev){
+        const _d=ptsRaw-_prev;
+        queuePtsToast(_d>=0?'POINTS EARNED':'POINTS LOST', _d,
+          {key:`seal:${_rid}:${ptsRaw}`, noCoalesce:true, dwell:2200});
+      }
+    }catch{}
+  }
+  // When curScn leaves MainLobby, hide lobby card and show match UI.
+  // First match of the room also raises the start overlay (once per rid).
+  // --- RANK UP / DOWN TOASTS: like victory/defeat, for milestone moves ---
+  // Fires when the ranked block's milestone changes within one rid: green
+  // RANK UP naming the new tier, red RANK DOWN naming it. Exactly-once per
+  // rid+milestone. The counter icons below re-render from the same block,
+  // so icon and toast can never disagree.
+  let _lastRank={};
+  function _rankIdx(name){
+    try{
+      const n=String(name||'');
+      for(let i=0;i<RANKED_TIERS.length;i++){ if(RANKED_TIERS[i].name===n) return i; }
+    }catch{}
+    return -1;
+  }
+  function updateRankToast(){
+    let rk=null;
+    try{ rk=(typeof liveRanked==='function') ? liveRanked() : null; }catch{ return; }
+    if(!rk) return;
+    if(!IS_GAME_FRAME) return;
+    const rid=String(rk.rid||'');
+    const ms=String(rk.milestone||'Unranked');
+    if(!rid) return;
+    const had=Object.prototype.hasOwnProperty.call(_lastRank, rid);
+    const prev=_had ? _lastRank[rid] : null;
+    _lastRank[rid]=ms;
+    if(!had || prev===ms) return;
+    const up=_rankIdx(ms)>_rankIdx(prev);
+    try{
+      queuePtsToast(up?'RANK UP':'RANK DOWN', 0,
+        {key:`rank:${rid}:${ms}`, noCoalesce:true, dwell:3000, tone:up?'up':'down', sub:ms});
+      logInfo(`[RANKED] rank ${up?'up':'down'} ${prev} -> ${ms}`);
+    }catch{}
+  }
+  // When curScn leaves MainLobby, hide lobby card and show match UI.
+  // First match of the room also raises the start overlay (once per rid).
   // --- RANKED MATCH UI: lobby->match transition on curScn ---
   // When curScn leaves MainLobby, hide lobby card and show match UI.
   // First match of the room also raises the start overlay (once per rid).
@@ -2460,6 +3037,7 @@
     }catch{}
     // Match overlay (points): show only when in match
     try{ updateRankedOverlay(); }catch{}
+    try{ updateRankedDebugChip(); }catch{}
     // Start overlay: first sealed version edge while in match.
     const _srvMatch=!!(sess && String(sess.state||'').toLowerCase()==='match');
     if(rk && inMatch && _srvMatch){
@@ -2482,7 +3060,7 @@
     }catch{ try{ if(!drawerOpen && rankedActive) fetchStats(false); }catch{} }
     // capture watchdog: logged in but nothing reaching the server. Stats can
     // stay green for hours while captures are dead (the exact shape that hid
-    // the JKVUD session) â€” say so loudly instead of failing silent.
+    // the JKVUD session) — say so loudly instead of failing silent.
     try{
       if(sessionId && _capFails>=3 && Date.now()-_lastCapWarn>60000){
         _lastCapWarn=Date.now();
@@ -2497,7 +3075,7 @@
   // --- RANKED LOBBY CARD: lobby-only tall card, center-left ---
   // Order: season line / tier icon + big points / progress bar to next /
   // room line (code, players, sealed) / host line. Ranked-session ONLY and
-  // lobby-state only â€” but it SURVIVES match end: after the last seal the
+  // lobby-state only — but it SURVIVES match end: after the last seal the
   // server stops serving the block, so an ended endpoint verdict renders the
   // cached snapshot (marked Final) until the player leaves the room.
   // Pointer-transparent, game frame only.
@@ -2526,42 +3104,70 @@
     // card. A leave hides locally and never re-shows (liveRanked owns that).
     const show=!!(rk && !inMatch && sess);
     const sig=(rk?`${rk.rid}:${rk.points}/${rk.milestone}`:'-')+'|'+(sess?String(sess.state||'?'):'none')+'|'+(show?'SHOW':'HIDE')+'|'+(pend?'P':'C');
+    let _ladderPts='-';
+    try{ const _a=sc&&sc.arena?sc.arena:null; if(_a&&_a.points!=null) _ladderPts=String(Number(_a.points)); }catch{}
     if(sig!==_lastLobbySig){
       _lastLobbySig=sig;
-      try{ logInfo(`[RANKED] lobby-card -> ${show?'SHOW':'HIDE'} ranked=${rk?rk.rid+' '+rk.points+'pts/'+rk.milestone:'none'} session=${sess?sess.state:'none'}`); }catch{}
+      try{ logInfo(`[RANKED] lobby-card -> ${show?'SHOW':'HIDE'} ranked=${rk?rk.rid+' '+rk.points+'pts/'+rk.milestone:'none'} ladder=${_ladderPts} session=${sess?sess.state:'none'}`); }catch{}
     }
     if(!show){ el.style.display='none'; return; }
     const color=rk.milestone_color || '#fff';
     const icon=rk.milestone_icon_url
       ? `<img src="${String(rk.milestone_icon_url).replace(/"/g,'')}" alt="" style="width:80px;height:80px;object-fit:contain" onerror="this.style.display='none'" />`
       : '';
-    const ptsRaw=Number(rk.points||0);
-    // Server-confirmed totals; a pending seal shows as approximate.
-    const pts=ptsRaw.toLocaleString('en-US')+(pend?' &#8776;':'');
+    // Big number = LADDER points (your current points), not tourney points:
+    // in a ranked session players care about their own total, and a fresh
+    // tourney would otherwise read "0". Falls back to the block's points.
+    const _ar=sc && sc.arena ? sc.arena : null;
+    const ptsRaw=(_ar && _ar.points!=null) ? Number(_ar.points) : Number(rk.points||0);
+    // Room line replaced: code/player-count out, next-milestone progress in.
+    let roomLine='';
+    try{
+      if(_ar && _ar.next_milestone){
+        roomLine=`${Number(_ar.points_to_next||0).toLocaleString('en-US')} pts to ${String(_ar.next_milestone).replace(/</g,'&lt;')}`;
+      } else if(_ar){
+        roomLine='Max rank reached';
+      }
+    }catch{ roomLine=''; }
+    // v1: plain ladder total, no pending marker.
+    const pts=ptsRaw.toLocaleString('en-US');
     const ms=String(rk.milestone||'Unranked').replace(/</g,'&lt;');
     const season=(sc && sc.arena && sc.arena.season!=null) ? `Nectar Ranked Season ${sc.arena.season}` : 'Nectar Ranked';
-    const code=String(rk.short_code||'').replace(/</g,'&lt;');
-    const players=(sess && sess.players_count!=null) ? Number(sess.players_count) : null;
-    let roomLine=code;
-    if(players!=null) roomLine+=` Â· ${players} player${players===1?'':'s'}`;
-    // Room exists but was never started â€” seals can't fire. Same card plus
+    // Room exists but was never started — seals can't fire. Same card plus
     // an unmissable amber prompt for the host.
     const notStarted=String(rk.status||'').toLowerCase()==='lobby';
     const sleepingNote=rankedEnabled()?'':'<div style="font-size:11px;font-weight:700;color:#f87171;margin-top:2px">RANKED SLEEPING - matches will not seal</div>';
-    const startLine=notStarted ? `<div style="font-size:12px;font-weight:800;color:#f59e0b;margin-top:4px">NOT STARTED â€” host: /ranked start</div>` : '';
+    const startLine=notStarted ? `<div style="font-size:12px;font-weight:800;color:#f59e0b;margin-top:4px">NOT STARTED — host: /ranked start</div>` : '';
     el.innerHTML=`<div style="font-size:13px;font-weight:800;color:#fff">${season}</div>${icon}<div style="font-size:22px;font-weight:800;color:${color}">${pts} (${ms})</div><div style="font-size:11px;color:#9ca3af">${roomLine}</div>${startLine}${sleepingNote}`;
     el.style.display='flex';
   }
 
-  // --- RANKED POINTS TOASTS: Victory / Elimination / Placement on seals ---
-  // Fires on a match-version bump with a matching last_result. The label uses
-  // the same priority as Comp: wins up -> VICTORY, kills up -> ELIMINATION,
+  // --- RANKED POINTS TOASTS: component queue on seals ---
+  // Fires on a match-version bump with a matching last_result. When the
+  // server ships the seal breakdown, each nonzero component queues its own
+  // toast (ELIMINATIONS / VICTORY / PLACEMENT / DEFEAT) — losses included,
+  // placement never swallowed into a single total. A capped match appends
+  // a MATCH TOTAL summary with the enforced total. Without a breakdown
+  // (older servers) falls back to the single total toast with the same
+  // priority as Comp: wins up -> VICTORY, kills up -> ELIMINATION,
   // otherwise PLACEMENT. A result write can trail its version bump, so keep
   // the edge pending until that matching row arrives.
-  // --- RANKED POINTS TOAST QUEUE: lossless FIFO, coalescing, exactly-once ---
-  // Identical title+delta within 60s coalesce into a xN badge; each seal
-  // carries a key (rid:v) fired at most once per session.
+  // --- RANKED POINTS TOAST QUEUE: lossless FIFO, exactly-once ---
+  // Seal toasts carry deterministic per-component keys (rid:v:pts:comp)
+  // fired at most once per session and never coalesced: two seals with
+  // identical numbers stay two seals. Legacy single toasts keep the old
+  // identical title+delta 60s coalescing behind opts.noCoalesce=false.
   let _prevRankSnap=null, _pendingRankToast=null;
+  // v1 ship switch: seal toasts (rooms + sessions) are OFF — counters are
+  // the source of truth tonight. Flip to true to restore component toasts.
+  // Baselines below keep tracking so re-enabling never back-fires old seals.
+  const RANKED_SEAL_TOASTS=false;
+  // Mini toasts stay ON: one small toast per priced kill (matches the
+  // optimistic bump 1:1) and one per ladder movement (matches the counter
+  // exactly, seals + streaks + corrections alike). These can never
+  // disagree with the counter — they ARE its movements.
+  const MINI_TOASTS=true;
+  let _lastLobbyServerPts={};
   const _ptsToastQueue=[];
   const _ptsToastShownKeys={};
   let _ptsToastBusy=false;
@@ -2574,20 +3180,22 @@
         return;
       }
       for(const q of _ptsToastQueue){
-        if(q.title===t && q.delta===d && now-q.at<60000){
+        if(!opts.noCoalesce && q.title===t && q.delta===d && now-q.at<60000){
           q.count=(q.count||1)+1; q.at=now;
           try{ logInfo(`[RANKED] points-toast coalesced "${t}" ${d>=0?'+':''}${d} x${q.count}`); }catch{}
           return;
         }
       }
-      const item={title:t, delta:d, at:now, count:1, dwell:Number(opts.dwell)||3500, end:!!opts.pinnedLast, key:opts.key||null};
+      const item={title:t, delta:d, at:now, count:1, dwell:Number(opts.dwell)||3500, end:!!opts.pinnedLast, key:opts.key||null, tone:opts.tone||null, sub:opts.sub||null};
       if(item.end) _ptsToastQueue.push(item);   // session summary always last
       else{
         let i=_ptsToastQueue.length;
         while(i>0 && _ptsToastQueue[i-1].end) i--;
         _ptsToastQueue.splice(i,0,item);
       }
-      while(_ptsToastQueue.length>8){           // overflow: drop oldest non-summary
+      while(_ptsToastQueue.length>12){           // overflow: drop oldest non-summary
+        // 12 deep: two full component seals (5 each) plus headroom, so a
+        // back-to-back seal never eats the previous seal's components
         let di=-1;
         for(let k=0;k<_ptsToastQueue.length;k++){ if(!_ptsToastQueue[k].end){ di=k; break; } }
         if(di<0) break;
@@ -2606,10 +3214,15 @@
     const title=item.count>1 ? `${item.title} x${item.count}` : item.title;
     const delta=item.delta;
     if(item.key){ try{ _ptsToastShownKeys[item.key]=Date.now(); }catch{} }
-    const gain=delta>=0;
+    // tone overrides the gain color (rank toasts carry delta 0 but still
+    // need green/red); sub replaces the "+N Points" line (rank name).
+    const gain=item.tone ? item.tone==='up' : delta>=0;
     const el=document.createElement('div');
     Object.assign(el.style,{position:'fixed', left:'0', top:'50%', transform:'translate(-120%,-50%)', transition:'transform 300ms cubic-bezier(0.22,1,0.36,1)', zIndex:'2147483641', background:'#0f0f0f', border:'1px solid rgba(255,255,255,0.12)', borderLeft:'3px solid '+(gain?'#10b981':'#ef4444'), borderRadius:'0 12px 12px 0', padding:'12px 18px 12px 14px', fontFamily:'Inter, system-ui, sans-serif', pointerEvents:'none', boxShadow:'8px 0 32px rgba(0,0,0,0.45)'});
-    el.innerHTML=`<div style="font-size:15px;font-weight:800;color:#fff">${title.replace(/</g,'&lt;')}</div><div style="font-size:22px;font-weight:800;color:${gain?'#10b981':'#ef4444'}">${gain?'+':''}${Number(delta).toLocaleString('en-US')} Points</div>`;
+    const subLine=item.sub!=null
+      ? `<div style="font-size:22px;font-weight:800;color:${gain?'#10b981':'#ef4444'}">${String(item.sub).replace(/</g,'&lt;')}</div>`
+      : `<div style="font-size:22px;font-weight:800;color:${gain?'#10b981':'#ef4444'}">${gain?'+':''}${Number(delta).toLocaleString('en-US')} Points</div>`;
+    el.innerHTML=`<div style="font-size:15px;font-weight:800;color:#fff">${title.replace(/</g,'&lt;')}</div>${subLine}`;
     try{ (document.body||document.documentElement).appendChild(el); }catch{ _ptsToastBusy=false; return; }
     requestAnimationFrame(()=>{ requestAnimationFrame(()=>{ try{ el.style.transform='translate(0,-50%)'; }catch{} }); });
     setTimeout(()=>{
@@ -2635,6 +3248,12 @@
     const prev=_prevRankSnap;
     _prevRankSnap=snap;
     if(!prev) return;  // first sighting: baseline only
+    // Tourney sessions (RT-*) are owned by the RT toasts below: the same
+    // seal would otherwise queue twice (seal components here + the
+    // standings-delta toast there). Keep tracking the baseline so a later
+    // room session re-baselines silently.
+    if(snap.active && /^RT-/i.test(snap.rid||'')){ _pendingRankToast=null; return; }
+    if(!RANKED_SEAL_TOASTS){ _pendingRankToast=null; return; }  // v1: counters only
     if(!IS_GAME_FRAME){ _pendingRankToast=null; return; }  // track baseline everywhere, toast in game only
     if(!snap.active || snap.rid!==prev.rid){
       _pendingRankToast=null;
@@ -2652,6 +3271,30 @@
     if(!(lr && Number(lr.match_version)===snap.v)) return;
     const gained=Number(lr.gained);
     _pendingRankToast=null;
+    // Include the post-seal total so a later score correction is a distinct,
+    // deterministic event while duplicate polls remain deduped by the queue.
+    const sealKey=`${snap.rid}:${snap.v}:${snap.pts}`;
+    // Component queue: one toast per nonzero seal component, in scoring
+    // order, each exactly-once by its own key. Losses queue too (red),
+    // placement is never merged away, and a capped match closes with its
+    // enforced total. Zero components queue nothing (a 0-0 seal is silent).
+    const bd=lr.breakdown;
+    if(bd && typeof bd==='object'){
+      const comps=[['ELIMINATIONS', Number(bd.kills)], ['VICTORY', Number(bd.win)],
+                   ['PLACEMENT', Number(bd.placement)], ['DEFEAT', Number(bd.loss)]];
+      let shown=0;
+      for(const [title, val] of comps){
+        if(!Number.isFinite(val) || val===0) continue;
+        queuePtsToast(title, val, {key:`${sealKey}:${title}`, noCoalesce:true, dwell:2400});
+        shown++;
+      }
+      if(bd.capped===true && Number.isFinite(gained)){
+        queuePtsToast('MATCH TOTAL (capped)', gained, {key:`${sealKey}:TOTAL`, noCoalesce:true, dwell:2800});
+        shown++;
+      }
+      try{ logInfo(`[RANKED] points-toast components v=${snap.v} shown=${shown} gained=${gained}`); }catch{}
+      return;
+    }
     if(!Number.isFinite(gained) || gained===0) return;
     const winsUp=(snap.wins!=null && pending.prev.wins!=null)
       ? snap.wins>pending.prev.wins
@@ -2660,9 +3303,6 @@
       ? snap.kills>pending.prev.kills
       : Number(lr.kills)>0;
     const label=winsUp ? 'VICTORY' : (killsUp ? 'ELIMINATION' : 'PLACEMENT');
-    // Include the post-seal total so a later score correction is a distinct,
-    // deterministic event while duplicate polls remain deduped by the queue.
-    const sealKey=`${snap.rid}:${snap.v}:${snap.pts}`;
     queuePtsToast(label, gained, {key:sealKey});
   }
 
@@ -2677,6 +3317,7 @@
     try{ const el=document.getElementById('bnc-ranked-start'); if(el) el.remove(); }catch{}
   }
   function updateRankedStart(){
+    return;  // v1: "This is a Ranked Match" panel removed — no pre-match popup.
     if(!IS_GAME_FRAME) return;
     const rk=liveRanked();
     const inMatch=effInMatch()===true;
@@ -2691,7 +3332,7 @@
     const ov=document.createElement('div');
     ov.id='bnc-ranked-start';
     Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483643', background:'rgba(0,0,0,0.72)', display:'flex', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif', cursor:'pointer'});
-    ov.innerHTML=`<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:16px;padding:28px;width:420px;max-width:92vw;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,0.5)"><div style="font-size:20px;font-weight:800;color:#fff">This is a Ranked Match</div><div style="font-size:13px;color:#e5e7eb;line-height:1.6;margin-top:10px">Kills 4–18 by opponent strength, less after the 2nd Â· Win scales with lobby Â· Loss −5 to −32 by tier</div><div style="font-size:11px;color:#6b7280;margin-top:14px">click anywhere to close</div></div>`;
+    ov.innerHTML=`<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:16px;padding:28px;width:420px;max-width:92vw;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,0.5)"><div style="font-size:20px;font-weight:800;color:#fff">This is a Ranked Match</div><div style="font-size:13px;color:#e5e7eb;line-height:1.6;margin-top:10px">Kills 1–8 by opponent strength · Win 8–20 by lobby · Losses scale by killer · Match clamp −50/+30</div><div style="font-size:11px;color:#6b7280;margin-top:14px">click anywhere to close</div></div>`;
     ov.addEventListener('click', ()=> _dismissRankedStart());
     try{ (document.body||document.documentElement).appendChild(ov); }catch{ return; }
     _rankedStartTimer=setTimeout(()=> _dismissRankedStart(), 5000);
@@ -2731,19 +3372,19 @@
   }
   function isHost12Keybind(e){ return bindMatches(e, getHost12Keybind()); }
 
-  // --- RANKED PANEL (Phase 8): F9 â€” milestones map + ranked leaderboard ---
+  // --- RANKED PANEL (Phase 8): F9 — milestones map + ranked leaderboard ---
   const RANKED_ASSETS='https://mnpwvwjqawmuqmickteu.supabase.co/storage/v1/object/public/assets';
   const RANKED_TIERS=[
     {name:'Unranked', min:0, fee:0, color:'#6b7280'},
-    {name:'Bronze', min:200, fee:10, color:'#CD7F32'},
-    {name:'Silver', min:500, fee:25, color:'#C0C0C0'},
-    {name:'Gold', min:1000, fee:50, color:'#FFD700'},
-    {name:'Platinum', min:1500, fee:75, color:'#E5E7EB'},
-    {name:'Diamond', min:2000, fee:100, color:'#B9F2FF'},
-    {name:'Emerald', min:3000, fee:150, color:'#10b981'},
-    {name:'Champion', min:4000, fee:200, color:'#f59e0b'},
-    {name:'Master', min:5000, fee:250, color:'#9333EA'},
-    {name:'Grandmaster', min:7500, fee:300, color:'#ef4444'},
+    {name:'Bronze', min:500, fee:25, color:'#CD7F32'},
+    {name:'Silver', min:1200, fee:60, color:'#C0C0C0'},
+    {name:'Gold', min:2500, fee:125, color:'#FFD700'},
+    {name:'Platinum', min:4000, fee:200, color:'#E5E7EB'},
+    {name:'Diamond', min:6000, fee:300, color:'#B9F2FF'},
+    {name:'Emerald', min:9000, fee:450, color:'#10b981'},
+    {name:'Champion', min:13000, fee:650, color:'#f59e0b'},
+    {name:'Master', min:18000, fee:900, color:'#9333EA'},
+    {name:'Grandmaster', min:25000, fee:1250, color:'#ef4444'},
   ];
   // Bucket filenames: platinum is stored as platinium.png (typo upstream).
   const RANKED_ICON_SLUG=t=>t==='Platinum'?'platinium':t.toLowerCase();
@@ -2766,10 +3407,11 @@
     const ov=document.createElement('div');
     ov.id='bnc-ranked';
     Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483646', background:'rgba(0,0,0,0.64)', display:'none', opacity:'0', transition:'opacity 180ms ease-out', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif'});
-    ov.innerHTML=`<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:14px;width:700px;max-width:94vw;height:500px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden"><div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.08)"><div><b style="font-size:16px;color:#fff">Nectar Ranked</b><div id="bnc-ranked-season" style="font-size:11px;color:#9ca3af;margin-top:2px">Season â€”</div></div><button id="bnc-ranked-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px">Close</button></div><div style="display:flex;gap:8px;padding:12px 18px 0 18px"><button id="bnc-ranked-tab-ms" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Milestones</button><button id="bnc-ranked-tab-lb" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Leaderboard</button></div><div id="bnc-ranked-body" style="flex:1;overflow:auto;padding:16px 18px"></div></div>`;
+    ov.innerHTML=`<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:14px;width:700px;max-width:94vw;height:500px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden"><div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.08)"><div><b style="font-size:16px;color:#fff">Nectar Ranked</b><div id="bnc-ranked-season" style="font-size:11px;color:#9ca3af;margin-top:2px">Season —</div></div><button id="bnc-ranked-dbg-btn" style="background:#1f2937;color:#93c5fd;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:11px;margin-right:6px" title="Toggle the field-test debug chip (curScn / match version / pending seal)">DBG</button><button id="bnc-ranked-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px">Close</button></div><div style="display:flex;gap:8px;padding:12px 18px 0 18px"><button id="bnc-ranked-tab-ms" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Milestones</button><button id="bnc-ranked-tab-lb" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Leaderboard</button></div><div id="bnc-ranked-body" style="flex:1;overflow:auto;padding:16px 18px"></div></div>`;
     (document.body||document.documentElement).appendChild(ov);
     ov.addEventListener('click', (e)=>{ if(e.target===ov) toggleRankedPanel(false); });
     ov.querySelector('#bnc-ranked-close').onclick=()=> toggleRankedPanel(false);
+    ov.querySelector('#bnc-ranked-dbg-btn').onclick=()=>{ try{ const on=localStorage.getItem('bnc_ranked_dbg')==='1'; try{ localStorage.setItem('bnc_ranked_dbg', on?'0':'1'); }catch{} try{ logInfo(`[RANKED] debug chip ${on?'OFF':'ON'}`); }catch{} updateRankedDebugChip(); }catch{} };
     ov.querySelector('#bnc-ranked-tab-ms').onclick=()=>{ rankedTab='milestones'; renderRankedPanel(); };
     ov.querySelector('#bnc-ranked-tab-lb').onclick=()=>{ rankedTab='leaderboard'; renderRankedPanel(); fetchRankedLb(); };
     rankedPanel=ov;
@@ -2780,8 +3422,7 @@
     try{
       const rk=liveRanked();
       if(!rk) return false;
-      const sess=statsCache.session;
-      return !!(sess && String(sess.state||'').toLowerCase()==='match');
+      return effInMatch()===true;
     }catch{ return false; }
   }
   function toggleRankedPanel(force){
@@ -2826,10 +3467,10 @@
     const reset=a && a.reset_at ? a.reset_at : (c ? c.reset_at : null);
     if(season!=null){
       const left=_resetIn(reset);
-      el.textContent=`Season ${season}`+(left?` Â· Resets in ${left}`:'');
+      el.textContent=`Season ${season}`+(left?` · Resets in ${left}`:'');
       el.title=reset?`Resets at ${reset}`:'';
     } else {
-      el.textContent='Season â€”';
+      el.textContent='Season —';
       el.title='';
     }
   }
@@ -2872,13 +3513,13 @@
         ? `${Number(ar.points_to_next||0).toLocaleString('en-US')} points to ${String(ar.next_milestone).replace(/</g,'&lt;')}`
         : 'Max rank reached';
       const summaryPx=RANKED_ICON_PX(tier.name);
-      const summary=`<div style="display:flex;align-items:center;gap:12px;background:#171717;border:1px solid ${tier.color};border-radius:10px;padding:12px 14px;margin-bottom:16px"><img src="${tier.icon}" alt="" style="width:${summaryPx}px;height:${summaryPx}px;object-fit:contain;flex-shrink:0" onerror="this.style.display='none'" /><div style="flex:1;min-width:0"><div style="font-size:13px;font-weight:700;color:#fff">${tier.name} Â· ${Number(pts).toLocaleString('en-US')} pts</div><div style="height:6px;background:rgba(255,255,255,0.10);border-radius:999px;margin-top:8px;overflow:hidden"><div style="height:100%;width:${pct}%;background:${tier.color};border-radius:999px"></div></div><div style="font-size:11px;color:rgba(255,255,255,0.56);margin-top:6px">${toNext} (${pct}%)</div></div></div>`;
+      const summary=`<div style="display:flex;align-items:center;gap:12px;background:#171717;border:1px solid ${tier.color};border-radius:10px;padding:12px 14px;margin-bottom:16px"><img src="${tier.icon}" alt="" style="width:${summaryPx}px;height:${summaryPx}px;object-fit:contain;flex-shrink:0" onerror="this.style.display='none'" /><div style="flex:1;min-width:0"><div style="font-size:13px;font-weight:700;color:#fff">${tier.name} · ${Number(pts).toLocaleString('en-US')} pts</div><div style="height:6px;background:rgba(255,255,255,0.10);border-radius:999px;margin-top:8px;overflow:hidden"><div style="height:100%;width:${pct}%;background:${tier.color};border-radius:999px"></div></div><div style="font-size:11px;color:rgba(255,255,255,0.56);margin-top:6px">${toNext} (${pct}%)</div></div></div>`;
       const cards=RANKED_TIERS.map(t=>{
         const isHere=t.name===here;
         const px=RANKED_ICON_PX(t.name);
-        return `<div style="background:#171717;border:1px solid ${isHere?t.color:'rgba(255,255,255,0.10)'};border-radius:10px;padding:14px 8px 12px 8px;text-align:center"><div style="height:72px;display:flex;align-items:center;justify-content:center"><img src="${t.icon}" alt="${t.name}" style="width:${px}px;height:${px}px;object-fit:contain" onerror="this.style.display='none'" /></div><div style="font-size:12px;font-weight:700;color:${t.color};margin-top:10px">${t.name}</div><div style="font-size:11px;color:rgba(255,255,255,0.56);margin-top:2px">${Number(t.min).toLocaleString('en-US')}+</div><div style="font-size:11px;color:rgba(255,255,255,0.36)">Fee ${t.fee}</div>${isHere?`<div style="font-size:11px;font-weight:700;color:#fff;margin-top:8px">â— You are here</div>`:''}</div>`;
+        return `<div style="background:#171717;border:1px solid ${isHere?t.color:'rgba(255,255,255,0.10)'};border-radius:10px;padding:14px 8px 12px 8px;text-align:center"><div style="height:72px;display:flex;align-items:center;justify-content:center"><img src="${t.icon}" alt="${t.name}" style="width:${px}px;height:${px}px;object-fit:contain" onerror="this.style.display='none'" /></div><div style="font-size:12px;font-weight:700;color:${t.color};margin-top:10px">${t.name}</div><div style="font-size:11px;color:rgba(255,255,255,0.56);margin-top:2px">${Number(t.min).toLocaleString('en-US')}+</div><div style="font-size:11px;color:rgba(255,255,255,0.36)">Fee ${t.fee}</div>${isHere?`<div style="font-size:11px;font-weight:700;color:#fff;margin-top:8px">● You are here</div>`:''}</div>`;
       }).join('');
-      body.innerHTML=`${summary}<div style="display:grid;grid-template-columns:repeat(5,1fr);grid-auto-rows:1fr;gap:12px">${cards}</div><div style="font-size:11px;color:rgba(255,255,255,0.36);text-align:center;margin-top:12px">Entry fees burn on every ranked start â€” higher tier, steeper entry.</div>`;
+      body.innerHTML=`${summary}<div style="display:grid;grid-template-columns:repeat(5,1fr);grid-auto-rows:1fr;gap:12px">${cards}</div><div style="font-size:11px;color:rgba(255,255,255,0.36);text-align:center;margin-top:12px">Entry fees burn on every ranked start — higher tier, steeper entry.</div>`;
     } else {
       renderRankedLb(rankedLbCache ? rankedLbCache.rows : null);
     }
@@ -2888,11 +3529,11 @@
     const body=rankedPanel.querySelector('#bnc-ranked-body');
     if(!body) return;
     if(!rows){
-      body.innerHTML=`<div style="text-align:center;color:#9ca3af;font-size:13px;padding:40px 0">Loading leaderboardâ€¦</div>`;
+      body.innerHTML=`<div style="text-align:center;color:#9ca3af;font-size:13px;padding:40px 0">Loading leaderboard…</div>`;
       return;
     }
     if(!rows.length){
-      body.innerHTML=`<div style="text-align:center;color:#9ca3af;font-size:13px;padding:40px 0">No ranked players yet â€” be the first.</div>`;
+      body.innerHTML=`<div style="text-align:center;color:#9ca3af;font-size:13px;padding:40px 0">No ranked players yet — be the first.</div>`;
       return;
     }
     let meDid=null;
@@ -2906,7 +3547,7 @@
     }).join('');
     body.innerHTML=`<div style="display:flex;flex-direction:column;gap:2px">${lines}</div>`;
   }
-  // Privileged GET for the F9 leaderboard (explicit user action â€” the only
+  // Privileged GET for the F9 leaderboard (explicit user action — the only
   // client-initiated ranked read left). GM_xhr first, bare fetch fallback.
   function rankedApiGet(path, cb){
     let base=''; try{ base=resolveApiBase(); }catch{}
@@ -3005,7 +3646,7 @@
     const ov=document.createElement('div');
     ov.id='bnc-host11';
     Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483646', background:'rgba(0,0,0,0.64)', display:'none', opacity:'0', transition:'opacity 180ms ease-out', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif'});
-    ov.innerHTML=`<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:14px;width:640px;max-width:94vw;height:480px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden"><div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.08)"><div><b id="bnc-host11-title" style="font-size:16px;color:#fff">Host roster</b><div id="bnc-host11-sub" style="font-size:11px;color:#9ca3af;margin-top:2px">â€”</div></div><div><button id="bnc-host11-refresh" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px;margin-right:6px">Refresh</button><button id="bnc-host11-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px">Close</button></div></div><div id="bnc-host11-body" style="flex:1;overflow:auto;padding:16px 18px;font-size:13px;color:#e5e7eb"></div></div>`;
+    ov.innerHTML=`<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:14px;width:640px;max-width:94vw;height:480px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden"><div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.08)"><div><b id="bnc-host11-title" style="font-size:16px;color:#fff">Host roster</b><div id="bnc-host11-sub" style="font-size:11px;color:#9ca3af;margin-top:2px">—</div></div><div><button id="bnc-host11-refresh" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px;margin-right:6px">Refresh</button><button id="bnc-host11-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px">Close</button></div></div><div id="bnc-host11-body" style="flex:1;overflow:auto;padding:16px 18px;font-size:13px;color:#e5e7eb"></div></div>`;
     (document.body||document.documentElement).appendChild(ov);
     ov.addEventListener('click', (e)=>{ if(e.target===ov) toggleHost11Panel(false); });
     ov.querySelector('#bnc-host11-close').onclick=()=> toggleHost11Panel(false);
@@ -3028,8 +3669,8 @@
   function fetchHostTourney(){
     const tid=hostTourneyId();
     const body=document.getElementById('bnc-host11-body');
-    if(tid==null){ if(body) body.innerHTML='<span style="color:#9ca3af">No tourney context â€” join the tourney room first.</span>'; return; }
-    if(body) body.innerHTML='<span style="color:#9ca3af">Loadingâ€¦</span>';
+    if(tid==null){ if(body) body.innerHTML='<span style="color:#9ca3af">No tourney context — join the tourney room first.</span>'; return; }
+    if(body) body.innerHTML='<span style="color:#9ca3af">Loading…</span>';
     rankedApiGet('/api/comp/tourney?id='+encodeURIComponent(tid), (j)=>{
       _hostTourneyCache=j||null;
       rankedApiGet('/api/leaderboard?sort=pr&limit=100', (lb)=>{
@@ -3046,7 +3687,7 @@
     try{ const _t=document.getElementById('bnc-host11-title'); if(_t) _t.textContent='Host roster'; }catch{}
     const t=(_hostTourneyCache||{}).tourney||{};
     const sub=document.getElementById('bnc-host11-sub');
-    if(sub) sub.textContent=(t.name||'Tourney')+' Â· '+(t.status||'');
+    if(sub) sub.textContent=(t.name||'Tourney')+' · '+(t.status||'');
     const st=(_hostTourneyCache||{}).standings||[];
     if(!st.length){ body.innerHTML='<span style="color:#9ca3af">No sealed matches yet.</span>'; return; }
     const prm=_hostPrCache||{};
@@ -3054,7 +3695,7 @@
     st.forEach((r,i)=>{
       const nm=(r&&r.name)||'?'; const did=String((r&&r.discord_id)||'');
       const pr=prm[did];
-      h+=`<tr style="border-top:1px solid rgba(255,255,255,0.06)"><td>${i+1}</td><td><b style="color:#fff">${String(nm).replace(/</g,'&lt;')}</b></td><td>${r.points||0}</td><td>${r.kills||0}</td><td>${r.wins||0}</td><td>${r.avg_placement!=null?r.avg_placement:'â€”'}</td><td>${pr!=null?pr:'â€”'}</td></tr>`;
+      h+=`<tr style="border-top:1px solid rgba(255,255,255,0.06)"><td>${i+1}</td><td><b style="color:#fff">${String(nm).replace(/</g,'&lt;')}</b></td><td>${r.points||0}</td><td>${r.kills||0}</td><td>${r.wins||0}</td><td>${r.avg_placement!=null?r.avg_placement:'—'}</td><td>${pr!=null?pr:'—'}</td></tr>`;
     });
     body.innerHTML=h+'</table>';
   }
@@ -3078,12 +3719,12 @@
     const body=document.getElementById('bnc-host11-body');
     const title=document.getElementById('bnc-host11-title');
     if(title) title.innerHTML='Ranked roster';
-    if(!ctx){ if(body) body.innerHTML='<span style="color:#9ca3af">No ranked context â€” join the ranked room first.</span>'; return; }
-    if(body) body.innerHTML='<span style="color:#9ca3af">Loadingâ€¦</span>';
+    if(!ctx){ if(body) body.innerHTML='<span style="color:#9ca3af">No ranked context — join the ranked room first.</span>'; return; }
+    if(body) body.innerHTML='<span style="color:#9ca3af">Loading…</span>';
     const rk=((statsCache||{}).ranked)||{};
     const mver=rk.match_version;
     const sub=document.getElementById('bnc-host11-sub');
-    if(sub) sub.textContent=`${ctx.code||'Ranked'} Â· ${ctx.status||''} Â· ${ctx.rid}`;
+    if(sub) sub.textContent=`${ctx.code||'Ranked'} · ${ctx.status||''} · ${ctx.rid}`;
     const pullLb=(match)=>{
       _hostRankedCache={ctx, match:match||null};
       rankedApiGet('/api/leaderboard?ranked=true&limit=100', (lb)=>{
@@ -3109,15 +3750,15 @@
     const board=m.board||[];
     const lb=_hostRankedLb||{};
     let h=`<div style="${RANKED_GOLD_BAR}"><b style="color:#FFD700">${String(ctx.code||'Ranked').replace(/</g,'&lt;')}</b>`
-      +`<span style="color:#e5e7eb"> Â· ${m.sealed?'sealed':'live'}${m.winner_discord_id?' Â· winner crowned':''} Â· ${board.length} playing</span></div>`;
+      +`<span style="color:#e5e7eb"> · ${m.sealed?'sealed':'live'}${m.winner_discord_id?' · winner crowned':''} · ${board.length} playing</span></div>`;
     if(!board.length){ body.innerHTML=h+'<span style="color:#9ca3af">No banked events yet this match.</span>'; return; }
     h+='<table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="color:#9ca3af;text-align:left"><th>#</th><th>Player</th><th>K</th><th>Plc</th><th>Match</th><th>Season</th></tr>';
     board.forEach((r,i)=>{
       const nm=String((r&&r.name)||'?').replace(/</g,'&lt;');
       const did=String((r&&r.discord_id)||'');
-      const crown=(r&&r.won)?' ðŸ‘‘':'';
+      const crown=(r&&r.won)?' 👑':'';
       const season=lb[did];
-      h+=`<tr style="border-top:1px solid rgba(255,255,255,0.06)"><td>${i+1}</td><td><b style="color:#fff">${nm}</b>${crown}</td><td>${(r&&r.kills)||0}</td><td>${(r&&r.placement)!=null?r.placement:'â€”'}</td><td>${(r&&r.points)||0}</td><td>${season!=null?season:'â€”'}</td></tr>`;
+      h+=`<tr style="border-top:1px solid rgba(255,255,255,0.06)"><td>${i+1}</td><td><b style="color:#fff">${nm}</b>${crown}</td><td>${(r&&r.kills)||0}</td><td>${(r&&r.placement)!=null?r.placement:'—'}</td><td>${(r&&r.points)||0}</td><td>${season!=null?season:'—'}</td></tr>`;
     });
     body.innerHTML=h+'</table>';
   }
@@ -3126,7 +3767,7 @@
     const ov=document.createElement('div');
     ov.id='bnc-host12';
     Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483646', background:'rgba(0,0,0,0.64)', display:'none', opacity:'0', transition:'opacity 180ms ease-out', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif'});
-    ov.innerHTML=`<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:14px;width:560px;max-width:94vw;max-height:90vh;display:flex;flex-direction:column;overflow:hidden"><div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.08)"><div><b id="bnc-host12-title" style="font-size:16px;color:#fff">Host controls</b><div id="bnc-host12-sub" style="font-size:11px;color:#9ca3af;margin-top:2px">â€”</div></div><button id="bnc-host12-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px">Close</button></div><div id="bnc-host12-body" style="padding:16px 18px;font-size:13px;color:#e5e7eb;overflow:auto"></div><div id="bnc-host12-status" style="padding:8px 18px;font-size:12px;color:#9ca3af;border-top:1px solid rgba(255,255,255,0.08)"></div></div>`;
+    ov.innerHTML=`<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:14px;width:560px;max-width:94vw;max-height:90vh;display:flex;flex-direction:column;overflow:hidden"><div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.08)"><div><b id="bnc-host12-title" style="font-size:16px;color:#fff">Host controls</b><div id="bnc-host12-sub" style="font-size:11px;color:#9ca3af;margin-top:2px">—</div></div><button id="bnc-host12-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px">Close</button></div><div id="bnc-host12-body" style="padding:16px 18px;font-size:13px;color:#e5e7eb;overflow:auto"></div><div id="bnc-host12-status" style="padding:8px 18px;font-size:12px;color:#9ca3af;border-top:1px solid rgba(255,255,255,0.08)"></div></div>`;
     (document.body||document.documentElement).appendChild(ov);
     ov.addEventListener('click', (e)=>{ if(e.target===ov) toggleHost12Panel(false); });
     ov.querySelector('#bnc-host12-close').onclick=()=> toggleHost12Panel(false);
@@ -3139,7 +3780,7 @@
     const t=(_hostTourneyCache||{}).tourney||{};
     const sub=document.getElementById('bnc-host12-sub');
     const m=hostOpenMatch();
-    if(sub) sub.textContent=(t.name||'Tourney')+(m?(' Â· match v'+m.version+' ('+m.status+')'):' Â· no open match');
+    if(sub) sub.textContent=(t.name||'Tourney')+(m?(' · match v'+m.version+' ('+m.status+')'):' · no open match');
     const inp=(id,ph)=>`<input id="${id}" placeholder="${ph}" style="background:#1f2937;color:#fff;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:6px 8px;font-size:12px;width:170px">`;
     const btn=(id,label)=>`<button id="${id}" style="background:#7c3aed;color:#fff;border:0;border-radius:6px;padding:6px 10px;cursor:pointer;font-size:12px;margin-left:6px">${label}</button>`;
     body.innerHTML=
@@ -3158,7 +3799,7 @@
         for(const r of st){ if(String(r.name||'').toLowerCase()===low) return String(r.discord_id); }
       }catch{} return null;
     };
-    q('h12-winGo').onclick=()=>{ const mm=needMatch(); if(!mm) return; const raw=q('h12-winner').value; const did=raw?resolveDid(raw):null; if(raw&&!did){ host12Say('Unknown player â€” use the F11 name or id.', true); return; } hostApiPost('/api/comp/match/winner',{match_id:mm.id,winner_discord_id:did},(j)=>{ host12Say(j&&!j.error?('Winner set'+(j.placements?' (+P1)':'')):('Failed: '+((j&&j.error)||'no response')), !(j&&!j.error)); fetchHostTourney(); }); };
+    q('h12-winGo').onclick=()=>{ const mm=needMatch(); if(!mm) return; const raw=q('h12-winner').value; const did=raw?resolveDid(raw):null; if(raw&&!did){ host12Say('Unknown player — use the F11 name or id.', true); return; } hostApiPost('/api/comp/match/winner',{match_id:mm.id,winner_discord_id:did},(j)=>{ host12Say(j&&!j.error?('Winner set'+(j.placements?' (+P1)':'')):('Failed: '+((j&&j.error)||'no response')), !(j&&!j.error)); fetchHostTourney(); }); };
     q('h12-sealGo').onclick=()=>{ const mm=needMatch(); if(!mm) return; hostApiPost('/api/comp/match/seal',{match_id:mm.id},(j)=>{ host12Say(j&&!j.error?'Sealed.':'Failed: '+((j&&j.error)||'no response'), !(j&&!j.error)); fetchHostTourney(); }); };
     q('h12-openGo').onclick=()=>{ const tid=hostTourneyId(); if(tid==null){ host12Say('No tourney context.', true); return; } hostApiPost('/api/comp/match/open',{tourney_id:tid},(j)=>{ host12Say(j&&!j.error?('Opened v'+j.version+'.'):'Failed: '+((j&&j.error)||'no response'), !(j&&!j.error)); fetchHostTourney(); }); };
     q('h12-rmGo').onclick=()=>{ const mm=needMatch(); if(!mm) return; const did=resolveDid(q('h12-rm').value); if(!did){ host12Say('Unknown player.', true); return; } hostApiPost('/api/comp/match/remove',{match_id:mm.id,discord_id:did},(j)=>{ host12Say(j&&!j.error?'Removed (ignored in placements).':'Failed: '+((j&&j.error)||'no response'), !(j&&!j.error)); fetchHostTourney(); }); };
@@ -3189,7 +3830,7 @@
     const ctx=(typeof hostRankedCtx==='function') ? hostRankedCtx() : null;
     try{ const _t=document.getElementById('bnc-host12-title'); if(_t) _t.innerHTML='<span style="background:linear-gradient(135deg,#FFD700,#f59e0b);-webkit-background-clip:text;background-clip:text;color:transparent">Ranked controls</span>'; }catch{}
     const sub=document.getElementById('bnc-host12-sub');
-    if(sub) sub.textContent=ctx?`${ctx.code||'Ranked'} Â· ${ctx.status||''} Â· ${ctx.rid}`:'â€”';
+    if(sub) sub.textContent=ctx?`${ctx.code||'Ranked'} · ${ctx.status||''} · ${ctx.rid}`:'—';
     const btn=(id,label,gold)=>`<button id="${id}" style="background:${gold?'linear-gradient(135deg,#FFD700,#f59e0b)':'#1f2937'};color:${gold?'#000':'#e5e7eb'};border:0;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:12px;font-weight:${gold?'800':'400'};margin:0 6px 6px 0">${label}</button>`;
     body.innerHTML=
       `<div style="${RANKED_GOLD_BAR}"><span style="color:#e5e7eb">Seals are automatic at match end. Use these for room lifecycle.</span></div>`+
@@ -3203,15 +3844,15 @@
     q('h12-rBackout').onclick=()=>{
       const c=needCtx(); if(!c) return;
       const d=did(); if(!d){ host12Say('Link your Discord account first.', true); return; }
-      host12Say('Backing outâ€¦');
+      host12Say('Backing out…');
       hostApiPost('/api/ranked/room/backout',{room_id:c.rid,discord_id:d},(j)=>{
-        host12Say(j&&!j.error?'Backed out â€” room is lobby. Restart via /ranked start.':'Failed: '+((j&&j.error)||'no response'), !(j&&!j.error));
+        host12Say(j&&!j.error?'Backed out — room is lobby. Restart via /ranked start.':'Failed: '+((j&&j.error)||'no response'), !(j&&!j.error));
       });
     };
     q('h12-rEnd').onclick=()=>{
       const c=needCtx(); if(!c) return;
       const d=did(); if(!d){ host12Say('Link your Discord account first.', true); return; }
-      host12Say('Endingâ€¦');
+      host12Say('Ending…');
       hostApiPost('/api/ranked/room/end',{room_id:c.rid,discord_id:d},(j)=>{
         host12Say(j&&!j.error?'Ended.':'Failed: '+((j&&j.error)||'no response'), !(j&&!j.error));
       });
@@ -3223,9 +3864,9 @@
       const mv=lastSealedMver(); if(mv==null){ host12Say('No sealed match yet.', true); return; }
       const raw=(q('h12-rWinner').value||'').trim()||null;
       const send=(wdid)=>{
-        host12Say('Setting winnerâ€¦');
+        host12Say('Setting winner…');
         hostApiPost('/api/ranked/match/winner',{room_id:c.rid,match_version:mv,discord_id:d,winner_discord_id:wdid},(j)=>{
-          host12Say(j&&!j.error?'Winner set â€” ledger recalculated.':'Failed: '+((j&&j.error)||'no response'), !(j&&!j.error));
+          host12Say(j&&!j.error?'Winner set — ledger recalculated.':'Failed: '+((j&&j.error)||'no response'), !(j&&!j.error));
         });
       };
       if(!raw){ send(null); return; }
@@ -3234,7 +3875,7 @@
         try{
           const b=(j&&j.board)||[]; const low=raw.toLowerCase();
           const hit=b.find(r=>String(r.discord_id)===raw)||b.find(r=>String(r.name||'').toLowerCase()===low);
-          if(!hit){ host12Say('Unknown player â€” use the F11 name or id.', true); return; }
+          if(!hit){ host12Say('Unknown player — use the F11 name or id.', true); return; }
           send(String(hit.discord_id));
         }catch{ host12Say('Resolve failed.', true); }
       });
@@ -3243,7 +3884,7 @@
       const c=needCtx(); if(!c) return;
       const d=did(); if(!d){ host12Say('Link your Discord account first.', true); return; }
       const mv=lastSealedMver(); if(mv==null){ host12Say('No sealed match yet.', true); return; }
-      host12Say('Recalculatingâ€¦');
+      host12Say('Recalculating…');
       hostApiPost('/api/ranked/match/recalc',{room_id:c.rid,match_version:mv,discord_id:d},(j)=>{
         if(j&&!j.error){
           const df=j.diffs||{}; const kl=Object.keys(df);
@@ -3255,7 +3896,7 @@
       });
     };
   }
-  // --- LEADERBOARD PANEL: Alt+Shift+L â€” all players, any time ---
+  // --- LEADERBOARD PANEL: Alt+Shift+L — all players, any time ---
   // Standalone overlay (same card pattern as the ranked panel): sortable
   // columns (points/kills/wins/K-D/playtime), paginated, Esc/backdrop closes.
   // Insights + Friends tabs plug into lbTab/renderLbPanel in later slices.
@@ -3420,15 +4061,15 @@
   }
   // On-screen keyboard for panel text fields (search, chat): clicks always
   // reach the panel, so typing via taps works even when the game eats every
-  // physical keystroke (defaultPrevented at window capture â€” see diagnosis
-  // above, which no element-level handler can undo). One âŒ¨ toggle per input,
+  // physical keystroke (defaultPrevented at window capture — see diagnosis
+  // above, which no element-level handler can undo). One ⌨ toggle per input,
   // grid sits below its row, Enter triggers the input's own action. Never throws.
   function attachVkbd(input, onEnter){
     try{
       if(!input || input.dataset.bncVkbd) return;
       input.dataset.bncVkbd='1';
       const toggle=document.createElement('button');
-      toggle.textContent='âŒ¨';
+      toggle.textContent='⌨';
       toggle.title='On-screen keyboard';
       toggle.style.cssText='background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:7px 10px;cursor:pointer;font-size:13px;flex-shrink:0';
       const grid=document.createElement('div');
@@ -3461,7 +4102,7 @@
       });
       const last=document.createElement('div');
       last.style.cssText='display:flex;gap:3px;justify-content:center';
-      [['space',' ',4],['âŒ«','\b',2],['Enter','\n',2],['Hide','',2]].forEach(([label,ch,flex])=>{
+      [['space',' ',4],['⌫','\b',2],['Enter','\n',2],['Hide','',2]].forEach(([label,ch,flex])=>{
         const b=document.createElement('button');
         b.textContent=label;
         b.style.cssText=`flex:${flex};background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:6px 0;cursor:pointer;font-size:12px`;
@@ -3499,14 +4140,14 @@
   // ranked tracker. Cleared on auth/leave with the room flag.
   let _compRoom=null, _compHudData=null, _publicRoom=false;
   // F7 host-backout reset: drop the local comp-room binding (backed out to
-  // lobby holding no code). No server call â€” the next pID join re-resolves
+  // lobby holding no code). No server call — the next pID join re-resolves
   // the same code fresh via fetchCompRoom. Never throws.
   function resetCompRoomLocal(){
     try{ _compRoom=null; }catch{}
     try{ _compHudData=null; }catch{}
     try{ _publicRoom=false; }catch{}
     try{ updateTourneyHud(); }catch{}
-    try{ showToast('Comp room cleared (F7) â€” re-set or rejoin the code', false); }catch{}
+    try{ showToast('Comp room cleared (F7) — re-set or rejoin the code', false); }catch{}
     try{ logInfo('[COMP] room binding cleared via F7 (host backout, no code)'); }catch{}
   }
   function fetchCompRoom(code){
@@ -3577,7 +4218,7 @@
     }catch{}
     if((!d || !sameRoom) && _compRoom){
       // local fallback: join-detected comp room, stats tag not there yet
-      // (or tag missing) â€” show what we know until stats confirm or deny.
+      // (or tag missing) — show what we know until stats confirm or deny.
       try{
         const cur2=(statsCache&&statsCache.session&&statsCache.session.short_code)||null;
         const fresh=Date.now()-_compRoom.at<600000;
@@ -3593,8 +4234,8 @@
       el.style.display='none';
       return;
     }
-    const escS=(v)=> String(v==null?'â€”':v).replace(/</g,'&lt;');
-    const pts=d.points!=null?Number(d.points).toLocaleString('en-US'):'â€”';
+    const escS=(v)=> String(v==null?'—':v).replace(/</g,'&lt;');
+    const pts=d.points!=null?Number(d.points).toLocaleString('en-US'):'—';
     // bare counter: just the number. No name, no rank, no K/W, no "pts".
     el.innerHTML=`<div style="font-size:23px;font-weight:800;color:#fff">${escS(pts)}</div>`;
     el.style.display='flex';
@@ -3689,8 +4330,6 @@
     const el=ensureRtHud();
     if(!el) return;
     if(_publicRoom){ el.style.display='none'; return; }
-    try{ if(typeof _inCompRoom==='function' && _inCompRoom()){ el.style.display='none'; return; } }catch{}
-    try{ if(typeof liveRanked==='function' && liveRanked()){ el.style.display='none'; return; } }catch{}
     let d=null;
     try{ d=(statsCache&&statsCache.ranked_tourney)||null; }catch{}
     let sameRoom=false;
@@ -3714,15 +4353,58 @@
       el.style.display='none';
       return;
     }
-    const escS=(v)=> String(v==null?'—':v).replace(/</g,'&lt;');
-    const pts=d.points!=null?Number(d.points).toLocaleString('en-US'):'—';
-    // bare counter like comp, gold accent for ranked identity
-    el.innerHTML=`<div style="font-size:23px;font-weight:800;color:#FFD700">${escS(pts)}</div>`;
-    el.style.display='flex';
+    // Toast edges fire even when the chip itself is hidden: on tourney
+    // sessions the synthesized ranked block makes liveRanked() claim the
+    // room (ranked lobby card/overlay own the display), but the seal deltas
+    // here are still the only toast source. Hide first would mute
+    // VICTORY/ELIMINATION/PLACEMENT toasts entirely.
     try{ updateRtToast(d); }catch{}
+    // Session end: sealed == series_len (and len > 0) raises the end
+    // overlay once per tourney — players otherwise never learn the series
+    // is over until the host stops it.
+    try{ updateRankedSessionEnd(d); }catch{}
+    try{ if(typeof _inCompRoom==='function' && _inCompRoom()){ el.style.display='none'; return; } }catch{}
+    // Ranked-session economy: no session-standings counter anywhere — the
+    // ranked overlay and lobby card show the ladder total, toasts/embeds
+    // report what each match paid. Toast edges above still fire.
+    el.style.display='none';
+    return;
+  }
+  // --- RANKED SESSION END: series complete overlay (once per tourney) ---
+  let _sessionEndShown={}, _sessionEndTimer=null;
+  function _dismissSessionEnd(){
+    try{ clearTimeout(_sessionEndTimer); }catch{}
+    _sessionEndTimer=null;
+    try{ const el=document.getElementById('bnc-ranked-end'); if(el) el.remove(); }catch{}
+  }
+  function updateRankedSessionEnd(d){
+    if(!IS_GAME_FRAME) return;
+    const tid=d && d.tourney_id!=null ? String(d.tourney_id) : '';
+    if(!tid || _sessionEndShown[tid]) return;
+    const series=Number((d && d.series_len)||0), sealed=Number((d && d.sealed)||0);
+    if(!(series>0 && sealed>=series)) return;
+    _sessionEndShown[tid]=true;
+    if(document.getElementById('bnc-ranked-end')) return;
+    let total=null;
+    try{
+      const sc=statsCache||{}, ar=sc.arena||null;
+      total=(ar && ar.points!=null) ? Number(ar.points) : null;
+    }catch{}
+    try{ logInfo(`[RANKED] session-end SHOW tid=${tid} sealed=${sealed}/${series}`); }catch{}
+    const ov=document.createElement('div');
+    ov.id='bnc-ranked-end';
+    Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483643', background:'rgba(0,0,0,0.72)', display:'flex', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif', cursor:'pointer'});
+    ov.innerHTML=`<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:16px;padding:28px;width:420px;max-width:92vw;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,0.5)"><div style="font-size:20px;font-weight:800;color:#fff">Ranked Session ended</div><div style="font-size:13px;color:#e5e7eb;line-height:1.6;margin-top:10px">Series complete — ${sealed}/${series} matches sealed${total!=null?`<br>Your total: <b>${total.toLocaleString('en-US')}</b> pts`:''}</div><div style="font-size:11px;color:#6b7280;margin-top:14px">host: /ranked stop to close · click anywhere to close</div></div>`;
+    ov.addEventListener('click', ()=> _dismissSessionEnd());
+    try{ (document.body||document.documentElement).appendChild(ov); }catch{ return; }
+    _sessionEndTimer=setTimeout(()=> _dismissSessionEnd(), 8000);
   }
   // --- RT TOASTS: same rule as comp (wins -> VICTORY, kills ->
   // ELIMINATION, else PLACEMENT), own baseline per tourney. Shared queue.
+  // Seals with a stored breakdown (frozen dynamic or room-seal bundle)
+  // queue one toast per nonzero component instead of the single delta —
+  // same shape as ranked rooms, exactly-once per version+component.
+  let _rtSealDone={};
   function updateRtToast(d){
     const snap=(d && d.tourney_id!=null)
       ? {tid:String(d.tourney_id), pts:Number(d.points)||0, kills:Number(d.kills)||0, wins:Number(d.wins)||0}
@@ -3732,8 +4414,38 @@
     if(!prev) return;  // first sighting: baseline only
     if(!IS_GAME_FRAME) return;  // track baseline everywhere, toast in game only
     if(!snap.tid || snap.tid!==prev.tid) return;  // left room / new tourney: re-baseline silently
+    if(!RANKED_SEAL_TOASTS) return;  // v1: counters only
+    // A fresh stored breakdown owns its seal (components, no delta toast).
+    // An already-toasted breakdown falls through: a newer seal without one
+    // still gets the legacy single toast.
+    let _rtOwned=false;
+    try{
+      const lr=d && d.last_result, bd=lr && lr.breakdown;
+      if(lr && bd && typeof bd==='object' && Number(lr.match_version)>0){
+        const v=Number(lr.match_version);
+        if(_rtSealDone[snap.tid]!==v){
+          _rtSealDone[snap.tid]=v;
+          const comps=[['ELIMINATIONS', Number(bd.kills)], ['VICTORY', Number(bd.win)],
+                       ['PLACEMENT', Number(bd.placement)], ['DEFEAT', Number(bd.loss)]];
+          for(const [title, val] of comps){
+            if(!Number.isFinite(val) || val===0) continue;
+            queuePtsToast(title, val, {key:`rt:${snap.tid}:${v}:${lr.gained}:${title}`, noCoalesce:true, dwell:2400});
+          }
+          if(bd.capped===true && Number.isFinite(Number(lr.gained))){
+            queuePtsToast('MATCH TOTAL (capped)', Number(lr.gained), {key:`rt:${snap.tid}:${v}:${lr.gained}:TOTAL`, noCoalesce:true, dwell:2800});
+          }
+          try{ logInfo(`[RANKED] rt-toast components v=${v} gained=${lr.gained}`); }catch{}
+          _rtOwned=true;
+        }
+      }
+    }catch{}
+    if(_rtOwned) return;  // baseline already tracked above, no delta toast
     const delta=snap.pts-prev.pts;
-    if(!(delta>0)) return;
+    if(!Number.isFinite(delta) || delta===0) return;
+    if(delta<0){
+      queuePtsToast('DEFEAT', delta, {key:`rt:${snap.tid}:${snap.pts}`});
+      return;
+    }
     const label=(snap.wins>prev.wins) ? 'VICTORY' : ((snap.kills>prev.kills) ? 'ELIMINATION' : 'PLACEMENT');
     queuePtsToast(label, delta, {key:`rt:${snap.tid}:${snap.pts}`});
   }
@@ -3747,15 +4459,13 @@
       if(!code) return {ok:false, code:null, why:'Join a private room first (your pID shows here)'};
       const tag=sess&&sess.tag;
       if(tag && String(tag.kind||'')==='tourney') return {ok:false, code:null, why:'Invites off in tourney rooms'};
-      const st=sess&&String(sess.state||'').toLowerCase();
-      let inMatch=false;
-      try{ inMatch=!!_optimisticState.inMatch; }catch{}
-      if(!inMatch) inMatch=(st==='match');
-      if(inMatch) return {ok:false, code:null, why:'Invites off mid-match'};
+      // Same match authority as everything else, so a stale server 'match'
+      // cannot keep invites disabled after the player is back in the lobby.
+      if(effInMatch()===true) return {ok:false, code:null, why:'Invites off mid-match'};
       return {ok:true, code:String(code).toUpperCase(), why:''};
     }catch{ return {ok:false, code:null, why:'Unavailable'}; }
   }
-  // Plain JSON POST (no session tokens â€” friends/party API is discord_id-keyed).
+  // Plain JSON POST (no session tokens — friends/party API is discord_id-keyed).
   function apiPostJson(path, body, cb){
     let base=''; try{ base=resolveApiBase(); }catch{}
     if(!base){ try{cb(null);}catch{} return; }
@@ -3797,487 +4507,8 @@
       ta.select(); document.execCommand('copy'); ta.remove(); done();
     }catch{ try{ done(); }catch{} }
   }
-  // ---- CLIPS (Postparty for BuildNow GG, drawer-only MVP) ----
-  // Rolling canvas capture: MediaRecorder on the Unity WebGL canvas keeps the
-  // last N seconds in memory; kill/win/hotkey slices it into a stored clip.
-  // Local-first (IndexedDB, no server) so the F4 > Clips tab works offline.
-  // Never throws (game loop must survive recorder failures).
-  const CLIP_DEF={enabled:true, len:30, fps:15, bitrate:1500000, autoKill:true, autoDeath:true, autoWin:true, after:5, audio:true};
-  function clipCfg(){
-    try{
-      return {
-        enabled: GMGet('bnc_clip_enabled', CLIP_DEF.enabled),
-        len: Number(GMGet('bnc_clip_len', CLIP_DEF.len))||CLIP_DEF.len,
-        fps: Number(GMGet('bnc_clip_fps', CLIP_DEF.fps))||CLIP_DEF.fps,
-        bitrate: Number(GMGet('bnc_clip_bitrate', CLIP_DEF.bitrate))||CLIP_DEF.bitrate,
-        autoKill: GMGet('bnc_clip_autokill', CLIP_DEF.autoKill),
-        autoDeath: GMGet('bnc_clip_autodeath', CLIP_DEF.autoDeath),
-        autoWin: GMGet('bnc_clip_autowin', CLIP_DEF.autoWin),
-        after: Number(GMGet('bnc_clip_after', CLIP_DEF.after))||0,
-        audio: GMGet('bnc_clip_audio', CLIP_DEF.audio)!==false,
-      };
-    }catch{ return Object.assign({}, CLIP_DEF); }
-  }
-  // Only encoder-affecting keys restart the recorder (changing Aftermath or
-  // auto-clip toggles must NOT wipe the buffered seconds).
-  function clipSet(k, v){ try{ GMSet(k, v); }catch{} try{ if(k==='bnc_clip_len'||k==='bnc_clip_fps'||k==='bnc_clip_bitrate'||k==='bnc_clip_enabled'||k==='bnc_clip_audio') clipRestart(); }catch{} try{ if(typeof renderLbClips==='function' && lbTab==='clips') renderLbClips(); }catch{} }
-  function clipPickMime(withAudio){
-    // Prefer hardware-accelerated codecs first (H.264 mp4), VP8 over VP9
-    // (VP9 software encode is what tanked FPS: 60 -> 20 at full-res).
-    // With audio we need an AV mux: AAC-in-mp4 first, then opus-in-webm.
-    try{
-      const cands=withAudio
-        ? ['video/mp4;codecs="avc1.42E01E,mp4a.40.2"','video/webm;codecs=vp8,opus','video/webm;codecs=vp9,opus','video/webm','video/mp4']
-        : ['video/mp4;codecs="avc1.42E01E"','video/mp4','video/webm;codecs=vp8','video/webm','video/webm;codecs=vp9'];
-      for(const m of cands){ try{ if(typeof MediaRecorder!=='undefined' && MediaRecorder.isTypeSupported(m)) return m; }catch{} }
-    }catch{}
-    return '';
-  }
-  function clipExt(mime){ try{ if(String(mime||'').includes('mp4')) return 'mp4'; }catch{} return 'webm'; }
-  let _clip={rec:null, stream:null, chunks:[], segTimer:null, segStartedAt:0, finalizing:false, started:false, lastErr:'', mime:'', withAudio:false, recStartedAt:0, killAt:0, winAt:0, winKey:'',     pendingTimer:null, pendingTrigger:null, lastKill:null, deathAt:0, cw:0, ch:0};
-  function clipFindCanvas(){
-    try{
-      const cs=document.querySelectorAll('canvas');
-      if(!cs || !cs.length) return null;
-      let best=null, bestArea=0;
-      for(const c of cs){ try{ const a=(c.width||0)*(c.height||0); if(a>bestArea){ bestArea=a; best=c; } }catch{} }
-      return best;
-    }catch{ return null; }
-  }
-  // ---- CLIPS AUDIO TAP (game sound in recordings) ----
-  // Unity WebGL plays all sound through realtime AudioContexts ending at
-  // ctx.destination. We override that getter with a transparent GainNode
-  // passthrough: game -> proxy -> speakers, plus proxy -> MediaStream.
-  // Sample-accurate, no latency, no double audio. Nodes connected BEFORE this
-  // runs keep pointing at the real destination (missed), but every sound that
-  // reads ctx.destination afterwards â€” virtually all SFX â€” flows through.
-  // disconnect(realDest) from game code is remapped to the proxy so sounds can
-  // still be stopped. All try/caught: on failure clips fall back to silent
-  // video, game audio is never broken.
-  const _clipCtxs=new Set();
-  const _clipTaps=(typeof WeakMap!=='undefined')?new WeakMap():null;
-  let _clipAudioPatched=false;
-  function clipPatchAudio(){
-    if(_clipAudioPatched) return true;
-    try{
-      if(typeof AudioNode==='undefined') return false;
-      const protos=[];
-      try{ if(typeof BaseAudioContext!=='undefined'&&BaseAudioContext.prototype&&protos.indexOf(BaseAudioContext.prototype)<0) protos.push(BaseAudioContext.prototype); }catch{}
-      try{ if(typeof AudioContext!=='undefined'&&AudioContext.prototype&&protos.indexOf(AudioContext.prototype)<0) protos.push(AudioContext.prototype); }catch{}
-      try{ const wac=window.webkitAudioContext; if(wac&&wac.prototype&&protos.indexOf(wac.prototype)<0) protos.push(wac.prototype); }catch{}
-      let ok=false;
-      for(const p of protos){
-        try{
-          if(p.__bncClipTap){ ok=true; continue; }
-          let realGet=null, owner=p;
-          while(owner){ const d=Object.getOwnPropertyDescriptor(owner,'destination'); if(d&&d.get){ realGet=d.get; break; } owner=Object.getPrototypeOf(owner); }
-          if(!realGet) continue;
-          Object.defineProperty(p,'destination',{configurable:true,enumerable:false,get:function(){
-            try{
-              const ctx=this;
-              try{ _clipCtxs.add(ctx); }catch{}
-              let t=null;
-              try{ t=_clipTaps?_clipTaps.get(ctx):ctx.__bncClipTap; }catch{}
-              if(!t){
-                const real=realGet.call(ctx);
-                const msd=ctx.createMediaStreamDestination();
-                const proxy=ctx.createGain(); proxy.gain.value=1;
-                try{ proxy.connect(real); }catch{}
-                try{ proxy.connect(msd); }catch{}
-                t={proxy:proxy, real:real, msd:msd};
-                try{ if(_clipTaps) _clipTaps.set(ctx,t); else ctx.__bncClipTap=t; }catch{}
-              }
-              return t.proxy;
-            }catch(e){ try{ return realGet.call(this); }catch(e2){ return null; } }
-          }});
-          try{ p.__bncClipTap=true; }catch{}
-          ok=true;
-        }catch{}
-      }
-      try{
-        if(!AudioNode.prototype.__bncClipDisc){
-          const origDisc=AudioNode.prototype.disconnect;
-          AudioNode.prototype.disconnect=function(){
-            try{
-              const a=Array.prototype.slice.call(arguments);
-              if(a.length&&a[0]&&typeof a[0]==='object'){
-                let t=null;
-                try{ t=this.context&&(_clipTaps?_clipTaps.get(this.context):this.context.__bncClipTap); }catch{}
-                if(t&&a[0]===t.real) a[0]=t.proxy;
-              }
-              return origDisc.apply(this,a);
-            }catch(e){ try{ return origDisc.apply(this,arguments); }catch(e2){} }
-          };
-          try{ AudioNode.prototype.__bncClipDisc=true; }catch{}
-        }
-      }catch{}
-      _clipAudioPatched=ok;
-      return ok;
-    }catch{ return false; }
-  }
-  function clipGameAudioTrack(){
-    try{
-      let found=null;
-      _clipCtxs.forEach((ctx)=>{
-        if(found) return;
-        try{
-          if(typeof OfflineAudioContext!=='undefined'&&ctx instanceof OfflineAudioContext) return;
-          let t=null;
-          try{ t=_clipTaps?_clipTaps.get(ctx):ctx.__bncClipTap; }catch{}
-          if(!t){
-            try{ void ctx.destination; }catch{}
-            try{ t=_clipTaps?_clipTaps.get(ctx):ctx.__bncClipTap; }catch{}
-          }
-          if(t&&t.msd&&t.msd.stream){
-            const trs=t.msd.stream.getAudioTracks()||[];
-            for(const tr of trs){ if(tr&&tr.readyState==='live'){ found=tr; break; } }
-          }
-        }catch{}
-      });
-      return found;
-    }catch{ return null; }
-  }
-  // Canvas resizes (window resize, fullscreen, render-scale change) rewrite the
-  // encoder's codec description mid-segment â€” Chrome's avc1 warning, and the
-  // resulting footage corrupts. Detect + restart the segment on new geometry.
-  function clipCanvasChanged(){
-    try{
-      const c=clipFindCanvas();
-      if(!c||!_clip.cw||!_clip.ch) return false;
-      const w=c.width||0, h=c.height||0;
-      return w>0&&h>0&&(w!==_clip.cw||h!==_clip.ch);
-    }catch{ return false; }
-  }
-  // Instant resize guard (the 15s poll is backup): a canvas geometry change
-  // mid-segment rewrites the encoder's codec description â€” Chrome's avc1
-  // warning â€” and corrupts everything after it. Restart immediately so no
-  // saved clip ever spans a resize. During a kill aftermath wait, finalize
-  // early instead: a shorter playable clip beats a full corrupted one.
-  let _clipRO=null;
-  function clipWatchResize(canvas){
-    try{
-      if(_clipRO){ try{ _clipRO.disconnect(); }catch{} _clipRO=null; }
-      if(!canvas||typeof ResizeObserver==='undefined') return;
-      let lastW=canvas.width||0, lastH=canvas.height||0;
-      _clipRO=new ResizeObserver(()=>{
-        try{
-          const w=canvas.width||0, h=canvas.height||0;
-          if(!(w>0&&h>0)) return;
-          if(w===lastW&&h===lastH) return;
-          lastW=w; lastH=h;
-          try{ _clip.cw=w; _clip.ch=h; }catch{}
-          if(!_clip.started||_clip.finalizing) return;
-          if(_clip.pendingTimer){
-            try{ clearTimeout(_clip.pendingTimer); _clip.pendingTimer=null; }catch{}
-            try{ logInfo('[CLIPS] resize during aftermath â€” finalizing early'); }catch{}
-            saveClip(_clip.pendingTrigger||'kill');
-            return;
-          }
-          try{ logInfo('[CLIPS] canvas resized â€” restarting segment'); }catch{}
-          clipRestart();
-        }catch{}
-      });
-      try{ _clipRO.observe(canvas); }catch{}
-    }catch{}
-  }
-  // Playability self-check: decode the first frame before storing. A broken
-  // mux (mid-segment resize, bad audio interleave) then becomes a clear
-  // "discarded" + status reason instead of a black file in the library.
-  function clipVerifyPlayable(blob){
-    return new Promise((res)=>{
-      let done=false, url='', v=null;
-      const finish=(ok)=>{
-        if(done) return; done=true;
-        try{ if(v){ try{ v.pause(); }catch{} try{ v.removeAttribute('src'); }catch{} try{ v.load(); }catch{} try{ v.remove(); }catch{} } }catch{}
-        try{ if(url) URL.revokeObjectURL(url); }catch{}
-        res(ok);
-      };
-      try{
-        url=URL.createObjectURL(blob);
-        v=document.createElement('video');
-        v.muted=true; v.preload='auto';
-        v.onloadeddata=()=>finish(true);
-        v.onerror=()=>finish(false);
-        v.src=url;
-        setTimeout(()=>finish(false), 6000);
-      }catch(e){ finish(false); }
-    });
-  }
-  function clipRestart(){
-    try{ clipStop(); }catch{}
-    try{ clipStart(); }catch{}
-  }
-  function clipStart(){
-    try{
-      const cfg=clipCfg();
-      if(!cfg.enabled) return;
-      if(!IS_GAME_FRAME) return;
-      if(typeof MediaRecorder==='undefined') { _clip.lastErr='MediaRecorder unsupported'; return; }
-      if(_clip.started) return;
-      const canvas=clipFindCanvas();
-      if(!canvas){ _clip.lastErr='No game canvas found'; return; }
-      try{ _clip.cw=canvas.width||0; _clip.ch=canvas.height||0; }catch{}
-      try{ clipWatchResize(canvas); }catch{}
-      let stream=null;
-      try{ stream=canvas.captureStream(Number(cfg.fps)||15); }
-      catch(e){ try{ stream=canvas.captureStream(); }catch(e2){ _clip.lastErr='captureStream failed'; return; } }
-      if(!stream){ _clip.lastErr='captureStream empty'; return; }
-      try{ clipPatchAudio(); }catch{}
-      // Mix game audio in: canvas video track + tap audio track, one stream.
-      // No live audio track (patch late / sound off / disabled) = video-only.
-      let withAudio=false;
-      try{
-        const vt=(stream.getVideoTracks()||[])[0]||null;
-        if(cfg.audio&&vt){
-          const at=clipGameAudioTrack();
-          if(at){ stream=new MediaStream([vt, at]); withAudio=true; }
-        }
-      }catch{}
-      _clip.withAudio=withAudio;
-      _clip.stream=stream; _clip.lastErr='';
-      _clip.started=true; _clip.recStartedAt=Date.now();
-      if(!clipStartSegment()){ try{ stream.getVideoTracks().forEach(t=>{ try{ t.stop(); }catch{} }); }catch{} _clip.stream=null; _clip.withAudio=false; _clip.started=false; return; }
-      try{
-        if(!clipStart._visHooked){
-          clipStart._visHooked=true;
-          document.addEventListener('visibilitychange', ()=>{ try{ if(document.hidden) clipPause(true); else clipPause(false); }catch{} });
-        }
-      }catch{}
-    }catch{}
-  }
-  function clipPause(p){
-    try{
-      const r=_clip.rec;
-      if(!r) return;
-      if(p && r.state==='recording'){ try{ r.pause(); }catch{} }
-      else if(!p && r.state==='paused'){ try{ r.resume(); }catch{} }
-    }catch{}
-  }
-  // Segmented recording: each segment opens with a fresh keyframe + headers,
-  // so finalizing it with stop() yields a self-contained playable file.
-  // Slicing chunks out of a running stream (the old ring-buffer approach)
-  // starts mid-GOP with no reference frame â€” macroblock garbage like the
-  // 1:09 corrupted mp4. Never build files that way; always finalize.
-  function clipStartSegment(){
-    try{
-      if(!_clip.stream) return false;
-      const cfg=clipCfg();
-      const mime=clipPickMime(!!_clip.withAudio);
-      const opts={videoBitsPerSecond:Number(cfg.bitrate)||1500000};
-      if(_clip.withAudio) opts.audioBitsPerSecond=128000;
-      if(mime) opts.mimeType=mime;
-      let rec=null;
-      try{ rec=new MediaRecorder(_clip.stream, opts); }catch(e){ try{ rec=new MediaRecorder(_clip.stream); }catch(e2){ _clip.lastErr='Recorder init failed'; return false; } }
-      _clip.rec=rec; _clip.chunks=[]; _clip.mime=mime||''; _clip.segStartedAt=Date.now(); _clip.finalizing=false;
-      rec.ondataavailable=(e)=>{ try{ if(e.data && e.data.size>0) _clip.chunks.push(e.data); }catch{} };
-      rec.onerror=()=>{ try{ _clip.lastErr='Recorder error'; }catch{} };
-      try{ rec.start(1000); }catch(e){ _clip.lastErr='Recorder start failed'; return false; }
-      try{ if(_clip.segTimer) clearTimeout(_clip.segTimer); }catch{}
-      try{ _clip.segTimer=setTimeout(()=>{ try{ clipRotate(); }catch{} }, Math.max(10, Math.min(90, Number(cfg.len)||30))*1000); }catch{}
-      return true;
-    }catch{ return false; }
-  }
-  function clipRotate(){
-    // Silent rotation at the buffer boundary: discard, start fresh.
-    try{
-      const r=_clip.rec;
-      if(!r || r.state==='inactive'){ try{ if(_clip.started) clipStartSegment(); }catch{} return; }
-      _clip.finalizing=true;
-      try{
-        r.onstop=()=>{ try{ if(_clip.rec!==r) return; _clip.rec=null; _clip.chunks=[]; _clip.finalizing=false; }catch{} try{ if(_clip.started && !clipStartSegment()) clipRetrySoon(); }catch{} };
-      }catch{}
-      try{ r.stop(); }catch(e){ try{ _clip.finalizing=false; }catch{} }
-    }catch{}
-  }
-  function clipRetrySoon(){
-    try{ if(_clip.segTimer) clearTimeout(_clip.segTimer); }catch{}
-    try{ _clip.segTimer=setTimeout(()=>{ try{ if(_clip.started && !_clip.rec) clipStartSegment(); }catch{} }, 5000); }catch{}
-  }
-  function clipFinalize(){
-    // Stop now and resolve with the finished playable blob (up to `len`
-    // seconds ending at the trigger). Container is closed properly by stop().
-    return new Promise((res)=>{
-      try{
-        const r=_clip.rec;
-        if(!r || r.state==='inactive' || _clip.finalizing){ res(null); return; }
-        _clip.finalizing=true;
-        try{ if(_clip.segTimer) clearTimeout(_clip.segTimer); }catch{}
-        const mime=(r.mimeType)||_clip.mime||clipPickMime(!!_clip.withAudio)||'video/webm';
-        let done=false;
-        const finish=()=>{ if(done) return; done=true; try{ if(_clip.rec!==r) return; _clip.rec=null; _clip.chunks=[]; _clip.finalizing=false; }catch{} try{ if(_clip.started && !_clip.rec && !clipStartSegment()) clipRetrySoon(); }catch{} };
-        try{ r.onstop=()=>{ try{ const blob=new Blob(_clip.chunks.slice(), {type:mime}); finish(); res({blob, mime}); }catch(e){ finish(); res(null); } }; }catch{ finish(); res(null); return; }
-        try{ r.requestData(); }catch{}
-        setTimeout(()=>{ try{ r.stop(); }catch(e){ finish(); res(null); } }, 250);
-        setTimeout(()=>{ if(!done){ finish(); res(null); } }, 4000);
-      }catch{ res(null); }
-    });
-  }
-  function clipStop(){
-    try{ if(_clipRO){ _clipRO.disconnect(); _clipRO=null; } }catch{}
-    try{ if(_clip.pendingTimer){ clearTimeout(_clip.pendingTimer); _clip.pendingTimer=null; } }catch{}
-    try{ if(_clip.segTimer){ clearTimeout(_clip.segTimer); _clip.segTimer=null; } }catch{}
-    try{ if(_clip.rec && _clip.rec.state!=='inactive'){ try{ _clip.rec.onstop=null; _clip.rec.stop(); }catch{} } }catch{}; _clip.rec=null;
-    try{ if(_clip.stream){ _clip.stream.getVideoTracks().forEach(t=>{ try{ t.stop(); }catch{} }); } }catch{}
-    _clip.rec=null; _clip.stream=null; _clip.chunks=[]; _clip.finalizing=false; _clip.withAudio=false; _clip.started=false;
-  }
-  function clipReady(){ try{ return !!(_clip.started && _clip.rec && _clip.rec.state==='recording' && !_clip.finalizing && (Date.now()-(_clip.segStartedAt||0))>3000); }catch{ return false; } }
-  function clipDb(){
-    return new Promise((res)=>{
-      try{
-        const rq=indexedDB.open('bnc-clips', 1);
-        rq.onupgradeneeded=()=>{ try{ rq.result.createObjectStore('clips', {keyPath:'id'}); }catch{} };
-        rq.onsuccess=()=>res(rq.result);
-        rq.onerror=()=>res(null);
-      }catch{ res(null); }
-    });
-  }
-  async function clipStore(meta, blob){
-    try{
-      const db=await clipDb();
-      if(!db) return null;
-      const row={id:'c'+Date.now().toString(36)+Math.floor(Math.random()*1e6).toString(36), ts:Date.now(), trigger:meta.trigger||'manual', mime:blob.type||'video/webm', size:blob.size||0, room:meta.room||null, mv:meta.mv||null, blob};
-      await new Promise((ok, no)=>{ try{ const tx=db.transaction('clips','readwrite'); tx.objectStore('clips').put(row); tx.oncomplete=ok; tx.onerror=no; }catch(e){ no(e); } });
-      // Cap library at 20 newest (30s@1.5Mbps â‰ˆ 5.6MB each â€” 50 would eat ~280MB).
-      try{
-        const all=await new Promise((res)=>{ try{ const tx=db.transaction('clips','readonly'); const q=tx.objectStore('clips').getAll(); q.onsuccess=()=>res(q.result||[]); q.onerror=()=>res([]); }catch{ res([]); } });
-        if(all.length>20){
-          all.sort((a,b)=>(a.ts||0)-(b.ts||0));
-          const drop=all.slice(0, all.length-20);
-          await new Promise((res)=>{ try{ const tx=db.transaction('clips','readwrite'); const st=tx.objectStore('clips'); drop.forEach(r=>{ try{ st.delete(r.id); }catch{} }); tx.oncomplete=res; tx.onerror=res; }catch{ res(); } });
-        }
-      }catch{}
-      try{ db.close(); }catch{}
-      return row;
-    }catch{ return null; }
-  }
-  async function clipList(){
-    try{
-      const db=await clipDb();
-      if(!db) return [];
-      const rows=await new Promise((res)=>{ try{ const tx=db.transaction('clips','readonly'); const q=tx.objectStore('clips').getAll(); q.onsuccess=()=>res(q.result||[]); q.onerror=()=>res([]); }catch{ res([]); } });
-      try{ db.close(); }catch{}
-      rows.sort((a,b)=>(b.ts||0)-(a.ts||0));
-      return rows.slice(0, 20);
-    }catch{ return []; }
-  }
-  async function clipDelete(id){
-    try{
-      const db=await clipDb();
-      if(!db) return;
-      await new Promise((res)=>{ try{ const tx=db.transaction('clips','readwrite'); tx.objectStore('clips').delete(id); tx.oncomplete=res; tx.onerror=res; }catch{ res(); } });
-      try{ db.close(); }catch{}
-    }catch{}
-  }
-  async function clipClearAll(){
-    try{
-      const db=await clipDb();
-      if(!db) return;
-      await new Promise((res)=>{ try{ const tx=db.transaction('clips','readwrite'); tx.objectStore('clips').clear(); tx.oncomplete=res; tx.onerror=res; }catch{ res(); } });
-      try{ db.close(); }catch{}
-    }catch{}
-  }
-  function clipRoomCtx(){
-    try{
-      const sess=statsCache&&statsCache.session;
-      return {room:(sess&&sess.short_code)||null, mv:(sess&&sess.match_version)||null};
-    }catch{ return {room:null, mv:null}; }
-  }
-  // Auto-clips (kill/win) wait `after` seconds before finalizing, so the clip
-  // keeps rolling through the aftermath (death cam, reactions) instead of
-  // cutting dead at the trigger frame. Manual F8 stays instant. While waiting,
-  // rotation is held off so the segment can't split mid-aftermath.
-  function clipScheduleAuto(trigger){
-    try{
-      const cfg=clipCfg();
-      if(!cfg.enabled) return;
-      if(_clip.finalizing || _clip.pendingTimer) return;
-      if(!clipReady()){ saveClip(trigger); return; }
-      const wait=Math.max(0, Math.min(10, Number(cfg.after)||0));
-      if(wait<=0){ saveClip(trigger); return; }
-      try{ if(_clip.segTimer){ clearTimeout(_clip.segTimer); _clip.segTimer=null; } }catch{}
-      _clip.pendingTrigger=trigger;
-      try{ _clip.pendingTimer=setTimeout(()=>{ try{ _clip.pendingTimer=null; }catch{} saveClip(_clip.pendingTrigger||trigger); }, wait*1000); }catch{}
-      try{ if(lbTab==='clips') renderLbClips(); }catch{}
-    }catch{}
-  }
-  async function saveClip(trigger){
-    try{
-      try{ if(_clip.pendingTimer){ clearTimeout(_clip.pendingTimer); _clip.pendingTimer=null; } }catch{}
-      const cfg=clipCfg();
-      if(!cfg.enabled){ try{ showToast('Clipping is off (F4 > Clips > Enable)', true); }catch{} return null; }
-      if(!clipReady()){
-        try{ clipStart(); }catch{}
-        if(!clipReady()){ try{ showToast('Clip not ready yet â€” ' + (_clip.lastErr||'recordingâ€¦ try again in a few seconds'), true); }catch{} return null; }
-      }
-      const out=await clipFinalize();
-      if(!out || !out.blob || !out.blob.size){ try{ showToast('Clip not ready â€” try again in a few seconds', true); }catch{} return null; }
-      const blob=out.blob, mime=out.mime;
-      const plays=await clipVerifyPlayable(blob);
-      if(!plays){
-        try{ showToast('Clip corrupted â€” discarded, keep playing', true); }catch{}
-        try{ if(_clip.lastKill&&trigger!=='manual') _clip.lastKill.decision='corrupted'; }catch{}
-        try{ if(lbTab==='clips') renderLbClips(); }catch{}
-        return null;
-      }
-      const ctx=clipRoomCtx();
-      const row=await clipStore({trigger, room:ctx.room, mv:ctx.mv}, blob);
-      try{ if(row&&_clip.lastKill&&trigger!=='manual') _clip.lastKill.decision='saved'; }catch{}
-      try{ showToast('Clip saved â€” F4 > Clips to watch', false); }catch{}
-      try{ if(lbTab==='clips') fetchLbClips(); }catch{}
-      return row;
-    }catch{ return null; }
-  }
-  function clipOnKill(killer, victim, isKill){
-    try{
-      const stored=String(GMGet('bnc_game_username','')||'').trim();
-      const note=(decision)=>{ try{ _clip.lastKill={killer:String(killer||'?'), victim:String(victim||'?'), me:stored||'?', at:Date.now(), decision}; }catch{} };
-      if(!isKill){ note('knock-ignored'); return; }
-      const cfg=clipCfg();
-      if(!cfg.enabled){ note('clipping-off'); return; }
-      // Match on EITHER form: raw names ("cis6led" vs "cis6led") or normalized
-      // (strips color tags + "dc: " prefix, same as the ranked kill toast).
-      // No single canonical form is assumed â€” whichever side matches, clips.
-      const rawMe=stored.toLowerCase();
-      const rawK=String(killer||'').replace(/<[^>]*>/g,'').trim().toLowerCase();
-      const rawV=String(victim||'').replace(/<[^>]*>/g,'').trim().toLowerCase();
-      const meN=_normName(stored).trim().toLowerCase();
-      const kN=_normName(killer||'').trim().toLowerCase();
-      const vN=_normName(victim||'').trim().toLowerCase();
-      const amKiller=((meN&&kN&&meN===kN)||(rawMe&&rawK&&rawMe===rawK))||!stored;
-      const amVictim=((meN&&vN&&meN===vN)||(rawMe&&rawV&&rawMe===rawV));
-      const now=Date.now();
-      if(amKiller){
-        if(!cfg.autoKill){ note('auto-off'); return; }
-        if(now-_clip.killAt<8000){ note('debounced'); return; }
-        _clip.killAt=now;
-        note('queued');
-        clipScheduleAuto('kill');
-        return;
-      }
-      if(amVictim){
-        if(!cfg.autoDeath){ note('auto-off'); return; }
-        if(now-_clip.deathAt<8000){ note('debounced'); return; }
-        _clip.deathAt=now;
-        note('queued');
-        clipScheduleAuto('death');
-        return;
-      }
-      note('not-your-kill');
-    }catch{}
-  }
-  function clipOnWin(){
-    try{
-      const cfg=clipCfg();
-      if(!cfg.enabled || !cfg.autoWin) return;
-      const now=Date.now();
-      if(now-_clip.winAt<30000) return;
-      _clip.winAt=now;
-      clipScheduleAuto('win');
-    }catch{}
-  }
   let lbPanel=null, lbSort='points', lbOrder='desc', lbOffset=0, lbRows=[], lbCount=0, lbLoading=false, _lbFadeT=null;
-  let lbTab='board', lbIns=null, lbInsLoading=false; // 'board' | 'insights' | 'friends' | 'events' | 'clips'
-  let lbClips=[], lbClipsLoading=false, lbClipsNote='';
+  let lbTab='board', lbIns=null, lbInsLoading=false; // 'board' | 'insights' | 'friends' | 'events' | 'graphics' | 'presence'
   let lbEvents=null, lbEventsLoading=false, lbEventFilter='all', lbEventDetail=null, lbEventLoading=false;
   let lbProfile=null, lbProfileIns=null, lbProfileLoading=false; // open player profile (within panel)
   let lbFriends=null, lbFriendsLoading=false, lbInvites=null, lbSearch=[], lbSearchLoading=false;
@@ -4289,14 +4520,15 @@
     const ov=document.createElement('div');
     ov.id='bnc-lb';
     Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483646', background:'rgba(0,0,0,0.64)', display:'none', opacity:'0', transition:'opacity 180ms ease-out', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif'});
-    ov.innerHTML=`<div id="bnc-lb-card" style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:14px;width:700px;max-width:94vw;height:500px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden"><div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.08)"><div><b style="font-size:16px;color:#fff">Leaderboard</b><div id="bnc-lb-sub" style="font-size:11px;color:#9ca3af;margin-top:2px">All players</div></div><button id="bnc-lb-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px">Close</button></div><div style="display:flex;gap:8px;padding:12px 18px 0 18px"><button id="bnc-lb-tab-board" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Leaderboard</button><button id="bnc-lb-tab-ins" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Insights</button><button id="bnc-lb-tab-fr" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Friends</button><button id="bnc-lb-tab-ev" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Events</button></div><div id="bnc-lb-sorts" style="display:flex;gap:8px;padding:12px 18px 0 18px;flex-wrap:wrap"></div><div id="bnc-lb-body" style="flex:1;overflow:auto;padding:16px 18px"></div><div id="bnc-lb-foot" style="display:flex;justify-content:space-between;align-items:center;padding:10px 18px;border-top:1px solid rgba(255,255,255,0.08)"><button id="bnc-lb-prev" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px">â€¹ Prev</button><span id="bnc-lb-page" style="font-size:11px;color:#9ca3af"></span><button id="bnc-lb-next" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px">Next â€º</button></div></div>`;
+    ov.innerHTML=`<div id="bnc-lb-card" style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:14px;width:700px;max-width:94vw;height:500px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden"><div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.08)"><div><b style="font-size:16px;color:#fff">Leaderboard</b><div id="bnc-lb-sub" style="font-size:11px;color:#9ca3af;margin-top:2px">All players</div></div><button id="bnc-lb-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px">Close</button></div><div id="bnc-lb-tabs" style="display:flex;flex-wrap:wrap;gap:8px;padding:12px 18px 0 18px"><button id="bnc-lb-tab-board" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Leaderboard</button><button id="bnc-lb-tab-ins" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Insights</button><button id="bnc-lb-tab-fr" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Friends</button><button id="bnc-lb-tab-ev" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Events</button><button id="bnc-lb-tab-gfx" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Graphics</button><button id="bnc-lb-tab-rpc" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Presence</button></div><div id="bnc-lb-sorts" style="display:flex;gap:8px;padding:12px 18px 0 18px;flex-wrap:wrap"></div><div id="bnc-lb-body" style="flex:1;overflow:auto;padding:16px 18px"></div><div id="bnc-lb-foot" style="display:flex;justify-content:space-between;align-items:center;padding:10px 18px;border-top:1px solid rgba(255,255,255,0.08)"><button id="bnc-lb-prev" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px">‹ Prev</button><span id="bnc-lb-page" style="font-size:11px;color:#9ca3af"></span><button id="bnc-lb-next" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px">Next ›</button></div></div>`;
     (document.body||document.documentElement).appendChild(ov);
     // visible focus ring on panel text inputs (proves focus landed)
     try{
       if(!document.getElementById('bnc-lb-input-style')){
         const st=document.createElement('style');
         st.id='bnc-lb-input-style';
-        st.textContent='#bnc-fr-q:focus,#bnc-chat-in:focus{outline:2px solid #fff !important;border-color:#fff !important;}';
+        st.textContent='#bnc-fr-q:focus,#bnc-chat-in:focus{outline:2px solid #fff !important;border-color:#fff !important;}'
+          + '#bnc-lb-tabs>button{flex:1 1 0;min-width:70px}';
         (document.head||document.documentElement).appendChild(st);
       }
     }catch{}
@@ -4310,16 +4542,11 @@
     ov.querySelector('#bnc-lb-tab-ins').onclick=()=>{ lbTab='insights'; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); fetchLbIns(); };
     ov.querySelector('#bnc-lb-tab-fr').onclick=()=>{ lbTab='friends'; renderLbPanel(); fetchLbFriends(); };
     ov.querySelector('#bnc-lb-tab-ev').onclick=()=>{ lbTab='events'; lbEventDetail=null; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); fetchLbEvents(); };
-    try{
-      const tabsRow=ov.querySelector('#bnc-lb-tab-ev').parentElement;
-      if(tabsRow && !ov.querySelector('#bnc-lb-tab-clips')){
-        const b=document.createElement('button');
-        b.id='bnc-lb-tab-clips'; b.textContent='Clips';
-        b.style.cssText='flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer';
-        b.onclick=()=>{ lbTab='clips'; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); fetchLbClips(); };
-        tabsRow.appendChild(b);
-      }
-    }catch{}
+    ov.querySelector('#bnc-lb-tab-gfx').onclick=()=>{ lbTab='graphics'; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); };
+    ov.querySelector('#bnc-lb-tab-rpc').onclick=()=>{ lbTab='presence'; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); try{ if(rpcCfg().enabled) rpcProbe(()=>{ renderLbRpc(); startRpcView(); }); else { renderLbRpc(); startRpcView(); } }catch{} };
+    // Presence tab hidden for the ranked launch (Discord tray bridge retired
+    // from the panel — the tab code stays dormant, never rendered).
+    try{ const _rpcBtn=ov.querySelector('#bnc-lb-tab-rpc'); if(_rpcBtn) _rpcBtn.style.display='none'; }catch{}
     ov.querySelector('#bnc-lb-prev').onclick=()=>{ if(lbOffset>0){ lbOffset=Math.max(0, lbOffset-LB_LIMIT); fetchLb(); } };
     ov.querySelector('#bnc-lb-next').onclick=()=>{ lbOffset+=LB_LIMIT; fetchLb(); };
     lbPanel=ov;
@@ -4332,10 +4559,11 @@
     if(show){
       lbPanel.style.display='flex';
       requestAnimationFrame(()=>{ requestAnimationFrame(()=>{ try{ lbPanel.style.opacity='1'; }catch{} }); });
-      if(lbTab==='insights') fetchLbIns(); else if(lbTab==='friends') fetchLbFriends(); else if(lbTab==='events') fetchLbEvents(); else if(lbTab==='clips') fetchLbClips(); else fetchLb();
+      if(lbTab==='insights') fetchLbIns(); else if(lbTab==='friends') fetchLbFriends(); else if(lbTab==='events') fetchLbEvents(); else if(lbTab==='presence'){ renderLbRpc(); startRpcView(); } else fetchLb();
     } else {
       try{ lbPanel.style.opacity='0'; }catch{}
       try{ stopLbChat(); }catch{}
+      try{ stopRpcView(); }catch{}
       try{ untrapRelease(); }catch{}
       _lbFadeT=setTimeout(()=>{ try{ lbPanel.style.display='none'; }catch{} }, 180);
     }
@@ -4364,7 +4592,9 @@
     tabBtn('bnc-lb-tab-ins', lbTab==='insights');
     tabBtn('bnc-lb-tab-fr', lbTab==='friends');
     tabBtn('bnc-lb-tab-ev', lbTab==='events');
-    tabBtn('bnc-lb-tab-clips', lbTab==='clips');
+    tabBtn('bnc-lb-tab-gfx', lbTab==='graphics');
+    tabBtn('bnc-lb-tab-rpc', lbTab==='presence');
+    if(lbTab!=='presence'){ try{ stopRpcView(); }catch{} }
     // profile view replaces the board content (sorts + pagination hidden)
     if(lbTab==='board' && lbProfile){ renderLbProfile(); return; }
     const sorts=document.getElementById('bnc-lb-sorts');
@@ -4374,11 +4604,12 @@
     if(lbTab==='insights'){ renderLbIns(); return; }
     if(lbTab==='friends'){ renderLbFriends(); return; }
     if(lbTab==='events'){ renderLbEvents(); return; }
-    if(lbTab==='clips'){ renderLbClips(); return; }
+    if(lbTab==='graphics'){ renderLbGfx(); return; }
+    if(lbTab==='presence'){ renderLbRpc(); startRpcView(); return; }
     if(sorts){
       sorts.innerHTML=LB_SORTS.map(([v,label])=>{
         const active = lbSort===v;
-        return `<button data-lb-sort="${v}" style="flex:1;min-width:90px;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer;border:1px solid ${active?'#fff':'rgba(255,255,255,0.12)'};background:${active?'#fff':'#171717'};color:${active?'#000':'#9ca3af'}">${label}${active?(lbOrder==='desc'?' â†“':' â†‘'):''}</button>`;
+        return `<button data-lb-sort="${v}" style="flex:1;min-width:90px;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer;border:1px solid ${active?'#fff':'rgba(255,255,255,0.12)'};background:${active?'#fff':'#171717'};color:${active?'#000':'#9ca3af'}">${label}${active?(lbOrder==='desc'?' ↓':' ↑'):''}</button>`;
       }).join('');
       sorts.querySelectorAll('button[data-lb-sort]').forEach(btn=>{
         btn.onclick=()=>{
@@ -4391,9 +4622,9 @@
     }
     renderLbBody();
     const page=document.getElementById('bnc-lb-page');
-    if(page) page.textContent = lbRows.length ? `Showing ${lbOffset+1}â€“${lbOffset+lbRows.length}` : 'No players yet';
+    if(page) page.textContent = lbRows.length ? `Showing ${lbOffset+1}–${lbOffset+lbRows.length}` : 'No players yet';
     const sub=document.getElementById('bnc-lb-sub');
-    if(sub) sub.textContent = `All players Â· sorted by ${(LB_SORTS.find(s=>s[0]===lbSort)||[,'?'])[1]}`;
+    if(sub) sub.textContent = `All players · sorted by ${(LB_SORTS.find(s=>s[0]===lbSort)||[,'?'])[1]}`;
   }
   function fetchLbIns(){
     if(!lbPanel || lbTab!=='insights') return;
@@ -4411,20 +4642,20 @@
     const body=document.getElementById('bnc-lb-body');
     if(!body) return;
     const sub=document.getElementById('bnc-lb-sub');
-    const esc=(v)=> String(v==null?'â€”':v).replace(/</g,'&lt;');
+    const esc=(v)=> String(v==null?'—':v).replace(/</g,'&lt;');
     const sess=(m)=>{
-      if(!m) return 'â€”';
-      const res=m.win?'W':(m.defeat?'L':'â€“');
+      if(!m) return '—';
+      const res=m.win?'W':(m.defeat?'L':'–');
       return `${m.kills||0}K/${m.deaths||0}D ${res} (${esc(fmtGmDrawer(m.gm))})`;
     };
     if(sub) sub.textContent='Your gameplay insights';
-    if(lbInsLoading){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Loading insightsâ€¦</div>`; return; }
+    if(lbInsLoading){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Loading insights…</div>`; return; }
     if(!lbIns){
       let did=null;
       try{ did=(statsCache&&statsCache.discord_id)||GMGet('bnc_discord_id',null)||null; }catch{}
       body.innerHTML=!did
-        ? `<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Link your account first â€” open the player info drawer to link.</div>`
-        : `<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">No insights yet â€” play a few matches first.</div>`;
+        ? `<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Link your account first — open the player info drawer to link.</div>`
+        : `<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">No insights yet — play a few matches first.</div>`;
       return;
     }
     const card=(label,val)=>`<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 12px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;font-size:12px"><span style="color:#9ca3af">${label}</span><span style="color:#fff;font-weight:700;text-align:right">${val}</span></div>`;
@@ -4432,24 +4663,24 @@
     const mateI=lbIns.fav_teammate;
     const mateLine=mateI&&mateI.player?`${esc(mateI.player)} (${mateI.shared||0} shared)`:'Not yet found';
     const form=(lbIns.recent_form||[]).slice(0,5).map((m,i)=>`<div style="font-size:12px;color:#e5e7eb;padding:5px 12px">${i+1}. ${esc(sess(m))}</div>`).join('') || `<div style="font-size:12px;color:#9ca3af;padding:5px 12px">No recent matches</div>`;
-    const mastery=(lbIns.mode_mastery||[]).slice(0,4).map(m=>`<div style="font-size:12px;color:#e5e7eb;padding:5px 12px;display:flex;justify-content:space-between"><span>${esc(fmtGmDrawer(m.gm))} Â· ${m.matches} matches</span><span>${esc(m.kd)} K/D Â· ${Math.round((m.win_rate||0)*100)}% W</span></div>`).join('');
+    const mastery=(lbIns.mode_mastery||[]).slice(0,4).map(m=>`<div style="font-size:12px;color:#e5e7eb;padding:5px 12px;display:flex;justify-content:space-between"><span>${esc(fmtGmDrawer(m.gm))} · ${m.matches} matches</span><span>${esc(m.kd)} K/D · ${Math.round((m.win_rate||0)*100)}% W</span></div>`).join('');
     const styleTip=(typeof PLAYSTYLE_TIPS!=='undefined' && PLAYSTYLE_TIPS[lbIns.playstyle]) || 'Playstyle from kills/match, K/D and win rate.';
     body.innerHTML=`<div style="display:flex;flex-direction:column;gap:6px">`
-      + `<div style="font-size:13px;font-weight:800;color:#fff;text-align:center;padding:4px 0">Playstyle: <span title="${esc(styleTip)}" style="text-decoration:underline dotted;cursor:help">${esc(lbIns.playstyle)}</span> <span style="color:#6b7280;font-weight:400">Â· ${lbIns.matches_analyzed||0} matches</span></div>`
-      + card('ðŸ”¥ Best session', esc(sess(lbIns.best_session)))
-      + card('ðŸ§Š Worst session', esc(sess(lbIns.worst_session)))
-      + card('ðŸ˜± Biggest fear', fear&&fear.player?`${esc(fear.player)} (${fear.deaths} deaths)`:'â€”')
-      + card('ðŸŽ¯ Biggest free kill', farm&&farm.player?`${esc(farm.player)} (${farm.kills} kills)`:'â€”')
-      + card('ðŸŽ® Fav mode', esc(fmtGmDrawer(lbIns.fav_game_mode)))
-      + card('ðŸ¤ Best teammate', mateLine)
-      + card('ðŸ§¤ Clutch wins (â‰¤1 kill)', esc(lbIns.clutch_factor))
+      + `<div style="font-size:13px;font-weight:800;color:#fff;text-align:center;padding:4px 0">Playstyle: <span title="${esc(styleTip)}" style="text-decoration:underline dotted;cursor:help">${esc(lbIns.playstyle)}</span> <span style="color:#6b7280;font-weight:400">· ${lbIns.matches_analyzed||0} matches</span></div>`
+      + card('🔥 Best session', esc(sess(lbIns.best_session)))
+      + card('🧊 Worst session', esc(sess(lbIns.worst_session)))
+      + card('😱 Biggest fear', fear&&fear.player?`${esc(fear.player)} (${fear.deaths} deaths)`:'—')
+      + card('🎯 Biggest free kill', farm&&farm.player?`${esc(farm.player)} (${farm.kills} kills)`:'—')
+      + card('🎮 Fav mode', esc(fmtGmDrawer(lbIns.fav_game_mode)))
+      + card('🤝 Best teammate', mateLine)
+      + card('🧤 Clutch wins (≤1 kill)', esc(lbIns.clutch_factor))
       + `<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">RECENT FORM</div>` + form
       + (mastery?`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">MODE MASTERY</div>`+mastery:'')
       + `</div>`;
   }
   // --- FRIENDS TAB: request / accept / decline / invite-to-party / join ---
   // Invite is gated on holding a live private pID (myLiveCode); join copies
-  // the code â€” the game needs manual entry, no auto-join is possible.
+  // the code — the game needs manual entry, no auto-join is possible.
   function fetchLbFriends(){
     if(!lbPanel || lbTab!=='friends') return;
     stopLbChat();
@@ -4482,7 +4713,7 @@
       lbChatLoading=false;
       lbChat=(j && !j.error && j.messages) ? j.messages : [];
       if(lbTab==='friends' && lbChatWith) renderLbFriends();
-      // reading marks them read server-side â€” refresh the unread badges
+      // reading marks them read server-side — refresh the unread badges
       try{
         rankedApiGet(`/api/friends/unread?discord_id=${encodeURIComponent(did)}`, (u)=>{
           lbUnread=(u && !u.error) ? u : lbUnread;
@@ -4554,7 +4785,7 @@
       });
       return;
     }
-    btn.disabled=true; btn.textContent='â€¦';
+    btn.disabled=true; btn.textContent='…';
     apiPostJson('/api/friends/request', {requester_discord_id:did, addressee_discord_id:target}, (j)=>{
       if(j && (j.ok || (j.status&&j.status!=='pending'))){ btn.textContent='Sent'; try{ showToast('Friend request sent', false); }catch{} }
       else if(j && j.error && /already/i.test(j.error)){ btn.textContent='Sent'; }
@@ -4566,12 +4797,12 @@
     const body=document.getElementById('bnc-lb-body');
     if(!body) return;
     const sub=document.getElementById('bnc-lb-sub');
-    const esc=(v)=> String(v==null?'â€”':v).replace(/</g,'&lt;');
+    const esc=(v)=> String(v==null?'—':v).replace(/</g,'&lt;');
     if(sub) sub.textContent='Friends & party invites';
     const did=myDiscordId();
-    if(!did){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Link your account first â€” open the player info drawer to link.</div>`; return; }
-    if(lbFriendsLoading){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Loading friendsâ€¦</div>`; return; }
-    if(!lbFriends && !lbInvites){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Couldn't load friends â€” server unreachable?</div>`; return; }
+    if(!did){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Link your account first — open the player info drawer to link.</div>`; return; }
+    if(lbFriendsLoading){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Loading friends…</div>`; return; }
+    if(!lbFriends && !lbInvites){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Couldn't load friends — server unreachable?</div>`; return; }
     // chat view replaces the lists while open
     if(lbChatWith){ renderLbChatView(body, esc); wireLbChat(body, did, esc); return; }
     const code=myLiveCode();
@@ -4590,7 +4821,7 @@
       const n=Number(unreadBy[String(did2)]||0);
       return n>0?`<span style="background:#ef4444;color:#fff;border-radius:999px;font-size:10px;font-weight:800;padding:1px 7px;margin-left:6px">${n}</span>`:'';
     };
-    // row() takes pre-built SAFE html for the title (dot/badge markup) â€”
+    // row() takes pre-built SAFE html for the title (dot/badge markup) —
     // escape dynamic text BEFORE composing (esc() here would print tags).
     const row=(titleHtml,sub2,controls)=>`<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 12px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;font-size:12px"><div style="min-width:0"><div style="color:#fff;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${titleHtml}</div>${sub2?`<div style="color:#6b7280;font-size:11px">${esc(sub2)}</div>`:''}</div><div style="display:flex;gap:6px;flex-shrink:0;align-items:center">${controls}</div></div>`;
     const nm=(e)=> e.discord_username || e.game_username || String(e.discord_id||'').slice(0,6);
@@ -4598,27 +4829,27 @@
     // incoming party invites first (join = copy code)
     const incoming=(lbInvites&&lbInvites.incoming)||[];
     if(incoming.length){
-      html+=`<div style="font-size:11px;font-weight:800;color:#f59e0b;letter-spacing:.06em;padding:4px 12px 0">PARTY INVITES â€” TAP JOIN, THEN ENTER THE CODE IN-GAME</div>`;
+      html+=`<div style="font-size:11px;font-weight:800;color:#f59e0b;letter-spacing:.06em;padding:4px 12px 0">PARTY INVITES — TAP JOIN, THEN ENTER THE CODE IN-GAME</div>`;
       incoming.forEach((inv,i)=>{
         const from=inv.from_discord_username || inv.from_game_username || String(inv.from_discord_id||'').slice(0,6);
-        html+=row(`ðŸ“¨ ${esc(from)} â†’ room ${esc(inv.code||'?')}`, null, `<button data-join="${i}" style="background:#f59e0b;color:#000;border:0;border-radius:6px;padding:4px 12px;cursor:pointer;font-size:11px;font-weight:800;white-space:nowrap">Join</button>`);
+        html+=row(`📨 ${esc(from)} → room ${esc(inv.code||'?')}`, null, `<button data-join="${i}" style="background:#f59e0b;color:#000;border:0;border-radius:6px;padding:4px 12px;cursor:pointer;font-size:11px;font-weight:800;white-space:nowrap">Join</button>`);
       });
     }
     // friends + presence + invite/chat buttons
     const friends=(lbFriends&&lbFriends.friends)||[];
     const unreadTotal=Number((lbUnread&&lbUnread.total)||0);
-    if(sub) sub.textContent='Friends & party invites'+(unreadTotal>0?` Â· ${unreadTotal} unread`:'');
-    html+=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">FRIENDS (${friends.length})${code?` Â· YOUR CODE: ${esc(code)}`:' Â· HOLD A PRIVATE ROOM TO INVITE'}</div>`;
+    if(sub) sub.textContent='Friends & party invites'+(unreadTotal>0?` · ${unreadTotal} unread`:'');
+    html+=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">FRIENDS (${friends.length})${code?` · YOUR CODE: ${esc(code)}`:' · HOLD A PRIVATE ROOM TO INVITE'}</div>`;
     html+= friends.length ? friends.map(f=>{
       const p=f.presence||{detail:'offline'};
       const dot=`<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${presDot(p.detail)};margin-right:6px" title="${esc(presText(f))}"></span>`;
-      const sub2=[presText(f), (f.game_username&&f.discord_username)?f.game_username:null].filter(Boolean).join(' Â· ');
+      const sub2=[presText(f), (f.game_username&&f.discord_username)?f.game_username:null].filter(Boolean).join(' · ');
       const gate=canPartyInvite();
       return row(dot+esc(nm(f))+unreadBadge(f.discord_id), sub2,
         `<button data-chat="${esc(f.discord_id)}" title="Chat" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:4px 10px;cursor:pointer;font-size:11px;font-weight:700;white-space:nowrap">Chat</button>`
         +btn('inv:'+f.discord_id, 'Invite', gate.ok, gate.ok?`Invite to room ${gate.code}`:gate.why));
     }).join('')
-      : `<div style="font-size:12px;color:#9ca3af;padding:5px 12px">No friends yet â€” search below to add some.</div>`;
+      : `<div style="font-size:12px;color:#9ca3af;padding:5px 12px">No friends yet — search below to add some.</div>`;
     // incoming requests
     const reqs=(lbFriends&&lbFriends.incoming)||[];
     if(reqs.length){
@@ -4637,7 +4868,7 @@
       const _near=((playersCache&&playersCache.players)||[]).filter(p=>
         p && p.in_db && p.discord_id && !p.is_self && String(p.discord_id)!==String(did));
       if(_near.length){
-        html+=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">NEARBY â€” IN YOUR ROOM (${_near.length})</div>`;
+        html+=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">NEARBY — IN YOUR ROOM (${_near.length})</div>`;
         _near.slice(0,12).forEach(p=>{
           const label=p.discord_username || p.username || String(p.discord_id).slice(0,6);
           html+=row(esc(label), p.game_username&&p.discord_username?p.game_username:null,
@@ -4648,7 +4879,7 @@
     }catch{}
     // add by search
     html+=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">ADD FRIEND</div>
-      <div style="display:flex;gap:6px;padding:0 12px"><input id="bnc-fr-q" placeholder="Discord or game nameâ€¦" value="" style="flex:1;background:#1f2937;border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:7px 10px;color:#e5e7eb;font-size:12px;outline:none;min-width:0"><button id="bnc-fr-go" style="background:#fff;color:#000;border:0;border-radius:8px;padding:7px 14px;cursor:pointer;font-size:12px;font-weight:800">Search</button></div>
+      <div style="display:flex;gap:6px;padding:0 12px"><input id="bnc-fr-q" placeholder="Discord or game name…" value="" style="flex:1;background:#1f2937;border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:7px 10px;color:#e5e7eb;font-size:12px;outline:none;min-width:0"><button id="bnc-fr-go" style="background:#fff;color:#000;border:0;border-radius:8px;padding:7px 14px;cursor:pointer;font-size:12px;font-weight:800">Search</button></div>
       <div id="bnc-fr-results" style="display:flex;flex-direction:column;gap:6px"></div>`;
     html+=`</div>`;
     body.innerHTML=html;
@@ -4658,7 +4889,7 @@
       const v=(q&&q.value||'').trim();
       if(v.length<2){ try{ showToast('Type at least 2 characters', true); }catch{} return; }
       const box=document.getElementById('bnc-fr-results');
-      if(box) box.innerHTML=`<div style="font-size:12px;color:#9ca3af;padding:4px 12px">Searchingâ€¦</div>`;
+      if(box) box.innerHTML=`<div style="font-size:12px;color:#9ca3af;padding:4px 12px">Searching…</div>`;
       rankedApiGet(`/api/search?q=${encodeURIComponent(v)}&limit=10`, (j)=>{
         lbSearch=(j&&j.results)||[];
         const bx=document.getElementById('bnc-fr-results');
@@ -4704,7 +4935,7 @@
       b.onclick=()=>{
         const inv=incoming[Number(b.dataset.join)];
         if(!inv||!inv.code) return;
-        copyText(inv.code, `Code ${inv.code} copied â€” enter it in a private room`);
+        copyText(inv.code, `Code ${inv.code} copied — enter it in a private room`);
       };
     });
     body.querySelectorAll('button[data-chat]').forEach(b=>{
@@ -4725,9 +4956,9 @@
     const friends=(lbFriends&&lbFriends.friends)||[];
     const peer=friends.find(f=>String(f.discord_id)===String(lbChatWith))||{discord_id:lbChatWith};
     const name=peer.discord_username || peer.game_username || String(lbChatWith||'').slice(0,6);
-    if(sub) sub.textContent='Chat â€” '+name;
+    if(sub) sub.textContent='Chat — '+name;
     const did=myDiscordId();
-    // Poll refresh while typing: the input is alive and focused â€” update ONLY
+    // Poll refresh while typing: the input is alive and focused — update ONLY
     // the message list so the draft and focus survive. Full rebuilds happen
     // on open/send, where losing focus is correct.
     const liveIn=document.getElementById('bnc-chat-in');
@@ -4737,7 +4968,7 @@
         box.innerHTML=(lbChat||[]).map(m=>{
           const mine=String(m.from_discord_id)===String(did);
           return `<div style="align-self:${mine?'flex-end':'flex-start'};max-width:80%;background:${mine?'#fff':'#1f2937'};color:${mine?'#000':'#e5e7eb'};border-radius:10px;padding:6px 10px;font-size:12px;word-break:break-word">${esc(m.body)}</div>`;
-        }).join('') || `<div style="color:#9ca3af;font-size:12px;text-align:center">No messages yet â€” say hi.</div>`;
+        }).join('') || `<div style="color:#9ca3af;font-size:12px;text-align:center">No messages yet — say hi.</div>`;
         box.scrollTop=box.scrollHeight;
       }
       return;
@@ -4747,9 +4978,9 @@
       return `<div style="align-self:${mine?'flex-end':'flex-start'};max-width:80%;background:${mine?'#fff':'#1f2937'};color:${mine?'#000':'#e5e7eb'};border-radius:10px;padding:6px 10px;font-size:12px;word-break:break-word">${esc(m.body)}</div>`;
     }).join('');
     body.innerHTML=`<div style="display:flex;flex-direction:column;gap:6px;height:100%">`
-      + `<div style="padding:0 12px"><button id="bnc-chat-back" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:4px 12px;cursor:pointer;font-size:11px;font-weight:700">â€¹ Back</button></div>`
-      + `<div id="bnc-chat-msgs" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;padding:6px 12px;min-height:200px;max-height:46vh">${lbChatLoading?`<div style="color:#9ca3af;font-size:12px;text-align:center">Loadingâ€¦</div>`:((msgs||`<div style="color:#9ca3af;font-size:12px;text-align:center">No messages yet â€” say hi.</div>`))}</div>`
-      + `<div style="display:flex;gap:6px;padding:0 12px"><input id="bnc-chat-in" maxlength="500" placeholder="Message ${esc(name)}â€¦" style="flex:1;background:#1f2937;border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:8px 10px;color:#e5e7eb;font-size:12px;outline:none;min-width:0"><button id="bnc-chat-send" style="background:#fff;color:#000;border:0;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:12px;font-weight:800">Send</button></div>`
+      + `<div style="padding:0 12px"><button id="bnc-chat-back" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:4px 12px;cursor:pointer;font-size:11px;font-weight:700">‹ Back</button></div>`
+      + `<div id="bnc-chat-msgs" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;padding:6px 12px;min-height:200px;max-height:46vh">${lbChatLoading?`<div style="color:#9ca3af;font-size:12px;text-align:center">Loading…</div>`:((msgs||`<div style="color:#9ca3af;font-size:12px;text-align:center">No messages yet — say hi.</div>`))}</div>`
+      + `<div style="display:flex;gap:6px;padding:0 12px"><input id="bnc-chat-in" maxlength="500" placeholder="Message ${esc(name)}…" style="flex:1;background:#1f2937;border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:8px 10px;color:#e5e7eb;font-size:12px;outline:none;min-width:0"><button id="bnc-chat-send" style="background:#fff;color:#000;border:0;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:12px;font-weight:800">Send</button></div>`
       + `</div>`;
   }
   function wireLbChat(body, did, esc){
@@ -4774,7 +5005,7 @@
       try{ inp._vkbdAction=doSend; }catch{}
       try{ untrapInput(inp); }catch{}
       try{ attachVkbd(inp, doSend); }catch{}
-      // refocus only right after OUR send (never on poll refresh â€” reading
+      // refocus only right after OUR send (never on poll refresh — reading
       // history must not yank focus while the user watches).
       if(_chatRefocus){ _chatRefocus=false; try{ inp.focus(); }catch{} }
     }
@@ -4810,10 +5041,10 @@
     const body=document.getElementById('bnc-lb-body');
     if(!body) return;
     const sub=document.getElementById('bnc-lb-sub');
-    const esc=(v)=> String(v==null?'â€”':v).replace(/</g,'&lt;');
+    const esc=(v)=> String(v==null?'—':v).replace(/</g,'&lt;');
     if(lbEventDetail || lbEventLoading){ renderLbEventDetail(body, esc, sub); return; }
     if(sub) sub.textContent='Tournament events';
-    if(lbEventsLoading){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Loading eventsâ€¦</div>`; return; }
+    if(lbEventsLoading){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Loading events…</div>`; return; }
     const list=lbEvents||[];
     const chips=[['all','All'],['scheduled','Scheduled'],['running','Running'],['ended','Ended']];
     const rows=list.filter(t=>lbEventFilter==='all' || String(t.status||'').toLowerCase()===lbEventFilter);
@@ -4823,13 +5054,13 @@
     }).join('');
     let html=`<div style="display:flex;gap:6px;margin-bottom:10px">${chipHtml}</div>`;
     if(!rows.length){
-      const hint=lbEventFilter==='running' ? 'No running events â€” check scheduled.' : lbEventFilter==='ended' ? 'No ended events yet.' : 'No events yet â€” hosts create them with /tourney-create.';
+      const hint=lbEventFilter==='running' ? 'No running events — check scheduled.' : lbEventFilter==='ended' ? 'No ended events yet.' : 'No events yet — hosts create them with /tourney-create.';
       html+=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">${hint}</div>`;
     } else {
       html+=rows.map(t=>{
         const m=evStatusMeta(t.status);
         const prog=(t.series_len||0)>0 ? `${t.sealed||0}/${t.series_len}` : `${t.sealed||0} played`;
-        return `<div data-ev-open="${t.id}" title="Open event" style="display:flex;gap:10px;align-items:center;padding:9px 12px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;font-size:12px;cursor:pointer;margin-bottom:6px"><span style="width:9px;height:9px;border-radius:50%;background:${m.color};flex-shrink:0" title="${m.label}"></span><div style="flex:1;min-width:0"><div style="color:#fff;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">#${t.id} ${esc(t.name)}</div><div style="color:#6b7280;font-size:11px">${m.label} Â· ${prog} matches Â· ${t.players||0} players</div></div><span style="color:#6b7280;font-size:14px">â€º</span></div>`;
+        return `<div data-ev-open="${t.id}" title="Open event" style="display:flex;gap:10px;align-items:center;padding:9px 12px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;font-size:12px;cursor:pointer;margin-bottom:6px"><span style="width:9px;height:9px;border-radius:50%;background:${m.color};flex-shrink:0" title="${m.label}"></span><div style="flex:1;min-width:0"><div style="color:#fff;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">#${t.id} ${esc(t.name)}</div><div style="color:#6b7280;font-size:11px">${m.label} · ${prog} matches · ${t.players||0} players</div></div><span style="color:#6b7280;font-size:14px">›</span></div>`;
       }).join('');
     }
     body.innerHTML=html;
@@ -4841,10 +5072,10 @@
     });
   }
   function renderLbEventDetail(body, esc, sub){
-    if(lbEventLoading){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Loading eventâ€¦</div>`; return; }
+    if(lbEventLoading){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Loading event…</div>`; return; }
     if(!lbEventDetail){
       body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Couldn't load this event.</div>
-        <div style="text-align:center"><button id="bnc-ev-back" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px;font-weight:700">â€¹ Back</button></div>`;
+        <div style="text-align:center"><button id="bnc-ev-back" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px;font-weight:700">‹ Back</button></div>`;
       const bb=document.getElementById('bnc-ev-back');
       if(bb) bb.onclick=()=>{ lbEventDetail=null; renderLbEvents(); };
       return;
@@ -4854,7 +5085,7 @@
     if(sub) sub.textContent=`Event #${t.id}`;
     const card=(label,val)=>`<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 12px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;font-size:12px"><span style="color:#9ca3af">${label}</span><span style="color:#fff;font-weight:700;text-align:right">${val}</span></div>`;
     // Scoring readout from the tourney points table (WIN owns P1: 1st dropped).
-    const evOrd=(n)=>{ try{ n=Number(n); const s=['th','st','nd','rd']; const v=n%100; return (n+(s[(v-20)%10]||s[v]||s[0])).toUpperCase(); }catch{ return 'â€”'; } };
+    const evOrd=(n)=>{ try{ n=Number(n); const s=['th','st','nd','rd']; const v=n%100; return (n+(s[(v-20)%10]||s[v]||s[0])).toUpperCase(); }catch{ return '—'; } };
     let scoringHtml='';
     try{
       const pt=(t&&t.points_table)||{};
@@ -4862,7 +5093,7 @@
       const parts=[`WIN = ${pt.win!=null?pt.win:3} PTS`, `KILLS = ${pt.kill!=null?pt.kill:1} PTS`];
       pl.forEach((p,i)=>{ if(i===0) return; parts.push(`${evOrd(i+1)} = ${p} PTS`); });
       scoringHtml=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">SCORING</div>`
-        + `<div style="font-size:12px;color:#e5e7eb;padding:5px 12px;line-height:1.7">${parts.map(esc).join(' Â· ')}</div>`;
+        + `<div style="font-size:12px;color:#e5e7eb;padding:5px 12px;line-height:1.7">${parts.map(esc).join(' · ')}</div>`;
     }catch{}
     const players=lbEventDetail.players||[];
     const standings=lbEventDetail.standings||[];
@@ -4870,134 +5101,36 @@
     const boards=lbEventDetail.match_boards||[];
     const boardFor=(v)=>{ const b=boards.find(x=>x&&(x.version===v)); return (b&&b.rows)||[]; };
     let html=`<div style="display:flex;flex-direction:column;gap:6px">`
-      + `<div style="display:flex;align-items:center;gap:10px"><button id="bnc-ev-back" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:5px 12px;cursor:pointer;font-size:12px;font-weight:700;flex-shrink:0">â€¹ Back</button><b style="font-size:15px;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0">#${t.id} ${esc(t.name)}</b><span style="font-size:10px;font-weight:800;color:${m.color}">${m.label.toUpperCase()}</span></div>`
-      + card('Series', `${t.sealed||0}/${t.series_len||'âˆž'} matches`)
+      + `<div style="display:flex;align-items:center;gap:10px"><button id="bnc-ev-back" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:5px 12px;cursor:pointer;font-size:12px;font-weight:700;flex-shrink:0">‹ Back</button><b style="font-size:15px;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0">#${t.id} ${esc(t.name)}</b><span style="font-size:10px;font-weight:800;color:${m.color}">${m.label.toUpperCase()}</span></div>`
+      + card('Series', `${t.sealed||0}/${t.series_len||'∞'} matches`)
       + (t.code?card('Room code', `<span style="font-family:monospace">${esc(t.code)}</span>`):'')
       + scoringHtml
       + `<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">LEADERBOARD (${standings.length})</div>`
-      + (standings.length ? standings.slice(0,15).map((r,i)=>`<div style="font-size:12px;color:#e5e7eb;padding:5px 12px;display:flex;justify-content:space-between"><span>${i+1}. ${esc(r.name||'?')}</span><span><b>${r.points||0}</b> pts Â· ${r.kills||0}K Â· ${r.wins||0}W${r.avg_placement!=null?' Â· '+r.avg_placement+' avg':''}</span></div>`).join('') : `<div style="font-size:12px;color:#9ca3af;padding:5px 12px">No sealed matches yet.</div>`)
+      + (standings.length ? standings.slice(0,15).map((r,i)=>`<div style="font-size:12px;color:#e5e7eb;padding:5px 12px;display:flex;justify-content:space-between"><span>${i+1}. ${esc(r.name||'?')}</span><span><b>${r.points||0}</b> pts · ${r.kills||0}K · ${r.wins||0}W${r.avg_placement!=null?' · '+r.avg_placement+' avg':''}</span></div>`).join('') : `<div style="font-size:12px;color:#9ca3af;padding:5px 12px">No sealed matches yet.</div>`)
       + `<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">MATCHES (${matches.length})</div>`
       + (matches.length ? matches.map(mm=>{
           const rows=boardFor(mm.version);
-          return `<div style="background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:8px 12px"><div style="font-size:12px;color:#fff;font-weight:700">Match v${mm.version} <span style="color:#6b7280;font-weight:400">Â· winner ${esc(mm.winner||'â€”')}</span></div>`
+          return `<div style="background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:8px 12px"><div style="font-size:12px;color:#fff;font-weight:700">Match v${mm.version} <span style="color:#6b7280;font-weight:400">· winner ${esc(mm.winner||'—')}</span></div>`
             + (rows.length?rows.slice(0,5).map((r,i)=>`<div style="font-size:11px;color:#9ca3af;display:flex;justify-content:space-between;padding:2px 0"><span>${i+1}. ${esc(r.name||'?')}</span><span>${r.points||0} pts</span></div>`).join(''):'')
             + `</div>`;
         }).join('') : `<div style="font-size:12px;color:#9ca3af;padding:5px 12px">No matches sealed.</div>`)
       + `<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">PLAYERS (${players.length})</div>`
-      + `<div style="font-size:12px;color:#e5e7eb;padding:5px 12px;line-height:1.7">${players.length?players.slice(0,40).map(p=>esc(p.name||'?')).join(' Â· '):'No registrations yet.'}</div>`
+      + `<div style="font-size:12px;color:#e5e7eb;padding:5px 12px;line-height:1.7">${players.length?players.slice(0,40).map(p=>esc(p.name||'?')).join(' · '):'No registrations yet.'}</div>`
       + `</div>`;
     body.innerHTML=html;
     const back=document.getElementById('bnc-ev-back');
     if(back) back.onclick=()=>{ lbEventDetail=null; renderLbEvents(); };
   }
-  function fetchLbClips(){
-    if(!lbPanel) return;
-    lbClipsLoading=true; renderLbClips();
-    clipList().then((rows)=>{
-      lbClipsLoading=false; lbClips=rows||[];
-      if(lbTab==='clips') renderLbClips();
-    }).catch(()=>{ lbClipsLoading=false; lbClips=[]; if(lbTab==='clips') renderLbClips(); });
-  }
-  function renderLbClips(){
-    const body=document.getElementById('bnc-lb-body');
-    if(!body) return;
-    const sub=document.getElementById('bnc-lb-sub');
-    if(sub) sub.textContent='My clips â€” stored in this browser';
-    const esc=(v)=> String(v==null?'â€”':v).replace(/</g,'&lt;');
-    const cfg=clipCfg();
-    const mimeShort=(()=>{ try{ const m=(_clip.rec&&_clip.rec.mimeType)||_clip.mime||''; let s='?'; if(m.includes('avc1')||m.includes('mp4')) s='mp4/h264'; else if(m.includes('vp8')) s='vp8'; else if(m.includes('vp9')) s='vp9'; else s=m.split(';')[0]||'?'; if(m.includes('mp4a')) s+='+aac'; else if(m.includes('opus')) s+='+opus'; return s; }catch{ return '?'; } })();
-    const audioBit=_clip.withAudio?' Â· +audio':(cfg.audio?' Â· no-audio':'');
-    const heavy=cfg.fps>=30 && cfg.bitrate>=2500000;
-    const segAge=Math.max(0,Math.round((Date.now()-(_clip.segStartedAt||Date.now()))/1000));
-    const recState=_clip.pendingTimer ? `Saving ${(_clip.pendingTrigger||'clip')} clipâ€¦` : (clipReady() ? `REC seg ${segAge}/${cfg.len}s Â· ${cfg.fps}fps ${mimeShort}${audioBit}` : (_clip.lastErr||'startingâ€¦'));
-    const dot=clipReady() ? '#ef4444' : '#6b7280';
-    const sel=(id, val, opts)=>`<select id="${id}" style="background:#171717;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;font-size:11px;padding:4px 6px">`+opts.map(([v,l])=>`<option value="${v}"${String(v)===String(val)?' selected':''}>${l}</option>`).join('')+`</select>`;
-    const chk=(id, on, label)=>`<label style="display:flex;align-items:center;gap:6px;font-size:11px;color:#e5e7eb;cursor:pointer"><input type="checkbox" id="${id}"${on?' checked':''} style="accent-color:#fff"> ${label}</label>`;
-    let html=`<div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">`
-      + `<button id="bnc-clip-now" style="flex:1;min-width:120px;background:#fff;color:#000;border:0;border-radius:8px;padding:8px 0;font-size:12px;font-weight:800;cursor:pointer">â— Clip now (F8)</button>`
-      + `<span style="display:flex;align-items:center;gap:6px;font-size:11px;color:#9ca3af"><span style="width:8px;height:8px;border-radius:50%;background:${dot};display:inline-block"></span>${esc(recState)}</span></div>`;
-    try{
-      const lk=_clip.lastKill;
-      if(lk&&lk.at){
-        const ago=Math.max(0,Math.round((Date.now()-lk.at)/1000));
-        const why={'queued':'clip queued','saved':'clip saved','not-your-kill':'skipped (not your kill)','knock-ignored':'skipped (knock)','debounced':'skipped (too soon)','auto-off':'auto-clip off','clipping-off':'clipping off','corrupted':'discarded (corrupted)'}[lk.decision]||lk.decision||'';
-        const you=lk.decision==='not-your-kill' ? ' (you: '+(lk.me||'?').slice(0,24)+')' : '';
-        html+=`<div style="font-size:11px;color:#6b7280;margin:-2px 0 10px">Last killfeed: ${esc(lk.killer)} â†’ ${esc(lk.victim)} Â· ${ago}s ago Â· ${esc(why)}${esc(you)}</div>`;
-      }
-    }catch{}
-    if(lbClipsLoading){ body.innerHTML=html+`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:20px 0">Loading clipsâ€¦</div>`; return; }
-    const list=lbClips||[];
-    if(!list.length){
-      html+=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:24px 0">No clips yet â€” press F8 or get a kill.<br><span style="font-size:11px">Clips capture up to the last ${cfg.len}s ending at the trigger.</span></div>`;
-    } else {
-      html+=`<div style="display:flex;justify-content:space-between;align-items:center;margin:4px 0 8px"><span style="font-size:11px;color:#6b7280">${list.length} clip${list.length===1?'':'s'} Â· ${(list.reduce((a,r)=>a+(r.size||0),0)/1048576).toFixed(1)} MB</span><button id="bnc-clips-clear" style="background:none;border:0;color:#6b7280;font-size:11px;cursor:pointer;text-decoration:underline">Clear all</button></div>`;
-      html+=list.map((r)=>{
-        const d=new Date(r.ts||Date.now());
-        const when=d.toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
-        const badge={kill:'#ef4444',death:'#f59e0b',win:'#10b981',manual:'#6b7280'}[r.trigger]||'#6b7280';
-        return `<div data-clip="${r.id}" style="background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:10px 12px;margin-bottom:8px">`
-          + `<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><span style="font-size:10px;font-weight:800;color:#fff;background:${badge};border-radius:4px;padding:2px 6px">${esc((r.trigger||'manual').toUpperCase())}</span><span style="font-size:11px;color:#9ca3af">${esc(when)} Â· ${((r.size||0)/1024).toFixed(0)} KB${r.room?' Â· '+esc(r.room):''}</span></div>`
-          + `<video data-clip-vid="${r.id}" preload="metadata" muted playsinline controls style="width:100%;max-height:220px;background:#000;border-radius:6px"></video>`
-          + `<div style="display:flex;gap:8px;margin-top:8px"><button data-clip-dl="${r.id}" style="flex:1;background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:6px 0;font-size:11px;font-weight:700;cursor:pointer">Download</button><button data-clip-del="${r.id}" style="background:none;border:1px solid rgba(255,255,255,0.12);color:#9ca3af;border-radius:6px;padding:6px 12px;font-size:11px;cursor:pointer">Delete</button></div></div>`;
-      }).join('');
-    }
-    html+=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:10px 0 4px">CLIPPING SETTINGS</div>`
-      + `<div style="display:flex;flex-direction:column;gap:8px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:12px">`
-      + `<div style="display:flex;gap:12px;flex-wrap:wrap">${chk('bnc-clip-enabled', cfg.enabled, 'Enable clipping')}${chk('bnc-clip-autokill', cfg.autoKill, 'Auto-clip my kills')}${chk('bnc-clip-autodeath', cfg.autoDeath, 'Auto-clip my deaths')}${chk('bnc-clip-autowin', cfg.autoWin, 'Auto-clip wins')}${chk('bnc-clip-audio', cfg.audio, 'Game audio')}</div>`
-      + `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:11px;color:#9ca3af"><span>Buffer</span>${sel('bnc-clip-len', cfg.len, [[15,'15s'],[30,'30s'],[45,'45s'],[60,'60s']])}<span>FPS</span>${sel('bnc-clip-fps', cfg.fps, [[10,'10'],[15,'15 âœ“'],[30,'30'],[60,'60']])}<span>Quality</span>${sel('bnc-clip-bitrate', cfg.bitrate, [[1500000,'Low âœ“'],[2500000,'Medium'],[5000000,'High']])}<span>Aftermath</span>${sel('bnc-clip-after', cfg.after, [[0,'0s'],[3,'3s'],[5,'5s âœ“'],[8,'8s']])}</div>`
-      + (heavy?`<div style="font-size:11px;color:#eab308">High FPS + quality can drop game FPS â€” try 15 FPS / Low if the game stutters.</div>`:'')
-      + `<div style="font-size:11px;color:#6b7280">Hotkey: F8 (change in <a href="#" id="bnc-clip-keys" style="color:#e5e7eb">Shortcuts menu</a>) Â· clips stay in this browser until downloaded. Clips saved before v2.23.2 are corrupted â€” delete them.</div>`
-      + `</div>`;
-    body.innerHTML=html;
-    const now=document.getElementById('bnc-clip-now');
-    if(now) now.onclick=()=>{ try{ saveClip('manual'); }catch{} };
-    const clr=document.getElementById('bnc-clips-clear');
-    if(clr) clr.onclick=()=>{ if(!confirm('Delete all clips?')) return; clipClearAll().then(()=>fetchLbClips()); };
-    const keys=document.getElementById('bnc-clip-keys');
-    if(keys) keys.onclick=(e)=>{ try{ e.preventDefault(); toggleKeybinds(); }catch{} };
-    const bind=(id, fn)=>{ const el=document.getElementById(id); if(el) el.onchange=fn; };
-    bind('bnc-clip-enabled', (e)=>clipSet('bnc_clip_enabled', e.target.checked));
-    bind('bnc-clip-autokill', (e)=>clipSet('bnc_clip_autokill', e.target.checked));
-    bind('bnc-clip-autodeath', (e)=>clipSet('bnc_clip_autodeath', e.target.checked));
-    bind('bnc-clip-autowin', (e)=>clipSet('bnc_clip_autowin', e.target.checked));
-    bind('bnc-clip-audio', (e)=>clipSet('bnc_clip_audio', e.target.checked));
-    bind('bnc-clip-len', (e)=>clipSet('bnc_clip_len', Number(e.target.value)||30));
-    bind('bnc-clip-fps', (e)=>clipSet('bnc_clip_fps', Number(e.target.value)||15));
-    bind('bnc-clip-bitrate', (e)=>clipSet('bnc_clip_bitrate', Number(e.target.value)||1500000));
-    bind('bnc-clip-after', (e)=>{ const v=Number(e.target.value); clipSet('bnc_clip_after', isNaN(v)?5:Math.max(0,Math.min(10,v))); });
-    try{
-      const byId={}; (lbClips||[]).forEach(r=>{ byId[r.id]=r; });
-      body.querySelectorAll('video[data-clip-vid]').forEach(v=>{
-        const r=byId[v.dataset.clipVid];
-        if(r && r.blob){ try{ v.src=URL.createObjectURL(r.blob); }catch{} }
-      });
-      body.querySelectorAll('[data-clip-dl]').forEach(b=>{
-        b.onclick=()=>{
-          const r=byId[b.dataset.clipDl];
-          if(!r || !r.blob) return;
-          try{
-            const a=document.createElement('a');
-            a.href=URL.createObjectURL(r.blob);
-            a.download=`buildnow-${r.trigger||'clip'}-${r.ts||Date.now()}.${clipExt(r.mime||(r.blob&&r.blob.type))}`;
-            (document.body||document.documentElement).appendChild(a); a.click(); a.remove();
-          }catch{}
-        };
-      });
-      body.querySelectorAll('[data-clip-del]').forEach(b=>{
-        b.onclick=()=>{ clipDelete(b.dataset.clipDel).then(()=>fetchLbClips()); };
-      });
-    }catch{}
-  }
   function renderLbBody(){
     const body=document.getElementById('bnc-lb-body');
     if(!body) return;
-    const esc=(v)=> String(v==null?'â€”':v).replace(/</g,'&lt;');    if(lbLoading){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Loadingâ€¦</div>`; return; }
-    if(!lbRows.length){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">No players yet â€” play a match first.</div>`; return; }
+    const esc=(v)=> String(v==null?'—':v).replace(/</g,'&lt;');    if(lbLoading){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Loading…</div>`; return; }
+    if(!lbRows.length){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">No players yet — play a match first.</div>`; return; }
     const prMode=(typeof lbSort!=='undefined' && lbSort==='pr');
     const rows=lbRows.map(r=>{
-      const name=r.game_username || r.discord_username || 'â€”';
-      const kd=(r.kd==null)?'â€”':r.kd;
-      const pt=prMode ? (r.tourney_pr==null?'â€”':r.tourney_pr) : ((r.points==null)?'â€”':Number(r.points).toLocaleString('en-US'));
+      const name=r.game_username || r.discord_username || '—';
+      const kd=(r.kd==null)?'—':r.kd;
+      const pt=prMode ? (r.tourney_pr==null?'—':r.tourney_pr) : ((r.points==null)?'—':Number(r.points).toLocaleString('en-US'));
       const color=r.milestone_color || '#fff';
       return `<div style="display:grid;grid-template-columns:34px 1fr 70px 56px 56px 56px 76px;gap:6px;align-items:center;padding:7px 4px;border-bottom:1px solid rgba(255,255,255,0.05);font-size:12px"><span style="color:#6b7280">#${esc(r.rank)}</span><span data-prof="${esc(r.discord_id||'')}" title="Open profile" style="color:#fff;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer;text-decoration:underline;text-decoration-color:rgba(255,255,255,0.25)">${esc(name)}</span><span style="color:${color};font-weight:700;text-align:right">${esc(pt)}</span><span style="color:#e5e7eb;text-align:right">${esc(r.kills)}</span><span style="color:#e5e7eb;text-align:right">${esc(r.wins)}</span><span style="color:#e5e7eb;text-align:right">${esc(kd)}</span><span style="color:#9ca3af;text-align:right">${esc(fmtPlaytimeDrawer(r.playtime_global))}</span></div>`;
     }).join('');
@@ -5036,9 +5169,9 @@
     if(!body || !lbProfile) return;
     const sub=document.getElementById('bnc-lb-sub');
     if(sub) sub.textContent='Player profile';
-    const esc=(v)=> String(v==null?'â€”':v).replace(/</g,'&lt;').replace(/"/g,'&quot;');
+    const esc=(v)=> String(v==null?'—':v).replace(/</g,'&lt;').replace(/"/g,'&quot;');
     const r=lbProfile;
-    const name=r.game_username || r.discord_username || 'â€”';
+    const name=r.game_username || r.discord_username || '—';
     const meDid=(typeof myDiscordId==='function' ? myDiscordId() : null);
     const canAddFriend=!!(r.discord_id && meDid && String(r.discord_id)!==String(meDid));
     const skinId=(r.skin!=null && String(r.skin).trim()!=='' && String(r.skin).toLowerCase()!=='nan') ? r.skin : 'cct_0_default';
@@ -5046,16 +5179,16 @@
     const ins=lbProfileIns;
     const box=(label,val,tip)=>`<div title="${esc(tip||label)}" style="background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:10px 12px;min-width:0"><div style="font-size:10px;font-weight:800;color:#6b7280;letter-spacing:.06em">${esc(label)}</div><div style="font-size:15px;font-weight:800;color:#fff;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${val}</div></div>`;
     const sess=(m)=>{
-      if(!m) return 'â€”';
-      const res=m.win?'W':(m.defeat?'L':'â€“');
-      return `${m.kills||0}K/${m.deaths||0}D ${res} Â· ${esc(fmtGmDrawer(m.gm))}`;
+      if(!m) return '—';
+      const res=m.win?'W':(m.defeat?'L':'–');
+      return `${m.kills||0}K/${m.deaths||0}D ${res} · ${esc(fmtGmDrawer(m.gm))}`;
     };
     const mate=ins&&ins.fav_teammate;
-    const mateVal=!ins?'â€¦':(mate&&mate.player?`${esc(mate.player)} <span style="color:#6b7280;font-weight:400">(${mate.shared} shared)</span>`:'Not yet found');
-    const styleVal=!ins?'â€¦':esc(ins.playstyle||'â€”');
+    const mateVal=!ins?'…':(mate&&mate.player?`${esc(mate.player)} <span style="color:#6b7280;font-weight:400">(${mate.shared} shared)</span>`:'Not yet found');
+    const styleVal=!ins?'…':esc(ins.playstyle||'—');
     const styleTip=!ins?'':(PLAYSTYLE_TIPS[ins.playstyle]||'Playstyle from kills/match, K/D and win rate.');
     const boxes=[
-      box('Points', r.points!=null?Number(r.points).toLocaleString('en-US'):'â€”'),
+      box('Points', r.points!=null?Number(r.points).toLocaleString('en-US'):'—'),
       box('Kills', esc(r.kills)),
       box('Deaths', esc(r.deaths)),
       box('K/D', esc(r.kd)),
@@ -5063,16 +5196,16 @@
       box('Playtime', esc(fmtPlaytimeDrawer(r.playtime_global))),
       box('Last online', esc(fmtLastSeen(r.last_seen)), r.last_seen ? ('Last seen ' + r.last_seen) : 'No heartbeat yet'),
       box('Playstyle', styleVal, styleTip),
-      box('Best session', !ins?'â€¦':esc(sess(ins.best_session))),
-      box('Fav mode', !ins?'â€¦':esc(fmtGmDrawer(ins.fav_game_mode))),
+      box('Best session', !ins?'…':esc(sess(ins.best_session))),
+      box('Fav mode', !ins?'…':esc(fmtGmDrawer(ins.fav_game_mode))),
       box('Best teammate', mateVal, 'Most shared team-mode matches. Needs duo/team history.'),
-      box('Biggest fear', !ins?'â€¦':((ins.biggest_fear&&ins.biggest_fear.player)?`${esc(ins.biggest_fear.player)} (${ins.biggest_fear.deaths})`:'â€”')),
+      box('Biggest fear', !ins?'…':((ins.biggest_fear&&ins.biggest_fear.player)?`${esc(ins.biggest_fear.player)} (${ins.biggest_fear.deaths})`:'—')),
     ].join('');
     body.innerHTML=`<div style="display:flex;flex-direction:column;gap:10px;height:100%">`
-      + `<div style="display:flex;align-items:center;gap:10px"><button id="bnc-prof-back" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:5px 12px;cursor:pointer;font-size:12px;font-weight:700">â€¹ Back</button><b style="font-size:16px;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0">${esc(name)}</b>${r.rank!=null?`<span style="font-size:11px;color:#6b7280">#${esc(r.rank)}</span>`:''}${canAddFriend?`<button id="bnc-prof-add" style="background:#fff;color:#000;border:0;border-radius:6px;padding:5px 12px;cursor:pointer;font-size:12px;font-weight:800;flex-shrink:0">Add friend</button>`:''}</div>`
+      + `<div style="display:flex;align-items:center;gap:10px"><button id="bnc-prof-back" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:5px 12px;cursor:pointer;font-size:12px;font-weight:700">‹ Back</button><b style="font-size:16px;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0">${esc(name)}</b>${r.rank!=null?`<span style="font-size:11px;color:#6b7280">#${esc(r.rank)}</span>`:''}${canAddFriend?`<button id="bnc-prof-add" style="background:#fff;color:#000;border:0;border-radius:6px;padding:5px 12px;cursor:pointer;font-size:12px;font-weight:800;flex-shrink:0">Add friend</button>`:''}</div>`
       + `<div style="flex:1;display:flex;gap:10px;min-height:0;overflow:auto">`
-      + `<div style="width:190px;flex-shrink:0;background:#0a0a0a;border:1px solid rgba(255,255,255,0.08);border-radius:12px;display:flex;align-items:center;justify-content:center;align-self:stretch;padding:12px">${skinUrl?`<img src="${skinUrl}" style="max-width:100%;max-height:100%;object-fit:contain;image-rendering:pixelated" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div style="display:none;font-size:40px">â–£</div>`:`<div style="font-size:40px">â–£</div>`}</div>`
-      + `<div style="flex:1;display:grid;grid-template-columns:1fr 1fr;gap:8px;align-content:start;min-width:0">${lbProfileLoading?`<div style="grid-column:1/-1;color:#9ca3af;font-size:12px;text-align:center;padding:16px 0">Loading insightsâ€¦</div>`:boxes}</div>`
+      + `<div style="width:190px;flex-shrink:0;background:#0a0a0a;border:1px solid rgba(255,255,255,0.08);border-radius:12px;display:flex;align-items:center;justify-content:center;align-self:stretch;padding:12px">${skinUrl?`<img src="${skinUrl}" style="max-width:100%;max-height:100%;object-fit:contain;image-rendering:pixelated" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div style="display:none;font-size:40px">▣</div>`:`<div style="font-size:40px">▣</div>`}</div>`
+      + `<div style="flex:1;display:grid;grid-template-columns:1fr 1fr;gap:8px;align-content:start;min-width:0">${lbProfileLoading?`<div style="grid-column:1/-1;color:#9ca3af;font-size:12px;text-align:center;padding:16px 0">Loading insights…</div>`:boxes}</div>`
       + `</div></div>`;
     const back=document.getElementById('bnc-prof-back');
     if(back) back.onclick=()=>{ lbProfile=null; lbProfileIns=null; renderLbPanel(); };
@@ -5087,11 +5220,728 @@
       };
     }
   }
+  // ---- GRAPHICS FILTERS (F4 > Graphics tab) ----
+  // One layer: plain CSS filter primitives on the game render surface only
+  // (never the panel or the page, so the UI stays untinted while the game is
+  // filtered). A preset is just a named bundle of slider values, so applying
+  // one writes the sliders - the panel can never disagree with the canvas.
+  // Values live in GM storage and are re-applied on a slow poll, because Unity
+  // can swap the canvas (resolution change, fullscreen) at any time.
+  const GFX_KEYS=['tint','saturation','brightness','contrast','grayscale'];
+  const GFX_DEF={ tint:0, saturation:100, brightness:100, contrast:100, grayscale:0 };
+  const GFX_RANGES={ tint:[-180,180], saturation:[0,200], brightness:[50,150], contrast:[50,150], grayscale:[0,100] };
+  // Each preset is only a bundle of the five sliders above, applied by writing
+  // them: tint is hue-rotate (negative = warmer, positive = cooler), then
+  // saturate, brightness, contrast and grayscale ride on top. Colour-vision
+  // entries rotate the hue axis and lift saturation so the colours a player
+  // confuses land further apart - they do not simulate the deficiency.
+  const GFX_PRESETS={
+    none:{ label:'None', values:{ tint:0, saturation:100, brightness:100, contrast:100, grayscale:0 } },
+    custom:{ label:'Custom' },
+    vivid:{ label:'Vivid', values:{ tint:0, saturation:142, brightness:104, contrast:112, grayscale:0 } },
+    competitive:{ label:'Competitive', values:{ tint:0, saturation:118, brightness:104, contrast:124, grayscale:0 } },
+    night:{ label:'Night', values:{ tint:26, saturation:70, brightness:134, contrast:106, grayscale:0 } },
+    warm:{ label:'Warm', values:{ tint:-16, saturation:112, brightness:104, contrast:102, grayscale:0 } },
+    cool:{ label:'Cool', values:{ tint:18, saturation:108, brightness:102, contrast:104, grayscale:0 } },
+    mono:{ label:'Mono', values:{ tint:0, saturation:0, brightness:106, contrast:118, grayscale:0 } },
+    protanopia:{ label:'Red-weak (protanopia)', values:{ tint:-30, saturation:132, brightness:106, contrast:110, grayscale:0 } },
+    deuteranopia:{ label:'Green-weak (deuteranopia)', values:{ tint:32, saturation:132, brightness:106, contrast:110, grayscale:0 } },
+    tritanopia:{ label:'Blue-weak (tritanopia)', values:{ tint:-52, saturation:128, brightness:104, contrast:108, grayscale:0 } },
+  };
+  function gfxNum(k, def){
+    try{
+      const r=GFX_RANGES[k]||[0,100];
+      let v=Number(GMGet('bnc_gfx_'+k, def));
+      if(!isFinite(v)) v=def;
+      return Math.max(r[0], Math.min(r[1], Math.round(v)));
+    }catch{ return def; }
+  }
+  function gfxCfg(){
+    try{
+      let preset=String(GMGet('bnc_gfx_preset','none')||'none');
+      if(!GFX_PRESETS[preset]) preset='none';
+      const out={ preset };
+      GFX_KEYS.forEach(k=>{ out[k]=gfxNum(k, GFX_DEF[k]); });
+      return out;
+    }catch{ return Object.assign({ preset:'none' }, GFX_DEF); }
+  }
+  // CSS filter string for a config: first-applied primitive wins, so tint sees
+  // the raw canvas and grayscale flattens whatever the rest produced.
+  function gfxCss(cfg){
+    const c=cfg||gfxCfg();
+    const parts=[];
+    if(c.tint!==0) parts.push('hue-rotate('+c.tint+'deg)');
+    if(c.saturation!==100) parts.push('saturate('+c.saturation+'%)');
+    if(c.brightness!==100) parts.push('brightness('+c.brightness+'%)');
+    if(c.contrast!==100) parts.push('contrast('+c.contrast+'%)');
+    if(c.grayscale>0) parts.push('grayscale('+c.grayscale+'%)');
+    return parts.join(' ');
+  }
+  function gfxTargets(){
+    const out=[];
+    try{ document.querySelectorAll('canvas').forEach(c=>{ if(c) out.push(c); }); }catch{}
+    return out;
+  }
+  let _gfxOwned=[];
+  // css null = plain reset. Idempotent: safe to call on a timer (it only
+  // touches style.filter when the string actually changed).
+  function gfxApply(){
+    try{
+      const css=gfxCss();
+      const targets=gfxTargets();
+      for(const el of _gfxOwned){ if(!css || targets.indexOf(el)<0){ try{ if(el.style.filter) el.style.filter=''; }catch{} } }
+      for(const el of targets){ try{ if(el.style.filter!==css) el.style.filter=css; }catch{} }
+      _gfxOwned=targets;
+      return css;
+    }catch{ return ''; }
+  }
+  function gfxWrite(k, v){ try{ GMSet('bnc_gfx_'+k, v); }catch{} }
+  // Manual slider change: the values are the truth, so the named preset steps
+  // aside and the chips fall back to "Custom".
+  function gfxPersist(k, v){
+    try{
+      if(k!=='preset'){
+        const cur=gfxCfg().preset;
+        const base=GFX_PRESETS[cur] && GFX_PRESETS[cur].values;
+        if(base && Number(base[k])!==Number(v)) gfxWrite('preset','custom');
+      }
+    }catch{}
+    gfxWrite(k, v);
+    try{ gfxApply(); }catch{}
+  }
+  // Picking a preset writes every slider it bundles, then re-applies once.
+  function gfxUsePreset(name){
+    const p=GFX_PRESETS[name];
+    if(!p || !p.values) return;  // 'custom' is a state, not something to apply
+    GFX_KEYS.forEach(k=> gfxWrite(k, p.values[k]));
+    gfxWrite('preset', name);
+    try{ gfxApply(); }catch{}
+  }
+  function renderLbGfx(){
+    const body=document.getElementById('bnc-lb-body');
+    if(!body) return;
+    const sub=document.getElementById('bnc-lb-sub');
+    if(sub) sub.textContent='Game filters — tint, saturation, brightness, contrast, grayscale';
+    const cfg=gfxCfg();
+    const unit=(k)=> k==='tint' ? '°' : '%';
+    const slider=(k, label, hint)=>{
+      const r=GFX_RANGES[k];
+      return '<div style="margin-bottom:10px">'
+        + '<div style="display:flex;justify-content:space-between;font-size:11px;color:#9ca3af"><span>'+label+'</span><span id="bnc-gfx-'+k+'-v" style="color:#fff;font-weight:700">'+cfg[k]+unit(k)+'</span></div>'
+        + '<input id="bnc-gfx-'+k+'" type="range" min="'+r[0]+'" max="'+r[1]+'" value="'+cfg[k]+'" style="width:100%;accent-color:#fff">'
+        + '<div style="font-size:10px;color:#6b7280">'+hint+'</div></div>';
+    };
+    const head=(t)=>'<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:0 0 6px">'+t+'</div>';
+    const presets=Object.keys(GFX_PRESETS).map(k=>{
+      const active=cfg.preset===k;
+      return '<button data-gfx-preset="'+k+'" style="flex:1;min-width:120px;padding:7px 10px;border-radius:999px;font-size:11px;font-weight:700;cursor:pointer;border:1px solid '+(active?'#fff':'rgba(255,255,255,0.12)')+';background:'+(active?'#fff':'#171717')+';color:'+(active?'#000':'#9ca3af')+'">'+GFX_PRESETS[k].label+'</button>';
+    }).join('');
+    const canvases=gfxTargets().length;
+    const css=gfxCss(cfg);
+    body.innerHTML=head('PRESETS')
+      + '<div style="display:flex;gap:8px;flex-wrap:wrap">'+presets+'</div>'
+      + '<div style="font-size:10px;color:#6b7280;margin:8px 0 2px">A preset just sets the sliders below — tweak them after and the chip turns into Custom.</div>'
+      + '<div style="padding:12px 0 6px">'+head('IMAGE')+'</div>'
+      + slider('tint','Tint','Hue rotation. Negative is warmer (reds up), positive is cooler (blues up).')
+      + slider('saturation','Saturation','0% is full greyscale, 200% is vivid.')
+      + slider('brightness','Brightness','Lifts dark rooms without blowing out the whites.')
+      + slider('contrast','Contrast','Separates enemies from busy backgrounds.')
+      + slider('grayscale','Grayscale','Drains colour after everything above.')
+      + '<div style="display:flex;gap:10px;align-items:center;margin-top:8px"><button id="bnc-gfx-reset" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:8px;padding:7px 14px;font-size:12px;font-weight:700;cursor:pointer">Reset all</button></div>'
+      + '<div style="margin-top:12px;font-size:10px;color:#6b7280;line-height:1.7">Applies to the game canvas only — menus and this panel stay untouched.<br>'
+      + (canvases? 'Live on '+canvases+' canvas'+(canvases===1?'':'es')+' in this frame: <code style="color:#e5e7eb">'+(css||'no filter')+'</code>'
+                 : 'No canvas in this frame — press F4 while the game frame has focus so the filter lands on the game surface.')
+      + '</div>';
+    GFX_KEYS.forEach(k=>{
+      const el=document.getElementById('bnc-gfx-'+k);
+      if(!el) return;
+      el.oninput=()=>{
+        const v=Number(el.value);
+        gfxPersist(k, v);
+        const lab=document.getElementById('bnc-gfx-'+k+'-v');
+        if(lab) lab.textContent=v+unit(k);
+      };
+      // Committing the drag re-renders, so the preset chip can go Custom.
+      el.onchange=()=>{ try{ renderLbGfx(); }catch{} };
+    });
+    body.querySelectorAll('[data-gfx-preset]').forEach(b=>{
+      b.onclick=()=>{ if(b.dataset.gfxPreset==='custom') return; gfxUsePreset(b.dataset.gfxPreset); renderLbGfx(); };
+    });
+    const reset=document.getElementById('bnc-gfx-reset');
+    if(reset) reset.onclick=()=>{
+      GFX_KEYS.forEach(k=> gfxWrite(k, GFX_DEF[k]));
+      gfxWrite('preset','none');
+      gfxApply();
+      renderLbGfx();
+      try{ showToast('Graphics reset', false); }catch{}
+    };
+  }
+
+  // ---- PASSIVE COUNTERS (former NERDS TAB) -----------------------------
+  // The Nerds tab (F4) was removed; what remains is only the passive data
+  // feeds with no UI: per-packet net counters, socket ping pairing, socket
+  // notes and the captured GL context list. All cheap (integer adds), never
+  // sampled on a loop, never sent to the API. Kept because the capture path
+  // and the boot hook already write here — deleting the object would mean
+  // touching those hot paths for zero runtime gain.
+  let _nerds={ fps:{frames:0,t0:0,fps:0,ms:0,worstMs:0,hist:[]}, net:{inP:0,inB:0,outP:0,outB:0,rates:{inP:0,inB:0,outP:0,outB:0,avgPkt:0},totalIn:0,totalOut:0,lastAt:0,lastDir:''}, draw:{calls:0,tris:0,verts:0,rates:{calls:0,tris:0},lastCalls:0,lastTris:0}, ws:null, glCtxs:[], raf:null, timer:null, rafLast:0,
+    ping:{ samples:[], last:0, avg:0, min:0, max:0, jitter:0, n:0, at:0, op:0, opName:'', pend:{}, api:{samples:[],last:0,avg:0,min:0,max:0,jitter:0,n:0,at:0,fails:0} } };
+
+  function netLen(d){
+    try{
+      if(!d) return 0;
+      if(typeof d.byteLength==='number') return d.byteLength;
+      if(typeof d.size==='number') return d.size;
+      if(typeof d.length==='number') return d.length;
+    }catch{}
+    return 0;
+  }
+  // Called for EVERY frame on the socket (essential or filtered), so it stays
+  // a couple of integer adds - nothing here may allocate.
+  function _netNote(dir, len){
+    try{
+      const n=Number(len)||0;
+      if(dir==='in'){ _nerds.net.inP++; _nerds.net.inB+=n; _nerds.net.totalIn+=n; }
+      else { _nerds.net.outP++; _nerds.net.outB+=n; _nerds.net.totalOut+=n; }
+      _nerds.net.lastAt=Date.now(); _nerds.net.lastDir=dir;
+    }catch{}
+  }
+  // --- PING ---------------------------------------------------------
+  // Photon answers an OperationRequest (type 2) with an OperationResponse
+  // (type 3) carrying the SAME op code, so a two-byte header peek on both
+  // directions times a real round trip on the socket the game is playing on.
+  // This runs for EVERY frame (essential or filtered), so it allocates nothing
+  // until a pair completes.
+  //
+  // What the recorded captures say about the sample rate (37 sessions): the
+  // client's only frequent traffic is RaiseEvent 253 (~10/s), which the server
+  // never answers, and op 249 appears ZERO times in all of them. The ops that do
+  // come back are Authenticate 230, SetProperties 252, JoinRandomRoom 225,
+  // JoinRoom 226 and CreateRoom 227 - 398 responses across the 37 sessions, a
+  // handful per minute. A socket ping is therefore correct but sparse by
+  // nature; the panel shows how old the sample is instead of pretending the
+  // number is live.
+  // 3s cut-off: a response that lands later than this is a stall, not a ping,
+  // and pairing it would print a 3-second "ping" that never happened.
+  const PING_TTL_MS=3000;   // unanswered request / implausible round trip cut-off
+  const PING_OPS={249:'Ping 249',230:'Authenticate 230',231:'AuthenticateOnce 231',225:'JoinRandomRoom 225',226:'JoinRoom 226',227:'CreateRoom 227',224:'CancelJoinRandom 224',229:'JoinLobby 229',228:'LeaveLobby 228',252:'SetProperties 252',251:'GetProperties 251',220:'GetRegions 220'};
+  function _pingHeader(d){
+    try{
+      if(!d) return null;
+      let v=null;
+      if(typeof ArrayBuffer!=='undefined'){
+        if(d instanceof ArrayBuffer) v=new Uint8Array(d);
+        else if(typeof DataView!=='undefined'&&d instanceof DataView) v=new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
+        else if(ArrayBuffer.isView(d)) v=d;
+      }
+      if(!v||v.length<3) return null;
+      return { type:v[1], code:v[2] };
+    }catch{} return null;
+  }
+  function _pingPush(bucket, rtt){
+    try{
+      if(!bucket) return;
+      const r=Math.round(Number(rtt));
+      if(!(r>=0&&r<60000)) return;
+      // Jitter = EWMA of |this - previous| (mouse-friendly, stable to read).
+      if(bucket.last){ const d=Math.abs(r-bucket.last); bucket.jitter=Math.round(bucket.jitter?((bucket.jitter*7+d)/8):d); }
+      bucket.last=r; bucket.at=Date.now(); bucket.n=(bucket.n||0)+1;
+      bucket.samples.push(r); if(bucket.samples.length>30) bucket.samples.shift();
+      let mn=bucket.samples[0],mx=bucket.samples[0];
+      for(const s of bucket.samples){ if(s<mn) mn=s; if(s>mx) mx=s; }
+      // avg is an EWMA (a quarter of the new sample): a route change shows up
+      // within a few samples instead of waiting out a 30-sample mean, which
+      // read as a number that was right but stuck. min/max stay windowed.
+      const prev=Number(bucket.avg)||0;
+      bucket.avg=prev? Math.round((prev*3+r)/4) : r;
+      bucket.min=mn; bucket.max=mx;
+    }catch{}
+  }
+  function _pingNote(dir, data){
+    try{
+      const h=_pingHeader(data); if(!h) return;
+      const p=_nerds.ping;
+      const now=(typeof performance!=='undefined'&&performance.now)?performance.now():Date.now();
+      if(dir==='out'){
+        if(h.type!==2) return;
+        const q=p.pend[h.code]||(p.pend[h.code]=[]);
+        q.push(now);
+        while(q.length&&(now-q[0])>PING_TTL_MS) q.shift();   // never answered -> stale
+        if(q.length>6) q.shift();
+        return;
+      }
+      if(h.type!==3) return;
+      const q=p.pend[h.code];
+      if(!q||!q.length) return;
+      // Pair with the oldest *live* request: a request nothing ever answered is
+      // dropped here too, otherwise a later response would inherit its age and
+      // print a 4-second "ping".
+      while(q.length&&(now-q[0])>PING_TTL_MS) q.shift();
+      if(!q.length) return;
+      const rtt=now-q.shift();
+      if(!(rtt>=0&&rtt<=PING_TTL_MS)) return;
+      p.op=h.code; p.opName=PING_OPS[h.code]||('op '+h.code);
+      _pingPush(p, rtt);
+    }catch{}
+  }
+  // The stats poll reaches the API over plain HTTPS, so its own round trip is a
+  // second, independent sample - and the only one on a quiet socket.
+  function _apiPing(t0, ok){
+    try{
+      const a=_nerds.ping.api;
+      if(!ok){ a.fails=(a.fails||0)+1; return; }
+      if(!t0) return;
+      const now=(typeof performance!=='undefined'&&performance.now)?performance.now():Date.now();
+      _pingPush(a, now-t0);
+    }catch{}
+  }
+  // Remember the socket we are riding: Photon hosts carry the cluster id
+  // (gcams1128.exitgames.com:19090/game/), which is the closest thing to a
+  // region the client is told about.
+  function _noteWs(url, state){
+    try{
+      const u=String(url||''); if(!u) return;
+      const hostPort=u.replace(/^wss?:\/\//,'').split('/')[0].split('?')[0];
+      const parts=hostPort.split(':');
+      const host=parts[0], port=parts[1]||'';
+      const m=host.match(/^gcams(\d+)/i);
+      _nerds.ws={ url:u.slice(0,120), host:host, port:port, cluster:m?m[1]:null, label:(typeof labelForUrl==='function'?labelForUrl(u):'WS'), state:state||'open', at:Date.now() };
+    }catch{}
+  }
+  // --- FPS CHIP ---------------------------------------------------------
+  // The one number that answers "why does it feel bad", in the top-right corner:
+  // the live frame rate plus this session's worst and best second. It is
+  // click-through by design (pointer-events:none) - the corner still belongs to
+  // the game - and it steps aside for the full-screen panels (never for the
+  // drawer, which is a left-hand panel the corner can coexist with).
+  const FPS_CHIP_ID='bnc-fps-chip';
+  // Panel ROOTS that hide themselves with display:none. Never a card *inside*
+  // one (#bnc-lb-card keeps display:flex while the #bnc-lb overlay around it is
+  // hidden) and never the drawer: the drawer is a LEFT panel that hides by
+  // transform, so once its element exists its inline display never reads 'none'
+  // - consulting it meant "a panel is always open" and the chip stayed
+  // invisible for everyone who plays with the drawer open. The chip sits
+  // top-right, where the drawer never reaches anyway.
+  const FPS_CHIP_PANELS=['bnc-lb','bnc-ranked','bnc-keys','bnc-host11','bnc-host12'];
+  let _fpsChip={ el:null, raf:null, frames:0, t0:0, secFrames:0, secT0:0, fps:0, min:null, max:null, warm:1, hiddenBy:'', lastTs:0, worst:0, winWorst:0 };
+  // Id of the panel covering the chip's corner, or '' when the corner is free.
+  // Returning the id (instead of a boolean) is what makes "I don't see the
+  // chip" answerable from the console: __BNC__.fpsChip.hiddenBy
+  function _fpsChipBlocker(){
+    try{
+      for(const id of FPS_CHIP_PANELS){
+        const el=document.getElementById(id);
+        if(el && el.style && el.style.display && el.style.display!=='none') return id;
+      }
+    }catch{}
+    return '';
+  }
+  function _fpsChipPaint(){
+    const c=_fpsChip, el=c.el;
+    if(!el) return;
+    try{
+      c.hiddenBy=_fpsChipBlocker();
+      if(c.hiddenBy){ el.style.display='none'; return; }
+      el.style.display='block';
+      if(!c.fps){ el.textContent='-- FPS'; return; }   // first window still open
+      el.textContent=c.fps+' FPS \u2193 '+((c.min==null)?'--':c.min)+' MIN FPS \u2191 '+((c.max==null)?'--':c.max)+' MAX FPS'+(c.winWorst>0?' \u00B7 '+c.winWorst+'ms worst':'');
+      el.style.color=(c.fps>=55?'#a7f3d0':(c.fps>=30?'#fde68a':'#fecaca'));
+    }catch{}
+  }
+  function _fpsChipFrame(ts){
+    _fpsChip.raf=null;
+    try{
+      const c=_fpsChip;
+      let hidden=false;
+      try{ hidden=!!document.hidden; }catch{}
+      if(hidden){
+        // rAF pauses in a hidden tab anyway: reset both windows so the first
+        // visible second is measured from a clean start instead of from a
+        // multi-second gap (which would read as one frame per window).
+        c.t0=0; c.frames=0; c.secT0=0; c.secFrames=0; c.warm=1; c.lastTs=0; c.worst=0; c.winWorst=0;
+      } else if(!c.t0){
+        c.t0=ts; c.frames=0; c.secT0=ts; c.secFrames=0; c.lastTs=ts; c.worst=0;
+      } else {
+        const dt=ts-c.t0, sdt=ts-c.secT0;
+        if(dt>0){
+          c.frames++;
+          // Worst SINGLE frame in this window: the 250ms average above hides
+          // individual hitches (fifteen 16ms frames + one 23ms frame still
+          // rounds to 60). Unity's in-game counter is instantaneous-ish, so
+          // it swings while we sit pinned — this field moves with it.
+          // Same-thread only: GPU-bound dips without main-thread delay are
+          // invisible here, and values above display refresh are unobservable.
+          const _d=ts-(c.lastTs||ts);
+          if(_d>0 && _d<1000) c.worst=Math.max(c.worst||0,_d);
+          c.lastTs=ts;
+        }
+        if(sdt>0) c.secFrames++;
+        // Headline: repaint four times a second. A full second between updates
+        // is what read as "accurate but slow" - the frame rate changes faster
+        // than the number did.
+        if(dt>=250){
+          const fps=Math.round(c.frames*1000/dt);
+          c.frames=0; c.t0=ts;
+          if(fps>0 && fps<=1000){ c.fps=fps; c.winWorst=Math.round((c.worst||0)*10)/10; _fpsChipPaint(); }
+          c.worst=0;
+        }
+        // MIN/MAX keep their one-second meaning: the worst and best second
+        // since load, so a dip is visible without every quarter-second window
+        // rewriting the extremes.
+        if(sdt>=1000){
+          const sec=Math.round(c.secFrames*1000/sdt);
+          c.secFrames=0; c.secT0=ts;
+          // The first second after a load or a tab switch is a warm-up, not a
+          // sample: it would poison MIN forever ("min 3 FPS" on every boot).
+          if(c.warm>0) c.warm--;
+          else if(sec>0 && sec<=1000){
+            c.min=(c.min==null)?sec:Math.min(c.min,sec);
+            c.max=(c.max==null)?sec:Math.max(c.max,sec);
+            _fpsChipPaint();
+          }
+        }
+      }
+    }catch{}
+    try{ _fpsChip.raf=requestAnimationFrame(_fpsChipFrame); }catch{}
+  }
+  function _fpsChipHome(){
+    // Re-parent into the fullscreen element when there is one: a fixed chip on
+    // the body is not rendered while a wrapper element is fullscreen. (A bare
+    // <canvas> cannot overlay children, so fullscreen canvases still win.)
+    try{
+      const el=_fpsChip.el||document.getElementById(FPS_CHIP_ID);
+      if(!el) return;
+      const fsEl=document.fullscreenElement||document.webkitFullscreenElement||null;
+      const host=(fsEl && fsEl.tagName && fsEl.tagName!=='CANVAS') ? fsEl : (document.body||document.documentElement);
+      if(host && el.parentNode!==host) host.appendChild(el);
+    }catch{}
+  }
+  function mountFpsChip(){
+    try{
+      if(document.getElementById(FPS_CHIP_ID)) return;
+      const el=document.createElement('div');
+      el.id=FPS_CHIP_ID;
+      el.title='BuildNow Companion - frame rate (mouse click-through)';
+      el.style.cssText=[
+        'position:fixed','top:8px','right:8px','z-index:2147483645',
+        'pointer-events:none','user-select:none',
+        'font:800 11px/1.25 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
+        'color:#a7f3d0','background:rgba(0,0,0,0.46)',
+        'border:1px solid rgba(255,255,255,0.12)','border-radius:8px',
+        'padding:4px 8px','text-shadow:0 1px 2px rgba(0,0,0,0.65)',
+        'letter-spacing:.02em','white-space:nowrap'
+      ].join(';');
+      el.textContent='-- FPS';
+      (document.body||document.documentElement).appendChild(el);
+      _fpsChip.el=el;
+      _fpsChipHome();
+      _fpsChipPaint();
+      if(_fpsChip.raf==null) _fpsChip.raf=requestAnimationFrame(_fpsChipFrame);
+      // Mount + verdict in the console: that pair is what tells a "the script
+      // never ran" report apart from a chip that is mounted but hidden.
+      logInfo('[FPS] chip mounted (top-right, click-through)');
+      setTimeout(()=>{ try{ _fpsChipPaint(); logInfo(_fpsChip.hiddenBy?('[FPS] chip hidden while #'+_fpsChip.hiddenBy+' is open'):'[FPS] chip visible'); }catch{} }, 600);
+    }catch{}
+  }
+  try{ setTimeout(mountFpsChip, 1200); }catch{}
+  try{ document.addEventListener('fullscreenchange', _fpsChipHome); }catch{}
+  try{ document.addEventListener('webkitfullscreenchange', _fpsChipHome); }catch{}
+  function _gameCanvas(){
+    try{
+      const all=[...document.querySelectorAll('canvas')].filter(c=>c && c.width>0 && c.height>0);
+      if(!all.length) return null;
+      all.sort((a,b)=>(b.width*b.height)-(a.width*a.height));
+      return all[0];
+    }catch{ return null; }
+  }
+  // The game's WebGL context is CAPTURED, never created. Asking a canvas for a
+  // context type it does not have is harmless, but asking one that has no
+  // context yet CREATES it - a second context on Unity's canvas breaks the
+  // game's boot (PlayerLoop recursion, "Runtime is not defined"). So the canvas
+  // getContext is wrapped as early as this script runs (see the capture hook at
+  // the bottom of this file) and this side only ever reads what the game itself
+  // asked for. If the script loaded after the game already had its context,
+  // there is nothing to read and the tab says so instead of probing.
+  function _rememberGl(gl){
+    try{
+      if(!gl || typeof gl.getParameter!=='function') return;
+      if(_nerds.glCtxs.some(c=>c.gl===gl)) return;
+      _nerds.glCtxs.push({ gl:gl, canvas:gl.canvas||null, at:Date.now() });
+      if(_nerds.glCtxs.length>4) _nerds.glCtxs.shift();
+    }catch{}
+  }
+  // ---- DISCORD RICH PRESENCE (F4 > Presence tab) ----
+  // The userscript owns only what it alone knows (scene, ranked session,
+  // tourney, private-party pID) and pushes plain facts to the local Python
+  // bridge, which formats them and drives Discord. Bridge defaults to
+  // 127.0.0.1:8765 and falls back to 8766-8769 when the decryptor already owns
+  // 8765; rpcProbe() asks each candidate /health and keeps the one that
+  // answers as the presence bridge, so both services run side by side.
+  const RPC_DEF={ enabled:false, port:8765, auto:true };
+  const RPC_PORTS=[8765,8766,8767,8768,8769];
+  const RPC_SERVICE='nectar-rich-presence';
+  // 15s: fast enough that a scene flip lands on the card while it still
+  // matters, slow enough to be invisible. The bridge's stale window is 45s, so
+  // one missed push can never blank the card.
+  const RPC_PUSH_MS=15000;
+  const RPC_VIEW_MS=15000;   // how often the panel re-reads what Discord is showing
+  // The tray app is how this runs in practice: it hosts the bridge in-process
+  // (and the decryptor next to it), so there is no second terminal to keep open.
+  // Users are pointed at the tray, never at a Python command line: the packaged
+  // build is a double-click, and the source path is only the fallback for
+  // machines without it.
+  const RPC_CMD='python companion/tray/tray_app.py';
+  const RPC_TRAY_CMD = (()=>{
+    try{ return /win/i.test(String(navigator.platform||navigator.userAgent||'')) ? 'dist\\BuildNowTray.exe' : RPC_CMD; }catch{ return RPC_CMD; }
+  })();
+  let _rpc={ port:null, up:false, discord:false, probing:false, lastPush:0, lastErr:'', timer:null, since:0, lastSig:'', lastKey:'',
+             activity:null, activityMode:'', activityAt:0, view:null };
+  function rpcCfg(){
+    try{
+      let port=Number(GMGet('bnc_rpc_port', RPC_DEF.port));
+      if(!isFinite(port) || port<1 || port>65535) port=RPC_DEF.port;
+      return { enabled:GMGet('bnc_rpc_enabled', RPC_DEF.enabled)===true, port:port, auto:GMGet('bnc_rpc_auto', RPC_DEF.auto)!==false };
+    }catch{ return Object.assign({}, RPC_DEF); }
+  }
+  function rpcUrl(port, path){ return 'http://127.0.0.1:'+port+path; }
+  function rpcHttp(port, path, opts, cb){
+    const o=opts||{};
+    const method=o.method||'GET';
+    const body=o.body||null;
+    const done=(ok, txt)=>{ let j=null; try{ j=txt?JSON.parse(txt):null; }catch{ j=null; } try{ cb(!!ok, j, txt||''); }catch{} };
+    try{
+      const GM=(typeof GM_xmlhttpRequest!=='undefined') ? GM_xmlhttpRequest : ((typeof unsafeWindow!=='undefined' && unsafeWindow.GM_xmlhttpRequest) || null);
+      if(GM){
+        GM({ method:method, url:rpcUrl(port,path), data:body?JSON.stringify(body):undefined, headers:body?{'Content-Type':'application/json'}:undefined, timeout:4000,
+             onload:r=>done(r.status>=200&&r.status<300, r.responseText), onerror:()=>done(false,''), ontimeout:()=>done(false,'') });
+        return;
+      }
+    }catch{}
+    try{
+      fetch(rpcUrl(port,path), { method:method, headers:body?{'Content-Type':'application/json'}:undefined, body:body?JSON.stringify(body):undefined })
+        .then(r=>r.text().then(t=>done(r.ok,t)).catch(()=>done(false,'')))
+        .catch(()=>done(false,''));
+    }catch{ done(false,''); }
+  }
+  function rpcProbe(cb){
+    const cfg=rpcCfg();
+    const cands=cfg.auto ? RPC_PORTS : [cfg.port];
+    let i=0;
+    _rpc.probing=true;
+    const step=()=>{
+      if(i>=cands.length){ _rpc.probing=false; _rpc.up=false; _rpc.port=null; try{ cb&&cb(false); }catch{} return; }
+      const port=cands[i++];
+      rpcHttp(port, '/health', null, (ok, j)=>{ if(ok && j && String(j.service||'')===RPC_SERVICE){ _rpc.probing=false; _rpc.up=true; _rpc.port=port; _rpc.discord=!!j.discord; try{ cb&&cb(true); }catch{} } else step(); });
+    };
+    step();
+  }
+  // Facts only — the bridge owns wording, icons and the join button.
+  function rpcFacts(){
+    const sess=(statsCache&&statsCache.session)||null;
+    const tag=(sess&&sess.tag)||null;
+    let inMatch=false, gmKey=null, duo=false;
+    try{ inMatch=!!_optimisticState.inMatch; }catch{}
+    try{
+      if(sess){
+        if(typeof sess.game_mode==='string' && sess.game_mode) gmKey=sess.game_mode;
+        duo=String(sess.game_variant||'').toLowerCase()==='duo';
+      }
+    }catch{}
+    // One authority for "am I in a match": effInMatch() is freshest-first (the
+    // scene/auth/leave packets, then the capture shadow, then the server).
+    // Reading sess.state straight into inMatch is what pinned the card on
+    // "In Match - <mode>" while the player was in the lobby.
+    try{ const eff=effInMatch(); if(eff!==null) inMatch=!!eff; }catch{}
+    let gmLabel=null;
+    try{ gmLabel=gmKey?fmtGmDrawer(gmKey, duo):null; }catch{}
+    let partyActive=false, pid=null;
+    try{ partyActive=!!(sess&&sess.party&&sess.party.is_party); }catch{}
+    if(partyActive){
+      // The drawer's own rule, with the drawer's own sources: the room we are
+      // standing in first (that code is what a friend can type), then the
+      // session's party/short code - a party formed in the lobby has no room
+      // code of its own, and without that fallback the card read "in a party"
+      // with no way in at all. Same 5-char gate the game uses for a pID.
+      try{ pid=myLiveCode(); }catch{}
+      if(!pid){ try{ pid=getPartyInfo(sess).code; }catch{} }
+      if(pid){ pid=String(pid).trim().toUpperCase(); if(!/^[A-Z0-9]{5}$/.test(pid)) pid=null; }
+    }
+    const rt=(statsCache&&statsCache.ranked_tourney)||null;
+    const ct=(statsCache&&statsCache.comp_tourney)||null;
+    const rk=(statsCache&&statsCache.ranked)||null;
+    let kind=null, name=null, extra=null;
+    if(tag && String(tag.kind||'').toLowerCase()==='tourney' && tag.name){ kind='tourney'; name=String(tag.name); }
+    if(!kind && rt && rt.name){ kind='tourney'; name=String(rt.name); }
+    if(!kind && ct && ct.name){ kind='tourney'; name=String(ct.name); }
+    // Field size only. Rank and points never ride along: a Discord card is
+    // visible to the whole friends list, so the ladder stays private.
+    if(kind==='tourney'){
+      const t=rt||ct||null;
+      if(t && t.players!=null) extra=Number(t.players)+' in tourney';
+    } else if(rk && (rk.active || rk.short_code)){
+      kind='ranked'; name='Ranked Session';
+    }
+    // (X/Y) on the activity line: players in this match over the room's max.
+    let cur=null, max=null;
+    try{ if(sess){ if(sess.players_count!=null) cur=Number(sess.players_count)||0; if(sess.max_players!=null) max=Number(sess.max_players)||0; } }catch{}
+    let scene=null;
+    try{ scene=_optimisticState.curScn||null; }catch{}
+    const status=inMatch?'match':(sess?'lobby':'menu');
+    const key=status+'|'+(kind||'')+'|'+(name||'');
+    if(key!==_rpc.lastKey){ _rpc.lastKey=key; _rpc.since=Date.now(); }
+    if(!_rpc.since) _rpc.since=Date.now();
+    return {
+      version: BNC_VERSION,
+      ts: Date.now(),
+      since: _rpc.since,
+      user: String(GMGet('bnc_game_username','')||((statsCache&&statsCache.game_username)||''))||null,
+      status: status,
+      scene: scene,
+      party: { active: partyActive, private: !!(partyActive&&pid), pid: pid||null },
+      mode: { key: gmKey, label: gmLabel },
+      context: { kind: kind, name: name, extra: extra },
+      players: { cur: cur, max: max },
+    };
+  }
+  function rpcPush(force){
+    try{
+      if(!rpcCfg().enabled) return;
+      if(!_rpc.port){
+        rpcProbe((up)=>{ if(up) rpcPush(force); else { _rpc.lastErr='bridge not found on '+RPC_PORTS.join('/'); try{ if(lbTab==='presence') renderLbRpc(); }catch{} } });
+        return;
+      }
+      const facts=rpcFacts();
+      const sig=JSON.stringify(facts);
+      if(!force && sig===_rpc.lastSig && (Date.now()-_rpc.lastPush)<RPC_PUSH_MS) return;
+      _rpc.lastSig=sig;
+      rpcHttp(_rpc.port, '/presence', { method:'POST', body:facts }, (ok, j)=>{
+        if(ok && j){
+          _rpc.up=true; _rpc.discord=!!j.discord; _rpc.lastErr=j.discord?'':String(j.error||''); _rpc.lastPush=Date.now();
+          // The bridge echoes back exactly what it handed Discord: the status
+          // dot reads `discord` from it, and the activity is kept for debugging.
+          if(j.activity){ _rpc.activity=j.activity; _rpc.activityAt=Date.now(); }
+          if(j.mode) _rpc.activityMode=String(j.mode);
+        } else {
+          _rpc.up=false; _rpc.port=null; _rpc.lastErr='bridge error (is rich_presence.py running?)';
+        }
+        try{ if(lbTab==='presence') renderLbRpc(); }catch{}
+      });
+    }catch{}
+  }
+  function rpcClear(){
+    try{
+      const port=_rpc.port||rpcCfg().port;
+      rpcHttp(port, '/clear', { method:'POST', body:{} }, ()=>{ _rpc.lastSig=''; _rpc.activity=null; _rpc.activityMode='cleared'; _rpc.activityAt=Date.now(); try{ if(lbTab==='presence') renderLbRpc(); }catch{} });
+    }catch{}
+  }
+  // Keeps the panel's status fresh while it is open: /health reports whether
+  // the bridge reached Discord (the tray's answer, not our guess at it).
+  function rpcFetchActivity(cb){
+    try{
+      const port=_rpc.port||rpcCfg().port;
+      const cands=_rpc.port?[_rpc.port]:(rpcCfg().auto?RPC_PORTS:[rpcCfg().port]);
+      let i=0;
+      const step=()=>{
+        if(i>=cands.length){ try{ cb&&cb(false); }catch{} return; }
+        const p=cands[i++];
+        rpcHttp(p, '/health', null, (ok, j)=>{
+          if(ok && j && String(j.service||'')===RPC_SERVICE){
+            _rpc.up=true; _rpc.port=p; _rpc.discord=!!j.discord; _rpc.probing=false;
+            _rpc.activity=(j.activity||null); _rpc.activityAt=Date.now(); _rpc.activityMode=String(j.mode||'');
+            try{ cb&&cb(true); }catch{}
+          } else step();
+        });
+      };
+      step();
+    }catch{ try{ cb&&cb(false); }catch{} }
+  }
+  // The preview refreshes on its own 15s clock, only while the tab is open.
+  function startRpcView(){
+    if(_rpc.view) return;   // already ticking: several render paths call this
+    const beat=()=>{
+      try{
+        if(lbTab!=='presence' || !lbPanel || lbPanel.style.display==='none'){ stopRpcView(); return; }
+        rpcFetchActivity(()=>{ try{ renderLbRpc(); }catch{} });
+      }catch{}
+    };
+    try{ _rpc.view=setInterval(beat, RPC_VIEW_MS); }catch{}
+    beat();
+  }
+  function stopRpcView(){
+    try{ if(_rpc.view){ clearInterval(_rpc.view); _rpc.view=null; } }catch{}
+  }
+  function rpcStop(){
+    try{ if(_rpc.timer){ clearInterval(_rpc.timer); _rpc.timer=null; } }catch{}
+    try{ if(_rpc.port) rpcHttp(_rpc.port, '/clear', { method:'POST', body:{} }, ()=>{}); }catch{}
+    _rpc.up=false; _rpc.port=null; _rpc.lastSig='';
+  }
+  function rpcStart(){
+    try{
+      rpcStop();
+      if(!rpcCfg().enabled){ try{ if(lbTab==='presence') renderLbRpc(); }catch{} return; }
+      rpcProbe((up)=>{ if(up) rpcPush(true); else { _rpc.lastErr='bridge not found on '+RPC_PORTS.join('/'); try{ if(lbTab==='presence') renderLbRpc(); }catch{} } });
+      _rpc.timer=setInterval(()=>{ try{ if(!_rpc.port) rpcProbe((up)=>{ if(up) rpcPush(true); }); else rpcPush(false); }catch{} }, RPC_PUSH_MS);
+    }catch{}
+  }
+  function rpcSet(k, v){
+    try{ GMSet('bnc_rpc_'+k, v); }catch{}
+    if(k==='enabled' || k==='port' || k==='auto'){ _rpc.port=null; rpcStart(); }
+    try{ if(lbTab==='presence') renderLbRpc(); }catch{}
+  }
+  function renderLbRpc(){
+    const body=document.getElementById('bnc-lb-body');
+    if(!body) return;
+    const sub=document.getElementById('bnc-lb-sub');
+    if(sub) sub.textContent='Show what you are playing on Discord';
+    const cfg=rpcCfg();
+    const on=!!cfg.enabled;
+    const up=!!_rpc.up;
+    const live=up && _rpc.discord;
+    const dot=!on?'#6b7280':(live?'#10b981':(up?'#eab308':'#ef4444'));
+    // User wording only: what they get, what is missing, what to do about it.
+    const state=!on?'Off'
+      :(live?'On — your friends can see what you are playing.'
+          :(up?'The tray is running, but the Discord app is closed. Open Discord and it updates itself.'
+               :(_rpc.probing?'Looking for the tray…':'The tray is not running yet — launch it below.')));
+    const esc=(v)=> String(v==null?'':v).replace(/</g,'&lt;');
+    const btn='background:#1f2937;color:#e5e7eb;border:0;border-radius:8px;padding:8px 14px;font-size:11px;font-weight:700;cursor:pointer';
+    // No card preview here on purpose: the panel is the switch and the status,
+    // nothing else. What the card says lives on Discord itself.
+    body.innerHTML='<label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#e5e7eb;font-weight:700;cursor:pointer"><input type="checkbox" id="bnc-rpc-enabled"'+(on?' checked':'')+' style="accent-color:#fff"> Show what I\'m playing on Discord</label>'
+      + '<div style="display:flex;align-items:center;gap:8px;margin:10px 0 2px;font-size:12px;color:'+dot+';font-weight:700"><span style="width:8px;height:8px;border-radius:50%;background:'+dot+';display:inline-block"></span>'+esc(state)+'</div>'
+      + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:14px">'
+      + (live
+          ? '<button id="bnc-rpc-tray" disabled style="'+btn+';opacity:.45;cursor:default">Tray is running</button>'
+          : '<button id="bnc-rpc-tray" style="'+btn+';background:#fff;color:#000">Launch the tray</button>')
+      + '<button id="bnc-rpc-push" style="'+btn+'">Refresh now</button>'
+      + '<button id="bnc-rpc-clear" style="'+btn+'">Clear card</button>'
+      + '</div>'
+      + '<div style="margin-top:10px;font-size:11px;color:#6b7280;line-height:1.7">'
+      + 'The tray is one small app that keeps this and the game connection running in the background: launch it once and leave it in the system tray. Discord must be open for the card to appear.'
+      + '</div>'
+      + '<div style="margin-top:14px;font-size:11px;color:#6b7280;line-height:1.7">Friends see your mode, the scene you are in and whether you are in a party — never your rank or points. Two buttons ride along: <b>Join Nectar</b>, and <b>Join my party</b> while your party has a code to share. A lobby with no mode picked yet reads <b>Idle</b> on the card.</div>'
+      + '<label style="display:flex;align-items:center;gap:6px;margin-top:14px;font-size:11px;color:#9ca3af;cursor:pointer"><input type="checkbox" id="bnc-rpc-auto"'+(cfg.auto?' checked':'')+' style="accent-color:#fff"> Auto-detect the tray</label>';
+    const en=document.getElementById('bnc-rpc-enabled');
+    if(en) en.onchange=()=>{ rpcSet('enabled', en.checked); };
+    const auto=document.getElementById('bnc-rpc-auto');
+    if(auto) auto.onchange=()=>{ rpcSet('auto', auto.checked); };
+    const tray=document.getElementById('bnc-rpc-tray');
+    if(tray) tray.onclick=()=>{ try{ copyText(RPC_TRAY_CMD, 'Tray ready — launch it once and leave it running'); }catch{} };
+    const push=document.getElementById('bnc-rpc-push');
+    if(push) push.onclick=()=>{ if(!rpcCfg().enabled){ try{ showToast('Turn presence on first', false); }catch{} return; } _rpc.lastSig=''; _rpc.lastErr=''; _rpc.port=null; rpcStart(); };
+    const clr=document.getElementById('bnc-rpc-clear');
+    if(clr) clr.onclick=()=>rpcClear();
+  }
+  // Filters re-apply after the game swaps canvases; presence pushes on its own
+  // timer so it keeps working with the panel closed.
+  try{ setInterval(()=>{ try{ gfxApply(); }catch{} }, 4000); }catch{}
+  try{ setTimeout(()=>{ try{ gfxApply(); }catch{} try{ rpcStart(); }catch{} }, 1500); }catch{}
+
   const PLAYSTYLE_TIPS={
     Aggressor:'Drops into fights: 3+ kills per match with a strong K/D.',
     Anchor:'Holds ground: solid K/D and wins half or more of the matches.',
     Support:'Plays for the team: fewer kills but a steady win rate.',
-    Wildcard:'Unpredictable mix â€” every lobby is different.',
+    Wildcard:'Unpredictable mix — every lobby is different.',
   };
 
   // --- KEYBINDS / SETTINGS MENU (Ctrl+Shift+K) ---
@@ -5101,7 +5951,7 @@
     const ov=document.createElement('div');
     ov.id='bnc-keys';
     Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483646', background:'rgba(0,0,0,0.54)', display:'none', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif'});
-    ov.innerHTML = `<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:20px;min-width:360px;max-width:520px;color:#e5e7eb"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><b style="font-size:15px;color:#fff">BuildNow Companion - Shortcuts & Settings</b><button id="bnc-keys-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 8px;cursor:pointer">Close</button></div><div id="bnc-keys-list" style="display:flex;flex-direction:column;gap:6px;font-size:12px"></div><div style="display:flex;gap:8px;margin-top:12px"><button id="bnc-keys-open-drawer" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open player info</button><button id="bnc-keys-open-ranked" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open ranked panel</button><button id="bnc-keys-open-lb" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open leaderboard</button></div><div style="margin-top:8px;font-size:11px;color:#9ca3af"><code>&#96;</code> - This menu (rebindable like any row; Ctrl+Shift+K still works)</div><div style="margin-top:10px;font-size:11px;opacity:0.7">Panels open with one key: <b>F2</b> player info Â· <b>F4</b> leaderboard Â· <b>F9</b> ranked. Mac: F-keys work as-is (on small MacBooks hold <b>Fn</b>). Combos with Ctrl/âŒ˜ also work via Change.</div><div style="margin-top:10px"><button id="bnc-keys-reset" style="width:100%;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Reset all shortcuts to defaults</button></div><div id="bnc-dev-row" style="margin-top:14px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);font-size:11px;opacity:0.7">Settings: <label style="cursor:pointer"><input type="checkbox" id="bnc-dev-toggle"> Dev mode (feed)</label></div></div>`;
+    ov.innerHTML = `<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:20px;min-width:360px;max-width:520px;color:#e5e7eb"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><b style="font-size:15px;color:#fff">BuildNow Companion - Shortcuts & Settings</b><button id="bnc-keys-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 8px;cursor:pointer">Close</button></div><div id="bnc-keys-list" style="display:flex;flex-direction:column;gap:6px;font-size:12px"></div><div style="display:flex;gap:8px;margin-top:12px"><button id="bnc-keys-open-drawer" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open player info</button><button id="bnc-keys-open-ranked" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open ranked panel</button><button id="bnc-keys-open-lb" style="flex:1;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Open leaderboard</button></div><div style="margin-top:8px;font-size:11px;color:#9ca3af"><code>&#96;</code> - This menu (rebindable like any row; Ctrl+Shift+K still works)</div><div style="margin-top:10px;font-size:11px;opacity:0.7">Panels open with one key: <b>F2</b> player info · <b>F4</b> leaderboard · <b>F9</b> ranked. Mac: F-keys work as-is (on small MacBooks hold <b>Fn</b>). Combos with Ctrl/⌘ also work via Change.</div><div style="margin-top:10px"><button id="bnc-keys-reset" style="width:100%;padding:7px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#171717;color:#e5e7eb;font-size:12px;font-weight:700;cursor:pointer">Reset all shortcuts to defaults</button></div><div id="bnc-dev-row" style="margin-top:14px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);font-size:11px;opacity:0.7">Settings: <label style="cursor:pointer"><input type="checkbox" id="bnc-dev-toggle"> Dev mode (feed)</label></div></div>`;
     (document.body||document.documentElement).appendChild(ov);
     ov.addEventListener('click', (e)=>{ if(e.target===ov) ov.style.display='none'; });
     ov.querySelector('#bnc-keys-close').onclick=()=> ov.style.display='none';
@@ -5119,7 +5969,7 @@
         try{
           BNC_BINDS.forEach(b=>{ try{ GMDel(b.key); }catch{} });
           renderKeybindRows();
-          showToast('Shortcuts reset: F2 player info Â· F4 leaderboard Â· F9 ranked', false);
+          showToast('Shortcuts reset: F2 player info · F4 leaderboard · F9 ranked', false);
         }catch{}
       };
     }catch{}
@@ -5154,7 +6004,7 @@
     _keybindCapturing=true;
     try{ _keybindCaptureAt=Date.now(); }catch{}
     const orig=btn.textContent;
-    btn.textContent='Pressâ€¦';
+    btn.textContent='Press…';
     const hint=document.createElement('span');
     hint.style.cssText='font-size:11px;color:#6b7280';
     hint.textContent='Press any key or combo. Esc to cancel.';
@@ -5173,7 +6023,7 @@
       const nb={ctrl:!!e.ctrlKey, meta:!!e.metaKey, shift:!!e.shiftKey, alt:!!e.altKey, key:String(e.key).toUpperCase(), code:String(e.code||'').toUpperCase()||null};
       if(!nb.key) return;
       const warn=bindWarning(nb, b.id);
-      if(warn){ hint.textContent='âš  '+warn; return; }  // stay capturing
+      if(warn){ hint.textContent='⚠ '+warn; return; }  // stay capturing
       try{ GMSet(b.key, JSON.stringify(nb)); }catch{ try{ GMSet(b.key, nb); }catch{} }
       done(`${b.label} set to ${formatKeybind(nb)}`);
     };
@@ -5188,6 +6038,10 @@
     if(_keybindCapturing) return;
     try{ releaseStuckCapture(); }catch{}
     if((e.key||'')!=='Escape'){ try{ if(untrapHoldActive()) return; }catch{} }
+    // Held-key auto-repeat must never re-fire toggles: the repeat would
+    // instantly undo the press (F9 panel flashing open-shut). Nothing in
+    // this dispatcher is repeat-meaningful — every action is a toggle/menu.
+    if(e.repeat) return;
     if (isModalOrInputFocused() || isTypingKey()) return;
     if((e.key||'')==='Escape' && typeof lbPanel!=='undefined' && lbPanel && lbPanel.style.display!=='none' && lbPanel.style.display){ e.preventDefault(); try{ untrapRelease(); }catch{} toggleLbPanel(false); return; }
     if((e.key||'')==='Escape' && typeof rankedPanel!=='undefined' && rankedPanel && rankedPanel.style.display!=='none' && rankedPanel.style.display){ e.preventDefault(); toggleRankedPanel(false); return; }
@@ -5201,7 +6055,7 @@
     if(modKey(e) && e.shiftKey && (e.key||'').toUpperCase()==='K'){ e.preventDefault(); e.stopPropagation(); toggleKeybinds(); }
   }, true);
 
-  // Ranked UI removed â€” ranked is not ready. (Host mode toggle removed too;
+  // Ranked UI removed — ranked is not ready. (Host mode toggle removed too;
   // individualist tracking only for now.)
 
   function isPhotonUrl(url){ if(!url) return false; const u=String(url); if(u.includes(APP_ID)) return true; for(const h of PHOTON_HOSTS) if(u.toLowerCase().includes(h)) return true; if(u.includes('wss://')&&u.includes('exitgames')) return true; return false; }
@@ -5231,11 +6085,11 @@
   let lastCaptureBlockedLog=0;
   // Capture health: stamped on every successful /api/capture. The drawer dot
   // is stats-based (green while stats poll), which hides a dead capture
-  // session â€” these counters let the dot + logs tell them apart. Never raise.
+  // session — these counters let the dot + logs tell them apart. Never raise.
   let lastCaptureOkAt=0, _capFails=0, _capSeen=0, _lastCapWarn=0;
   function captureAgeMs(){ try{ return lastCaptureOkAt? Date.now()-lastCaptureOkAt : -1; }catch{ return -1; } }
   // Footer dot truth: Offline (no api) / Login (no session) / Online (capture
-  // fresh <90s) / Idle (hook alive, no essential packets â€” normal lobby idle)
+  // fresh <90s) / Idle (hook alive, no essential packets — normal lobby idle)
   // / Cap STALE (hook dead too, no WS for 90s+).
   function updateApiDot(){
     try{
@@ -5274,8 +6128,8 @@
       if(!st) return;
       const w=Number(st.win||0), d=Number(st.daily||0);
       if(_lastStreakWin===null){ _lastStreakWin=w; _lastStreakDaily=d; return; }
-      if(w>=2 && w>_lastStreakWin) showToast(`ðŸ”¥ Win streak x${w}`, false);
-      else if(d>=2 && d>_lastStreakDaily) showToast(`ðŸ“… Daily streak x${d}`, false);
+      if(w>=2 && w>_lastStreakWin) showToast(`🔥 Win streak x${w}`, false);
+      else if(d>=2 && d>_lastStreakDaily) showToast(`📅 Daily streak x${d}`, false);
       _lastStreakWin=w; _lastStreakDaily=d;
     }catch{}
   }
@@ -5309,6 +6163,27 @@
     }catch{ return false; }
   }
 
+  // ---- PROVEN SELF-LEAVE ----
+  // One path for "I am no longer in a room", shared by MY LeaveRoom op (254
+  // out) and an inbound Leave event whose ActorNr is PROVEN to be mine
+  // (isMyActor). Both are the game telling us directly that the room is gone,
+  // so the room flags, the optimistic lobby stamp and the ranked UI all come
+  // down here — and the tracked actor number is dropped with the room (the next
+  // join/create response pins the next one). Never throws.
+  function _selfLeftRoom(reason){
+    const why=reason||'self-leave';
+    try{ schedulePlayersRefresh(why); }catch{}
+    // MY leave is a LOBBY trigger, exactly like an auth: the game goes back to
+    // the lobby without ever re-sending a scene, so waiting for a curScn left
+    // the client "in match" for the whole lobby (paused music, match UI up,
+    // wrong Discord card). Stamp the scene as lobby here.
+    try{ _applyOptimisticCurScn('MainLobby'); }catch{}
+    try{ noteLocalRoom(false); }catch{}
+    try{ _publicRoom=false; _compRoom=null; _compHudData=null; updateTourneyHud(); resetRtRoomLocal(); }catch{}
+    try{ disableRanked(why); }catch{}
+    try{ _clearMyActor(why); }catch{}
+  }
+
   function enqueue(dir, bytes, url){
     if(isLocked) return;
     if(!bytes||!bytes.length) return;
@@ -5320,22 +6195,45 @@
     const rawHex = hexOf(bytes);
     const type = bytes[1], code = bytes[2];
     const rec = { seq:++seq, t:Date.now(), dir, url: shortUrl(url), fullUrl: String(url).slice(0,256), label: labelForUrl(url), rawHex, _isEssential: isEssential, _type:type, _code:code };
+    // MY actor number (see _myActor): Photon returns it on MY join/create
+    // response and echoes it on my own Join/PropertiesChanged event. Learned
+    // HERE, before the leave/ranked chain below, so a Leave event in the same
+    // batch can already be proven to be mine. Never throws.
+    try{
+      if(dir==='in'){
+        const _ma=sniffMyActor(bytes, type);
+        if(_ma && _ma.actorNr!=null){
+          if(type===3 && (code===225||code===226||code===227)) _noteMyActor(_ma.actorNr, 'join-resp');
+          // Event fallback (capture started mid-room, or the response was never
+          // seen): only a packet that NAMES me pins a number, and only while
+          // nothing is pinned yet — a same-named stranger must never re-pin it.
+          else if(_myActor.nr==null && _ma.name && _isMyGameName(_ma.name)) _noteMyActor(_ma.actorNr, code===255?'join-ev':'props-ev');
+        }
+      }
+    }catch{}
     // ranked tracking (comp-copy): ONLY on MY join/create (226/227 out):
     // pID present -> track the code, pid-less (public matchmaking) ->
     // ranked mode OFF. Auth (230/231) never touches the leave guard
     // (mid-match re-auths must recover); MY leave op (254 out) always
     // hides ranked UI + sets the guard. Incoming 226/227
-    // (server responses/echoes) never touch tracking. Incoming Leave
-    // events (254 in = someone else left) only refresh the player list —
-    // they must NOT hide my ranked UI.
-    // Incoming Leave events (254 in = someone else left) only refresh the
-    // player list â€” they must NOT hide my ranked UI.
-    // Any Leave event (254 in = someone left queue/match) and any of MY
-    // room changes -> prompt player-list refresh (server prunes on Leave).
+    // (server responses/echoes) never touch tracking.
+    // Incoming Leave events (254 in) belong to somebody else UNLESS the event's
+    // ActorNr is the number Photon pinned to ME (isMyActor): then it is my own
+    // leave and runs the exact same teardown as my leave op — proof, not a guess
+    // from the leaver's name. Either way the player list is refreshed, because
+    // the server prunes on Leave.
     try{
-      if((type===2||type===3)&&(code===230||code===231)){ schedulePlayersRefresh('auth'); try{ noteLocalRoom(false); }catch{} try{ _publicRoom=false; _compRoom=null; _compHudData=null; updateTourneyHud(); resetRtRoomLocal(); }catch{} }
-      else if((type===2||type===3)&&code===254&&dir==='out'){ schedulePlayersRefresh('leave-op'); try{ noteLocalRoom(false); }catch{} try{ _publicRoom=false; _compRoom=null; _compHudData=null; updateTourneyHud(); resetRtRoomLocal(); }catch{} try{ disableRanked('leave-op'); }catch{} }
-      else if(type===4&&code===254&&dir==='in') schedulePlayersRefresh('leave-ev');
+      if((type===2||type===3)&&(code===230||code===231)){ schedulePlayersRefresh('auth'); try{ _clearMyActor('auth'); }catch{} try{ noteLocalRoom(false); }catch{} try{ _publicRoom=false; _compRoom=null; _compHudData=null; updateTourneyHud(); resetRtRoomLocal(); }catch{} }
+      else if((type===2||type===3)&&code===254&&dir==='out') _selfLeftRoom('leave-op');
+      else if(type===4&&code===254&&dir==='in'){
+        // PROVEN self-leave: a Leave event carries its ActorNr, and when that
+        // number is the one Photon gave MY join the event is about me. Anything
+        // else is somebody else leaving: refresh the list, never tear me down.
+        let _selfEv=false;
+        try{ const _meEv=sniffMyActor(bytes, type); _selfEv=!!(_meEv && isMyActor(_meEv.actorNr)); }catch{}
+        if(_selfEv) _selfLeftRoom('leave-ev');
+        else schedulePlayersRefresh('leave-ev');
+      }
       else if((type===2||type===3)&&(code===225||code===226||code===227)&&dir==='out'){
         try{ noteLocalRoom(true); }catch{}
         // comp-room check on the join pID (stable comp detection) + ranked
@@ -5349,8 +6247,8 @@
         try{ schedulePlayersRefresh('join-room'); }catch{}
       }
       // stG match markers (match start/end) ride 253s and join/create
-      // responses â€” hook for the instant win toast + stats pull (no-op untracked).
-      // (Ranked stG detection removed; stG still drives flush priority + clips below.)
+      // responses — hook for the instant win toast + stats pull (no-op untracked).
+      // (Ranked stG detection removed; stG still drives flush priority below.)
     }catch{}
     if(collectMode){
       collectedPackets.push({...rec, _bytes: new Uint8Array(bytes)});
@@ -5412,11 +6310,11 @@
       } catch(e) {}
     }
 
-    // Optimistic: detect Authenticate (opCode 230 = 0xE6) outgoing â†’ lobby.
-    // First auth = login: set lobby state silently (never touch audio â€” it's
+    // Optimistic: detect Authenticate (opCode 230 = 0xE6) outgoing → lobby.
+    // First auth = login: set lobby state silently (never touch audio — it's
     // either already starting or will start via stats). Later auths = back to
-    // lobby â†’ normal path, which unpauses if we flipped out of a match.
-    if(dir==='out' && type===2 && code===230) {
+    // lobby → normal path, which unpauses if we flipped out of a match.
+    if(dir==='out' && type===2 && (code===230 || code===231)) {   // both auth ops send us to the lobby
       _authCount++;
       if(_authCount === 1) {
         _applyOptimisticCurScn('MainLobby', {silent:true});
@@ -5425,7 +6323,7 @@
       }
     }
 
-    // Optimistic: detect killfeed (type=4, code=101) â†’ increment kills/deaths immediately
+    // Optimistic: detect killfeed (type=4, code=101) → increment kills/deaths immediately
     if(type===4 && code===101 && dir==='in') {
       try {
         const kfHex = rawHex.toLowerCase();
@@ -5481,15 +6379,14 @@
               logSys(`[OPTIMISTIC] killfeed detected killer=${killer} victim=${victim}`);
               try{ console.log(`%c[BNC]%c KILL killer=${killer} victim=${victim} seq=${rec.seq}`, 'color:#ef4444;font-weight:900',''); }catch{}
               try{ _applyOptimisticKillfeed(killer, victim); }catch{}
-              try{ clipOnKill(killer, victim, isKill); }catch{}
               // True optimism: toast + delta NOW, no server roundtrip.
-              // Kills only (knocks don't seal). Death is silent here â€”
+              // Kills only (knocks don't seal). Death is silent here —
               // the seal toast covers it.
               // (Ranked optimistic delta removed with detection.)
             }
           }
         } else {
-          // No known verb: never stay silent â€” raw strings diagnose new formats.
+          // No known verb: never stay silent — raw strings diagnose new formats.
           try{ console.log(`%c[BNC]%c KILL-RAW seq=${rec.seq} strings=${JSON.stringify(strings.slice(0,4))}`, 'color:#f59e0b;font-weight:900',''); }catch{}
         }
       } catch(e) {}
@@ -5498,12 +6395,11 @@
     delete rec._isEssential; delete rec._type; delete rec._code;
     queue.push(rec);
     feedLog('capture', {type, code, dir, label:rec.label, seq:rec.seq, hex:rawHex.slice(0,12)+'..', queued:queue.length});
-    // Priority lane: kills + match markers skip the batch timer â€” the
+    // Priority lane: kills + match markers skip the batch timer — the
     // toast/seal path needs them now, not in 250ms. Everything else batches.
     try{
       const _isKill=(type===4 && code===101);
       const _isMarker=((type===4 && code===253) || ((type===2||type===3)&&(code===226||code===227))) && sniffStg(rawHex)!=null;
-      try{ if(_isMarker && sniffStg(rawHex)===3) clipOnWin(); }catch{}
       if(_isKill || _isMarker){ flush(); return; }
     }catch{}
     scheduleFlush();
@@ -5513,8 +6409,8 @@
   // Heartbeat: every 5s send an empty test-cap batch so the server session
   // stays warm (_cached_at slides, stats/presence stay fresh) through quiet
   // stretches (idle lobby, mobile players). Records carry NO rawHex, so the
-  // server skips them before engine.feed AND the processor â€” zero effect on
-  // kills/wins/versions/seals â€” and NO req_token, so no rotation is burned.
+  // server skips them before engine.feed AND the processor — zero effect on
+  // kills/wins/versions/seals — and NO req_token, so no rotation is burned.
   // A 200 response stamps client liveness (dot Online, captureFresh true):
   // the server answered fine, so Cap STALE must not fire while heartbeats
   // land. Ghost safety: the response body is ignored (no noteCaptureSnap),
@@ -5580,7 +6476,7 @@
         try{ lastCaptureOkAt=Date.now(); _capFails=0; }catch{}
         try{
           const j=JSON.parse(txt);
-          if(j.new_req_token) { storeSession({new_req_token:j.new_req_token, new_counter:j.new_counter}); logInfo(`capture token rotated ${String(j.new_req_token).slice(0,4)}â€¦`); feedLog('ok', {rotated:j.new_req_token.slice(0,4)}); }
+          if(j.new_req_token) { storeSession({new_req_token:j.new_req_token, new_counter:j.new_counter}); logInfo(`capture token rotated ${String(j.new_req_token).slice(0,4)}…`); feedLog('ok', {rotated:j.new_req_token.slice(0,4)}); }
           if(j.packets && j.packets.length){
             for(const p of j.packets){
               const dec = p.decrypted_hex || p.raw || {};
@@ -5635,7 +6531,7 @@
 
             // Apply server reconciliation from capture response (shared helper)
             // + instant ranked refresh: captures arrive far more often than
-            // stats polls during play â€” drive ranked UI off them (throttled
+            // stats polls during play — drive ranked UI off them (throttled
             // to 2s; polls + transitions cover the rest).
             let _capFlip=false;
             try{ noteCaptureSnap(j); }catch{}
@@ -5667,14 +6563,12 @@
         feedLog('err', {count:batch.length, ok:false, txt:String(txt).slice(0,120)});
         if(String(txt).includes('Invalid req_token') || String(txt).includes('expired')){
           queue=[]; feedLog('err', {msg:'token error - re-link'});
-          if(String(txt).toLowerCase().includes('session expired') && sessionId){
-            // 2-day session expiry: drop session (login token kept) and
-            // re-validate silently; the token prompt only appears on
-            // explicit rejection inside silentRevalidate.
-            logInfo('[AUTH] session expired - refreshing');
-            try{ clearSessionOnly(); }catch{}
-            try{ showToast('Session expired - refreshing...', false); }catch{}
-            try{ silentRevalidate('expired'); }catch{}
+          if(String(txt).toLowerCase().includes('session expired')){
+            // 2-day session expiry: onSessionExpired drops the session (login
+            // token kept), re-validates silently and shows the refresh modal -
+            // including the /refresh-token instructions when the saved token is
+            // no longer good.
+            try{ onSessionExpired('capture'); }catch{}
           }
         } else {
           queue=batch.concat(queue).slice(0,BATCH_MAX*4);
@@ -5723,6 +6617,8 @@
         try{
           const u=this.url||'';
           if(isPhotonUrl(u)){
+            try{ _netNote('out', netLen(data)); }catch{}
+            try{ _pingNote('out', data); }catch{}
             const h=peekHeader(data);
             if(h&&!isEssentialHeader(h)) return origSend.call(this,data);
             const b=toBytes(data); if(b) captureOut(b,u);
@@ -5746,6 +6642,8 @@
           const wrapped=function(ev){
             try{
               const d=ev.data;
+              try{ _netNote('in', netLen(d)); }catch{}
+              try{ _pingNote('in', d); }catch{}
               if(peekHeader(d)&&!isEssentialHeader(peekHeader(d))) return listener.call(this,ev);
               const b=toBytes(d); if(b) captureIn(b,self.url);
               else if(typeof Blob!=='undefined'&&d instanceof Blob) d.arrayBuffer().then(ab=>{ const bb=toBytes(ab); if(bb) captureIn(bb,self.url); }).catch(()=>{});
@@ -5770,6 +6668,8 @@
                 const wrapped=function(ev){
                   try{
                     const d=ev.data;
+                    try{ _netNote('in', netLen(d)); }catch{}
+                    try{ _pingNote('in', d); }catch{}
                     if(peekHeader(d)&&!isEssentialHeader(peekHeader(d))) return fn.call(this,ev);
                     const b=toBytes(d); if(b) captureIn(b,self.url);
                   }catch{}
@@ -5782,7 +6682,7 @@
           });
         }
       }catch(e){ logErr(`onmessage patch failed: ${e.message}`); }
-      Proto[hookKey+'_proto']=true; logSys(`prototype patches on ${w===window?'window':'unsafeWindow'} âœ“`);
+      Proto[hookKey+'_proto']=true; logSys(`prototype patches on ${w===window?'window':'unsafeWindow'} ✓`);
     }catch(e){ logErr(`proto patch failed: ${e.message}`); }
   }
   for(const w of windowsToHook){
@@ -5793,17 +6693,40 @@
         if(isDecryptor) return protocols!==undefined?new OrigWS(url,protocols):new OrigWS(url);
         const ws=protocols!==undefined?new OrigWS(url,protocols):new OrigWS(url);
         if(!isPhotonUrl(url)) return ws;
-        logOk(`HOOKED Photon WSS â†’ ${url}`);
+        logOk(`HOOKED Photon WSS → ${url}`);
         try{ ws.binaryType='arraybuffer'; }catch{}
-        ws.addEventListener('open',()=>logOk(`WSS OPEN ${labelForUrl(url)}`));
-        ws.addEventListener('close',(ev)=>logSys(`WSS CLOSE ${labelForUrl(url)} code=${ev.code}`));
+        try{ _noteWs(url,'connecting'); }catch{}
+        ws.addEventListener('open',()=>{ logOk(`WSS OPEN ${labelForUrl(url)}`); try{ _noteWs(url,'open'); }catch{} });
+        ws.addEventListener('close',(ev)=>{ logSys(`WSS CLOSE ${labelForUrl(url)} code=${ev.code}`); try{ _noteWs(url,'closed'); }catch{} });
         return ws;
       }
       HookedWS.prototype=OrigWS.prototype;
       HookedWS.CONNECTING=OrigWS.CONNECTING; HookedWS.OPEN=OrigWS.OPEN; HookedWS.CLOSING=OrigWS.CLOSING; HookedWS.CLOSED=OrigWS.CLOSED;
       HookedWS[hookKey]=true; w.WebSocket=HookedWS;
-      logSys(`WebSocket hook installed on ${w===window?'window':'unsafeWindow'} âœ“`);
+      logSys(`WebSocket hook installed on ${w===window?'window':'unsafeWindow'} ✓`);
     }catch(e){ logErr(`hook failed: ${e.message}`); }
+  }
+  // --- WebGL context capture (passive log) ----------------------------------
+  // Installed as early as this script runs so the context Unity creates later
+  // is ours to read. This wrapper never creates anything: it only hands back
+  // exactly what the game asked for, and remembers it in _nerds.glCtxs. (Do
+  // NOT replace this with a getContext() probe: on a canvas without a context
+  // yet that CREATES one, and Unity then boots with a dead canvas.)
+  for(const w of windowsToHook){
+    try{
+      const proto=w.HTMLCanvasElement&&w.HTMLCanvasElement.prototype;
+      if(!proto||proto[hookKey+'_gl']) continue;
+      const origGet=proto.getContext;
+      proto.getContext=function(type, attrs){
+        const gl=origGet.call(this, type, attrs);
+        try{
+          if(gl && String(type||'').toLowerCase().indexOf('webgl')>=0) _rememberGl(gl);
+        }catch{}
+        return gl;
+      };
+      proto[hookKey+'_gl']=true;
+      logSys(`WebGL capture installed on ${w===window?'window':'unsafeWindow'} ✓`);
+    }catch(e){ logErr(`gl capture failed: ${e.message}`); }
   }
   try{
     const api={
@@ -5812,6 +6735,21 @@
       flush:()=>flush(),
       clearToken:()=>{ cleanTokenStorage(); showToast('Token cleared',false); },
       get collect(){ return { enabled: collectMode, count: collectedPackets.length, packets: collectedPackets }; },
+      get myActorNr(){ return _myActor.nr; },
+      get myActorVia(){ return _myActor.via; },
+      // Where the FPS chip stands. The one call that answers "I don't see the
+      // chip" without guessing: mounted? display? hidden by which panel? rect?
+      get fpsChip(){
+        try{
+          const el=_fpsChip.el||document.getElementById(FPS_CHIP_ID);
+          const r=el?el.getBoundingClientRect():null;
+          return { mounted:!!el, display:el?el.style.display:'', hiddenBy:_fpsChip.hiddenBy||_fpsChipBlocker(),
+                   text:el?el.textContent:'', fps:_fpsChip.fps, min:_fpsChip.min, max:_fpsChip.max,
+                   worstMs:_fpsChip.winWorst,
+                   rect:r?{top:Math.round(r.top),right:Math.round(r.right),w:Math.round(r.width),h:Math.round(r.height)}:null,
+                   viewport:{w:innerWidth,h:innerHeight}, fullscreen:!!(document.fullscreenElement||document.webkitFullscreenElement) };
+        }catch(e){ return { err:String(e&&e.message||e) }; }
+      },
       toggleCollect: toggleCollectMode,
       saveCollect: downloadCollected,
       loadCollect: ()=> document.getElementById('bnc-file-input')?.click(),
@@ -5823,6 +6761,6 @@
     // legacy alias
     window.__PHOTON_SNIFFER__=api;
     if(typeof unsafeWindow!=='undefined'&&unsafeWindow!==window){ unsafeWindow.__BUILDNOW_COMPANION__=api; unsafeWindow.__BNC__=api; unsafeWindow.__PHOTON_SNIFFER__=api; }
-    logSys('ready - BuildNow Companion active (project-nectar-6n70.onrender.com) Â· COLLECT Ctrl+Shift+C/S/L/R');
+    logSys('ready - BuildNow Companion active (project-nectar-6n70.onrender.com) · COLLECT Ctrl+Shift+C/S/L/R');
   }catch{}
 })();

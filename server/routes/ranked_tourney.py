@@ -25,8 +25,12 @@ from typing import Any
 from ..lib.supabase_client import supabase, db_io, is_transient_error
 from ..lib.logger import log_err, log_comp
 from ..lib.ranked import (_get_points_many as _ladder_points,
-                          loss_for as _ladder_loss,
-                          milestone_for as _ladder_milestone)
+                           loss_for as _ladder_loss,
+                           loss_vs as _ladder_loss_vs,
+                           milestone_for as _ladder_milestone,
+                           clamp_match_delta as _clamp_match_delta,
+                           ranked_sleeping as _ranked_sleeping,
+                           _bump_points_many as _ladder_bump)
 
 router = APIRouter()
 
@@ -180,13 +184,19 @@ def tourney_kill_delta(killer_pts: Any, victim_pts: Any,
 
 
 def tourney_win_delta(winner_pts: Any, n: Any) -> int:
-    """Victory award from the winner's ladder points + lobby size. Pure."""
+    """Victory award from the winner's ladder points + lobby size. Pure.
+
+    Bounded 12..30, deliberately under the +30 per-match clamp: weak
+    winners in small lobbies feel the scale (12+), strong lobbies still
+    saturate the cap. A legacy-sized purse would cap every single win and
+    make scaling moot — that saturation was the "every win pays +30" bug.
+    """
     try:
         w = max(0.0, float(winner_pts or 0))
         n = max(1, int(n or 1))
-        return max(35, min(95, int(round(50 * (1.0 + w / 4000.0 + 0.03 * n)))))
+        return max(12, min(30, int(round(18 * (1.0 + w / 4000.0 + 0.03 * n)))))
     except Exception:
-        return 50
+        return 18
 
 
 def tourney_place_delta(place: Any, player_pts: Any, avg_pts: Any) -> int:
@@ -233,13 +243,17 @@ def tourney_table_for(avg: Any, n: Any, kill_awards: list | None = None,
 
 
 def _tourney_ladder_snapshot(dids) -> dict:
-    """ranked_points snapshot for dids (fresh: seal-time truth). Never raises."""
+    """ranked_points snapshot for dids (fresh: seal-time truth). Never raises.
+
+    Unranked roster members come back at 0, so a fresh tourney still shows a
+    real average (avg 0.0 pts / Unranked) instead of a blank rank line.
+    """
     try:
         want = sorted({str(d) for d in (dids or []) if str(d or "").strip()})[:200]
         if not want or not supabase:
             return {}
-        pts = _ladder_points(want, fresh=True)
-        return {str(k): int(v or 0) for k, v in (pts or {}).items()}
+        pts = _ladder_points(want, fresh=True) or {}
+        return {d: int(pts.get(d) or 0) for d in want}
     except Exception:
         return {}
 
@@ -264,12 +278,29 @@ def freeze_match_table(mid: int) -> dict | None:
     try:
         if not supabase or mid is None:
             return None
-        mres = supabase.table("bngc_ranked_tourney_matches").select(
-            "id,tourney_id,winner_discord_id,placements,removed_discord_ids,point_awards"
-        ).eq("id", int(mid)).limit(1).execute()
+        try:
+            mres = supabase.table("bngc_ranked_tourney_matches").select(
+                "id,tourney_id,winner_discord_id,placements,removed_discord_ids,point_awards,points_table"
+            ).eq("id", int(mid)).limit(1).execute()
+        except Exception as exc:
+            # pre-v249 (no points_table column): classic shape, no seal modes
+            if "points_table" not in str(exc) and "42703" not in str(exc):
+                return None
+            mres = supabase.table("bngc_ranked_tourney_matches").select(
+                "id,tourney_id,winner_discord_id,placements,removed_discord_ids,point_awards"
+            ).eq("id", int(mid)).limit(1).execute()
         if not mres.data:
             return None
         m = mres.data[0] or {}
+        try:
+            _existing = (m or {}).get("points_table")
+            if isinstance(_existing, dict) and str(_existing.get("mode") or "") in (
+                    "room-seal-v1", "room-seal-pending-v1"):
+                # bridge-owned: the room seal's deltas (or its pending join
+                # keys) — tourney-dynamic math must never overwrite them.
+                return _existing if _existing.get("mode") == "room-seal-v1" else None
+        except Exception:
+            pass
         try:
             xset = {str(x) for x in ((m or {}).get("removed_discord_ids") or [])
                     if str(x or "").strip()}
@@ -316,11 +347,21 @@ def freeze_match_table(mid: int) -> dict | None:
         # victim name -> did (best effort: regs + game names, else the
         # killer's own rating, rooms' conservative rule).
         name2did: dict[str, str] = {}
+        _reg_teams: dict[str, list] = {}
         try:
             rres = supabase.table("bngc_ranked_tourney_registrations").select(
                 "member_ids,member_names").eq(
                 "tourney_id", (m or {}).get("tourney_id")).neq(
                 "status", "banned").limit(500).execute()
+            try:
+                for _r in (rres.data or []):
+                    _mids = [str(x).strip() for x in ((_r or {}).get("member_ids") or [])
+                             if str(x or "").strip()]
+                    if len(_mids) > 1:
+                        for _d in _mids:
+                            _reg_teams.setdefault(_d, _mids)
+            except Exception:
+                pass
             rids = sorted({str(x) for r in (rres.data or [])
                            for x in ((r or {}).get("member_ids") or []) if x})[:200]
             disp: dict[str, str] = {}
@@ -352,8 +393,42 @@ def freeze_match_table(mid: int) -> dict | None:
                     name2did.setdefault(nn, str(did))
         except Exception:
             pass
+        # Eliminated victims never own a kill row (discord_id is the
+        # killer's) and their alv row can be unmapped — without this they
+        # drop out of parts entirely: no loss, no board row, no toast.
+        # Resolve kill targets into parts so every death pays.
+        try:
+            _added: set[str] = set()
+            for e in (events or []):
+                try:
+                    if (e or {}).get("etype") != "kill":
+                        continue
+                    _t = str((e or {}).get("target_name") or "").strip()
+                    if not _t:
+                        continue
+                    _v = name2did.get(_norm_nm(_t))
+                    if _v and _v not in xset and _v not in parts:
+                        parts.add(_v)
+                        _added.add(_v)
+                except Exception:
+                    continue
+            if _added:
+                try:
+                    _fresh = _tourney_ladder_snapshot(_added)
+                    for _d in _added:
+                        ladder[_d] = int((_fresh or {}).get(_d, 0))
+                    n = len(parts)
+                    avg = round(sum(ladder.get(d, 0) for d in parts) / n, 1) if n else 0.0
+                except Exception:
+                    pass
+        except Exception:
+            pass
         awards: list[dict] = []
         counts: dict[str, int] = {}
+        # death -> killer for killer-relative losses (last killer wins).
+        # Only resolved victims count: an unresolvable target falls back
+        # to the killer's own did, which reads as "unknown killer".
+        death_killer: dict[str, str] = {}
         for e in events:
             try:
                 if (e or {}).get("etype") != "kill":
@@ -365,6 +440,11 @@ def freeze_match_table(mid: int) -> dict | None:
                 victim = name2did.get(_norm_nm(target)) or killer
                 if victim in xset:
                     victim = killer
+                try:
+                    if victim != killer and victim in parts:
+                        death_killer[victim] = killer
+                except Exception:
+                    pass
                 n_k = int(counts.get(killer, 0)) + 1
                 counts[killer] = n_k
                 awards.append({
@@ -397,8 +477,16 @@ def freeze_match_table(mid: int) -> dict | None:
         holder_of = {did: i + 1 for i, did in enumerate(order)}
         holder_of.update({d: p for d, p in man.items() if d in parts})
         place_of = {p: d for d, p in holder_of.items()}
+        # Top-half placement only: the purse covers places 1..ceil(n/2), so
+        # last place (P2 of 2, P4 of 6, ...) pays nothing. The engine pays
+        # purse[p-1] only when p fits the list, so truncating IS the rule —
+        # frozen verbatim, replayed forever, no engine change.
+        try:
+            _paid_places = max(1, -(-int(n) // 2))
+        except Exception:
+            _paid_places = 5
         placement = [tourney_place_delta(p, ladder.get(place_of.get(p), avg), avg)
-                     for p in range(1, 6)]
+                     for p in range(1, 6)][:max(1, min(5, _paid_places))]
         try:
             wdid = str((m or {}).get("winner_discord_id") or "").strip() or None
             if not wdid and order:
@@ -407,12 +495,74 @@ def freeze_match_table(mid: int) -> dict | None:
                 wdid = None
         except Exception:
             wdid = None
-        win = tourney_win_delta(ladder.get(wdid, avg) if wdid else avg, n)
+        # Duo co-winners: teammates of the winner who survived (no kill
+        # evidence against them) share P1 — otherwise the surviving
+        # partner "wins" the game and still pays a defeat. Solo regs
+        # (single member), removed players, dead teammates (their death
+        # placement + loss stand) and manually-placed teammates are
+        # untouched. Engine P1-tie semantics pay every holder the win
+        # bonus with no loss.
         try:
-            loss = {d: int(_ladder_loss(ladder.get(d, 0))) for d in parts}
+            if wdid:
+                _mates = (_reg_teams or {}).get(str(wdid)) or []
+                if len(_mates) > 1:
+                    _deadset = set()
+                    try:
+                        _deadset = {str(v) for v in (death_killer or {})}
+                        _deadset |= {str(d) for d in (death_order or [])}
+                    except Exception:
+                        pass
+                    _tie1 = []
+                    for _tm in _mates:
+                        try:
+                            _t = str(_tm or "").strip()
+                            if (not _t or _t == str(wdid) or _t in xset
+                                    or _t not in parts or _t in _deadset
+                                    or _t in (man or {})):
+                                continue
+                            _tie1.append(_t)
+                        except Exception:
+                            continue
+                    if _tie1:
+                        try:
+                            _base_pl = dict(((m or {}).get("placements")) or {})
+                            for _t in _tie1:
+                                _base_pl.setdefault(str(_t), 1)
+                            m = dict(m or {}, placements=_base_pl)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        win = tourney_win_delta(ladder.get(wdid, avg) if wdid else avg, n)
+        # Killer-relative seal-time losses, frozen with the table: dying to
+        # a weaker killer costs up to -50, dying up is cheap, unknown/zone
+        # killers pay the flat tier stake. Stored for every involved did.
+        try:
+            loss = {}
+            for d in parts:
+                try:
+                    _kd = death_killer.get(str(d))
+                    if _kd:
+                        loss[str(d)] = int(_ladder_loss_vs(
+                            ladder.get(str(d), 0), ladder.get(_kd)))
+                    else:
+                        loss[str(d)] = int(_ladder_loss(ladder.get(str(d), 0)))
+                except Exception:
+                    try:
+                        loss[str(d)] = int(_ladder_loss(ladder.get(str(d), 0)))
+                    except Exception:
+                        continue
         except Exception:
             loss = {}
         table = tourney_table_for(avg, n, awards, win, placement, loss)
+        try:
+            # Per-player seal components (clamped totals) for toasts/embeds:
+            # same math the boards replay, so board == toast totals.
+            _, bd = _score_frozen_with_breakdown(table, m, events)
+            if bd:
+                table["breakdown"] = {str(k): v for k, v in bd.items()}
+        except Exception:
+            pass
         try:
             supabase.table("bngc_ranked_tourney_matches").update(
                 {"points_table": table, "avg_points": avg}).eq(
@@ -425,9 +575,251 @@ def freeze_match_table(mid: int) -> dict | None:
         return None
 
 
-def _score_tourney_match(tourney: dict | None, m: dict, events: list) -> list[dict]:
-    """Score ONE match: frozen dynamic replay, else legacy static replay.
+def _score_room_seal_bundle(ft: dict, m: dict, events: list) -> list[dict]:
+    """Score ONE match from its stored room-seal deltas. Pure.
 
+    The room seal already paid these exact deltas to the ladder at seal
+    time, so the board replays them verbatim (board == ladder movement):
+    no kill math, no loss, no clamp (the seal applied all three). Names
+    resolve from the banked tourney events, falling back to did prefix.
+    Manual point_awards on the tourney row still apply on top (dashboard
+    corrections). Never raises; [] on failure.
+    """
+    try:
+        pts = {str(k): int(v) for k, v in ((ft or {}).get("points") or {}).items()
+               if str(k or "").strip()}
+        if not pts:
+            return []
+        try:
+            kills = {str(k): int(v) for k, v in ((ft or {}).get("kills") or {}).items()}
+        except Exception:
+            kills = {}
+        try:
+            plc = {str(k): int(v) for k, v in ((ft or {}).get("placements") or {}).items()}
+        except Exception:
+            plc = {}
+        try:
+            winner = str((ft or {}).get("winner") or (m or {}).get("winner_discord_id") or "")
+        except Exception:
+            winner = ""
+        try:
+            awards_map = ((m or {}).get("point_awards")) or {}
+        except Exception:
+            awards_map = {}
+        try:
+            breakdown_map = ((ft or {}).get("breakdown")) or {}
+        except Exception:
+            breakdown_map = {}
+        names: dict[str, str] = {}
+        for e in (events or []):
+            try:
+                did = str((e or {}).get("discord_id") or "").strip()
+                nm = str((e or {}).get("actor_name") or "").strip()
+                if did and nm and did not in names:
+                    names[did] = nm[:32]
+            except Exception:
+                continue
+        out = []
+        for did, p in pts.items():
+            try:
+                extra = 0
+                try:
+                    extra = int((awards_map or {}).get(did) or 0)
+                except Exception:
+                    extra = 0
+                try:
+                    _bd = (breakdown_map or {}).get(did) or {}
+                    _breakdown = {"kills": int(_bd.get("kills") or 0),
+                                  "win": int(_bd.get("win") or 0),
+                                  "placement": int(_bd.get("placement") or 0),
+                                  "loss": int(_bd.get("loss") or 0),
+                                  "total": int(_bd.get("total", p) or 0),
+                                  "capped": bool(_bd.get("capped", False))}
+                except Exception:
+                    _breakdown = None
+                _row = {"discord_id": did, "name": names.get(did) or did[:6],
+                        "kills": int(kills.get(did) or 0),
+                        "placement": plc.get(did),
+                        "won": bool(winner and did == winner),
+                        "points": int(p) + extra}
+                if _breakdown is not None:
+                    _row["breakdown"] = _breakdown
+                out.append(_row)
+            except Exception:
+                continue
+        out.sort(key=lambda r: ((r or {}).get("points", 0),
+                                (r or {}).get("kills", 0)), reverse=True)
+        return out
+    except Exception:
+        return []
+
+
+def _score_frozen_with_breakdown(ft: dict, m: dict, events: list) -> tuple[list, dict]:
+    """Frozen tourney-dynamic-v1 scoring + per-player seal components. Pure
+    except the post-freeze loss fallback (current-ladder loss for a did that
+    postdates the freeze, e.g. linked after sealing).
+
+    Kills inject per-killer frozen awards on a kill-0 base, win/placement
+    come from the frozen table, non-winners pay the frozen loss. Each
+    player's delta is clamped to the ranked per-match clamp (-50/+30, same
+    as rooms) so tourney boards and ladder movement obey one rule.
+
+    Returns (rows, breakdown) with rows shaped like _score_tourney_match
+    and breakdown {did: {kills, win, placement, loss, total, capped}} for
+    toasts/embeds (same shape as rooms' arena_breakdown). Never raises;
+    ([], {}) on failure.
+    """
+    try:
+        winner = (m or {}).get("winner_discord_id")
+        try:
+            removed = [str(x) for x in ((m or {}).get("removed_discord_ids") or [])
+                       if str(x or "").strip()]
+        except Exception:
+            removed = []
+        try:
+            awards_map = (m or {}).get("point_awards") or {}
+        except Exception:
+            awards_map = {}
+        try:
+            base = {"kill": 0, "win": int((ft or {}).get("win") or 0),
+                    "placement": list((ft or {}).get("placement") or [])}
+        except Exception:
+            base = {"kill": 0, "win": 0, "placement": []}
+        rows = compute_match_points(
+            events or [], base, winner, (m or {}).get("placements"),
+            removed, awards_map)
+        try:
+            bonus: dict[str, int] = {}
+            for a in ((ft or {}).get("kill_awards") or []):
+                try:
+                    k = str((a or {}).get("killer") or "").strip()
+                    if k:
+                        bonus[k] = bonus.get(k, 0) + int((a or {}).get("points") or 0)
+                except Exception:
+                    continue
+        except Exception:
+            bonus = {}
+        try:
+            lossmap = {str(k): int(v) for k, v in
+                       ((ft or {}).get("loss_awards") or {}).items()}
+        except Exception:
+            lossmap = {}
+        try:
+            # victim -> killer from the frozen awards (last wins), for the
+            # post-freeze fallback below (did linked after sealing).
+            deathmap: dict[str, str] = {}
+            for a in ((ft or {}).get("kill_awards") or []):
+                try:
+                    _k = str((a or {}).get("killer") or "").strip()
+                    _v = str((a or {}).get("victim") or "").strip()
+                    if _k and _v and _v != _k:
+                        deathmap[_v] = _k
+                except Exception:
+                    continue
+        except Exception:
+            deathmap = {}
+        try:
+            purse = list((ft or {}).get("placement") or [])
+        except Exception:
+            purse = []
+        try:
+            twin = int((ft or {}).get("win") or 0)
+        except Exception:
+            twin = 0
+        out, breakdown = [], {}
+        for r in rows or []:
+            try:
+                did = str((r or {}).get("discord_id") or "")
+                won = bool((r or {}).get("won"))
+                try:
+                    plc = (r or {}).get("placement")
+                    plc = int(plc) if plc is not None else None
+                except Exception:
+                    plc = None
+                kb = int(bonus.get(did, 0))
+                wb = twin if won else 0
+                try:
+                    pp = purse[plc - 1] if plc and 1 <= plc <= len(purse) else 0
+                except Exception:
+                    pp = 0
+                lb = 0
+                if not won:
+                    if did in lossmap:
+                        lb = int(lossmap[did])
+                    else:
+                        try:
+                            _snap = _tourney_ladder_snapshot([did])
+                            _kd = deathmap.get(did)
+                            if _kd:
+                                _ksnap = _tourney_ladder_snapshot([_kd])
+                                lb = int(_ladder_loss_vs(
+                                    _snap.get(did, 0), _ksnap.get(_kd)))
+                            else:
+                                lb = int(_ladder_loss(_snap.get(did, 0)))
+                        except Exception:
+                            lb = 0
+                raw = int((r or {}).get("points") or 0) + kb + (lb if not won else 0)
+                try:
+                    total = int(_clamp_match_delta(raw))
+                except Exception:
+                    total = raw
+                breakdown[did] = {"kills": kb, "win": wb,
+                                  "placement": int(pp), "loss": int(lb),
+                                  "total": total,
+                                  "capped": bool(raw != total)}
+                out.append({"discord_id": did, "name": (r or {}).get("name"),
+                            "kills": int((r or {}).get("kills") or 0),
+                            "placement": plc,
+                            "won": won, "points": total,
+                            "breakdown": dict(breakdown.get(did) or {})})
+            except Exception:
+                continue
+        # Victims with no engine row (no kills, no mapped alv, no manual
+        # placement) still paid the frozen loss at seal time — they must
+        # board as loss-only rows or they vanish: no board, no ladder pay,
+        # no toast. Winner never lands here.
+        try:
+            _seen = {str((r or {}).get("discord_id") or "") for r in (out or [])}
+            for _did, _lb in (lossmap or {}).items():
+                try:
+                    _d = str(_did or "").strip()
+                    if not _d or _d in _seen or _d in {str(x) for x in (removed or [])}:
+                        continue
+                    if _d == str(winner or ""):
+                        continue
+                    _lbv = int(_lb or 0)
+                    try:
+                        _raw = _lbv + int((awards_map or {}).get(_d) or 0)
+                    except Exception:
+                        _raw = _lbv
+                    try:
+                        _total = int(_clamp_match_delta(_raw))
+                    except Exception:
+                        _total = _raw
+                    breakdown[_d] = {"kills": 0, "win": 0, "placement": 0,
+                                     "loss": int(_lbv), "total": int(_total),
+                                     "capped": bool(_raw != _total)}
+                    out.append({"discord_id": _d, "name": _d[:6],
+                                "kills": 0, "placement": None,
+                                "won": False, "points": int(_total),
+                                "breakdown": dict(breakdown.get(_d) or {})})
+                    _seen.add(_d)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        out.sort(key=lambda r: ((r or {}).get("points", 0),
+                                (r or {}).get("kills", 0)), reverse=True)
+        return out, breakdown
+    except Exception:
+        return [], {}
+
+
+def _score_tourney_match(tourney: dict | None, m: dict, events: list) -> list[dict]:
+    """Score ONE match: stored room-seal replay, frozen dynamic replay,
+    else legacy static replay.
+
+    Room-seal (mode room-seal-v1): the seal's ladder deltas, verbatim.
     Frozen (mode tourney-dynamic-v1): kills inject per-killer frozen awards
     on a kill-0 base, win/placement come from the frozen table, non-winners
     pay the frozen loss (current-ladder loss when the did postdates the
@@ -436,6 +828,9 @@ def _score_tourney_match(tourney: dict | None, m: dict, events: list) -> list[di
     Never raises; [] on failure.
     """
     try:
+        ft0 = (m or {}).get("points_table")
+        if isinstance(ft0, dict) and ft0.get("mode") == "room-seal-v1":
+            return _score_room_seal_bundle(ft0, m, events)
         winner = (m or {}).get("winner_discord_id")
         try:
             removed = [str(x) for x in ((m or {}).get("removed_discord_ids") or [])
@@ -449,52 +844,20 @@ def _score_tourney_match(tourney: dict | None, m: dict, events: list) -> list[di
         ft = (m or {}).get("points_table")
         if isinstance(ft, dict) and ft.get("mode") == "tourney-dynamic-v1":
             try:
-                base = {"kill": 0, "win": int(ft.get("win") or 0),
-                        "placement": list(ft.get("placement") or [])}
-            except Exception:
-                base = {"kill": 0, "win": 0, "placement": []}
-            rows = compute_match_points(
-                events or [], base, winner, (m or {}).get("placements"),
-                removed, awards_map)
-            try:
-                bonus: dict[str, int] = {}
-                for a in (ft.get("kill_awards") or []):
-                    try:
-                        k = str((a or {}).get("killer") or "").strip()
-                        if k:
-                            bonus[k] = bonus.get(k, 0) + int((a or {}).get("points") or 0)
-                    except Exception:
-                        continue
-            except Exception:
-                bonus = {}
-            try:
-                lossmap = {str(k): int(v) for k, v in
-                           ((ft or {}).get("loss_awards") or {}).items()}
-            except Exception:
-                lossmap = {}
-            out = []
-            for r in rows or []:
+                rows, bd = _score_frozen_with_breakdown(ft, m, events)
                 try:
-                    did = str((r or {}).get("discord_id") or "")
-                    pts = int((r or {}).get("points") or 0) + bonus.get(did, 0)
-                    if not (r or {}).get("won"):
-                        if did in lossmap:
-                            pts += lossmap[did]
-                        else:
-                            try:
-                                pts += int(_ladder_loss(
-                                    _tourney_ladder_snapshot([did]).get(did, 0)))
-                            except Exception:
-                                pass
-                    out.append({"discord_id": did, "name": (r or {}).get("name"),
-                                "kills": int((r or {}).get("kills") or 0),
-                                "placement": (r or {}).get("placement"),
-                                "won": bool((r or {}).get("won")), "points": pts})
+                    for _r in (rows or []):
+                        try:
+                            _d = str((_r or {}).get("discord_id") or "")
+                            if _d and "breakdown" not in (_r or {}) and _d in (bd or {}):
+                                _r["breakdown"] = dict((bd or {})[_d] or {})
+                        except Exception:
+                            continue
                 except Exception:
-                    continue
-            out.sort(key=lambda r: ((r or {}).get("points", 0),
-                                    (r or {}).get("kills", 0)), reverse=True)
-            return out
+                    pass
+                return rows
+            except Exception:
+                return []
         # legacy static replay (bit-identical to the old path)
         try:
             table = _table_of(tourney)
@@ -582,19 +945,24 @@ def code_tourney_points(code: str | None, discord_id: str | None) -> dict | None
         if not code or not did or not supabase:
             return None
         tres = supabase.table("bngc_ranked_tourneys").select(
-            "id,name,points_table").eq("code", code).neq(
+            "id,name,points_table,series_len").eq("code", code).neq(
             "status", "ended").limit(2).execute()
         rows = tres.data or []
         if len(rows) != 1:
             return None
         t = rows[0]
+        try:
+            _series_len = int(t.get("series_len") or 0)
+        except Exception:
+            _series_len = 0
         mres = supabase.table("bngc_ranked_tourney_matches").select(
-            "id,winner_discord_id,placements,removed_discord_ids,point_awards").eq("tourney_id", t["id"]).in_(
+            "id,version,winner_discord_id,placements,removed_discord_ids,point_awards").eq("tourney_id", t["id"]).in_(
             "status", ["sealed", "manual"]).order("version").limit(200).execute()
         sealed = mres.data or []
         if not sealed:
             return {"tourney_id": t["id"], "name": t.get("name"), "points": 0,
-                    "kills": 0, "wins": 0, "rank": None, "players": 0}
+                    "kills": 0, "wins": 0, "rank": None, "players": 0,
+                    "series_len": _series_len, "sealed": 0}
         mids = [m["id"] for m in sealed]
         eres = supabase.table("bngc_ranked_tourney_events").select(
             "match_id,etype,discord_id,actor_name,alive").in_(
@@ -602,18 +970,70 @@ def code_tourney_points(code: str | None, discord_id: str | None) -> dict | None
         by_mid: dict = {}
         for e in (eres.data or []):
             by_mid.setdefault((e or {}).get("match_id"), []).append(e)
+        attached = _attach_frozen_tables(sealed)
         per_match, board = ranked_standings_for_matches(
-            t, _attach_frozen_tables(sealed), by_mid, _tourney_adjustments(t.get("id")))
+            t, attached, by_mid, _tourney_adjustments(t.get("id")))
+        # Latest sealed result for me (drives component toasts): stored
+        # room-seal bundle or frozen dynamic breakdown — the exact deltas
+        # the board paid. Legacy rows (no stored components) stay None and
+        # the client falls back to its single-delta toast.
+        last_result = None
+        try:
+            for m in sorted(attached, key=lambda x: int((x or {}).get("version") or 0),
+                            reverse=True):
+                ft = (m or {}).get("points_table")
+                bd = None
+                try:
+                    if isinstance(ft, dict) and ft.get("mode") == "room-seal-v1":
+                        bd = ((ft.get("breakdown") or {}).get(did)) or None
+                    elif isinstance(ft, dict) and ft.get("mode") == "tourney-dynamic-v1":
+                        bd = ((ft.get("breakdown") or {}).get(did)) or None
+                except Exception:
+                    bd = None
+                if not (bd and isinstance(bd, dict)):
+                    continue
+                try:
+                    plc = (((m or {}).get("placements")) or {}).get(did)
+                    plc = int(plc) if plc is not None else None
+                except Exception:
+                    plc = None
+                try:
+                    kc = sum(1 for e in (by_mid.get((m or {}).get("id"), []) or [])
+                             if (e or {}).get("etype") == "kill"
+                             and str((e or {}).get("discord_id") or "") == did)
+                except Exception:
+                    kc = 0
+                last_result = {
+                    "match_version": int((m or {}).get("version") or 0),
+                    "gained": int(bd.get("total") or 0),
+                    "won": bool(did and str((m or {}).get("winner_discord_id") or "")
+                                == did),
+                    "kills": int(kc),
+                    "placement": plc,
+                    "breakdown": {"kills": int(bd.get("kills") or 0),
+                                  "win": int(bd.get("win") or 0),
+                                  "placement": int(bd.get("placement") or 0),
+                                  "loss": int(bd.get("loss") or 0),
+                                  "total": int(bd.get("total") or 0),
+                                  "capped": bool(bd.get("capped"))},
+                }
+                break
+        except Exception:
+            last_result = None
         me = next((r for r in board if str(r.get("discord_id")) == did), None)
         rank = next((i + 1 for i, r in enumerate(board) if str(r.get("discord_id")) == did), None)
         if me is None:
             return {"tourney_id": t["id"], "name": t.get("name"), "points": 0,
                     "kills": 0, "wins": 0, "avg_placement": None,
-                    "rank": None, "players": len(board)}
+                    "rank": None, "players": len(board),
+                    "series_len": _series_len, "sealed": len(sealed),
+                    "last_result": last_result}
         return {"tourney_id": t["id"], "name": t.get("name"),
                 "points": int(me.get("points") or 0), "kills": int(me.get("kills") or 0),
                 "wins": int(me.get("wins") or 0), "avg_placement": me.get("avg_placement"),
-                "rank": rank, "players": len(board)}
+                "rank": rank, "players": len(board),
+                "series_len": _series_len, "sealed": len(sealed),
+                "last_result": last_result}
     except Exception:
         return None
 
@@ -893,6 +1313,11 @@ async def tourney_detail(request: Request):
                         "series_len": t.get("series_len") or 0, "sealed": len(sealed),
                         "points_table": table, "scheduled_at": t.get("scheduled_at"),
                         "started_at": t.get("started_at"), "ended_at": t.get("ended_at"),
+                        # Hosts panel (dashboard): creator + listed hosts, plus
+                        # the bridge's host_playing flag. Display only.
+                        "created_by": (str(t.get("created_by") or "") or None),
+                        "hosts": [str(x) for x in (t.get("hosts") or []) if str(x or "").strip()],
+                        "host_playing": t.get("host_playing") is not False,
                         "rank_avg": _avg, "rank_milestone": _ms},
             "players": [{"discord_id": str(x), "name": names.get(str(x), str(x)[:6])}
                         for r in regs for x in (r.get("member_ids") or []) if x],
@@ -902,12 +1327,39 @@ async def tourney_detail(request: Request):
                           "winner": winners.get(m.get("id"))}
                          for m in matches],
             "match_boards": [{"version": m.get("version"),
-                              "rows": (per_match[i] if i < len(per_match) else [])[:10]}
-                             for i, m in enumerate(sealed)],
+                               "status": m.get("status"),
+                               "paid": _match_ladder_paid(m, t),
+                               "rows": (per_match[i] if i < len(per_match) else [])[:10]}
+                              for i, m in enumerate(sealed)],
             "standings": board,
         })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+def _match_ladder_paid(m: dict | None, t: dict | None) -> bool:
+    """True when this sealed match already moved the ladder. Pure.
+
+    Room-seal bundles paid via the room seal; dynamic rows pay per seal
+    (ladder_paid marker); manual rows settle at stop (tourney points_paid
+    flag). Anything else (legacy, unpaid) is False. Never raises.
+    """
+    try:
+        m, t = (m or {}), (t or {})
+        if str(m.get("status") or "") == "manual":
+            return bool(t.get("points_paid"))
+        if str(m.get("status") or "") != "sealed":
+            return False
+        ft = m.get("points_table")
+        if not isinstance(ft, dict):
+            return False
+        if ft.get("mode") == "room-seal-v1":
+            return True
+        if ft.get("mode") == "tourney-dynamic-v1":
+            return isinstance(ft.get("ladder_paid"), dict)
+        return False
+    except Exception:
+        return False
 
 
 async def _json(request: Request) -> dict:
@@ -1072,7 +1524,8 @@ async def comp_match_seal(request: Request):
 
     Freezes the match's dynamic scoring table from the current ladder
     right after sealing (best-effort: boards fall back to legacy replay
-    until a freeze lands, and calculate backfills missing tables)."""
+    until a freeze lands, and calculate backfills missing tables), then
+    runs a calculate so boards refresh and the ladder is paid per seal."""
     err = _need()
     if err:
         return err
@@ -1099,6 +1552,28 @@ async def comp_match_seal(request: Request):
                     log_comp(f"seal match={mid}: dynamic freeze missed (legacy replay until calculate)")
                 except Exception:
                     pass
+        except Exception:
+            pass
+        try:
+            # Ranked-session economy: sealing pays the ladder now (per-seal
+            # deltas + boards refresh), not at stop. Best-effort.
+            _tid = None
+            try:
+                _mr = await db_io(lambda: supabase.table(
+                    "bngc_ranked_tourney_matches").select("tourney_id").eq(
+                    "id", mid).limit(1).execute())
+                _rows = (_mr.data or [])
+                _tid = (_rows[0] or {}).get("tourney_id") if _rows else None
+            except Exception:
+                _tid = None
+            if _tid is not None:
+                await db_io(calculate_tourney_sync, int(_tid), "dashboard-seal")
+        except Exception:
+            pass
+        try:
+            # Losers' win streaks reset here: no defeat rows exist, so the
+            # seal is the only place the loser is known. Best-effort.
+            await db_io(reset_loser_streaks_sync, int(mid))
         except Exception:
             pass
         return JSONResponse({"ok": True, "match_id": mid})
@@ -1391,6 +1866,209 @@ async def comp_tourney_hosts(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+def _pending_seal_tables(mids: list) -> dict:
+    """{match_id: pending-table} for bridge-pending rows. Never raises.
+
+    Separate narrow select (the calculate selects predate the points_table
+    column): {} when the column/table is missing (pre-v249) or DB down."""
+    try:
+        if not supabase or not mids:
+            return {}
+        try:
+            ids = [int(x) for x in (mids or []) if x is not None][:200]
+        except Exception:
+            return {}
+        if not ids:
+            return {}
+        res = supabase.table("bngc_ranked_tourney_matches").select(
+            "id,points_table").in_("id", ids).execute()
+        out = {}
+        for r in (res.data or []):
+            try:
+                pt = (r or {}).get("points_table")
+                if isinstance(pt, dict) and pt.get("mode") == "room-seal-pending-v1":
+                    out[(r or {}).get("id")] = pt
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return {}
+
+
+def reset_loser_streaks_sync(mid: int) -> int:
+    """Reset win_streak for a sealed match's losers. Sync. Never raises.
+
+    No code banks "defeat" rows, so the batch streak logic can never reset
+    on a loss — the seal is the one place the loser is known exactly.
+    Leavers (removed_discord_ids) are spared: leaves are ignored by design
+    (crashes happen). Winner None (total wipe) resets everyone involved.
+    Returns reset count. One UPDATE.
+    """
+    try:
+        if not supabase or mid is None:
+            return 0
+        try:
+            mres = supabase.table("bngc_ranked_tourney_matches").select(
+                "winner_discord_id,placements,removed_discord_ids,status").eq(
+                "id", int(mid)).limit(1).execute()
+        except Exception:
+            return 0
+        rows = mres.data or []
+        if not rows:
+            return 0
+        m = rows[0] or {}
+        if str(m.get("status") or "") not in ("sealed", "manual"):
+            return 0
+        try:
+            removed = {str(x) for x in ((m or {}).get("removed_discord_ids") or [])
+                       if str(x or "").strip()}
+        except Exception:
+            removed = set()
+        involved: set[str] = set()
+        try:
+            eres = supabase.table("bngc_ranked_tourney_events").select(
+                "discord_id").eq("match_id", int(mid)).limit(2000).execute()
+            for e in (eres.data or []):
+                try:
+                    d = str((e or {}).get("discord_id") or "").strip()
+                    if d:
+                        involved.add(d)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        try:
+            for k in (((m or {}).get("placements")) or {}):
+                if str(k or "").strip():
+                    involved.add(str(k))
+        except Exception:
+            pass
+        try:
+            winner = str((m or {}).get("winner_discord_id") or "").strip() or None
+        except Exception:
+            winner = None
+        losers = sorted((involved - removed) - ({winner} if winner else set()))
+        if not losers:
+            return 0
+        try:
+            supabase.table("bngc_users").update({"win_streak": 0}).in_(
+                "discord_id", losers[:200]).execute()
+            return len(losers)
+        except Exception:
+            return 0
+    except Exception:
+        return 0
+
+
+def _pay_sealed_ladders(ms: list) -> dict:
+    """Pay clamped per-seal deltas to the ladder. Sync. Never raises.
+
+    For every status=sealed match with a tourney-dynamic-v1 frozen table
+    carrying a stored breakdown and no ladder_paid marker, bumps
+    ranked_points by the breakdown totals and stamps the marker (persisted
+    on the match row). Room-seal bundles (ladder paid by the room seal),
+    manual rows (settled at stop) and legacy rows (no components) are
+    skipped. Returns {match_id: {did: delta}} paid this call. Best-effort
+    exactly-once: concurrent calculates can double-pay a marker-less row,
+    same as the rest of this module's best-effort writes.
+    """
+    paid: dict = {}
+    try:
+        if not supabase or not ms:
+            return paid
+        try:
+            if _ranked_sleeping():
+                return paid
+        except Exception:
+            pass
+        for m in (ms or []):
+            try:
+                if str((m or {}).get("status") or "") != "sealed":
+                    continue
+                ft = (m or {}).get("points_table")
+                if not (isinstance(ft, dict)
+                        and ft.get("mode") == "tourney-dynamic-v1"):
+                    continue
+                if isinstance((ft or {}).get("ladder_paid"), dict):
+                    continue
+                bd = (ft or {}).get("breakdown")
+                if not (isinstance(bd, dict) and bd):
+                    continue
+                deltas = {}
+                for did, comp in bd.items():
+                    try:
+                        d = str(did or "").strip()
+                        v = int((comp or {}).get("total") or 0)
+                        if d and v:
+                            deltas[d] = v
+                    except Exception:
+                        continue
+                # Fresh marker re-read: the table above may be seconds old
+                # and a concurrent calculate can pay the same row twice.
+                # Re-read, skip when another writer already stamped it, and
+                # pay the freshly read breakdown (same numbers by construction).
+                try:
+                    if (m or {}).get("id") is not None:
+                        _chk = supabase.table("bngc_ranked_tourney_matches").select(
+                            "points_table").eq("id", (m or {}).get("id")).limit(1).execute()
+                        _rows = (_chk.data or [])
+                        _fresh = ((_rows[0] or {}).get("points_table")
+                                  if _rows else None)
+                        if isinstance((_fresh or {}).get("ladder_paid"), dict):
+                            try:
+                                m["points_table"] = _fresh
+                            except Exception:
+                                pass
+                            continue
+                        _fbd = (_fresh or {}).get("breakdown") if isinstance(_fresh, dict) else None
+                        if isinstance(_fbd, dict) and _fbd:
+                            deltas = {}
+                            for did, comp in _fbd.items():
+                                try:
+                                    d = str(did or "").strip()
+                                    v = int((comp or {}).get("total") or 0)
+                                    if d and v:
+                                        deltas[d] = v
+                                except Exception:
+                                    continue
+                except Exception:
+                    pass
+                try:
+                    if deltas:
+                        _ladder_bump(deltas)
+                except Exception:
+                    continue  # bump failed: no marker, next calculate retries
+                marker = {str(k): int(v) for k, v in deltas.items()}
+                # Stamp on the freshly read table when we have it, so a
+                # concurrent writer's keys (e.g. a backfilled breakdown)
+                # are preserved instead of clobbered by our stale copy.
+                try:
+                    _base = _fresh if isinstance(_fresh, dict) else ft
+                except Exception:
+                    _base = ft
+                ft = dict(_base if isinstance(_base, dict) else (ft or {}))
+                try:
+                    from datetime import datetime, timezone
+                    ft["ladder_paid_at"] = datetime.now(timezone.utc).isoformat()
+                except Exception:
+                    pass
+                ft["ladder_paid"] = marker
+                try:
+                    if (m or {}).get("id") is not None:
+                        supabase.table("bngc_ranked_tourney_matches").update(
+                            {"points_table": ft}).eq(
+                            "id", (m or {}).get("id")).execute()
+                        m["points_table"] = ft
+                        paid[(m or {}).get("id")] = marker
+                except Exception:
+                    continue
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return paid
+
+
 def _calculate_sync(trous: dict, matches: list, by_mid: dict,
                     computed_by: str = "dashboard") -> dict:
     """Shared calculate core: per-match points + aggregate boards + snapshot
@@ -1410,11 +2088,63 @@ def _calculate_sync(trous: dict, matches: list, by_mid: dict,
         for tid, ms in by_tid.items():
             trow = (trous or {}).get(tid) or {}
             try:
+                # Bridge pending join keys -> stored seal bundles (room seals
+                # that landed after the tourney seal). Resolved here so the
+                # freeze loop below and every board replay see the bundle.
+                _pend = _pending_seal_tables([m.get("id") for m in ms])
+                if _pend:
+                    from ..lib import ranked as _rk_seal
+                    for m in ms:
+                        try:
+                            pt = _pend.get((m or {}).get("id"))
+                            if not pt:
+                                continue
+                            b = _rk_seal.seal_bundle_for(
+                                pt.get("rid"), pt.get("room_match_version"))
+                            if isinstance(b, dict):
+                                supabase.table("bngc_ranked_tourney_matches").update(
+                                    {"points_table": b}).eq(
+                                    "id", (m or {}).get("id")).execute()
+                                m["points_table"] = b
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+            try:
                 for m in ms:
                     if (m or {}).get("points_table") is None and (m or {}).get("id") is not None:
                         ft = freeze_match_table((m or {}).get("id"))
                         if isinstance(ft, dict):
                             m["points_table"] = ft
+            except Exception:
+                pass
+            try:
+                # Breakdown backfill: frozen tables sealed before stored
+                # breakdowns existed get clamped per-player components so
+                # toasts/embeds match the (now clamped) boards. One write
+                # per match, then the row is current.
+                for m in ms:
+                    try:
+                        ft = (m or {}).get("points_table")
+                        if not (isinstance(ft, dict)
+                                and ft.get("mode") == "tourney-dynamic-v1"):
+                            continue
+                        if isinstance(ft.get("breakdown"), dict):
+                            continue
+                        _, bd = _score_frozen_with_breakdown(
+                            ft, m, (by_mid or {}).get((m or {}).get("id"), []))
+                        if bd and (m or {}).get("id") is not None:
+                            ft = dict(ft)
+                            ft["breakdown"] = {str(k): v for k, v in bd.items()}
+                            try:
+                                supabase.table("bngc_ranked_tourney_matches").update(
+                                    {"points_table": ft}).eq(
+                                    "id", (m or {}).get("id")).execute()
+                            except Exception:
+                                pass
+                            m["points_table"] = ft
+                    except Exception:
+                        continue
             except Exception:
                 pass
             per: dict = {}
@@ -1424,6 +2154,18 @@ def _calculate_sync(trous: dict, matches: list, by_mid: dict,
                         trow, m, (by_mid or {}).get(m["id"], []))
                 except Exception:
                     per[m["id"]] = []
+            try:
+                # Per-seal ladder pay (ranked-session economy): every sealed
+                # dynamic match pays its clamped breakdown deltas to
+                # ranked_points immediately, so counters move per match.
+                # Room-seal bundles already paid via the room seal, manual
+                # rows settle at stop, legacy rows carry no components —
+                # none of those are touched. Exactly-once per match via the
+                # ladder_paid marker stored on the frozen table (no schema
+                # change; backfills preserve it). Never breaks the board.
+                _pay_sealed_ladders(ms)
+            except Exception:
+                pass
             _pm = [per[m["id"]] for m in ms]
             try:
                 boards[str(tid)] = apply_adjustments(

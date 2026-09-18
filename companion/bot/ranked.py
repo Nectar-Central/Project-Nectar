@@ -87,8 +87,18 @@ ALLOWED_GMS = ("zw_lg", "df", "wwzw")
 # Human-readable mode names for embeds (never show raw ids like ZW_LG).
 GM_NAMES = {
     "zw_lg": "Late Game Zonewars",
+    "zw": "Zone Wars",
+    "wwzw": "Duo Wild West",
+    "ww": "Solo Wild West",
+    "bf": "Boxfights",
+    "bf2v2": "Boxfights 2v2",
+    "bf_2v2": "Boxfights 2v2",
+    "va": "V-Arena",
+    "tdm_bvr": "Red Vs Blue",
+    "rvb": "Red Vs Blue",
+    "r_1v1": "Realistic 1v1",
     "df": "Free Mode",
-    "wwzw": "Wild West Zonewars",
+    "lobby": "Lobby",
 }
 
 
@@ -99,12 +109,12 @@ def gm_name(gm: str) -> str:
         return "Unknown"
 
 # Milestone entry fees: at/above each tier you burn the fee on every start.
-# (Unranked <200 pays nothing.) Tune freely — (threshold, name, fee).
-MILESTONE_FEES = [(7500, "Grandmaster", 300), (5000, "Master", 250),
-                  (4000, "Champion", 200), (3000, "Emerald", 150),
-                  (2000, "Diamond", 100), (1500, "Platinum", 75),
-                  (1000, "Gold", 50), (500, "Silver", 25),
-                  (200, "Bronze", 10)]
+# (Unranked <500 pays nothing.) Tune freely — (threshold, name, fee).
+MILESTONE_FEES = [(25000, "Grandmaster", 1250), (18000, "Master", 900),
+                  (13000, "Champion", 650), (9000, "Emerald", 450),
+                  (6000, "Diamond", 300), (4000, "Platinum", 200),
+                  (2500, "Gold", 125), (1200, "Silver", 60),
+                  (500, "Bronze", 25)]
 
 
 def milestone_for(points: int):
@@ -127,8 +137,12 @@ def entry_fee(room: dict, player_points: int) -> int:
 RULES_TEXT = (
     "1. Roster only — outsiders earn nothing and may get the room reset.\n"
     "2. Host's word is final; host must stay in the room.\n"
-    "3. No smurfing, stream-sniping or point boosting — bans apply.\n"
-    "4. If you crash, rejoin fast and tell the host."
+    "3. The timer is always 4:30 — no shooting before it hits zero. "
+    "Shot early? Open a ticket with proof (clip or screenshot). "
+    "Caught shooting early? Blacklist + ban from ranked.\n"
+    "4. No smurfing, stream-sniping, teaming in solo, or point boosting — bans apply.\n"
+    "5. No exploiting bugs or glitches — report them instead, bans apply.\n"
+    "6. If you crash, rejoin fast and tell the host."
 )
 
 
@@ -423,12 +437,6 @@ def lobby_embed(room: dict) -> dict:
             starts = f"<t:{ts}:R>"
         except Exception:
             starts = str(room.get("starts_at"))
-    host_line = f"<@{room.get('host_discord_id')}>"
-    hs = (room.get("host_status") or "").strip()
-    if hs == "hosting_only":
-        host_line += " (hosting only)"
-    elif hs == "is_host_playing":
-        host_line += " (playing)"
     try:
         rids = roster_ids(room)
         if rids:
@@ -444,7 +452,6 @@ def lobby_embed(room: dict) -> dict:
     return {
         "title": f"Ranked Lobby {room['id']} — {gm_name(room.get('gm'))}",
         "fields": [
-            ("Host", host_line, True),
             ("Status", "Lobby — code hidden until start", True),
             ("Players", f"{len(roster_ids(room))}/{room.get('max_players')}", True),
             ("Avg", avg_line, True),
@@ -453,24 +460,15 @@ def lobby_embed(room: dict) -> dict:
             ("Join fee", str(room.get("fee") or 0), True),
             ("Starts", starts, True),
         ],
-        "footer": f"{room['id']} · press Join to enter · host sets the roster",
+        "footer": f"{room['id']} · press Join to enter",
     }
 
 
 def live_embed(room: dict, thread_id=None, host_status: str = "") -> dict:
     """Spec for the flipped-live lobby embed."""
-    host_line = f"<@{room.get('host_discord_id')}>"
-    hs = host_status or (room.get("host_status") or "").strip()
-    if hs == "hosting_only":
-        host_line += " (hosting only)"
-    elif hs == "is_host_playing":
-        host_line += " (playing)"
-    elif hs:
-        host_line += f" ({hs})"
     return {
         "title": f"Ranked LIVE {room['id']} — {gm_name(room.get('gm'))}",
         "fields": [
-            ("Host", host_line, True),
             ("Status", "Live — code sent to roster DMs", True),
             ("Players", f"{len(roster_ids(room))}/{room.get('max_players')}", True),
             ("Matches", f"{sealed_count(room['id'])}/{room.get('max_matches')}", True),
@@ -481,16 +479,9 @@ def live_embed(room: dict, thread_id=None, host_status: str = "") -> dict:
 
 def ended_embed(room: dict, thread_id=None) -> dict:
     """Spec for the ended lobby embed."""
-    host_line = f"<@{room.get('host_discord_id')}>"
-    hs = (room.get("host_status") or "").strip()
-    if hs == "hosting_only":
-        host_line += " (hosting only)"
-    elif hs == "is_host_playing":
-        host_line += " (playing)"
     return {
         "title": f"Ranked ENDED {room['id']} — {gm_name(room.get('gm'))}",
         "fields": [
-            ("Host", host_line, True),
             ("Status", "Ended", True),
             ("Players", f"{len(roster_ids(room))}/{room.get('max_players')}", True),
             ("Matches", f"{sealed_count(room['id'])}/{room.get('max_matches')}", True),

@@ -34,7 +34,7 @@ LIVE_GRACE_S = 30 * 60  # rooms live within this window explain pending seals
 PAGE = 1000
 MAX_ROWS = 200_000
 TID_CAP = 200
-MAX_TIER_FEE = max(t["fee"] for t in MILESTONE_TIERS)  # 300 (Grandmaster)
+MAX_TIER_FEE = max(t["fee"] for t in MILESTONE_TIERS)  # 1250 (Grandmaster)
 
 
 def _page_all(table: str, select: str, order: str, errors: list | None = None) -> list:

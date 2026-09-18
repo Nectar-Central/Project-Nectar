@@ -70,13 +70,15 @@ def list_tourneys(status: str = "all") -> list:
         return []
 
 
-def create_tourney(*, name, series_len=0, mode="solo",
+def create_tourney(*, name=None, series_len=0, mode="solo",
                    created_by=None, game_mode=None,
                    ping_role_id=None) -> dict:
-    """Insert a `created` ranked tourney and return the row. Raises on DB error.
+    """Insert a `created` ranked session and return the row. Raises on DB error.
 
-    No room code here: the code is set at /rtourney start and dispatched
-    to the roster (create embed shows "Wait for start").
+    No room code here: the code is set at /ranked start and dispatched
+    to the roster (create embed shows "Wait for start"). Sessions are
+    auto-named "ranked session #<id>" — the name field is gone from create.
+    An explicit name still wins when passed (dashboard/legacy callers).
     """
     try:
         series = max(0, int(series_len or 0))
@@ -84,7 +86,7 @@ def create_tourney(*, name, series_len=0, mode="solo",
         series = 0
     mode = "duo" if str(mode or "").lower() == "duo" else "solo"
     row = {
-        "name": str(name or "").strip()[:80] or "Ranked Tourney",
+        "name": str(name or "").strip()[:80] or "ranked session",
         "code": None, "status": "created", "mode": mode,
         "series_len": series,
         "game_mode": (str(game_mode or "").strip() or None),
@@ -95,7 +97,16 @@ def create_tourney(*, name, series_len=0, mode="solo",
     rows = res.data or []
     if not rows:
         raise RuntimeError("insert returned no row")
-    return dict(rows[0])
+    out = dict(rows[0])
+    if not str(name or "").strip():
+        try:
+            named = f"ranked session #{out.get('id')}"
+            _sb().table(T_TOURNEY).update({"name": named}).eq(
+                "id", int(out.get("id"))).execute()
+            out["name"] = named
+        except Exception:
+            pass
+    return out
 
 
 def update_tourney(tid: int, fields: dict) -> dict | None:
@@ -320,9 +331,9 @@ def set_code(tid: int, code: str | None) -> tuple[bool, str]:
             return False, "Code must be 5 letters/digits."
         t = get_tourney(tid)
         if not t:
-            return False, "No ranked tourney with that ID."
+            return False, "No ranked session with that ID."
         if str(t.get("status") or "") == "ended":
-            return False, "Tourney already ended."
+            return False, "Session already ended."
         update_tourney(int(tid), {"code": code_c})
         return True, "Code cleared." if code_c is None else f"Code set to `{code_c}`."
     except Exception as exc:
@@ -380,6 +391,27 @@ def host_line(t: dict, rids) -> str:
 # Embed specs (bot.py renders these; same shape as ranked.lobby_embed)
 # ---------------------------------------------------------------------------
 
+def session_title(t: dict, suffix: str = "") -> str:
+    """Embed title for a ranked session. Never repeats itself.
+
+    Auto-named rows ("ranked session #8") render as just "Ranked Session
+    #8"; legacy custom names append after a dash ("Ranked Session #5 —
+    "Cup"). Never raises.
+    """
+    try:
+        t = t or {}
+        tid = t.get("id")
+        nm = str(t.get("name") or "").strip()
+        base = f"Ranked Session #{tid}" if tid is not None else "Ranked Session"
+        if nm and nm.lower() != f"ranked session #{tid}".lower():
+            base = f"{base} — {nm[:60]}"
+        if suffix:
+            base = f"{base} — {suffix}"
+        return base
+    except Exception:
+        return "Ranked Session"
+
+
 def lobby_spec(t: dict) -> dict:
     """Spec for the ranked-tourney lobby embed: title, fields, footer."""
     try:
@@ -394,22 +426,22 @@ def lobby_spec(t: dict) -> dict:
         except Exception:
             avg, ms = None, None
         series = t.get("series_len") or 0
-        code = (t.get("code") or "").strip() if t.get("code") else ""
         return {
-            "title": f"Ranked Tourney #{tid} — {t.get('name') or 'Untitled'}",
+            "title": session_title(t),
             "fields": [
-                ("Host", host_line(t, rids), True),
                 ("Status", str(t.get("status") or "created").capitalize(), True),
                 ("Players", str(len(rids)), True),
                 ("Series", f"{sealed_count(int(tid))}/{series or '∞'}" if tid is not None else "—", True),
                 ("Rank", f"avg {avg} pts ({ms})" if avg is not None else "—", True),
-                ("Game", str(t.get("game_mode") or "—"), True),
-                ("Code", f"`{code}`" if code else "Wait for start", True),
+                ("Game", ranked_mod.gm_name(t.get("game_mode") or "") or "—", True),
+                # The code never shows here: this embed lives in a public
+                # channel, the code goes to the thread + DMs only.
+                ("Code", "Wait for match", True),
             ],
-            "footer": f"rtourney #{tid} · press Join to enter · dashboard: /ranked",
+            "footer": f"ranked session #{tid} · press Join to enter · dashboard: /ranked",
         }
     except Exception:
-        return {"title": "Ranked Tourney", "fields": [], "footer": ""}
+        return {"title": "ranked session", "fields": [], "footer": ""}
 
 
 def live_spec(t: dict, thread_id=None) -> dict:
@@ -427,17 +459,16 @@ def live_spec(t: dict, thread_id=None) -> dict:
         except Exception:
             series, played = 0, 0
         return {
-            "title": f"Ranked Tourney LIVE #{tid} — {t.get('name') or 'Untitled'}",
+            "title": session_title(t, "LIVE"),
             "fields": [
-                ("Host", host_line(t, rids), True),
                 ("Status", "Live — scoring on the /ranked dashboard", True),
                 ("Players", str(len(rids)), True),
                 ("Series", f"{played}/{series or '∞'}", True),
             ],
-            "footer": f"rtourney #{tid} · thread: {thread_id or t.get('thread_id') or '—'}",
+            "footer": f"ranked session #{tid} · thread: {thread_id or t.get('thread_id') or '—'}",
         }
     except Exception:
-        return {"title": "Ranked Tourney LIVE", "fields": [], "footer": ""}
+        return {"title": "ranked session LIVE", "fields": [], "footer": ""}
 
 
 def ended_spec(t: dict, thread_id=None) -> dict:
@@ -450,13 +481,12 @@ def ended_spec(t: dict, thread_id=None) -> dict:
         except Exception:
             rids = []
         return {
-            "title": f"Ranked Tourney ENDED #{tid} — {t.get('name') or 'Untitled'}",
+            "title": session_title(t, "ENDED"),
             "fields": [
-                ("Host", host_line(t, rids), True),
                 ("Status", "Ended", True),
                 ("Players", str(len(rids)), True),
             ],
-            "footer": f"rtourney #{tid} · over · thread: {thread_id or t.get('thread_id') or '—'}",
+            "footer": f"ranked session #{tid} · over · thread: {thread_id or t.get('thread_id') or '—'}",
         }
     except Exception:
-        return {"title": "Ranked Tourney ENDED", "fields": [], "footer": ""}
+        return {"title": "ranked session ENDED", "fields": [], "footer": ""}

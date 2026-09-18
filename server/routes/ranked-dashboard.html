@@ -56,7 +56,7 @@
 <body>
 <div id="topbar" role="banner">
   <b>Nectar Ranked Dashboard</b>
-  <div class="sub">host console · python · <span id="live">●</span>
+  <div class="sub">session console · python · <span id="live">●</span>
     &nbsp; Server <input id="srv" size="24" value="">
     <button id="srvSave">Apply</button>
     <button id="refreshNow" title="Manual refresh (no full reload)">⟳ Refresh</button>
@@ -78,7 +78,7 @@
       </div>
       <div class="rowline">New tourney
         <input id="tNew" size="18" placeholder="name">
-        <button id="tNewGo" title="Create a ranked tourney">Create</button>
+        <button id="tNewGo" title="Create a ranked session">Create</button>
       </div>
     </fieldset>
   </div>
@@ -207,7 +207,7 @@ async function refreshList() {
       `<div><span class="tlink" data-t="${t.id}"><b>#${t.id} ${esc(t.name)}</b></span> ` +
       `<span class="pill ${cls[t.status] || 'end'}">${esc(t.status)}</span> ` +
       `<span class="dim">${t.sealed || 0}/${t.series_len || '∞'} · ${t.players || 0} players</span></div>`
-    ).join('') || '<span class="dim">None yet — create one with /tourney-create.</span>';
+    ).join('') || '<span class="dim">None yet — create one with /ranked create.</span>';
     // auto-select: keep the saved tourney if still listed, else pick the
     // newest non-ended one so Save/Calculate never fire with no selection.
     try {
@@ -253,19 +253,19 @@ async function refreshDetail() {
       editMatchId = (open || matches[matches.length - 1]).id;
       persistMatch();
     }
-    // build-once shell per tourney: inputs keep host edits across fills,
+    // build-once shell per tourney: inputs keep manager edits across fills,
     // table buttons are wired once. Fills below never rebuild the shell.
     if (_shellTid !== selTid) {
       box.innerHTML =
         `<div id="thead"></div>` +
-        `<fieldset style="margin-top:8px"><legend>Hosts</legend><div id="hosts">…</div></fieldset>` +
+        `<fieldset style="margin-top:8px"><legend>Managers</legend><div id="hosts">…</div></fieldset>` +
         `<fieldset style="margin-top:8px"><legend>Scoring (dynamic)</legend><div class="dim">` +
         `Kills 4–20 by ladder strength (upset pays more, bigger lobbies pay more) · ` +
-        `Win 35–95 by winner points + lobby size · ` +
-        `Placement 6–24 by placed-player points + session average · ` +
-        `Loss −5 to −32 by tier. Sealed values freeze per match and replay forever.</div>` +
+        `Win 12–30 by winner points + lobby size · ` +
+        `Placement 6–24, top-half finishers only · ` +
+        `Loss killer-relative (−50 floor) else tier stake. Sealed values freeze per match and replay forever.</div>` +
         `<div style="margin-top:6px"><button id="calc" class="primary">Calculate</button> <button id="dmOpen">Open blank match</button></div></fieldset>` +
-        `<fieldset style="margin-top:8px"><legend>Standings</legend><div id="board">…</div></fieldset>` +
+        `<fieldset style="margin-top:8px"><legend>Matches — ladder movement</legend><div id="board">…</div></fieldset>` +
         `<fieldset style="margin-top:8px"><legend>Matches — pick one</legend><div id="matchlist">…</div></fieldset>` +
         `<div class="cols" style="margin-top:8px">` +
         `<fieldset><legend id="mLeftLeg">Match</legend><div id="matchLeft"><span class="dim">Pick a match above.</span></div></fieldset>` +
@@ -294,14 +294,26 @@ function renderHead(j) {
     `<div class="dim" style="margin-top:3px">RANK · avg ${esc(t.rank_avg != null ? t.rank_avg : '—')} pts${t.rank_milestone ? ' (' + esc(t.rank_milestone) + ')' : ''} (ladder snapshot, display only)</div>`;
 }
 function renderBoard(j) {
+  // Ranked-session economy: no aggregate standings — every sealed match
+  // lists what it paid to the ladder (signed deltas), latest first.
   const el = $('board');
   if (!el) return;
-  const bd = ((j && j.standings) || []).map((r, i) =>
-    `<tr><td>${i + 1}</td><td>${esc(r.name)}</td><td>${r.points}</td><td>${r.kills}</td><td>${r.wins}</td><td>${r.avg_placement != null ? r.avg_placement : '—'}</td><td>${r.rank_pts != null ? r.rank_pts : '—'}</td></tr>`).join('');
-  el.innerHTML = bd ? `<table class="grid"><tr><th>#</th><th>Player</th><th>Pts</th><th>K</th><th>W</th><th>Avg</th><th>Rank</th></tr>${bd}</table>` : '<span class="dim">No sealed matches.</span>';
+  const ms = ((j && j.match_boards) || []).slice().sort((a, b) => ((b && b.version) || 0) - ((a && a.version) || 0));
+  if (!ms.length) { el.innerHTML = '<span class="dim">No sealed matches.</span>'; return; }
+  el.innerHTML = ms.map((m) => {
+    const rows = ((m && m.rows) || []).map((r) => {
+      const p = Number(r.points) || 0;
+      const tag = r.won ? 'win' : (r.placement != null ? 'P' + r.placement : '—');
+      return `<tr><td>${esc(r.name)}</td><td>${p >= 0 ? '+' : ''}${p}</td><td>${r.kills}</td><td>${tag}</td></tr>`;
+    }).join('');
+    const paidTag = (m && m.paid === true) ? 'ladder paid'
+      : ((m && m.status) === 'manual' ? 'settles at stop' : 'unpaid');
+    return `<div style="margin-bottom:10px"><b>Match v${(m && m.version) != null ? m.version : '?'} — ${paidTag}</b>` +
+      (rows ? `<table class="grid"><tr><th>Player</th><th>Match pts</th><th>K</th><th>Result</th></tr>${rows}</table>` : ' <span class="dim">empty</span>') + `</div>`;
+  }).join('');
 }
-// Hosts panel: host-playing toggle + add/remove, optimistic with lite
-// rollback on failure. The creator always hosts (even if unlisted).
+// Managers panel: scoring toggle + add/remove, optimistic with lite
+// rollback on failure. The creator always has access (even if unlisted).
 async function renderHosts(j) {
   const box = $('hosts');
   if (!box || selTid == null) return;
@@ -311,20 +323,28 @@ async function renderHosts(j) {
     const rawHosts = [...new Set([...((t.hosts) || []), ...(t.created_by ? [String(t.created_by)] : [])].map((x) => String(x)))].filter(Boolean);
     const pmap = {};
     (((j || detailCache || {}).players) || []).forEach((p) => { if (p.name) pmap[String(p.discord_id)] = p.name; });
+    // Per-host status: a host who is on the accepted roster of this tourney
+    // is playing; anyone else only hosts (mirrors the bot's host_line).
+    const roster = new Set((((j || detailCache || {}).players) || []).map((p) => String(p.discord_id)));
     const missing = rawHosts.filter((d) => !pmap[d]);
     if (missing.length) {
       const nm = await api('/api/ranked/names?ids=' + encodeURIComponent(missing.slice(0, 100).join(','))).catch(() => ({ names: {} }));
       Object.assign(pmap, (nm && nm.names) || {});
     }
     box.innerHTML =
-      `<div class="gap">Host: <b>${hp ? 'Playing' : 'Hosting only'}</b> ` +
-      `<button id="hpGo">${hp ? 'Switch to Hosting Only' : 'Switch to Playing'}</button></div>` +
-      `<div class="muted" style="margin:4px 0 2px">HOSTS (${rawHosts.length})</div>` +
-      (rawHosts.map((d) =>
-        `<div><b title="${esc(d)}">${esc(pmap[d] || 'Unknown player')}</b> ` +
-        `<button data-unhost="${esc(d)}">Remove</button></div>`).join('') || '<span class="dim">None listed.</span>') +
-      `<div class="gap"><input size="14" id="hostAdd" placeholder="discord id"> <button id="hostAddGo">Add host</button></div>` +
-      `<div class="dim">The creator always hosts, even if unlisted.</div>`;
+      `<div class="gap">Scoring: <b>${hp ? 'Playing' : 'Spectating'}</b> ` +
+      `<button id="hpGo">${hp ? 'Switch to Spectating' : 'Switch to Playing'}</button></div>` +
+      `<div class="muted" style="margin:4px 0 2px">MANAGERS (${rawHosts.length})</div>` +
+      (rawHosts.map((d) => {
+        const playing = roster.has(String(d));
+        const tag = String(d) === String(t.created_by || '') ? 'creator' : 'manager';
+        return `<div><b title="${esc(d)}">${esc(pmap[d] || 'Unknown player')}</b> ` +
+          `<span class="pill ${playing ? 'run' : 'sched'}">${playing ? 'playing' : 'spectating'}</span> ` +
+          `<span class="dim">${tag}</span> ` +
+          `<button data-unhost="${esc(d)}">Remove</button></div>`;
+      }).join('') || '<span class="dim">None listed.</span>') +
+      `<div class="gap"><input size="14" id="hostAdd" placeholder="discord id"> <button id="hostAddGo">Add manager</button></div>` +
+      `<div class="dim">The creator always has access, even if unlisted.</div>`;
     const flip = $('hpGo');
     if (flip) flip.onclick = async () => {
       flip.disabled = true;
@@ -332,14 +352,14 @@ async function renderHosts(j) {
         if (detailCache && detailCache.tourney) detailCache.tourney.host_playing = !hp;
         renderHosts(detailCache);
         await api('/api/ranked/tourney/host-playing', post({ tourney_id: selTid, host_playing: !hp }));
-        log('host status: ' + (!hp ? 'playing' : 'hosting only'));
-      } catch (e) { log('host status: ' + e.message, true); refreshTourneyLite(); }
+        log('scoring mode: ' + (!hp ? 'playing' : 'hosting only'));
+      } catch (e) { log('scoring mode: ' + e.message, true); refreshTourneyLite(); }
     };
     const addGo = $('hostAddGo');
     if (addGo) addGo.onclick = async () => {
       const inp = $('hostAdd');
       const did = (inp && inp.value.trim()) || '';
-      if (!did) { log('add host: enter a discord id', true); return; }
+      if (!did) { log('add manager: enter a discord id', true); return; }
       addGo.disabled = true;
       try {
         if (detailCache && detailCache.tourney) {
@@ -351,8 +371,8 @@ async function renderHosts(j) {
         const r = await api('/api/ranked/tourney/hosts', post({ tourney_id: selTid, add: did }));
         if (detailCache && detailCache.tourney) detailCache.tourney.hosts = r.hosts || detailCache.tourney.hosts;
         renderHosts(detailCache);
-        log('host added ' + did.slice(0, 6));
-      } catch (e) { log('add host: ' + e.message, true); refreshTourneyLite(); }
+        log('manager added ' + did.slice(0, 6));
+      } catch (e) { log('add manager: ' + e.message, true); refreshTourneyLite(); }
     };
     box.querySelectorAll('[data-unhost]').forEach((b) => {
       b.onclick = async () => {
@@ -366,13 +386,13 @@ async function renderHosts(j) {
           const r = await api('/api/ranked/tourney/hosts', post({ tourney_id: selTid, remove: did }));
           if (detailCache && detailCache.tourney) detailCache.tourney.hosts = r.hosts || [];
           renderHosts(detailCache);
-          log('host removed ' + did.slice(0, 6));
-        } catch (e) { log('remove host: ' + e.message, true); refreshTourneyLite(); }
+          log('manager removed ' + did.slice(0, 6));
+        } catch (e) { log('remove manager: ' + e.message, true); refreshTourneyLite(); }
       };
     });
   } catch (e) { box.innerHTML = '<span class="bad">Failed: ' + esc(e.message) + '</span>'; }
 }
-// narrow tourney refresh for table/calculate/open-match: header, standings
+// narrow tourney refresh for table/calculate/open-match: header, match results
 // and match list only. Inputs, match panel, regs and unmapped are untouched
 // (no lost edits, no scroll jumps).
 async function refreshTourneyLite() {
@@ -396,7 +416,7 @@ function needTid() {
   return selTid;
 }
 // calc/open buttons are wired once per shell build; success refreshes the
-// tourney lite (header/standings/match list) so inputs keep host edits
+// tourney lite (header/match results/match list) so inputs keep manager edits
 // and nothing else on the page rebuilds.
 function wireTableButtons() {
   $('calc').onclick = async (e) => {
@@ -667,7 +687,7 @@ function optTie(dids) {
 }
 function optSub(did, pts) {
   // optimistic points removal mirrors the ledger (global tourney level);
-  // reconcile (match + standings) corrects on fetch.
+  // reconcile (match + results) corrects on fetch.
   try {
     const b = matchCache.board || [];
     const r = b.find((x) => String(x.discord_id) === String(did));
@@ -729,7 +749,7 @@ function winnerNameOf(did) {
   return nameOfDid(did);
 }
 // patch -> render instantly -> POST -> reconcile with one match fetch
-// (failure render = rollback). liteToo also refreshes header/standings/
+// (failure render = rollback). liteToo also refreshes header/results/
 // match list, which seal changes.
 async function mutMatch(btn, patch, fn, what, liteToo) {
   try { patch(); } catch {}
@@ -768,7 +788,7 @@ function renderMatchPanel() {
   _matchLive = (m.status === 'open' || m.status === 'manual');
   const sc = feed ? feed.scrollTop : 0;
   if (leg) leg.textContent = `Match v${m.version} (${m.status || '?'})${m.room_id ? ' · ' + String(m.room_id).slice(0, 8) : ''}`;
-  // preserve whatever the host is typing while live polls re-render
+  // preserve whatever is typed while live polls re-render
   let _fId = null, _fVal = '';
   try {
     const a = document.activeElement;
@@ -1053,14 +1073,14 @@ $('tSetGo').onclick = async (e) => {
   await refreshList(); await refreshDetail();
   btn.disabled = false;
 };
-// Create: dashboard creates directly by name (bot: /rtourney create).
+// Create: dashboard creates directly by name (bot: /ranked create).
 $('tNewGo').onclick = async (e) => {
   const btn = e.currentTarget; btn.disabled = true;
   const name = ($('tNew').value || '').trim();
   if (!name) { log('create: enter a name first', true); btn.disabled = false; return; }
   try {
     const r = await api('/api/ranked/tourney/create', post({ name }));
-    log('ranked tourney created #' + r.tourney_id);
+    log('ranked session created #' + r.tourney_id);
     $('tNew').value = '';
     selTid = Number(r.tourney_id); editMatchId = null; _matchLive = false;
     persistMatch();

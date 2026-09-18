@@ -280,14 +280,14 @@ def test_fee_partial_leaves_tier_band_drift(sweep):
 
 
 def test_deficit_beyond_fees_is_critical(sweep):
-    # deficit 1900; fee+max-tier explain 800 max -> residual -1400 critical
+    # deficit 2500; fee+max-tier explain 1750 max -> residual -2000 critical
     fake = _FakeSB()
     fake.tables["ranked_points"] = [_points("A", 100)]
-    fake.tables["ranked_results"] = [_result("R1", 1, {"A": 2000})]
+    fake.tables["ranked_results"] = [_result("R1", 1, {"A": 2600})]
     fake.tables["ranked_rooms"] = [_room("R1", "ended", 500, [{"discord_id": "A"}])]
     rc, rep = sweep(fake)
     row = rep["players"][0]
-    assert row["delta"] == -1400 and row["status"] == reconcile.STATUS_CRITICAL
+    assert row["delta"] == -2000 and row["status"] == reconcile.STATUS_CRITICAL
     assert rep["counts"][reconcile.STATUS_CRITICAL] == 1
     assert rep["attribution"] == {"A": "entry fee attributed (500)"}
 

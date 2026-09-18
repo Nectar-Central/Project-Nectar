@@ -133,10 +133,12 @@ def _session_fresh(live_session) -> bool:
     """False when the session stopped capturing (kick/close/reload).
 
     Without this the drawer keeps showing the last cached room — including
-    the ranked block with its match ID — for up to the cache TTL. Prefers
-    the current room's last_packet_at (stamped per engine feed), falls back
-    to the persist-time _cached_at. No timestamps at all (old caches) fails
-    open. Never raises (fail-open True).
+    the ranked block with its match ID — for up to the cache TTL. Fresh if
+    the NEWEST of (last game packet, last capture batch) is within the
+    window: heartbeats stamp the view's _cached_at every batch, so an idle
+    but connected lobby (sit still, wait for players) stays live, while a
+    closed/reloaded tab stops all batches and still ages out. No timestamps
+    at all (old caches) fails open. Never raises (fail-open True).
     """
     try:
         import time as _t
@@ -147,20 +149,21 @@ def _session_fresh(live_session) -> bool:
             cur = rooms.get((live_session or {}).get("current_room_id"))
             if not cur and rooms:
                 cur = next(reversed(list(rooms.values())), None)
+        stamps: list = []
         if isinstance(cur, dict):
             try:
-                lp = cur.get("last_packet_at")
-                if lp:
-                    return (now - float(lp)) <= _SESSION_STALE_S
+                if cur.get("last_packet_at") is not None:
+                    stamps.append(float(cur.get("last_packet_at")))
             except Exception:
                 pass
         try:
-            ca = (live_session or {}).get("_cached_at")
-            if ca:
-                return (now - float(ca)) <= _SESSION_STALE_S
+            if (live_session or {}).get("_cached_at") is not None:
+                stamps.append(float((live_session or {}).get("_cached_at")))
         except Exception:
             pass
-        return True
+        if not stamps:
+            return True
+        return (now - max(stamps)) <= _SESSION_STALE_S
     except Exception:
         return True
 
@@ -429,7 +432,7 @@ async def get_stats(request: Request):
     # Ranked block: null unless the live room is a lobby/live ranked room.
     # Response-only UI: the userscript renders lobby vs match UI from this
     # (lobby = create/join bind confirmed here; match = curScn flip locally).
-    # Additive — non-ranked responses keep "ranked": null.
+    # Additive - non-ranked responses keep "ranked": null.
     ranked_out = None
     try:
         code = (session_out or {}).get("short_code")
@@ -441,8 +444,23 @@ async def get_stats(request: Request):
         # Flag parity: a sleeping server never serves the ranked block,
         # matching the seal/lookup gate in lib/ranked (UI without a
         # sealer is exactly the lie this gate prevents).
+        rdata = None
+        tourney_ctx = None
         if code and not ranked_mod.ranked_sleeping():
             rdata = await db_io(ranked_mod.get_ranked_room, code)
+            # rtourney sessions never create a ranked_rooms row, so the
+            # rooms lookup misses. Resolve the tourney tagged to this code
+            # instead; if one exists, synthesize a rooms-shaped presentation
+            # block below so the client surfaces (lobby card, F9 gate,
+            # drawer "Ranked" line, pending-seal marker) light up.
+            # Presentation-only: the seal bridge + standings payout remain
+            # the tourney truth.
+            if not rdata:
+                try:
+                    from .ranked_tourney import code_tourney_points as _rtp
+                    tourney_ctx = await db_io(_rtp, code, discord_id)
+                except Exception:
+                    tourney_ctx = None
             if rdata and rdata.get("status") in ("lobby", "live"):
                 pts = await db_io(ranked_mod.get_ranked_points, discord_id)
                 tier = ranked_mod.milestone_for(pts)
@@ -452,23 +470,48 @@ async def get_stats(request: Request):
                 except Exception:
                     mver = 0
                 # last sealed result for this room (drives the points toast):
-                # what I gained, whether I won, and my kills.
+                # what I gained, whether I won, my kills, my placement, and
+                # the per-component breakdown (kills/win/placement/loss,
+                # total, capped) the client renders as a component queue.
                 last_result = None
                 try:
-                    lr = await db_io(lambda: supabase.table("ranked_results").select(
-                        "match_version,winner_discord_id,kills,points"
-                    ).eq("room_id", rid).order("match_version", desc=True).limit(1).execute())
+                    try:
+                        lr = await db_io(lambda: supabase.table("ranked_results").select(
+                            "match_version,winner_discord_id,kills,points,placements,arena_breakdown"
+                        ).eq("room_id", rid).order("match_version", desc=True).limit(1).execute())
+                    except Exception as exc:
+                        # pre-migration (no placements/arena_breakdown
+                        # columns): classic shape, no components
+                        if "placements" not in str(exc) and "arena_breakdown" not in str(exc) \
+                                and "42703" not in str(exc):
+                            raise
+                        lr = await db_io(lambda: supabase.table("ranked_results").select(
+                            "match_version,winner_discord_id,kills,points"
+                        ).eq("room_id", rid).order("match_version", desc=True).limit(1).execute())
                     rows = lr.data or []
                     if rows:
                         row = rows[0]
                         pts_map = row.get("points") or {}
                         kills_map = row.get("kills") or {}
+                        plc_map = row.get("placements") or {}
+                        bd_map = row.get("arena_breakdown") or {}
                         me = str(discord_id or "")
+                        try:
+                            my_plc = plc_map.get(me)
+                            my_plc = int(my_plc) if my_plc is not None else None
+                        except Exception:
+                            my_plc = None
+                        try:
+                            my_bd = bd_map.get(me) or None
+                        except Exception:
+                            my_bd = None
                         last_result = {
                             "match_version": row.get("match_version"),
                             "gained": int(pts_map.get(me) or 0),
                             "won": bool(me) and str(row.get("winner_discord_id") or "") == me,
                             "kills": int(kills_map.get(me) or 0),
+                            "placement": my_plc,
+                            "breakdown": my_bd,
                         }
                 except Exception:
                     last_result = None
@@ -493,7 +536,7 @@ async def get_stats(request: Request):
                         int((last_result or {}).get("match_version") or 0) < mver)),
                 }
                 # Live board (comp-style poll freshness): top rows of the
-                # running match, recomputed per poll while live. Best-effort —
+                # running match, recomputed per poll while live. Best-effort -
                 # absent (not null) when nothing is banked yet.
                 try:
                     if rdata.get("status") == "live" and mver > 0:
@@ -503,8 +546,132 @@ async def get_stats(request: Request):
                         if live and live.get("board"):
                             ranked_out["match_board"] = live["board"]
                             ranked_out["match_sealed"] = bool(live.get("sealed"))
+                        # Debug-chip diagnostics: ~activity age of the newest
+                        # banked event and unmapped-name count for the open
+                        # match (stuck-seal / missing-link field visibility).
+                        if live:
+                            ranked_out["last_event_age_s"] = live.get("last_event_age_s")
+                            ranked_out["unmapped_names"] = int(live.get("unmapped_names") or 0)
                 except Exception:
                     pass
+            elif tourney_ctx is not None:
+                # Ranked session (rtourney): rooms-shaped presentation block.
+                # Ranked-session economy: the big number is YOUR ladder total
+                # (seals pay the ladder per match), never session standings.
+                # Per-match earned comes from the RT toasts (ranked_tourney
+                # last_result components). Milestone badge = ladder tier.
+                # pending_seal keys off the newest tourney match still being
+                # open, so the client honesty marker and start-overlay edge
+                # behave exactly as in rooms. is_host=False: tourney host
+                # controls are /rtourney commands, not the client panels.
+                try:
+                    lpts = await db_io(ranked_mod.get_ranked_points, discord_id)
+                except Exception:
+                    lpts = 0
+                tier = ranked_mod.milestone_for(lpts)
+                tid = tourney_ctx.get("tourney_id")
+                mver, open_match = 0, False
+                try:
+                    if tid is not None and supabase is not None:
+                        mres = await db_io(lambda: supabase.table(
+                            "bngc_ranked_tourney_matches").select(
+                            "version,status").eq("tourney_id", int(tid)).order(
+                            "version", desc=True).limit(1).execute())
+                        _mrow = (mres.data or [None])[0] or {}
+                        mver = int(_mrow.get("version") or 0)
+                        open_match = str(_mrow.get("status") or "") == "open"
+                except Exception:
+                    pass
+                # last sealed result for this tourney (drives the points
+                # toast, same shape as rooms): replayed from the match's
+                # stored seal — room-seal bundle verbatim, or the frozen
+                # tourney-dynamic breakdown (same deltas the ladder paid).
+                # Non-bundle rows (legacy/manual) stay None: no second
+                # economy to report.
+                last_result = None
+                try:
+                    if tid is not None and supabase is not None:
+                        sres = await db_io(lambda: supabase.table(
+                            "bngc_ranked_tourney_matches").select(
+                            "version,winner_discord_id,placements,points_table").eq(
+                            "tourney_id", int(tid)).in_(
+                            "status", ["sealed", "manual"]).order(
+                            "version", desc=True).limit(1).execute())
+                        _srow = (sres.data or [None])[0]
+                        _pt = (_srow or {}).get("points_table") if _srow else None
+                        if isinstance(_pt, dict) and _pt.get("mode") == "room-seal-v1":
+                            _pts = _pt.get("points") or {}
+                            _me = str(discord_id or "")
+                            if _me and _me in {str(k) for k in _pts}:
+                                try:
+                                    _plc = (_pt.get("placements") or {}).get(_me)
+                                    _plc = int(_plc) if _plc is not None else None
+                                except Exception:
+                                    _plc = None
+                                try:
+                                    _bd = (_pt.get("breakdown") or {}).get(_me) or None
+                                except Exception:
+                                    _bd = None
+                                try:
+                                    _win = str(_pt.get("winner") or
+                                               (_srow or {}).get("winner_discord_id") or "") == _me
+                                except Exception:
+                                    _win = False
+                                last_result = {
+                                    "match_version": (_srow or {}).get("version"),
+                                    "gained": int(_pts.get(_me) or 0),
+                                    "won": bool(_win),
+                                    "kills": int((_pt.get("kills") or {}).get(_me) or 0),
+                                    "placement": _plc,
+                                    "breakdown": _bd,
+                                }
+                        elif isinstance(_pt, dict) and _pt.get("mode") == "tourney-dynamic-v1":
+                            _me = str(discord_id or "")
+                            try:
+                                _bdm = (_pt.get("breakdown") or {}).get(_me) or None
+                            except Exception:
+                                _bdm = None
+                            if _me and isinstance(_bdm, dict):
+                                try:
+                                    _plc2 = (((_srow or {}).get("placements")) or {}).get(_me)
+                                    _plc2 = int(_plc2) if _plc2 is not None else None
+                                except Exception:
+                                    _plc2 = None
+                                try:
+                                    _kc = sum(1 for _a in ((_pt.get("kill_awards")) or [])
+                                              if str((_a or {}).get("killer") or "") == _me)
+                                except Exception:
+                                    _kc = 0
+                                try:
+                                    _win2 = str((_srow or {}).get("winner_discord_id") or "") == _me
+                                except Exception:
+                                    _win2 = False
+                                last_result = {
+                                    "match_version": (_srow or {}).get("version"),
+                                    "gained": int(_bdm.get("total") or 0),
+                                    "won": bool(_win2),
+                                    "kills": int(_kc),
+                                    "placement": _plc2,
+                                    "breakdown": _bdm,
+                                }
+                except Exception:
+                    last_result = None
+                ranked_out = {
+                    "active": True,
+                    "rid": f"RT-{tid}" if tid is not None else f"RT-{code}",
+                    "short_code": str(code or "").strip().upper(),
+                    "status": "live",
+                    "is_host": False,
+                    "tourney_id": tid,
+                    "points": lpts,
+                    "milestone": tier.get("name"),
+                    "milestone_icon_url": tier.get("icon_url"),
+                    "milestone_color": tier.get("color"),
+                    "match_id": f"RT-{tid}-{mver}" if tid is not None and mver > 0 else None,
+                    "match_version": mver,
+                    "last_result": last_result,
+                    "pending_seal": bool(mver > 0 and open_match),
+                }
     except Exception:
         ranked_out = None
     # Per-poll verdict log, sampled: a BLOCK line only when the verdict
@@ -515,7 +682,9 @@ async def get_stats(request: Request):
         _rk_code = (session_out or {}).get("short_code") or _stale_short_code
         _rk_sig = (str(ranked_out.get("rid")) if ranked_out else None,
                    ranked_out.get("match_version") if ranked_out else None,
-                   ranked_out.get("points") if ranked_out else None)
+                   ranked_out.get("points") if ranked_out else None,
+                   (ranked_out.get("last_result") or {}).get("match_version")
+                   if ranked_out else None)
         _rk_last = _stats_ranked_sig.get(str(discord_id or ""))
         _rk_now = _time.time()
         if _rk_last is None or _rk_last[0] != _rk_sig or _rk_now - _rk_last[1] >= 60:

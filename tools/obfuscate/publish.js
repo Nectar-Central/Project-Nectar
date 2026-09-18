@@ -19,7 +19,7 @@ const fs = require("fs");
 const path = require("path");
 
 const ROOT = path.join(__dirname, "..", "..");
-const VERSION = "2.22.1";
+const VERSION = "2.31.0";
 
 function loadEnv(p) {
   const env = {};

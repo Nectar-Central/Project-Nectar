@@ -11,7 +11,7 @@ import types
 import pytest
 
 from server.lib import ranked as ranked_mod
-from server.lib.photon_engine.models import KillInfo, Player, RoomView
+from server.lib.photon_engine.models import KillInfo, Player, RoomView, Team
 import server.scripts.processor as proc
 
 
@@ -217,11 +217,11 @@ def _use_fake_for_ranked(monkeypatch, fake):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("pts,name", [
-    (0, "Unranked"), (199, "Unranked"), (200, "Bronze"), (499, "Bronze"),
-    (500, "Silver"), (999, "Silver"), (1000, "Gold"), (1499, "Gold"),
-    (1500, "Platinum"), (1999, "Platinum"), (2000, "Diamond"), (2999, "Diamond"),
-    (3000, "Emerald"), (3999, "Emerald"), (4000, "Champion"), (4999, "Champion"),
-    (5000, "Master"), (7499, "Master"), (7500, "Grandmaster"), (99999, "Grandmaster"),
+    (0, "Unranked"), (499, "Unranked"), (500, "Bronze"), (1199, "Bronze"),
+    (1200, "Silver"), (2499, "Silver"), (2500, "Gold"), (3999, "Gold"),
+    (4000, "Platinum"), (5999, "Platinum"), (6000, "Diamond"), (8999, "Diamond"),
+    (9000, "Emerald"), (12999, "Emerald"), (13000, "Champion"), (17999, "Champion"),
+    (18000, "Master"), (24999, "Master"), (25000, "Grandmaster"), (99999, "Grandmaster"),
 ])
 def test_tier_boundaries(pts, name):
     assert ranked_mod.milestone_for(pts)["name"] == name
@@ -236,10 +236,10 @@ def test_tier_icons_present():
 
 def test_next_milestone_edges():
     nxt, need, pct = ranked_mod.next_milestone(0)
-    assert (nxt["name"], need, pct) == ("Bronze", 200, 0)
-    assert ranked_mod.next_milestone(7500) == (None, 0, 100)
-    nxt, need, pct = ranked_mod.next_milestone(1000)
-    assert (nxt["name"], need) == ("Platinum", 500)
+    assert (nxt["name"], need, pct) == ("Bronze", 500, 0)
+    assert ranked_mod.next_milestone(25000) == (None, 0, 100)
+    nxt, need, pct = ranked_mod.next_milestone(2500)
+    assert (nxt["name"], need) == ("Platinum", 1500)
 
 
 def test_arena_icon():
@@ -265,10 +265,10 @@ def _load_bot_ranked():
 
 def test_bot_tiers_mirror_server():
     bot_r = _load_bot_ranked()
-    for pts, name in [(0, "Unranked"), (200, "Bronze"), (500, "Silver"),
-                      (1000, "Gold"), (1500, "Platinum"), (2000, "Diamond"),
-                      (3000, "Emerald"), (4000, "Champion"), (5000, "Master"),
-                      (7500, "Grandmaster")]:
+    for pts, name in [(0, "Unranked"), (500, "Bronze"), (1200, "Silver"),
+                      (2500, "Gold"), (4000, "Platinum"), (6000, "Diamond"),
+                      (9000, "Emerald"), (13000, "Champion"), (18000, "Master"),
+                      (25000, "Grandmaster")]:
         assert bot_r.milestone_for(pts)[0] == ranked_mod.milestone_for(pts)["name"]
         assert bot_r.milestone_for(pts)[0] == name
 
@@ -401,13 +401,18 @@ def test_seal_match_kill_events_exact(monkeypatch):
                                 placements={"K": 1, "V": 2},
                                 kill_events=[("K", "V")])
     assert res["ok"] is True
-    # base table (avg 0): K = 1 kill (8) + win (50) + P1 (10) = 68; V = P2 (7) - 5 = 2
-    assert res["points"] == {"K": 68, "V": 2}
-    assert fake.points["K"] == 568
+    # base table (avg 0): K = 1 kill (8) + win (50) + P1 (10) = 68 -> clamp 30;
+    # V = P2 (7) - 5 = 2
+    assert res["points"] == {"K": 30, "V": 2}
+    assert fake.points["K"] == 530
     assert fake.points["V"] == 502
     row = fake.results[0]
     assert (row["room_id"], row["match_version"], row["winner_discord_id"]) == ("R-X", 2, "K")
     assert row["placements"] == {"K": 1, "V": 2}  # stored for the toast + review
+    assert row["arena_breakdown"]["K"] == {"kills": 8, "win": 50, "placement": 10,
+                                           "loss": 0, "total": 30, "capped": True}
+    assert row["arena_breakdown"]["V"] == {"kills": 0, "win": 0, "placement": 7,
+                                           "loss": -5, "total": 2, "capped": False}
 
 
 def test_seal_match_defeat_minus_lower_killer(monkeypatch):
@@ -422,9 +427,10 @@ def test_seal_match_defeat_minus_lower_killer(monkeypatch):
                                 kill_events=[("K", "V")],
                                 death_killers={"V": "K"})
     assert res["ok"] is True
-    # K = 1 kill (8) + P4 (3) - 5 = 6 (not winner); V = win (50) + P1 (10) = 60
+    # static: K = 1 kill (8) + P4 (3) - 5 = 6 (not winner);
+    # V = win (50) + P1 (10) = 60 -> clamp 30
     assert res["points"]["K"] == 6
-    assert res["points"]["V"] == 60
+    assert res["points"]["V"] == 30
 
 
 def test_seal_match_defeat_minus_peer_and_zone(monkeypatch):
@@ -439,9 +445,9 @@ def test_seal_match_defeat_minus_peer_and_zone(monkeypatch):
                                 placements={"A": 1, "B": 2, "C": 3, "D": 4},
                                 death_killers={"B": "A", "C": None})
     assert res["ok"] is True
-    # A = 2 kills (16) + win (50) + P1 (10) = 76; B = P2 (7) - 5 = 2;
-    # C = P3 (5) - 5 = 0; D = P4 (3) - 5 = -2
-    assert res["points"] == {"A": 76, "B": 2, "C": 0, "D": -2}
+    # static: A = 2 kills (16) + win (50) + P1 (10) = 76 -> clamp 30;
+    # B = P2 (7) - 5 = 2; C = P3 (5) - 5 = 0; D = P4 (3) - 5 = -2
+    assert res["points"] == {"A": 30, "B": 2, "C": 0, "D": -2}
 
 
 def test_seal_match_placements_capped_at_lobby_size(monkeypatch):
@@ -456,11 +462,11 @@ def test_seal_match_placements_capped_at_lobby_size(monkeypatch):
                                 placements={"K": 1, "V": 2, "X": 3},
                                 players_count=2)
     assert res["ok"] is True
-    assert res["points"] == {"K": 60, "V": 2, "X": 0}
+    assert res["points"] == {"K": 30, "V": 2, "X": 0}
 
 
 def test_seal_match_flat_no_scaling_by_avg_points(monkeypatch):
-    """No scaling by tier: same table for every lobby tier at equal avg."""
+    """Static branch ignores ratings: same table for equal lobbies."""
     fake = _FakeDB()
     _use_fake_for_ranked(monkeypatch, fake)
     now = time.time()
@@ -470,7 +476,7 @@ def test_seal_match_flat_no_scaling_by_avg_points(monkeypatch):
                                 winner_discord_id="H1", kills={},
                                 placements={"H1": 1, "H2": 2})
     assert res["ok"] is True
-    assert res["points"]["H1"] == 60
+    assert res["points"]["H1"] == 30  # 50 + 10, clamped
     assert res["points"]["H2"] == 2
 
     fake2 = _FakeDB()
@@ -481,7 +487,7 @@ def test_seal_match_flat_no_scaling_by_avg_points(monkeypatch):
                                  winner_discord_id="V1", kills={},
                                  placements={"V1": 1, "V2": 2})
     assert res2["ok"] is True
-    assert res2["points"]["V1"] == 60
+    assert res2["points"]["V1"] == 30  # ratings ignored on the static path
     assert res2["points"]["V2"] == 2
 
 
@@ -514,7 +520,7 @@ def test_seal_match_bulk_single_read_and_upsert(monkeypatch):
     assert {r["discord_id"] for r in ups[0][2]} == {"BK1", "BK2"}
     assert fake.points["BK1"] == 100 + res["points"]["BK1"]
     assert fake.points["BK2"] == 200 + res["points"]["BK2"]
-    assert res["points"] == {"BK1": 68, "BK2": 2}  # kill + win + P1 / P2 - loss
+    assert res["points"] == {"BK1": 30, "BK2": 2}  # kill + win + P1 (clamped) / P2 - loss
 
 
 def test_seal_match_winner_fallback_gets_first(monkeypatch):
@@ -527,7 +533,27 @@ def test_seal_match_winner_fallback_gets_first(monkeypatch):
                                 winner_discord_id="W", kills={},
                                 placements={})
     assert res["ok"] is True
-    assert res["points"] == {"W": 50}
+    assert res["points"] == {"W": 30}  # lone winner: win purse, clamped
+
+
+def test_seal_match_tied_winners_skip_loss(monkeypatch):
+    fake = _FakeDB()
+    _use_fake_for_ranked(monkeypatch, fake)
+    now = time.time()
+    monkeypatch.setitem(ranked_mod._points_cache, "W", (0, now))
+    monkeypatch.setitem(ranked_mod._points_cache, "T", (0, now))
+    monkeypatch.setitem(ranked_mod._points_cache, "L", (0, now))
+    # duo co-winner: full win bonus, no loss; loser pays the flat stake
+    res = ranked_mod.seal_match(rid="R-T", match_version=1, gm="zw_lg",
+                                winner_discord_id="W", kills={},
+                                placements={"W": 1, "T": 1, "L": 2},
+                                death_killers={"T": None, "L": None},
+                                tied_winners=["T"])
+    assert res["ok"] is True
+    assert res["breakdown"]["T"]["loss"] == 0
+    assert res["breakdown"]["T"]["win"] > 0
+    assert res["breakdown"]["L"]["loss"] < 0
+    assert res["points"]["T"] > 0
 
 
 # ---------------------------------------------------------------------------
@@ -617,7 +643,7 @@ def test_happy_path_winner_kills_losses(monkeypatch):
     assert kw["winner_discord_id"] == "K"            # alive roster did
     assert kw["kill_events"] == [("K", "V")]
     assert kw["kills"] == {"K": 1}
-    assert kw["death_killers"] == {"V": None}       # flat loss, no attribution
+    assert kw["death_killers"] == {"V": "K"}       # killer-relative loss attribution
     # no bngc_users rows in this fake: Victim unmapped, winner still cohered P1
     assert kw["placements"] == {"K": 1}
 
@@ -648,9 +674,35 @@ def test_nobody_alive_last_to_die_wins(monkeypatch):
     proc.seal_ranked_match("s", "K", r, "r1", "zw_lg")
     assert len(calls) == 1
     kw = calls[0]
-    # most-recent death (Victim) survived longest => winner, not None
-    assert kw["winner_discord_id"] == "V"
-    assert kw["death_killers"] == {"K": None}
+    # double-KO: nobody alive — the last KILLER (K, final blow on V) wins,
+    # not the last victim (K was alive at least until that kill)
+    assert kw["winner_discord_id"] == "K"
+    assert kw["death_killers"] == {"V": "K"}
+
+
+def test_duo_surviving_partner_shares_win(monkeypatch):
+    fake = _FakeDB()
+    monkeypatch.setattr(proc, "supabase", fake)
+    calls = []
+    _patch_ranked(monkeypatch, calls)
+    r = _room()
+    r.gv = "duo"
+    r.teams["t1"] = Team(team_id="t1", members=["Killer", "Partner"])
+    r.players[4] = Player(actor_nr=4, username="Partner", is_alive=True)
+    monkeypatch.setattr(proc, "_resolve_ranked_dids",
+                        lambda names: dict(_NAME2DID, Partner="P"))
+    room_data = dict(_ROOM_DATA, roster=[{"discord_id": "K"}, {"discord_id": "V"},
+                                         {"discord_id": "P"}])
+    monkeypatch.setattr(ranked_mod, "get_ranked_room", lambda code: room_data)
+    proc.seal_ranked_match("s", "K", r, "r1", "zw_lg")
+    assert len(calls) == 1
+    kw = calls[0]
+    # surviving partner shares the crown: P1 tie, no loss, no death row
+    # (V stays unplaced here: no verified identity in this fake, as in solo)
+    assert kw["winner_discord_id"] == "K"
+    assert kw["tied_winners"] == ["P"]
+    assert kw["placements"] == {"K": 1, "P": 1}
+    assert "P" not in kw["death_killers"]
 
 
 def test_hosting_only_host_not_counted_but_seals(monkeypatch):
@@ -867,8 +919,9 @@ def test_seal_double_ko_placements_agree_with_crown(monkeypatch):
     r = _room()
     r.players[1].is_alive = False  # zone double-KO: nobody alive
     proc.seal_ranked_match("s", "K", r, "r1", "zw_lg")
-    assert calls[0]["winner_discord_id"] == "V"
-    assert calls[0]["placements"] == {"V": 1, "K": 2}
+    # last killer (K) crowned over last victim: placements agree with crown
+    assert calls[0]["winner_discord_id"] == "K"
+    assert calls[0]["placements"] == {"K": 1, "V": 2}
 
 
 # ---------------------------------------------------------------------------
@@ -898,12 +951,12 @@ def test_seal_banked_kills_drive_awards(monkeypatch):
     now = time.time()
     monkeypatch.setitem(ranked_mod._points_cache, "K", (0, now))
     monkeypatch.setitem(ranked_mod._points_cache, "V", (0, now))
-    # legacy inputs say 0 kills: banked evidence (K x2) must win -> 16 + 50 + P1 (10)
+    # legacy inputs say 0 kills: banked evidence (K x2) must win -> 16 + 50 + P1 (10), clamped
     res = ranked_mod.seal_match(rid="R-B2", match_version=1, gm="zw_lg",
                                 winner_discord_id="K", kills={},
                                 placements={"K": 1, "V": 2})
     assert res["ok"] is True
-    assert res["points"]["K"] == 76
+    assert res["points"]["K"] == 30
 
 
 def test_seal_banked_loser_kill_keeps_flat_loss(monkeypatch):
@@ -1216,12 +1269,18 @@ def test_scaled_table_for():
 def test_dynamic_ranked_economy_is_bounded():
     # The feature flag controls rollout; these pure functions pin the new
     # economy independently of the legacy static-table compatibility path.
-    assert ranked_mod.kill_delta(0, 4000, 0) == 12
-    assert ranked_mod.kill_delta(4000, 0, 0) == 4
-    assert 35 <= ranked_mod.win_delta(7500, 16) <= 95
-    assert ranked_mod.win_delta(7500, 16) < 96
+    assert ranked_mod.kill_delta(0, 4000, 0) == 8
+    assert ranked_mod.kill_delta(4000, 0, 0) == 2
+    assert ranked_mod.win_delta(7500, 16) == 20
     assert ranked_mod.placement_delta(1, 0, 8) <= 22
     assert ranked_mod.placement_delta(1, 999999, 99) == 22
+    # per-match clamp + killer-relative loss
+    assert ranked_mod.clamp_match_delta(68) == 30
+    assert ranked_mod.clamp_match_delta(-80) == -50
+    assert ranked_mod.loss_vs(26000, 2500) == -48  # GM feeding a Gold
+    assert ranked_mod.loss_vs(26000, 26000) == -32  # peer rate
+    assert ranked_mod.loss_vs(26000, 30000) == -16  # dying up is cheap
+    assert ranked_mod.loss_vs(26000, None) == -32  # unknown killer: flat stake
 
 
 def test_dynamic_seal_freezes_per_kill_awards(monkeypatch):
@@ -1237,7 +1296,7 @@ def test_dynamic_seal_freezes_per_kill_awards(monkeypatch):
     assert res["ok"] is True
     table = fake.results[0]["points_table"]
     assert table["mode"] == "dynamic-v1"
-    assert table["kill_awards"] == [{"killer": "K", "victim": "V", "nth": 1, "points": 13}]
+    assert table["kill_awards"] == [{"killer": "K", "victim": "V", "nth": 1, "points": 8}]
 
 
 def test_dynamic_rows_exclude_a_removed_player():
@@ -1284,16 +1343,16 @@ def test_kill_awards_taper_within_match():
 
 def test_tier_index_and_scaled_loss():
     assert ranked_mod.tier_index_for(0) == 0
-    assert ranked_mod.tier_index_for(199) == 0
-    assert ranked_mod.tier_index_for(200) == 1
-    assert ranked_mod.tier_index_for(7500) == 9
+    assert ranked_mod.tier_index_for(499) == 0
+    assert ranked_mod.tier_index_for(500) == 1
+    assert ranked_mod.tier_index_for(25000) == 9
     assert ranked_mod.tier_index_for(99999) == 9
     assert ranked_mod.tier_index_for(None) == 0
     assert ranked_mod.loss_for(0) == -5
-    assert ranked_mod.loss_for(199) == -5
-    assert ranked_mod.loss_for(200) == -8
-    assert ranked_mod.loss_for(1000) == -14
-    assert ranked_mod.loss_for(7500) == -32
+    assert ranked_mod.loss_for(499) == -5
+    assert ranked_mod.loss_for(500) == -8
+    assert ranked_mod.loss_for(2500) == -14
+    assert ranked_mod.loss_for(25000) == -32
     assert ranked_mod.loss_for(99999) == -32
 
 
@@ -1306,7 +1365,7 @@ def test_dynamic_table_freezes_loss_awards():
 
 def test_dynamic_seal_freezes_tiered_loss_and_taper(monkeypatch):
     fake = _FakeDB()
-    fake.points = {"K": 0, "V": 1000}  # Unranked killer, Gold victim
+    fake.points = {"K": 0, "V": 1000}  # Unranked killer, Bronze victim
     _use_fake_for_ranked(monkeypatch, fake)
     ranked_mod._points_cache.clear()
     monkeypatch.setattr(ranked_mod, "RANKED_DYNAMIC", True)
@@ -1319,15 +1378,18 @@ def test_dynamic_seal_freezes_tiered_loss_and_taper(monkeypatch):
     table = row["points_table"]
     # tier-scaled losses frozen for everyone involved (winner included,
     # so a later crown swap finds the dethroned loss)
-    assert table["loss_awards"] == {"K": -5, "V": -14}
+    assert table["loss_awards"] == {"K": -5, "V": -8}
     assert [a["nth"] for a in table["kill_awards"]] == [1, 2, 3]
     base = ranked_mod.kill_delta(0, 1000, 500.0)
     assert [a["points"] for a in table["kill_awards"]] == [
         base, base, max(1, round(base * 0.8))]
-    # final ledger: K = tapered kills + win + P1, V = P2 + frozen -14
+    # final ledger: K = tapered kills (8+8+6) + win (8) + P1 (12) = 42 -> clamp 30;
+    # V = P2 (8) + frozen -8 = 0
     win, place = table["win"], table["placement"]
-    assert row["points"]["K"] == sum(a["points"] for a in table["kill_awards"]) + win + place[0]
-    assert row["points"]["V"] == place[1] - 14
+    assert row["points"]["K"] == 30
+    assert row["points"]["V"] == place[1] - 8
+    assert row["arena_breakdown"]["K"]["total"] == 30
+    assert row["arena_breakdown"]["K"]["capped"] is True
 
 
 def test_recalc_replays_frozen_loss_and_crown_swap(monkeypatch):
@@ -1404,7 +1466,7 @@ def test_seal_scaled_by_lobby_avg(monkeypatch):
                                 kill_events=[("K", "V"), ("K", "V")],
                                 avg_points=4000)
     assert res["ok"] is True
-    assert res["points"] == {"K": 152, "V": 9}
+    assert res["points"] == {"K": 30, "V": 9}  # 152-point game, clamped; V untouched
     row = fake.results[0]
     assert row["points_table"] == {"kill": 16, "win": 100,
                                    "placement": [20, 14, 10, 6, 2]}
@@ -1521,3 +1583,90 @@ def test_ranked_room_by_code(monkeypatch):
     assert _get({"code": "DUP11"}) == {"room": None}   # ambiguous
     assert _get({"code": "ab"}) == {"room": None}      # malformed
     assert _get({}) == {"room": None}                  # missing
+
+
+def test_live_board_diagnostics_age_and_unmapped(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    fake = _FakeDB()
+    now = datetime.now(timezone.utc)
+    iso = lambda dt: dt.isoformat()
+    fake.ranked_events = [
+        {"room_id": "R-X", "match_version": 2, "etype": "kill",
+         "actor_name": "Killer", "target_name": "Victim", "discord_id": "K",
+         "alive": None, "created_at": iso(now - timedelta(seconds=45))},
+        {"room_id": "R-X", "match_version": 2, "etype": "kill",
+         "actor_name": "Ghost", "target_name": "Victim", "discord_id": None,
+         "alive": None, "created_at": iso(now - timedelta(seconds=20))},
+        {"room_id": "R-X", "match_version": 2, "etype": "alv",
+         "actor_name": "Ghost", "discord_id": None, "alive": False,
+         "created_at": iso(now - timedelta(seconds=20))},
+        {"room_id": "R-X", "match_version": 2, "etype": "alv",
+         "actor_name": "Killer", "discord_id": "K", "alive": False,
+         "created_at": iso(now - timedelta(seconds=10))},
+    ]
+    _use_fake_sb(monkeypatch, fake)
+    out = ranked_mod.live_match_board_sync("R-X", 2)
+    # newest banked row is ~10s old; unmapped names are {Ghost, Victim}
+    assert out["last_event_age_s"] is not None and 0 <= out["last_event_age_s"] <= 120
+    assert out["unmapped_names"] == 2
+
+
+def test_live_board_diagnostics_degrade_without_timestamps(monkeypatch):
+    fake = _FakeDB()
+    _seed_banked(fake, rid="R-X", mver=2)  # pre-v240 rows: no created_at
+    _use_fake_sb(monkeypatch, fake)
+    out = ranked_mod.live_match_board_sync("R-X", 2)
+    assert out["last_event_age_s"] is None
+    assert out["unmapped_names"] == 0
+
+# ---------------------------------------------------------------------------
+# Room-seal rendezvous (tourney bridge per-seal pay)
+# ---------------------------------------------------------------------------
+
+def test_get_seal_result_reads_stored_row(monkeypatch):
+    fake = _FakeDB(results=[{
+        "room_id": "R-X", "match_version": 2, "winner_discord_id": "K",
+        "kills": {"K": 1}, "points": {"K": 30, "V": 2},
+        "placements": {"K": 1, "V": 2},
+        "arena_breakdown": {"K": {"total": 30, "capped": True}},
+    }])
+    _use_fake_for_ranked(monkeypatch, fake)
+    seal = ranked_mod.get_seal_result("R-X", 2)
+    assert seal["winner"] == "K"
+    assert seal["points"] == {"K": 30, "V": 2}
+    assert seal["kills"] == {"K": 1}
+    assert seal["placements"] == {"K": 1, "V": 2}
+    assert seal["breakdown"]["K"]["capped"] is True
+
+
+def test_get_seal_result_none_when_missing(monkeypatch):
+    fake = _FakeDB()
+    _use_fake_for_ranked(monkeypatch, fake)
+    assert ranked_mod.get_seal_result("R-X", 9) is None
+    assert ranked_mod.get_seal_result("", 2) is None
+    assert ranked_mod.get_seal_result("R-X", 0) is None
+
+
+def test_seal_bundle_for_packs_stored_deltas(monkeypatch):
+    fake = _FakeDB(results=[{
+        "room_id": "R-X", "match_version": 2, "winner_discord_id": "K",
+        "kills": {"K": 1}, "points": {"K": 30, "V": 2},
+        "placements": {"K": 1, "V": 2},
+        "arena_breakdown": {"K": {"total": 30, "capped": True}},
+    }])
+    _use_fake_for_ranked(monkeypatch, fake)
+    b = ranked_mod.seal_bundle_for("R-X", 2)
+    assert b["mode"] == "room-seal-v1"
+    assert (b["rid"], b["room_match_version"], b["winner"]) == ("R-X", 2, "K")
+    assert b["points"] == {"K": 30, "V": 2}
+    assert b["kills"] == {"K": 1}
+
+
+def test_seal_bundle_for_none_without_points(monkeypatch):
+    fake = _FakeDB(results=[{
+        "room_id": "R-X", "match_version": 2, "winner_discord_id": None,
+        "kills": {}, "points": {}, "placements": {},
+    }])
+    _use_fake_for_ranked(monkeypatch, fake)
+    assert ranked_mod.seal_bundle_for("R-X", 2) is None
+    assert ranked_mod.seal_bundle_for("R-X", 99) is None

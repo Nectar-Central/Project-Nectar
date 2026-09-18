@@ -106,16 +106,16 @@ POINTS_TTL_S = 60  # per-player points read cache (fast path; DB owns truth)
 # Milestone tiers, ascending. icon_url points at the public assets bucket.
 _ASSETS = "https://mnpwvwjqawmuqmickteu.supabase.co/storage/v1/object/public/assets"
 MILESTONE_TIERS = [
-    {"name": "Unranked",    "min": 0,    "fee": 0,   "color": "#6b7280", "icon_url": f"{_ASSETS}/unranked.png"},
-    {"name": "Bronze",      "min": 200,  "fee": 10,  "color": "#CD7F32", "icon_url": f"{_ASSETS}/bronze.png"},
-    {"name": "Silver",      "min": 500,  "fee": 25,  "color": "#C0C0C0", "icon_url": f"{_ASSETS}/silver.png"},
-    {"name": "Gold",        "min": 1000, "fee": 50,  "color": "#FFD700", "icon_url": f"{_ASSETS}/gold.png"},
-    {"name": "Platinum",    "min": 1500, "fee": 75,  "color": "#E5E7EB", "icon_url": f"{_ASSETS}/platinium.png"},
-    {"name": "Diamond",     "min": 2000, "fee": 100, "color": "#B9F2FF", "icon_url": f"{_ASSETS}/diamond.png"},
-    {"name": "Emerald",     "min": 3000, "fee": 150, "color": "#10b981", "icon_url": f"{_ASSETS}/emerald.png"},
-    {"name": "Champion",    "min": 4000, "fee": 200, "color": "#f59e0b", "icon_url": f"{_ASSETS}/champion.png"},
-    {"name": "Master",      "min": 5000, "fee": 250, "color": "#9333EA", "icon_url": f"{_ASSETS}/master.png"},
-    {"name": "Grandmaster", "min": 7500, "fee": 300, "color": "#ef4444", "icon_url": f"{_ASSETS}/grandmaster.png"},
+    {"name": "Unranked",    "min": 0,     "fee": 0,    "color": "#6b7280", "icon_url": f"{_ASSETS}/unranked.png"},
+    {"name": "Bronze",      "min": 500,   "fee": 25,   "color": "#CD7F32", "icon_url": f"{_ASSETS}/bronze.png"},
+    {"name": "Silver",      "min": 1200,  "fee": 60,   "color": "#C0C0C0", "icon_url": f"{_ASSETS}/silver.png"},
+    {"name": "Gold",        "min": 2500,  "fee": 125,  "color": "#FFD700", "icon_url": f"{_ASSETS}/gold.png"},
+    {"name": "Platinum",    "min": 4000,  "fee": 200,  "color": "#E5E7EB", "icon_url": f"{_ASSETS}/platinium.png"},
+    {"name": "Diamond",     "min": 6000,  "fee": 300,  "color": "#B9F2FF", "icon_url": f"{_ASSETS}/diamond.png"},
+    {"name": "Emerald",     "min": 9000,  "fee": 450,  "color": "#10b981", "icon_url": f"{_ASSETS}/emerald.png"},
+    {"name": "Champion",    "min": 13000, "fee": 650,  "color": "#f59e0b", "icon_url": f"{_ASSETS}/champion.png"},
+    {"name": "Master",      "min": 18000, "fee": 900,  "color": "#9333EA", "icon_url": f"{_ASSETS}/master.png"},
+    {"name": "Grandmaster", "min": 25000, "fee": 1250, "color": "#ef4444", "icon_url": f"{_ASSETS}/grandmaster.png"},
 ]
 
 # Overlay arena icon (bottom-left box next to points).
@@ -459,7 +459,8 @@ def _bump_points_many(deltas: dict[str, int]) -> dict[str, int]:
             raise RuntimeError("supabase not configured")
         cur = _get_points_many(list(clean))
         now = datetime.now(timezone.utc).isoformat()
-        rows = [{"discord_id": d, "points": int(cur.get(d, 0)) + delta, "updated_at": now}
+        # Lifetime floor at 0: a brutal loss can wipe a balance, never bury it.
+        rows = [{"discord_id": d, "points": max(0, int(cur.get(d, 0)) + delta), "updated_at": now}
                 for d, delta in clean.items()]
         sb.table("ranked_points").upsert(rows, on_conflict="discord_id").execute()
         ts = time.time()
@@ -493,11 +494,13 @@ def _bounded(value: Any, low: int, high: int) -> int:
 
 
 def kill_delta(killer_pts: Any, victim_pts: Any, avg_pts: Any = 0) -> int:
-    """Bounded Elo-ish award for one elimination (4..18).
+    """Bounded Elo-ish award for one elimination (1..8).
 
     The logistic term is the *upset* chance: beating a stronger victim pays
-    toward 12, while farming a much lower-rated victim trends to the 4 point
-    floor.  Lobby strength adds at most 15% before the hard cap.
+    toward 8, while farming a much lower-rated victim trends to the 1 point
+    floor. Lobby strength adds at most ~25% before the hard cap. Small by
+    design: matches are won on volume + placement + win, and the per-match
+    clamp (+30) is the grind guard, not the per-kill size.
     """
     try:
         import math
@@ -505,7 +508,7 @@ def kill_delta(killer_pts: Any, victim_pts: Any, avg_pts: Any = 0) -> int:
         victim = float(victim_pts or 0)
         avg = max(0.0, float(avg_pts or 0))
         upset = 1.0 / (1.0 + math.pow(10.0, (killer - victim) / 600.0))
-        return _bounded(KILL_POINTS * (0.5 + upset + 0.15 * avg / 4000.0), 4, 18)
+        return _bounded(2 + 6 * upset + avg / 4000.0, 1, 8)
     except Exception:
         return KILL_POINTS
 
@@ -524,11 +527,15 @@ def placement_delta(place: Any, avg_pts: Any = 0, players: Any = 0) -> int:
 
 
 def win_delta(avg_pts: Any = 0, players: Any = 0) -> int:
-    """Bounded victory award (35..95), based on lobby quality and size."""
+    """Bounded victory award (8..20), based on lobby quality and size.
+
+    Deliberately small: with the per-match clamp (+30), a legacy-sized win
+    purse would saturate the cap on every single win and make scaling moot.
+    """
     try:
         avg = max(0.0, float(avg_pts or 0))
         n = max(0, int(players or 0))
-        return _bounded(WIN_POINTS * (1.0 + avg / 4000.0 + 0.03 * n), 35, 95)
+        return _bounded(6 + avg / 500.0 + n / 4.0, 8, 20)
     except Exception:
         return WIN_POINTS
 
@@ -569,15 +576,50 @@ def tier_index_for(points: Any) -> int:
 
 
 def loss_for(points: Any) -> int:
-    """Tier-scaled loss for a non-winner, from the PRE-seal total.
+    """Tier-scaled loss for a non-winner with unknown killer, from the
+    PRE-seal total. -(5 + 3*tier): Unranked -5 ... Grandmaster -32.
+    Climbing raises the stakes; the floor never moves. Pure, unit-tested."""
+    try:
+        return -(5 + 3 * tier_index_for(points))
+    except Exception:
+        return LOSS_POINTS
 
-    -(5 + 3*tier): Unranked -5, Bronze -8, Silver -11, Gold -14,
-    Platinum -17, Diamond -20, Emerald -23, Champion -26, Master -29,
-    Grandmaster -32. Climbing raises the stakes; the floor never moves.
+
+# Per-match arena clamp. Asymmetric by design: winning big caps fast (grind
+# protection — no multi-rank jumps in one session), losing big hurts (stakes).
+MATCH_DELTA_MIN = -50
+MATCH_DELTA_MAX = 30
+
+
+def clamp_match_delta(value: Any) -> int:
+    """Clamp one match's arena delta to [MATCH_DELTA_MIN, MATCH_DELTA_MAX]."""
+    try:
+        return max(MATCH_DELTA_MIN, min(MATCH_DELTA_MAX, int(round(float(value)))))
+    except Exception:
+        return 0
+
+
+def loss_vs(my_pts: Any, killer_pts: Any = None) -> int:
+    """Killer-relative loss for one death (floor -50).
+
+    Base is the tier stake (5 + 3*tier, same as loss_for); the factor pays
+    the upset in reverse: dying to a much weaker killer trends to 1.5x
+    (a Grandmaster feeding a Gold loses ~48), dying to a peer pays 1x,
+    dying up pays 0.5x. Unknown/zone killer falls back to the flat base.
     Pure, unit-tested.
     """
     try:
-        return -(5 + 3 * tier_index_for(points))
+        base = 5 + 3 * tier_index_for(my_pts)
+    except Exception:
+        return LOSS_POINTS
+    try:
+        if killer_pts is None:
+            return -base
+        import math
+        me = float(my_pts or 0)
+        killer = float(killer_pts or 0)
+        p_beats_me = 1.0 / (1.0 + math.pow(10.0, (killer - me) / 600.0))
+        return -min(50, int(round(base * (0.5 + p_beats_me))))
     except Exception:
         return LOSS_POINTS
 
@@ -780,10 +822,11 @@ def _ranked_rows(events: list, table: dict, winner: str | None,
 
 
 def _read_ranked_events(sb, rid: str, match_version: int, limit: int = 500) -> list:
-    """Banked comp-style rows for one seal. [] on any failure. Never raises."""
+    """Banked comp-style rows for one seal. [] on any failure. Never raises.
+    Rows carry created_at (v240) for diagnostics; scoring ignores extra keys."""
     try:
         r = sb.table("bngc_ranked_events").select(
-            "etype,discord_id,actor_name,target_name,alive").eq(
+            "etype,discord_id,actor_name,target_name,alive,created_at").eq(
             "room_id", str(rid)).eq(
             "match_version", int(match_version)).limit(int(limit)).execute()
         return [dict(e) for e in (r.data or [])]
@@ -827,6 +870,34 @@ def live_match_board_sync(rid: str, match_version: int, top_n: int = 5,
         except Exception:
             sealed = None
         events = _read_ranked_events(sb, str(rid), mver, 1000)
+        # Field diagnostics (debug chip): age of the newest banked row as a
+        # ~last-seal-activity proxy, and how many distinct banked names
+        # carry no discord_id (unmapped evidence waiting for a /link).
+        try:
+            now = datetime.now(timezone.utc)
+            newest = None
+            for e in events:
+                try:
+                    ts = datetime.fromisoformat(
+                        str(e.get("created_at") or "").replace("Z", "+00:00"))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    if newest is None or ts > newest:
+                        newest = ts
+                except Exception:
+                    continue
+            out["last_event_age_s"] = (int((now - newest).total_seconds())
+                                       if newest else None)
+            unmapped: set = set()
+            for e in events:
+                if (e or {}).get("discord_id"):
+                    continue
+                for nm in ((e or {}).get("actor_name"), (e or {}).get("target_name")):
+                    if str(nm or "").strip():
+                        unmapped.add(str(nm).strip())
+            out["unmapped_names"] = len(unmapped)
+        except Exception:
+            pass
         if not events:
             return out
         winner = (sealed or {}).get("winner_discord_id") if sealed else None
@@ -893,10 +964,11 @@ def seal_match(*, rid: str, match_version: int, gm: str,
                kill_events: list | None = None,
                players_count: Any = None,
                player_ids: Any = None,
-               death_killers: dict[str, str | None] | None = None,
-               removed_discord_ids: set[str] | list[str] | None = None,
-               point_awards: dict | None = None,
-               avg_points: Any = None) -> dict[str, Any]:
+                death_killers: dict[str, str | None] | None = None,
+                removed_discord_ids: set[str] | list[str] | None = None,
+                point_awards: dict | None = None,
+                avg_points: Any = None,
+                tied_winners: set[str] | list[str] | None = None) -> dict[str, Any]:
     """Score one sealed match with comp math and persist results.
 
     Events come from the banked bngc_ranked_events rows when present (kill /
@@ -952,8 +1024,20 @@ def seal_match(*, rid: str, match_version: int, gm: str,
         winner = str(winner_discord_id) if winner_discord_id else None
         if winner in removed:
             winner = None
+        # Duo co-winners share the crown: no loss, full win bonus (same as
+        # a P1 placement tie). Solo callers leave this empty — behavior
+        # bit-identical to before.
+        try:
+            _tied = {str(d).strip() for d in (tied_winners or []) if str(d or "").strip()} - removed
+        except Exception:
+            _tied = set()
+        try:
+            _winners = ({str(winner)} if winner else set()) | _tied
+        except Exception:
+            _winners = {str(winner)} if winner else set()
         if winner:
             involved.add(winner)
+        involved |= _tied
         try:
             banked = _read_ranked_events(sb, rid, int(match_version))
         except Exception:
@@ -1004,18 +1088,36 @@ def seal_match(*, rid: str, match_version: int, gm: str,
                         rating_ids.update((str(pair[0]), str(pair[1])))
                     except Exception:
                         continue
+                try:
+                    for _kk in (death_killers or {}).values():
+                        if _kk:
+                            rating_ids.add(str(_kk))
+                except Exception:
+                    pass
                 rating_points = _get_points_many(rating_ids, fresh=True)
                 avg_ids = lobby_ids or involved
                 fresh_avg = (round(sum(rating_points.get(d, 0) for d in avg_ids) / len(avg_ids), 1)
                              if avg_ids else float(avg_points or 0))
                 awards = _kill_awards_for(pair_rows, rating_points, fresh_avg)
                 # Tier-scaled seal-time losses, frozen with the table so
-                # recalc and boards replay them exactly. Stored for every
-                # involved did (winner included: a later crown swap must
-                # find the dethroned winner's loss here).
+                # recalc and boards replay them exactly. Killer-relative:
+                # dying to a weaker killer costs up to -50, dying up is
+                # cheap; zone/unknown killers pay the flat tier stake.
+                # Stored for every involved did (winner included: a later
+                # crown swap must find the dethroned winner's loss here).
                 try:
-                    _loss_map = {str(d): loss_for(rating_points.get(str(d), 0))
-                                 for d in involved}
+                    _dk = death_killers or {}
+                    _loss_map = {}
+                    for d in involved:
+                        try:
+                            _kdid = _dk.get(str(d))
+                            _kpts = (rating_points.get(str(_kdid))
+                                     if _kdid else None)
+                            _loss_map[str(d)] = loss_vs(
+                                rating_points.get(str(d), 0), _kpts)
+                        except Exception:
+                            _loss_map[str(d)] = loss_for(
+                                rating_points.get(str(d), 0))
                 except Exception:
                     _loss_map = {}
                 table = dynamic_table_for(fresh_avg, players, awards, _loss_map)
@@ -1035,18 +1137,69 @@ def seal_match(*, rid: str, match_version: int, gm: str,
             _loss_map = {}
         # Frozen seal-time losses (dynamic) or flat -5 (static/legacy).
         _loss_get = lambda did: int(_loss_map.get(str(did), LOSS_POINTS))
+        # Exact per-killer sums (dynamic post-taper truth) for the breakdown.
+        _awards_by: dict = {}
+        try:
+            for _a in (awards if isinstance(awards, list) else []):
+                _dd = str((_a or {}).get("killer") or "").strip()
+                if _dd:
+                    _awards_by[_dd] = (_awards_by.get(_dd, 0)
+                                       + int((_a or {}).get("points") or 0))
+        except Exception:
+            pass
+        try:
+            _plist = list((table or {}).get("placement") or [])
+        except Exception:
+            _plist = []
+        try:
+            _twin = int((table or {}).get("win") or 0)
+        except Exception:
+            _twin = 0
         points_awarded = {}
+        _breakdown = {}
         for did in involved:
             try:
+                _is_w = str(did) in _winners
                 if did in comp_by:
-                    pts = comp_by[did] + (0 if did == winner else _loss_get(did))
+                    base_total = comp_by[did] + (0 if _is_w else _loss_get(did))
                 else:
-                    pts = kc_map.get(did, 0) * KILL_POINTS + (
-                        WIN_POINTS if did == winner else _loss_get(did))
+                    base_total = kc_map.get(did, 0) * KILL_POINTS + (
+                        WIN_POINTS if _is_w else _loss_get(did))
+                pts = clamp_match_delta(base_total)
                 points_awarded[did] = pts
+                # Component truth for toasts/embeds (same inputs as above).
+                try:
+                    _kb = _awards_by.get(did, 0)
+                    if not _kb:
+                        _kb = kc_map.get(did, 0) * int(
+                            (table or {}).get("kill") or 0)
+                except Exception:
+                    _kb = 0
+                try:
+                    _pl = pmap.get(did) if isinstance(pmap, dict) else None
+                    _pp = _plist[int(_pl) - 1] if _pl and 1 <= int(_pl) <= len(_plist) else 0
+                except Exception:
+                    _pp = 0
+                _wb = _twin if _is_w else 0
+                _lb = 0 if _is_w else _loss_get(did)
+                _breakdown[did] = {"kills": int(_kb), "win": int(_wb),
+                                   "placement": int(_pp), "loss": int(_lb),
+                                   "total": int(pts),
+                                   "capped": bool(base_total != pts)}
             except Exception:
                 continue
         totals = _bump_points_many(points_awarded)
+        # Losers' win streaks reset here: no defeat rows exist anywhere, so
+        # the seal is the only place the loser is known. Leavers spared.
+        try:
+            _losers = sorted((set(involved) - removed) - _winners)
+            if _losers:
+                _sb2 = _sb()
+                if _sb2:
+                    _sb2.table("bngc_users").update({"win_streak": 0}).in_(
+                        "discord_id", _losers[:200]).execute()
+        except Exception:
+            pass
         _row = {
             "room_id": rid,
             "match_version": int(match_version),
@@ -1057,15 +1210,17 @@ def seal_match(*, rid: str, match_version: int, gm: str,
             "placements": {str(k): int(v) for k, v in (placements or {}).items()
                            if str(k) not in removed},
             "points_table": table,
+            "arena_breakdown": _breakdown,
         }
         try:
             sb.table("ranked_results").upsert(_row, on_conflict="room_id,match_version").execute()
         except Exception as exc:
-            # pre-migration DBs (no points_table column): keep sealing with
-            # the classic row shape instead of failing the seal.
-            if "points_table" in str(exc) or "42703" in str(exc):
+            # pre-migration DBs (no points_table / arena_breakdown columns):
+            # keep sealing with the classic row shape instead of failing.
+            if "points_table" in str(exc) or "arena_breakdown" in str(exc) or "42703" in str(exc):
                 try:
                     _row.pop("points_table", None)
+                    _row.pop("arena_breakdown", None)
                     sb.table("ranked_results").upsert(
                         _row, on_conflict="room_id,match_version").execute()
                 except Exception as exc2:
@@ -1096,9 +1251,91 @@ def seal_match(*, rid: str, match_version: int, gm: str,
         except Exception:
             pass
         return {"ok": True, "points": points_awarded, "totals": totals,
+                "breakdown": _breakdown,
                 "match_version": int(match_version)}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Room-seal rendezvous (tourney bridge per-seal pay)
+#
+# The room seal above pays the ladder immediately, so it IS the arena pay.
+# The tourney bridge stores the seal's deltas on its match row (stored
+# deltas) instead of recomputing a second economy, and the tourney board
+# replays them verbatim — board == ladder movement, per seal, no lump
+# payout at stop. The two seals run in the same processor sweep (room
+# first), so the row usually exists at bridge-seal time; when it lands
+# later, the bridge stores pending join keys and calculate resolves them.
+# ---------------------------------------------------------------------------
+
+def get_seal_result(rid: str, match_version: int) -> dict | None:
+    """ranked_results row for one sealed room match. Never raises.
+
+    Returns {winner, kills, points, placements, breakdown} or None
+    (no seal yet / DB down). Read-only rendezvous for the tourney
+    bridge and the calculate backfill."""
+    try:
+        mver = int(match_version or 0)
+        if not rid or mver <= 0:
+            return None
+        sb = _sb()
+        if not sb:
+            return None
+        try:
+            r = sb.table("ranked_results").select(
+                "winner_discord_id,kills,points,placements,arena_breakdown").eq(
+                "room_id", str(rid)).eq("match_version", mver).limit(1).execute()
+        except Exception as exc:
+            # pre-migration (no arena_breakdown column): classic shape
+            if "arena_breakdown" not in str(exc) and "42703" not in str(exc):
+                return None
+            r = sb.table("ranked_results").select(
+                "winner_discord_id,kills,points,placements").eq(
+                "room_id", str(rid)).eq("match_version", mver).limit(1).execute()
+        rows = r.data or []
+        if not rows:
+            return None
+        row = rows[0] or {}
+        return {"winner": row.get("winner_discord_id"),
+                "kills": dict(row.get("kills") or {}),
+                "points": dict(row.get("points") or {}),
+                "placements": dict(row.get("placements") or {}),
+                "breakdown": dict(row.get("arena_breakdown") or {})}
+    except Exception:
+        return None
+
+
+def seal_bundle_for(rid: str, match_version: int) -> dict | None:
+    """Stored-deltas bundle for one sealed room match. Pure read + pack.
+
+    Returns the room-seal-v1 table the bridge stores on its match row,
+    or None when the room seal hasn't landed yet. Never raises."""
+    try:
+        seal = get_seal_result(rid, match_version)
+        if not seal or not seal.get("points"):
+            return None
+        pts = {str(k): int(v) for k, v in (seal.get("points") or {}).items()
+               if str(k or "").strip()}
+        if not pts:
+            return None
+        try:
+            kills = {str(k): int(v) for k, v in (seal.get("kills") or {}).items()
+                     if str(k or "").strip()}
+        except Exception:
+            kills = {}
+        try:
+            plc = {str(k): int(v) for k, v in (seal.get("placements") or {}).items()
+                   if str(k or "").strip()}
+        except Exception:
+            plc = {}
+        return {"mode": "room-seal-v1", "rid": str(rid),
+                "room_match_version": int(match_version or 0),
+                "winner": seal.get("winner"),
+                "points": pts, "kills": kills, "placements": plc,
+                "breakdown": seal.get("breakdown") or {}}
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
