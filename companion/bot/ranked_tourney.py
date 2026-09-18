@@ -72,7 +72,7 @@ def list_tourneys(status: str = "all") -> list:
 
 def create_tourney(*, name=None, series_len=0, mode="solo",
                    created_by=None, game_mode=None,
-                   ping_role_id=None) -> dict:
+                   ping_role_id=None, scheduled_at=None) -> dict:
     """Insert a `created` ranked session and return the row. Raises on DB error.
 
     No room code here: the code is set at /ranked start and dispatched
@@ -92,6 +92,7 @@ def create_tourney(*, name=None, series_len=0, mode="solo",
         "game_mode": (str(game_mode or "").strip() or None),
         "ping_role_id": (str(ping_role_id or "").strip() or None),
         "created_by": str(created_by or "") or None,
+        "scheduled_at": (str(scheduled_at or "").strip() or None),
     }
     res = _sb().table(T_TOURNEY).insert(row).execute()
     rows = res.data or []
@@ -426,10 +427,21 @@ def lobby_spec(t: dict) -> dict:
         except Exception:
             avg, ms = None, None
         series = t.get("series_len") or 0
+        try:
+            _sched = str(t.get("scheduled_at") or "").strip()
+            _ts = int(datetime.fromisoformat(
+                _sched.replace("Z", "+00:00")).timestamp()) if _sched else 0
+        except Exception:
+            _ts = 0
+        try:
+            _now = int(datetime.now(timezone.utc).timestamp())
+        except Exception:
+            _now = 0
         return {
             "title": session_title(t),
             "fields": [
                 ("Status", str(t.get("status") or "created").capitalize(), True),
+                ("Starting", f"<t:{_ts}:R>" if _ts and _ts > _now else "Now", True),
                 ("Players", str(len(rids)), True),
                 ("Series", f"{sealed_count(int(tid))}/{series or '∞'}" if tid is not None else "—", True),
                 ("Rank", f"avg {avg} pts ({ms})" if avg is not None else "—", True),

@@ -6180,7 +6180,8 @@ async def _rt_players_lines(tid: int) -> list:
 @app_commands.describe(series_len="Matches in the series, 0 = open-ended",
                        mode="Solo or duo",
                        game_mode="Game mode (flavor only, shown in lobby)",
-                       ping_role="Role pinged when the match goes live")
+                       ping_role="Role pinged when the match goes live",
+                       starts_in="Start in X minutes from now (0 = now)")
 @app_commands.choices(mode=[app_commands.Choice(name="Solo", value="solo"),
                             app_commands.Choice(name="Duo", value="duo")])
 @app_commands.choices(game_mode=[
@@ -6197,7 +6198,8 @@ async def _rt_players_lines(tid: int) -> list:
 async def ranked_session_create_cmd(interaction: discord.Interaction,
                               series_len: int = 0, mode: str = "solo",
                               game_mode: str | None = None,
-                              ping_role: discord.Role | None = None):
+                              ping_role: discord.Role | None = None,
+                              starts_in: int = 0):
     if not await _defer(interaction):
         return
     did = str(interaction.user.id)
@@ -6216,10 +6218,20 @@ async def ranked_session_create_cmd(interaction: discord.Interaction,
     except Exception:
         series = 0
     try:
+        _mins = max(0, int(starts_in or 0))
+    except Exception:
+        _mins = 0
+    try:
+        scheduled = ((datetime.now(timezone.utc) + timedelta(minutes=_mins)).isoformat()
+                     if _mins > 0 else None)
+    except Exception:
+        scheduled = None
+    try:
         t = await asyncio.to_thread(
             rt_mod.create_tourney, series_len=series, mode=mode,
             game_mode=game_mode,
             ping_role_id=(str(ping_role.id) if ping_role else None),
+            scheduled_at=scheduled,
             created_by=did)
     except ValueError as exc:
         return await interaction.followup.send(str(exc), ephemeral=True)
