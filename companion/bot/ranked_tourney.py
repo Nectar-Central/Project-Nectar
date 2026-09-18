@@ -440,6 +440,7 @@ def lobby_spec(t: dict) -> dict:
         return {
             "title": session_title(t),
             "fields": [
+                ("Host", host_line(t, rids), True),
                 ("Status", str(t.get("status") or "created").capitalize(), True),
                 ("Starting", f"<t:{_ts}:R>" if _ts and _ts > _now else "Now", True),
                 ("Players", str(len(rids)), True),

@@ -3663,7 +3663,7 @@ async def rank_cmd(interaction: discord.Interaction, user: discord.User | None =
             title=f"👑 Rank — {getattr(target, 'display_name', None) or getattr(target, 'name', '?')}",
             color=0xFFD700,
             description=(f"{getattr(target, 'mention', '')}\n"
-                         f":{str(milestone or 'unranked').strip().lower()}: **{milestone}** · **{pts}** pts\n"
+                         f"**{milestone}** · **{pts}** pts\n"
                          f"Leaderboard: **#{pos}** of {total}\n"
                          f"{prog}"))
         try:
@@ -3935,11 +3935,7 @@ def _ranked_board_lines(rows, offset: int = 0) -> list:
         for i, (did, pts, nm, ms) in enumerate(rows, 1):
             n = offset + i
             prefix = medals[n - 1] if n <= 3 else f"{n}."
-            try:
-                emo = f":{str(ms or 'unranked').strip().lower()}:"
-            except Exception:
-                emo = ":unranked:"
-            lines.append(f"{prefix} {_comp_mention(did)} **{nm}** - {pts} pts ({ms}) {emo}")
+            lines.append(f"{prefix} {_comp_mention(did)} **{nm}** — {pts} pts ({ms})")
     except Exception:
         pass
     return lines
@@ -5322,7 +5318,7 @@ async def _post_thread_leaderboard(thread, rid: str):
                 nm = (row or {}).get("game_username") or (row or {}).get("discord_username") or did
             except Exception:
                 nm = did
-            lines.append(f"**{i}.** {_rt_known(did, nm)} - {pts} pts ({tier}) :{str(tier or 'unranked').strip().lower()}:")
+            lines.append(f"**{i}.** {_rt_known(did, nm)} — {pts} pts ({tier})")
         e = discord.Embed(title="Arena leaderboard", color=0x7c3aed,
                           description="\n".join(lines))
         e.set_footer(text=f"{rid} · live standings")
@@ -6170,7 +6166,7 @@ async def _rt_players_lines(tid: int) -> list:
                 ms, _fee = ranked_mod.milestone_for(int(elos.get(did, 0)))
             except Exception:
                 ms = "Unranked"
-            lines.append(f"{_rt_known(did, nm)} - {elos.get(did, '?')} pts ({ms}) :{str(ms or 'unranked').strip().lower()}:")
+            lines.append(f"{_rt_known(did, nm)} — {elos.get(did, '?')} pts ({ms})")
         return lines
     except Exception:
         return []
