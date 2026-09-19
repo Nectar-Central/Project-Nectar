@@ -112,9 +112,37 @@ def _names_equal_fold(a, b) -> bool:
         return False
 
 
+def _leet_fold(s: str) -> str:
+    """Leet-insensitive fold: map common gamer-tag digit substitutions so
+    "Vo1d Eight" matches a registered "Void Eight" (1->i, 0->o).
+
+    Narrow on purpose (only 1/0): wider maps (3->e, 4->a, 5->s, 7->t)
+    conflate genuinely different names. Never raises.
+    """
+    try:
+        return (str(s or "").lower().replace("1", "i").replace("0", "o"))
+    except Exception:
+        return ""
+
+
+def _names_equal_leet(a, b) -> bool:
+    """Leet fallback: leet-folded comparison after normalization.
+
+    Catches digit-substituted tags ("VO1D" vs "Void") that strict+fold
+    miss. Callers must twin-guard (see _twin_ambiguous_leet). Never raises.
+    """
+    try:
+        na = _leet_fold(_norm_name(a))
+        nb = _leet_fold(_norm_name(b))
+        return bool(na and nb and na == nb)
+    except Exception:
+        return False
+
+
 def _self_match_tier(room, view, user, name) -> int:
     """Attribution tier for one killfeed name: 0 none, 1 exact, 2 strict,
-    3 fold (casing drift), 4 game-ID. Pure, unit-tested. Never raises.
+    3 fold (casing drift), 4 game-ID, 5 leet (digit-substituted tags).
+    Pure, unit-tested. Never raises.
 
     Exposed so the kill path can log WHEN the open fallback saves a player
     (tier 3) instead of silently crediting — that log line is the early
@@ -139,6 +167,8 @@ def _self_match_tier(room, view, user, name) -> int:
                 return 2
             if _names_equal_fold(name, me_name) and not _twin_ambiguous_fold(room, user, name):
                 return 3
+            if _names_equal_leet(name, me_name) and not _twin_ambiguous_leet(room, user, name):
+                return 5
         try:
             ugid = str((user.get("game_id") if isinstance(user, dict) else None) or "").strip()
         except Exception:
@@ -152,7 +182,8 @@ def _self_match_tier(room, view, user, name) -> int:
         for p in players.values():
             try:
                 pun = getattr(p, "username", None)
-                if not pun or not (_names_equal(pun, name) or _names_equal_fold(pun, name)):
+                if not pun or not (_names_equal(pun, name) or _names_equal_fold(pun, name)
+                                   or _names_equal_leet(pun, name)):
                     continue
                 if str(getattr(p, "game_id", "") or "").strip() == ugid:
                     return 4
@@ -172,7 +203,9 @@ def _is_self(room, view, user, name) -> bool:
     Tier 3 (fold + twin guard): case-insensitive catch for killfeed casing drift
       ("ALICE" vs "alice") — this is what kept players at 0 kills for hours while
       playtime counted. Blocked only on genuine fold-level twin conflict.
-    Tier 4 (game-ID): stable pfid through the room roster (strict or fold).
+    Tier 4 (game-ID): stable pfid through the room roster (strict, fold or leet).
+    Tier 5 (leet + twin guard): digit-substituted tags ("VO1D" vs "Void",
+      1->i / 0->o only) — blocked on genuine leet-level twin conflict.
     Never raises.
     """
     try:
@@ -217,6 +250,100 @@ def _twin_ambiguous_fold(room, user, name) -> bool:
         if ugid and any(str(getattr(p, "game_id", "") or "").strip() == ugid for p in mates):
             return False
         return True
+    except Exception:
+        return False
+
+
+def _twin_ambiguous_leet(room, user, name) -> bool:
+    """Twin check at leet level for the Tier-5 fallback (1->i / 0->o).
+    Same rule as _twin_ambiguous, widest net — a genuine leet-level twin
+    conflict (two roster rows folding to the same tag) blocks the credit
+    so lookalikes never cross-credit. Never raises."""
+    try:
+        players = getattr(room, "players", None) or {} if room is not None else {}
+        mates = [p for p in players.values()
+                 if getattr(p, "username", None) and _names_equal_leet(getattr(p, "username"), name)]
+        if len(mates) < 2:
+            return False
+        try:
+            ugid = str((user.get("game_id") if isinstance(user, dict) else None) or "").strip()
+        except Exception:
+            ugid = ""
+        if ugid and any(str(getattr(p, "game_id", "") or "").strip() == ugid for p in mates):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _heal_view_me(view, user):
+    """Adopt session identity from the roster when view.me never resolved.
+
+    Null-identity class of bug: join props arrived without a 255 username
+    (or under a drifting name), so view.me stays None while playtime still
+    counts — kills/deaths/wins silently miss for the whole session ("player
+    ignored" despite registering). The DB game_username (seeded at
+    /register) is the source of truth: when exactly one roster row matches
+    it through the attribution tiers (name OR stable game_id), adopt that
+    row as view.me so this batch credits correctly.
+
+    Only ever fills a missing view.me (never overwrites), prefers an exact
+    roster hit, and stays silent when ambiguous (twins) or absent — callers
+    keep the old me=? behavior there. Returns True when adopted. Never raises.
+    """
+    try:
+        if view is None or getattr(view, "me", None) is not None:
+            return False
+        try:
+            want = (user.get("game_username") if isinstance(user, dict) else None) or ""
+            ugid = str((user.get("game_id") if isinstance(user, dict) else None) or "").strip()
+        except Exception:
+            want, ugid = "", ""
+        if not (str(want or "").strip() or ugid):
+            return False
+        try:
+            rooms = list((getattr(view, "rooms", None) or {}).values())
+        except Exception:
+            rooms = []
+        for room in rooms:
+            try:
+                players = getattr(room, "players", None) or {}
+            except Exception:
+                continue
+            for p in players.values():
+                try:
+                    pun = getattr(p, "username", None)
+                    if not pun:
+                        continue
+                    hit = False
+                    try:
+                        hit = _is_self(room, view, user, pun)
+                    except Exception:
+                        hit = False
+                    if not hit:
+                        continue
+                    try:
+                        p.is_self = True
+                    except Exception:
+                        pass
+                    try:
+                        view.me = p
+                    except Exception:
+                        return False
+                    try:
+                        if getattr(room, "me", None) is None:
+                            room.me = p
+                    except Exception:
+                        pass
+                    try:
+                        log_sys(f"PROCESSOR identity healed me={pun} via roster "
+                                f"(tier={_self_match_tier(room, view, user, pun)})")
+                    except Exception:
+                        pass
+                    return True
+                except Exception:
+                    continue
+        return False
     except Exception:
         return False
 
@@ -2767,6 +2894,16 @@ async def process_batch(
     except Exception as exc:
         log_err(f"processor: get user failed {discord_id[:6]} {exc}")
         return                        # DB error → abort
+
+    # Null-identity heal: join props arrived without a 255 username (or under
+    # a drifting name), so view.me is None while playtime still counts — every
+    # kill/death/win silently misses ("registered but ignored"). Adopt the
+    # matching roster row via the DB game_username BEFORE me_name is read, so
+    # this batch credits correctly. No-op when identity already resolved.
+    try:
+        _heal_view_me(view, user)
+    except Exception:
+        pass
 
     # Log current user stats before processing (ALWAYS — every batch)
     log_sys(f"PROCESSOR CALL session={session_id[:13]} did={discord_id[:6]} n={len(packets)} "
