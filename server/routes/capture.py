@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 from ..lib.supabase_client import supabase, db, db_io
 from ..lib.redis_client import cache
 from ..lib.tokens import generate_request_token, validate_request_token, is_session_expired
-from ..lib.logger import log_sys, log_err, log_dbg
+from ..lib.logger import log_sys, log_err, log_ok, log_ranked, log_engine
 from ..lib.photon_engine import Engine
 from ..lib.alerts import create_alert
 
@@ -70,7 +70,20 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
     discord_id = body.get("discord_id")
     token = body.get("token")
     host_mode = bool(body.get("hostMode") or body.get("host_mode"))
+    # Client-known identity (userscript localStorage): breaks the null-identity
+    # deadlock where join props never carried a 255 username, so view.me stays
+    # None and every kill/win silently misses while playtime counts.
+    body_game_username = body.get("game_username") or body.get("gameUsername")
+    body_game_id = body.get("game_id") or body.get("gameId")
     ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "-")
+
+    # CALL LINE — every single capture call, always visible
+    try:
+        _sid = str(auth_session_id or session_id or "?")[:13]
+        _nrec = len(records) if isinstance(records, list) else "?"
+        log_sys(f"CAPTURE CALL sid={_sid} did={str(discord_id or '?')[:8]} nrec={_nrec} ip={ip} host={int(host_mode)}")
+    except Exception:
+        pass
 
     import time as _t
     _ct = {"t0": _t.time()}  # per-stage timings (measure-first: find the ack cost)
@@ -183,6 +196,13 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
         except Exception:
             pass
         packets.append(d)
+        # RANKED/PACKET LINE — every single packet, always visible
+        try:
+            _pt = d.get("packet") or d.get("packet_type") or "?"
+            _human = str(d.get("human") or "")[:120]
+            log_sys(f"CAPTURE PKT sid={str(auth_session_id or 'anon')[:13]} seq={rec.get('seq')} dir={rec.get('dir')} type={_pt} {_human}")
+        except Exception:
+            pass
     _ct["feed"] = _t.time()
 
     # persist host_mode on SessionView (lifetime of session) — individualist vs host collab
@@ -194,15 +214,58 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
         except Exception:
             pass
 
+    # Client identity adopt: when the engine never resolved view.me (join
+    # props without a 255 username) but the client tells us who it is, adopt
+    # it into the view AND heal a blank bngc_users.game_username at the
+    # source. Only fills blanks — never overwrites a known identity.
+    if auth_session_id and (body_game_username or body_game_id):
+        try:
+            vw2 = engine.get_session(auth_session_id)
+            if vw2 is not None and getattr(vw2, "me", None) is None:
+                _nm = str(body_game_username or "").strip()[:32] or None
+                _gid = str(body_game_id or "").strip() or None
+                if _nm or _gid:
+                    from server.lib.photon_engine.models import Player as _Pl
+                    vw2.me = _Pl(actor_nr=-1, username=_nm or "unknown",
+                                 game_id=_gid, is_alive=True, is_self=True)
+                    log_sys(f"CAPTURE identity adopted sid={str(auth_session_id)[:13]} "
+                            f"name={_nm} gid={str(_gid)[:8] if _gid else None} via client body")
+        except Exception as e:
+            log_err(f"CAPTURE identity adopt failed {e}")
+        try:
+            if discord_id and (body_game_username or body_game_id):
+                _u = await db_io(
+                    lambda: supabase.table("bngc_users").select(
+                        "game_username,game_id").eq("discord_id", discord_id).single().execute())
+                _row = _u.data if hasattr(_u, "data") else None
+                _upd = {}
+                if body_game_username and not ((_row or {}).get("game_username") or "").strip():
+                    _upd["game_username"] = str(body_game_username).strip()[:32]
+                if body_game_id and not ((_row or {}).get("game_id") or "").strip():
+                    _upd["game_id"] = str(body_game_id).strip()
+                if _upd:
+                    await db_io(
+                        lambda: supabase.table("bngc_users").update(
+                            _upd).eq("discord_id", discord_id).execute())
+                    log_sys(f"CAPTURE identity healed did={str(discord_id)[:6]} {sorted(_upd)} via client body")
+        except Exception as e:
+            log_err(f"CAPTURE identity heal failed {e}")
+
     # Get session view after batch
     view = engine.get_session(auth_session_id) if auth_session_id else None
-    session_dict = view.to_dict() if view else None
-    if session_dict:
+    # Presence stamp on the VIEW (not just the response dict): EVERY batch
+    # counts, including heartbeat-only ones with zero packets. An idle but
+    # connected lobby (sit still, wait for players) must not go stale after
+    # 120s — game silence is not absence. Tab closed/reloaded stops all
+    # batches so both timestamps still age out; kicks arrive as loud leave
+    # events that park current off the ranked room first.
+    if view is not None:
         try:
-            import time as _t
-            session_dict["_cached_at"] = _t.time()  # stats expiry for kicked/closed clients
+            import time as _t3
+            view._cached_at = _t3.time()
         except Exception:
             pass
+    session_dict = view.to_dict() if view else None
 
     # Run DB writes inline (awaited) — BackgroundTasks are unreliable on serverless
     # (frozen after response) and this keeps local + Vercel behavior identical.
@@ -213,7 +276,8 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
             from server.scripts.processor import process_batch
             try:
                 await process_batch(auth_session_id, packets, view)
-                log_dbg(f"CAPTURE processed {auth_session_id[:13]} {len(packets)} packets session players={view.players_count if view else '?'}")
+                # PROCESSOR LINE — every batch result, always visible
+                log_ok(f"CAPTURE→PROCESSOR OK sid={auth_session_id[:13]} n={len(packets)} players={view.players_count if view else '?'}")
             except Exception as e:
                 log_err(f"PROCESSOR FAILED session={auth_session_id[:13]} {type(e).__name__}: {e}")
         except Exception as e:
@@ -261,6 +325,12 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
         try:
             for room_id_r, room_r in view.rooms.items():
                 code_r = getattr(room_r, "short_code", None)
+                # RANKED LINE — every room code seen per batch, always visible
+                try:
+                    if code_r:
+                        log_ranked(f"[ranked] capture sid={str(auth_session_id or '')[:13]} room={str(room_id_r)[:8]} code={code_r} state={getattr(getattr(room_r, 'state', None), 'value', '?')} ver={getattr(room_r, 'match_version', '?')}")
+                except Exception:
+                    pass
                 if code_r and room_r.state.value == "match":
                     room_data = _cached_ranked_room(code_r)
                     if room_data and room_data.get("status") in ("lobby", "live"):
@@ -270,6 +340,10 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
                             "match_version": getattr(room_r, "match_version", 0),
                             "is_host": discord_id == room_data.get("host_discord_id"),
                         }
+                        try:
+                            log_ranked(f"[ranked] bind sid={str(auth_session_id or '')[:13]} code={code_r} status={room_data.get('status')} ver={getattr(room_r, 'match_version', 0)} is_host={discord_id == room_data.get('host_discord_id')}")
+                        except Exception:
+                            pass
                         break
         except Exception:
             pass
