@@ -1149,42 +1149,273 @@ def _roster_name2did(room_data, room) -> dict:
 
 
 _comp_logged_codes: set = set()
-_comp_seen: dict = {}  # mid -> set[(killer, victim)] already banked (dedup across batches)
-_comp_namemap: dict = {}  # game_username -> discord_id | None (process cache; twins stay None)
+_comp_seen: dict = {}  # mid -> set[(etype, killer, victim)] banked, normalized keys
+_comp_namemap: dict = {}  # game_username -> discord_id (positives only; twins stay None)
 
 _rt_logged_codes: set = set()
-_rt_seen: dict = {}  # mid -> set[(etype, killer, victim)] already banked (dedup across batches)
+_rt_seen: dict = {}  # mid -> set[(etype, killer, victim)] banked, normalized keys
 _rt_host_warned: set = set()  # (session, code) already told they are not host
 
 
+def _comp_norm_key(name) -> str:
+    """Normalized tourney dedup/match key: tags + dc: stripped, case-folded."""
+    try:
+        return _norm_name(name).lower()
+    except Exception:
+        return ""
+
+
 def _comp_map_names(names: list) -> dict:
-    """Batch game_username → discord_id. Unknown/twin names → None (never guess)."""
+    """Batch game_username → discord_id. Exact-first, fold-fallback, twins None.
+
+    Killfeed names drift (case, color tags, dc: prefix) while bngc_users stores
+    clean names — same tier rule as lifetime _is_self: a byte-exact single
+    owner wins; otherwise a normalized (tags/dc stripped, case-folded) single
+    owner wins; genuine conflicts stay None for the dashboard /link flow.
+    Only positive hits are cached, so a mid-tourney /link heals on the next
+    batch instead of sticking until process restart. Never raises.
+    """
     try:
         want = sorted({str(n) for n in (names or []) if str(n or "").strip()})
     except Exception:
         return {}
-    fresh = [n for n in want if n not in _comp_namemap]
-    if fresh and supabase is not None:
+    out: dict = {}
+    pending: list = []
+    for n in want:
         try:
-            ures = supabase.table("bngc_users").select(
-                "discord_id,game_username").in_("game_username", fresh[:50]).execute()
-            by_game: dict = {}
-            for r in (ures.data or []):
-                try:
-                    g, d = r.get("game_username"), r.get("discord_id")
-                    if g and d:
-                        by_game.setdefault(g, set()).add(d)
-                except Exception:
-                    continue
-            for n in fresh:
-                try:
-                    dids = by_game.get(n) or set()
-                    _comp_namemap[n] = next(iter(dids)) if len(dids) == 1 else None
-                except Exception:
-                    _comp_namemap[n] = None
+            hit = _comp_namemap.get(n)
         except Exception:
-            pass
-    return {n: _comp_namemap.get(n) for n in want}
+            hit = None
+        if hit:
+            out[n] = hit
+        else:
+            pending.append(n)
+    if not pending or supabase is None:
+        return {n: out.get(n) for n in want}
+    try:
+        ures = supabase.table("bngc_users").select(
+            "discord_id,game_username").in_("game_username", pending[:50]).execute()
+        by_game: dict = {}
+        for r in (ures.data or []):
+            try:
+                g, d = r.get("game_username"), r.get("discord_id")
+                if g and d:
+                    by_game.setdefault(g, set()).add(d)
+            except Exception:
+                continue
+        still: list = []
+        for n in pending:
+            try:
+                dids = by_game.get(n) or set()
+                if len(dids) == 1:
+                    did = next(iter(dids))
+                    _comp_namemap[n] = did
+                    out[n] = did
+                else:
+                    still.append(n)
+            except Exception:
+                still.append(n)
+    except Exception:
+        still = list(pending)
+    # Fold fallback (capped per batch; uncached misses retry next batch).
+    try:
+        for n in (still or [])[:20]:
+            try:
+                nk = _comp_norm_key(n)
+                if not nk:
+                    continue
+                fres = supabase.table("bngc_users").select(
+                    "discord_id,game_username").ilike("game_username", nk).execute()
+                dids = set()
+                for r in (fres.data or []):
+                    try:
+                        g, d = r.get("game_username"), r.get("discord_id")
+                        if g and d and _comp_norm_key(g) == nk:
+                            dids.add(d)
+                    except Exception:
+                        continue
+                if len(dids) == 1:
+                    did = next(iter(dids))
+                    _comp_namemap[n] = did
+                    out[n] = did
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return {n: out.get(n) for n in want}
+
+
+def _comp_roster_dids(room) -> set:
+    """discord_ids mapped from one room roster (fold-tolerant). Never raises."""
+    try:
+        names = [str(getattr(p, "username", "") or "")
+                 for p in (getattr(room, "players", None) or {}).values()]
+        names = [n for n in names if n.strip()]
+        if not names:
+            return set()
+        return {d for d in _comp_map_names(names).values() if d}
+    except Exception:
+        return set()
+
+
+def _comp_banked_keys(table: str, mid) -> set:
+    """Normalized (etype, killer, victim) keys already stored for one match.
+
+    Cross-process idempotency for collaborative banking: the in-memory
+    _comp_seen/_rt_seen guards only cover this worker, so contributors (and
+    the host, after a contributor) subtract what's already in the DB before
+    inserting. Canonical etypes: kill / leave. Never raises.
+    """
+    keys: set = set()
+    try:
+        if supabase is None or mid is None:
+            return keys
+        res = supabase.table(table).select(
+            "etype,actor_name,target_name").eq("match_id", mid).limit(500).execute()
+        for r in (res.data or []):
+            try:
+                et = str((r or {}).get("etype") or "").lower()
+                cet = "leave" if et == "leave" else "kill"
+                keys.add((cet, _comp_norm_key((r or {}).get("actor_name")),
+                          _comp_norm_key((r or {}).get("target_name"))))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return keys
+
+
+def _bank_open_events(*, table: str, seen: dict, mid, room, tag: str) -> int:
+    """Append fresh kill/leave rows into an already-open tourney match.
+
+    Shared by the host writer and roster contributors: collects this view's
+    recent killfeed, drops rows already banked (in-memory seen + DB check,
+    both normalized so "cis6led" and "CIS6LED" are the same kill), maps names
+    in one query, inserts the remainder. Unknown/twins stay null for /link.
+    Returns rows inserted. Never raises.
+    """
+    try:
+        kills = [k for k in (getattr(room, "recent_kills", None) or [])
+                 if getattr(k, "event_type", None) in ("killed", "left")]
+        if not kills:
+            return 0
+        seen_set = seen.setdefault(mid, set())
+        banked = _comp_banked_keys(table, mid)
+        fresh_kills = []
+        for k in kills[-200:]:
+            try:
+                et = str(getattr(k, "event_type", "") or "")
+                killer = str(getattr(k, "instigator", "") or "")
+                victim = str(getattr(k, "instigated", "") or "")
+                if not killer and not victim:
+                    continue
+                cet = "leave" if et == "left" else "kill"
+                key = (cet, _comp_norm_key(killer), _comp_norm_key(victim))
+                if key in seen_set or key in banked:
+                    continue
+                seen_set.add(key)
+                fresh_kills.append((et, killer, victim))
+            except Exception:
+                continue
+        if not fresh_kills:
+            return 0
+        mapping = _comp_map_names([n for (_et, killer, victim) in fresh_kills
+                                   for n in (killer, victim)])
+        batch = [{
+            "match_id": mid,
+            "etype": "leave" if et == "left" else "kill",
+            "actor_nr": None,
+            "actor_name": killer or victim,
+            "target_name": victim or None,
+            "discord_id": mapping.get(killer),
+            "alive": None,
+        } for et, killer, victim in fresh_kills]
+        try:
+            supabase.table(table).insert(batch).execute()
+            n_mapped = sum(1 for r in batch if r.get("discord_id"))
+            log_comp(f"{tag}match={mid} +{len(batch)} events ({n_mapped} mapped)")
+            return batch
+        except Exception as exc:
+            if not is_transient_error(exc):
+                log_comp(f"{tag}match={mid} event write failed ({str(exc)[:80]})")
+    except Exception:
+        pass
+    return []
+
+
+def _comp_contribute(tid, code, session_id, discord_id, room, room_id) -> bool:
+    """Roster-member event contribution into the open comp match.
+
+    All-players fix: the host owns the lifecycle (open / seal / alv snapshot /
+    leaver removal / auto-calc) so matches can never duplicate, but any
+    authenticated session whose discord_id maps to the room roster may append
+    fresh kill/leave rows the host missed. Returns True when membership proved
+    (handled — caller returns silently), False for strangers and anonymous
+    sessions (caller keeps the existing skip log). Never opens or seals.
+    Never raises.
+    """
+    try:
+        if not discord_id or supabase is None:
+            return False
+        try:
+            last_stg = getattr(room, "last_stg", None)
+            last_stg = int(float(last_stg)) if last_stg is not None else None
+        except Exception:
+            last_stg = None
+        if last_stg != 1:
+            return False
+        if str(discord_id) not in _comp_roster_dids(room):
+            return False
+        mid = None
+        try:
+            mres = supabase.table("bngc_comp_matches").select("id").eq(
+                "tourney_id", tid).eq("room_id", room_id).eq(
+                "status", "open").order("id", desc=True).limit(1).execute()
+            mrows = mres.data or []
+            if mrows:
+                mid = mrows[0].get("id")
+        except Exception:
+            mid = None
+        if mid is None:
+            return True  # member, but opens are host-owned
+        _bank_open_events(table="bngc_comp_events", seen=_comp_seen,
+                          mid=mid, room=room, tag="contrib ")
+        return True
+    except Exception:
+        return False
+
+
+def _rt_contribute(tid, code, session_id, discord_id, room, room_id) -> bool:
+    """Ranked-tourney mirror of _comp_contribute (same contract, ranked tables)."""
+    try:
+        if not discord_id or supabase is None:
+            return False
+        try:
+            last_stg = getattr(room, "last_stg", None)
+            last_stg = int(float(last_stg)) if last_stg is not None else None
+        except Exception:
+            last_stg = None
+        if last_stg != 1:
+            return False
+        if str(discord_id) not in _comp_roster_dids(room):
+            return False
+        mid = None
+        try:
+            mres = supabase.table("bngc_ranked_tourney_matches").select("id").eq(
+                "tourney_id", tid).eq("room_id", room_id).eq(
+                "status", "open").order("id", desc=True).limit(1).execute()
+            mrows = mres.data or []
+            if mrows:
+                mid = mrows[0].get("id")
+        except Exception:
+            mid = None
+        if mid is None:
+            return True  # member, but opens are host-owned
+        _bank_open_events(table="bngc_ranked_tourney_events", seen=_rt_seen,
+                          mid=mid, room=room, tag="rt contrib ")
+        return True
+    except Exception:
+        return False
 
 
 def _comp_bank_alv(tourney, mid, room) -> None:
@@ -1328,13 +1559,15 @@ def seal_comp_match(session_id, discord_id, room, room_id, gm) -> None:
                                    max+1, same as comp-intake.js), then write
       no row + otherwise        -> ignore (writes closed until next stG 1)
 
-    Only the tourney host's session writes (hosts[] / created_by): with N
-    clients capturing the same room, one writer means no duplicate
-    killfeeds. Other sessions run their normal job untouched. Dashboard
+    The host owns the lifecycle (open / seal / alv snapshot / auto-calc):
+    with N clients capturing the same room, one writer means no duplicate
+    matches. Kill/leave banking is collaborative (roster contributors fill
+    host misses). Dashboard
     manual rows are never auto-sealed. At seal, one alv row per roster
     player is banked (dead in kill order, survivors last) so placements
     and winner resolve with no manual override. Twin names stay null —
-    never guess (dashboard /link resolves).
+    never guess (dashboard /link resolves). Lifecycle host-owned, event
+    banking collaborative (roster contributors fill host misses).
     """
     try:
         code = str(getattr(room, "short_code", None) or "").strip().upper()
@@ -1366,7 +1599,9 @@ def seal_comp_match(session_id, discord_id, room, room_id, gm) -> None:
             return
         t = rows[0]
         tid = t.get("id")
-        # Host-only writes (created_by always counts as host, per v233).
+        # Host-only lifecycle (created_by always counts as host, per v233).
+        # Roster members may still append missed kill/leave rows into the open
+        # match via _comp_contribute (lifecycle itself never leaves the host).
         try:
             hosts = {str(h) for h in (t.get("hosts") or []) if h}
             if t.get("created_by"):
@@ -1374,6 +1609,11 @@ def seal_comp_match(session_id, discord_id, room, room_id, gm) -> None:
         except Exception:
             hosts = set()
         if not discord_id or str(discord_id) not in hosts:
+            try:
+                if _comp_contribute(tid, code, session_id, discord_id, room, room_id):
+                    return
+            except Exception:
+                pass
             try:
                 key = (str(session_id or "")[:13], code)
                 if key not in _comp_host_warned:
@@ -1477,50 +1717,18 @@ def seal_comp_match(session_id, discord_id, room, room_id, gm) -> None:
             # Write kill + leave events. Canonical bngc_comp_events shape
             # {match_id, etype, actor_nr, actor_name, target_name, discord_id, alive}
             # (no tourney_id / victim_name columns — matches comp-intake.js).
-            # Deduped per match across batches; names mapped in one query,
+            # Deduped per match across batches AND against stored rows (both
+            # normalized), so host + roster contributors never double-bank;
             # unknown/twins stay null for the dashboard /link flow.
         try:
-            kills = [k for k in (getattr(room, "recent_kills", None) or [])
-                     if getattr(k, "event_type", None) in ("killed", "left")]
-            seen = _comp_seen.setdefault(mid, set())
-            fresh_kills = []
-            for k in kills[-200:]:
-                try:
-                    et = str(getattr(k, "event_type", "") or "")
-                    killer = str(getattr(k, "instigator", "") or "")
-                    victim = str(getattr(k, "instigated", "") or "")
-                    if not killer and not victim:
-                        continue
-                    key = (et, killer, victim)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    fresh_kills.append((et, killer, victim))
-                except Exception:
-                    continue
-            if fresh_kills:
-                mapping = _comp_map_names([n for (_et, killer, victim) in fresh_kills for n in (killer, victim)])
-                batch = [{
-                    "match_id": mid,
-                    "etype": "leave" if et == "left" else "kill",
-                    "actor_nr": None,
-                    "actor_name": killer or victim,
-                    "target_name": victim or None,
-                    "discord_id": mapping.get(killer),
-                    "alive": None,
-                } for et, killer, victim in fresh_kills]
-                try:
-                    supabase.table("bngc_comp_events").insert(batch).execute()
-                    n_mapped = sum(1 for r in batch if r.get("discord_id"))
-                    log_comp(f"match={mid} +{len(batch)} events ({n_mapped} mapped)")
-                except Exception as exc:
-                    if not is_transient_error(exc):
-                        log_comp(f"match={mid} event write failed ({str(exc)[:80]})")
+            batch = _bank_open_events(table="bngc_comp_events", seen=_comp_seen,
+                                      mid=mid, room=room, tag="")
+            if batch:
                 # auto-remove mapped leavers from the match roster (mirrors
                 # comp-intake leaves[]; host adds back via dashboard/bot)
                 try:
-                    leave_dids = sorted({mapping.get(killer) for (et, killer, _v) in fresh_kills
-                                         if et == "left" and mapping.get(killer)})
+                    leave_dids = sorted({r.get("discord_id") for r in batch
+                                         if r.get("etype") == "leave" and r.get("discord_id")})
                     if leave_dids:
                         try:
                             mres = supabase.table("bngc_comp_matches").select(
@@ -1890,13 +2098,15 @@ def seal_ranked_tourney_match(session_id, discord_id, room, room_id, gm,
                                    max+1), then write
       no row + otherwise        -> ignore (writes closed until next stG 1)
 
-    Only the tourney host's session writes (hosts[] / created_by): with N
-    clients capturing the same room, one writer means no duplicate
-    killfeeds. Other sessions run their normal job untouched. Dashboard
+    The host owns the lifecycle (open / seal / alv snapshot / auto-calc):
+    with N clients capturing the same room, one writer means no duplicate
+    matches. Kill/leave banking is collaborative (roster contributors fill
+    host misses). Dashboard
     manual rows are never auto-sealed. At seal, one alv row per roster
     player is banked (dead in kill order, survivors last) so placements
     and winner resolve with no manual override. Twin names stay null —
-    never guess (dashboard /link resolves).
+    never guess (dashboard /link resolves). Lifecycle host-owned, event
+    banking collaborative (roster contributors fill host misses).
     """
     try:
         code = str(getattr(room, "short_code", None) or "").strip().upper()
@@ -1938,7 +2148,9 @@ def seal_ranked_tourney_match(session_id, discord_id, room, room_id, gm,
             return
         t = rows[0]
         tid = t.get("id")
-        # Host-only writes (created_by always counts as host).
+        # Host-only lifecycle (created_by always counts as host).
+        # Roster members may still append missed kill/leave rows into the open
+        # match via _rt_contribute (lifecycle itself never leaves the host).
         try:
             hosts = {str(h) for h in (t.get("hosts") or []) if h}
             if t.get("created_by"):
@@ -1946,6 +2158,11 @@ def seal_ranked_tourney_match(session_id, discord_id, room, room_id, gm,
         except Exception:
             hosts = set()
         if not discord_id or str(discord_id) not in hosts:
+            try:
+                if _rt_contribute(tid, code, session_id, discord_id, room, room_id):
+                    return
+            except Exception:
+                pass
             try:
                 key = (str(session_id or "")[:13], code)
                 if key not in _rt_host_warned:
@@ -2054,47 +2271,11 @@ def seal_ranked_tourney_match(session_id, discord_id, room, room_id, gm,
             log_comp(f"rt open tid={tid} code={code} match={mid} room={str(room_id)[:8]} (stG 1)")
             # Write kill + leave events. Canonical bngc_ranked_tourney_events shape
             # {match_id, etype, actor_nr, actor_name, target_name, discord_id, alive}.
-            # Deduped per match across batches; names mapped in one query,
+            # Deduped per match across batches AND against stored rows (both
+            # normalized), so host + roster contributors never double-bank;
             # unknown/twins stay null for the dashboard /link flow.
-        try:
-            kills = [k for k in (getattr(room, "recent_kills", None) or [])
-                     if getattr(k, "event_type", None) in ("killed", "left")]
-            seen = _rt_seen.setdefault(mid, set())
-            fresh_kills = []
-            for k in kills[-200:]:
-                try:
-                    et = str(getattr(k, "event_type", "") or "")
-                    killer = str(getattr(k, "instigator", "") or "")
-                    victim = str(getattr(k, "instigated", "") or "")
-                    if not killer and not victim:
-                        continue
-                    key = (et, killer, victim)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    fresh_kills.append((et, killer, victim))
-                except Exception:
-                    continue
-            if fresh_kills:
-                mapping = _comp_map_names([n for (_et, killer, victim) in fresh_kills for n in (killer, victim)])
-                batch = [{
-                    "match_id": mid,
-                    "etype": "leave" if et == "left" else "kill",
-                    "actor_nr": None,
-                    "actor_name": killer or victim,
-                    "target_name": victim or None,
-                    "discord_id": mapping.get(killer),
-                    "alive": None,
-                } for et, killer, victim in fresh_kills]
-                try:
-                    supabase.table("bngc_ranked_tourney_events").insert(batch).execute()
-                    n_mapped = sum(1 for r in batch if r.get("discord_id"))
-                    log_comp(f"rt match={mid} +{len(batch)} events ({n_mapped} mapped)")
-                except Exception as exc:
-                    if not is_transient_error(exc):
-                        log_comp(f"rt match={mid} event write failed ({str(exc)[:80]})")
-        except Exception:
-            pass
+        _bank_open_events(table="bngc_ranked_tourney_events", seen=_rt_seen,
+                          mid=mid, room=room, tag="rt ")
         # No phase-end handling here: sealing is decided above from last_stg.
     except Exception as exc:
         try:

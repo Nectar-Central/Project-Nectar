@@ -633,6 +633,7 @@ def test_no_processor_precheck_seal_owns_idempotency(monkeypatch):
 def test_happy_path_winner_kills_losses(monkeypatch):
     fake = _FakeDB()
     monkeypatch.setattr(proc, "supabase", fake)
+    proc._comp_namemap.clear()  # hermetic: no verified identity in this fake
     calls = []
     _patch_ranked(monkeypatch, calls)
     r = _room()
@@ -683,6 +684,7 @@ def test_nobody_alive_last_to_die_wins(monkeypatch):
 def test_duo_surviving_partner_shares_win(monkeypatch):
     fake = _FakeDB()
     monkeypatch.setattr(proc, "supabase", fake)
+    proc._comp_namemap.clear()  # hermetic: no verified identity in this fake
     calls = []
     _patch_ranked(monkeypatch, calls)
     r = _room()
