@@ -399,12 +399,18 @@ def freeze_match_table(mid: int) -> dict | None:
         # Resolve kill targets into parts so every death pays.
         try:
             _added: set[str] = set()
+            try:
+                _m_ign = _ignored_names(m)
+            except Exception:
+                _m_ign = set()
             for e in (events or []):
                 try:
                     if (e or {}).get("etype") != "kill":
                         continue
                     _t = str((e or {}).get("target_name") or "").strip()
                     if not _t:
+                        continue
+                    if _norm_ignored_name(_t) in _m_ign:
                         continue
                     _v = name2did.get(_norm_nm(_t))
                     if _v and _v not in xset and _v not in parts:
@@ -423,6 +429,32 @@ def freeze_match_table(mid: int) -> dict | None:
                     pass
         except Exception:
             pass
+        # Intruder exclusion: banned session members and per-match ignored
+        # names score nowhere — not in parts, not as killers/victims, never
+        # the winner. Dashboard Ban / match Ignore feed both lists.
+        _banned: set = set()
+        try:
+            _br = supabase.table("bngc_ranked_tourney_registrations").select(
+                "member_ids").eq("tourney_id", (m or {}).get("tourney_id")).eq(
+                "status", "banned").limit(500).execute()
+            for _r in ((_br.data) or []):
+                for _x in ((_r or {}).get("member_ids") or []):
+                    if str(_x or "").strip():
+                        _banned.add(str(_x))
+            _banned -= xset
+        except Exception:
+            _banned = set()
+        try:
+            _ign = _ignored_names(m)
+        except Exception:
+            _ign = set()
+        try:
+            if _banned:
+                parts -= _banned
+                n = len(parts)
+                avg = round(sum(ladder.get(d, 0) for d in parts) / n, 1) if n else 0.0
+        except Exception:
+            pass
         awards: list[dict] = []
         counts: dict[str, int] = {}
         # death -> killer for killer-relative losses (last killer wins).
@@ -434,10 +466,14 @@ def freeze_match_table(mid: int) -> dict | None:
                 if (e or {}).get("etype") != "kill":
                     continue
                 killer = str((e or {}).get("discord_id") or "").strip()
-                if not killer or killer in xset:
+                if not killer or killer in xset or killer in _banned:
                     continue
                 target = str((e or {}).get("target_name") or "").strip()
+                if _norm_ignored_name(target) in _ign:
+                    continue
                 victim = name2did.get(_norm_nm(target)) or killer
+                if victim in xset or victim in _banned:
+                    victim = killer
                 if victim in xset:
                     victim = killer
                 try:
@@ -491,7 +527,7 @@ def freeze_match_table(mid: int) -> dict | None:
             wdid = str((m or {}).get("winner_discord_id") or "").strip() or None
             if not wdid and order:
                 wdid = order[0]
-            if wdid and wdid in xset:
+            if wdid and (wdid in xset or wdid in _banned):
                 wdid = None
         except Exception:
             wdid = None
@@ -517,7 +553,7 @@ def freeze_match_table(mid: int) -> dict | None:
                         try:
                             _t = str(_tm or "").strip()
                             if (not _t or _t == str(wdid) or _t in xset
-                                    or _t not in parts or _t in _deadset
+                                    or _t in _banned or _t not in parts or _t in _deadset
                                     or _t in (man or {})):
                                 continue
                             _tie1.append(_t)
@@ -1866,6 +1902,139 @@ async def comp_tourney_hosts(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@router.post("/api/ranked/tourney/code")
+async def comp_tourney_code(request: Request):
+    """Set (or clear) a session's room code by hand (dashboard code box).
+
+    Body: {tourney_id, code}. Empty code clears. A set code must be 5
+    letters/digits and unused by any other non-ended session (the bridge
+    binds by code — duplicates would stall both sessions). Same rules as
+    the bot's /ranked change-code. Never raises beyond JSON errors."""
+    err = _need()
+    if err:
+        return err
+    b = await _json(request)
+    try:
+        tid = int(b.get("tourney_id"))
+    except Exception:
+        return JSONResponse({"error": "tourney_id required"}, status_code=400)
+    try:
+        code = str(b.get("code") or "").strip().upper() or None
+        if code is not None and (len(code) != 5 or not code.isalnum()):
+            return JSONResponse({"error": "code must be 5 letters/digits"}, status_code=400)
+        tres = supabase.table("bngc_ranked_tourneys").select(
+            "id,status").eq("id", tid).limit(1).execute()
+        if not tres.data:
+            return JSONResponse({"error": "tourney not found"}, status_code=404)
+        if str((tres.data[0] or {}).get("status") or "") == "ended":
+            return JSONResponse({"error": "session already ended"}, status_code=400)
+        if code is not None:
+            ores = supabase.table("bngc_ranked_tourneys").select("id").eq(
+                "code", code).neq("status", "ended").limit(10).execute()
+            taken = [str((r or {}).get("id")) for r in (ores.data or [])
+                     if str((r or {}).get("id")) != str(tid)]
+            if taken:
+                return JSONResponse(
+                    {"error": f"code already used by session #{taken[0]}"},
+                    status_code=400)
+        ures = supabase.table("bngc_ranked_tourneys").update(
+            {"code": code}).eq("id", tid).execute()
+        if not ures.data:
+            return JSONResponse({"error": "tourney not found"}, status_code=404)
+        return JSONResponse({"ok": True, "tourney_id": tid, "code": code})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@router.post("/api/ranked/reg/add")
+async def comp_reg_add(request: Request):
+    """Add a player to a session roster by hand (dashboard add-player box).
+
+    Body: {tourney_id, discord_id, display_name?}. Inserts one accepted
+    solo row; refuses banned players and duplicates (idempotent —
+    already-in returns ok). Mirrors the bot join flow. Never raises
+    beyond JSON errors."""
+    err = _need()
+    if err:
+        return err
+    b = await _json(request)
+    try:
+        tid = int(b.get("tourney_id"))
+        did = str(b.get("discord_id") or "").strip()
+    except Exception:
+        return JSONResponse({"error": "tourney_id and discord_id required"},
+                            status_code=400)
+    if not did:
+        return JSONResponse({"error": "discord_id required"}, status_code=400)
+    try:
+        rres = supabase.table("bngc_ranked_tourney_registrations").select(
+            "id,member_ids,status").eq("tourney_id", tid).limit(500).execute()
+        regs = rres.data or []
+        for r in regs:
+            mids = [str(x) for x in ((r or {}).get("member_ids") or [])]
+            if did in mids and str((r or {}).get("status")) == "banned":
+                return JSONResponse({"error": "player is banned from this session"},
+                                    status_code=400)
+            if did in mids and str((r or {}).get("status")) == "accepted":
+                return JSONResponse({"ok": True, "tourney_id": tid,
+                                     "discord_id": did, "present": True})
+        names = {}
+        try:
+            _dn = str(b.get("display_name") or "").strip()[:32]
+            if _dn:
+                names = {did: {"username": _dn, "display_name": _dn}}
+        except Exception:
+            names = {}
+        supabase.table("bngc_ranked_tourney_registrations").insert({
+            "tourney_id": tid, "member_ids": [did],
+            "member_names": names, "status": "accepted",
+        }).execute()
+        return JSONResponse({"ok": True, "tourney_id": tid,
+                             "discord_id": did, "present": False})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@router.post("/api/ranked/reg/remove")
+async def comp_reg_remove(request: Request):
+    """Remove a player from a session roster by hand (dashboard remove).
+
+    Body: {tourney_id, discord_id}. Deletes their accepted solo rows (duo
+    rows untouched — same rule as leaving via Discord). Missing player
+    returns ok/not-present. Never raises beyond JSON errors."""
+    err = _need()
+    if err:
+        return err
+    b = await _json(request)
+    try:
+        tid = int(b.get("tourney_id"))
+        did = str(b.get("discord_id") or "").strip()
+    except Exception:
+        return JSONResponse({"error": "tourney_id and discord_id required"},
+                            status_code=400)
+    if not did:
+        return JSONResponse({"error": "discord_id required"}, status_code=400)
+    try:
+        rres = supabase.table("bngc_ranked_tourney_registrations").select(
+            "id,member_ids,status").eq("tourney_id", tid).limit(500).execute()
+        n = 0
+        for r in (rres.data or []):
+            try:
+                mids = [str(x) for x in ((r or {}).get("member_ids") or [])]
+                if (mids == [did] and str((r or {}).get("status")) == "accepted"
+                        and (r or {}).get("id") is not None):
+                    supabase.table("bngc_ranked_tourney_registrations").delete().eq(
+                        "id", (r or {}).get("id")).execute()
+                    n += 1
+            except Exception:
+                continue
+        return JSONResponse({"ok": True, "tourney_id": tid,
+                             "discord_id": did, "removed": n,
+                             "present": n == 0})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 def _pending_seal_tables(mids: list) -> dict:
     """{match_id: pending-table} for bridge-pending rows. Never raises.
 
@@ -2711,15 +2880,42 @@ def _removed_list(m: dict) -> list:
         return []
 
 
+IGNORED_NAME_PREFIX = "name:"
+
+
+def _norm_ignored_name(s: str) -> str:
+    """Canonical key for an ignored actor name (same fold as _norm_nm)."""
+    try:
+        import re as _re
+        nm = _re.sub(r"<[^>]*>", "", str(s or "")).strip().lower()
+        return nm[3:].strip() if nm.startswith("dc:") else nm
+    except Exception:
+        return str(s or "").lower()
+
+
+def _ignored_names(m: dict) -> set:
+    """Actor names this match ignores (intruders): `name:<norm>` entries."""
+    try:
+        return {str(x)[len(IGNORED_NAME_PREFIX):]
+                for x in _removed_list(m)
+                if str(x).startswith(IGNORED_NAME_PREFIX)
+                and len(str(x)) > len(IGNORED_NAME_PREFIX)}
+    except Exception:
+        return set()
+
+
 @router.post("/api/ranked/match/remove")
 async def comp_match_remove(request: Request):
-    """Remove a player from a match roster (left mid-match).
+    """Remove a player from a match roster (left mid-match) or ignore an
+    unmapped intruder name for this match.
 
     Body: {match_id, discord_id?, actor_name?}. discord_id preferred; when
     only actor_name is given the server resolves it via regs/game_username
-    (best effort — the 🚪 leave line still shows regardless). Idempotent:
-    appends to removed_discord_ids. Removed players are ignored in placement
-    and calculations. Never raises beyond JSON errors."""
+    (best effort). An actor_name that resolves to nobody is stored as an
+    ignored name (`name:<norm>`) instead of erroring: ignored names never
+    map, place, or score in this match (dashboard Ignore button).
+    Idempotent: appends to removed_discord_ids. Never raises beyond
+    JSON errors."""
     err = _need()
     if err:
         return err
@@ -2767,7 +2963,21 @@ async def comp_match_remove(request: Request):
             except Exception:
                 pass
         if not did:
-            return JSONResponse({"error": "discord_id required (actor_name did not resolve)"}, status_code=400)
+            if not aname:
+                return JSONResponse({"error": "discord_id or actor_name required"},
+                                    status_code=400)
+            # intruder with no linkable identity: ignore the raw name for
+            # this match instead of erroring (dashboard Ignore button).
+            key = IGNORED_NAME_PREFIX + _norm_ignored_name(aname)
+            if not key[len(IGNORED_NAME_PREFIX):]:
+                return JSONResponse({"error": "actor_name required"}, status_code=400)
+            cur = _removed_list(m)
+            if key not in cur:
+                cur.append(key)
+                supabase.table("bngc_ranked_tourney_matches").update(
+                    {"removed_discord_ids": cur}).eq("id", mid).execute()
+            return JSONResponse({"ok": True, "match_id": mid, "ignored": aname,
+                                 "removed_discord_ids": cur})
         cur = _removed_list(m)
         if did not in cur:
             cur.append(did)
@@ -2782,8 +2992,9 @@ async def comp_match_remove(request: Request):
 async def comp_match_add_back(request: Request):
     """Add a removed player back to a match roster (/tourney add-back).
 
-    Body: {match_id, discord_id}. Removes from removed_discord_ids so the
-    player scores again. Never raises beyond JSON errors."""
+    Body: {match_id, discord_id?, actor_name?}. Removes the did (or the
+    ignored `name:<norm>` entry for actor_name) from removed_discord_ids
+    so the player scores again. Never raises beyond JSON errors."""
     err = _need()
     if err:
         return err
@@ -2791,10 +3002,11 @@ async def comp_match_add_back(request: Request):
     try:
         mid = int(b.get("match_id"))
         did = str(b.get("discord_id") or "").strip()
+        aname = str(b.get("actor_name") or "").strip()
     except Exception:
         return JSONResponse({"error": "match_id and discord_id required"}, status_code=400)
-    if not did:
-        return JSONResponse({"error": "discord_id required"}, status_code=400)
+    if not did and not aname:
+        return JSONResponse({"error": "discord_id or actor_name required"}, status_code=400)
     try:
         try:
             mres = supabase.table("bngc_ranked_tourney_matches").select(
@@ -2803,7 +3015,10 @@ async def comp_match_add_back(request: Request):
             return JSONResponse({"error": "removed_discord_ids column missing — apply add_comp_v237.sql"}, status_code=500)
         if not mres.data:
             return JSONResponse({"error": "match not found"}, status_code=404)
-        cur = [x for x in _removed_list(mres.data[0]) if x != did]
+        drop = {did} if did else set()
+        if aname:
+            drop.add(IGNORED_NAME_PREFIX + _norm_ignored_name(aname))
+        cur = [x for x in _removed_list(mres.data[0]) if x not in drop]
         supabase.table("bngc_ranked_tourney_matches").update(
             {"removed_discord_ids": cur}).eq("id", mid).execute()
         return JSONResponse({"ok": True, "match_id": mid, "removed_discord_ids": cur})
@@ -3135,7 +3350,9 @@ async def comp_match_tie(request: Request):
 async def comp_match_unmapped(request: Request):
     """Actor names in a match with no discord link (dashboard link UI).
 
-    Returns [{name, kills, deaths}] so the host can attach each to a player.
+    Returns {unmapped: [{name, kills, deaths}], ignored: [name]} — ignored
+    intruder names are listed separately so the dashboard can un-ignore
+    them. Ignored names never appear in unmapped.
     """
     err = _need()
     if err:
@@ -3145,9 +3362,16 @@ async def comp_match_unmapped(request: Request):
     except Exception:
         return JSONResponse({"error": "match_id required"}, status_code=400)
     try:
+        try:
+            mres = supabase.table("bngc_ranked_tourney_matches").select(
+                "removed_discord_ids").eq("id", mid).limit(1).execute()
+            ignored = _ignored_names((mres.data or [{}])[0]) if mres.data else set()
+        except Exception:
+            ignored = set()
         eres = supabase.table("bngc_ranked_tourney_events").select(
             "etype,discord_id,actor_name,target_name,alive").eq("match_id", mid).limit(5000).execute()
         agg: dict[str, dict] = {}
+        seen_ignored: set = set()
         for e in (eres.data or []):
             try:
                 if (e or {}).get("discord_id"):
@@ -3155,6 +3379,9 @@ async def comp_match_unmapped(request: Request):
                 for nm_raw in ((e or {}).get("actor_name"), (e or {}).get("target_name")):
                     nm = str(nm_raw or "").strip()
                     if not nm:
+                        continue
+                    if _norm_ignored_name(nm) in ignored:
+                        seen_ignored.add(nm)
                         continue
                     d = agg.setdefault(nm, {"name": nm, "kills": 0, "deaths": 0})
                     if (e or {}).get("etype") == "kill":
@@ -3166,7 +3393,8 @@ async def comp_match_unmapped(request: Request):
             except Exception:
                 continue
         return JSONResponse({"match_id": mid,
-                             "unmapped": sorted(agg.values(), key=lambda r: -r["kills"])})
+                             "unmapped": sorted(agg.values(), key=lambda r: -r["kills"]),
+                             "ignored": sorted(seen_ignored)})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -3195,6 +3423,16 @@ async def comp_match_link(request: Request):
         did = b.get("discord_id")
         did = str(did).strip() if did else None
         apply_all = bool(b.get("apply_to_all"))
+        if did:
+            try:
+                mchk = supabase.table("bngc_ranked_tourney_matches").select(
+                    "removed_discord_ids").eq("id", mid).limit(1).execute()
+                if mchk.data and _norm_ignored_name(name) in _ignored_names(mchk.data[0]):
+                    return JSONResponse(
+                        {"error": "name is ignored for this match — un-ignore it first"},
+                        status_code=400)
+            except Exception:
+                pass
         q = supabase.table("bngc_ranked_tourney_events").update(
             {"discord_id": did}).eq("match_id", mid).is_("discord_id", "null").eq(
             "actor_name", name)

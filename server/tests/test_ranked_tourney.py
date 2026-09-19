@@ -29,8 +29,11 @@ MIRROR_POST = [
     "/api/ranked/tourney/host-playing",
     "/api/ranked/tourney/hosts",
     "/api/ranked/tourney/table",
+    "/api/ranked/tourney/code",
     "/api/ranked/calculate",
     "/api/ranked/reg/status",
+    "/api/ranked/reg/add",
+    "/api/ranked/reg/remove",
     "/api/ranked/adjust",
     "/api/ranked/match/open",
     "/api/ranked/match/seal",
@@ -71,7 +74,7 @@ def test_all_29_mirror_paths_registered_once():
         assert routes.get(path) == {"GET"}, (path, routes.get(path))
     for path in MIRROR_POST:
         assert routes.get(path) == {"POST"}, (path, routes.get(path))
-    assert len(MIRROR_GET) + len(MIRROR_POST) == 29
+    assert len(MIRROR_GET) + len(MIRROR_POST) == 32
 
 
 def test_ranked_extras_registered():
@@ -122,6 +125,7 @@ class _T:
         self._update = None
         self._insert = None
         self._upsert = None
+        self._delete = False
 
     def select(self, *a, **k):
         return self
@@ -160,8 +164,16 @@ class _T:
         self._update = dict(data)
         return self
 
+    def delete(self):
+        self._delete = True
+        return self
+
     def execute(self):
         base = self._state.setdefault(self._name, [])
+        if self._delete:
+            doomed = list(self._rows)
+            base[:] = [x for x in base if x not in doomed]
+            return _R([dict(r) for r in doomed])
         if self._insert is not None:
             wrote = []
             for r in self._insert:
@@ -646,3 +658,110 @@ def test_room_seal_bundle_aggregates_like_ladder():
     assert totals == {"A": 16, "B": 15, "C": 2}
     assert next(r for r in board
                 if r["discord_id"] == "A")["matches"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Dashboard manual ops: code set, roster add/remove, intruder ignore
+# ---------------------------------------------------------------------------
+
+def test_tourney_code_set_clear_and_dup(monkeypatch):
+    state = {"bngc_ranked_tourneys": [
+        {"id": 0, "code": None, "status": "created"},
+        {"id": 1, "code": "ZZZZZ", "status": "started"},
+    ]}
+    code, j = _call(monkeypatch, state, rt_mod.comp_tourney_code,
+                    {"tourney_id": 0, "code": "abcde"})
+    assert code == 200, j
+    assert j["code"] == "ABCDE"
+    assert state["bngc_ranked_tourneys"][0]["code"] == "ABCDE"
+    # duplicate of another live session rejected
+    code, j = _call(monkeypatch, state, rt_mod.comp_tourney_code,
+                    {"tourney_id": 0, "code": "zzzzz"})
+    assert code == 400 and "already used" in j["error"]
+    # bad shape rejected
+    code, j = _call(monkeypatch, state, rt_mod.comp_tourney_code,
+                    {"tourney_id": 0, "code": "toolong"})
+    assert code == 400
+    # clear works
+    code, j = _call(monkeypatch, state, rt_mod.comp_tourney_code,
+                    {"tourney_id": 0, "code": ""})
+    assert code == 200 and j["code"] is None
+
+
+def test_reg_add_remove_roundtrip(monkeypatch):
+    state = {"bngc_ranked_tourney_registrations": []}
+    code, j = _call(monkeypatch, state, rt_mod.comp_reg_add,
+                    {"tourney_id": 0, "discord_id": "N", "display_name": "Newbie"})
+    assert code == 200 and j["present"] is False
+    regs = state["bngc_ranked_tourney_registrations"]
+    assert len(regs) == 1 and regs[0]["status"] == "accepted"
+    assert regs[0]["member_ids"] == ["N"]
+    # idempotent second add
+    code, j = _call(monkeypatch, state, rt_mod.comp_reg_add,
+                    {"tourney_id": 0, "discord_id": "N"})
+    assert code == 200 and j["present"] is True
+    assert len(state["bngc_ranked_tourney_registrations"]) == 1
+    # remove deletes the solo accepted row
+    code, j = _call(monkeypatch, state, rt_mod.comp_reg_remove,
+                    {"tourney_id": 0, "discord_id": "N"})
+    assert code == 200 and j["removed"] == 1
+    assert state["bngc_ranked_tourney_registrations"] == []
+    # removing a stranger is ok/not-present
+    code, j = _call(monkeypatch, state, rt_mod.comp_reg_remove,
+                    {"tourney_id": 0, "discord_id": "N"})
+    assert code == 200 and j["present"] is True
+
+
+def test_reg_add_refuses_banned(monkeypatch):
+    state = {"bngc_ranked_tourney_registrations": [
+        {"id": 9, "tourney_id": 0, "member_ids": ["B"],
+         "member_names": {}, "status": "banned"},
+    ]}
+    code, j = _call(monkeypatch, state, rt_mod.comp_reg_add,
+                    {"tourney_id": 0, "discord_id": "B"})
+    assert code == 400 and "banned" in j["error"]
+
+
+def test_match_remove_name_ignore_flow(monkeypatch):
+    state = {
+        "bngc_ranked_tourney_matches": [
+            {"id": 11, "tourney_id": 0, "removed_discord_ids": []},
+        ],
+        "bngc_ranked_tourney_events": [
+            {"id": 1, "match_id": 11, "etype": "alv", "discord_id": None,
+             "actor_name": "Intruder", "target_name": None, "alive": False},
+        ],
+        "bngc_ranked_tourney_registrations": [],
+        "bngc_users": [],
+    }
+    # unresolvable actor_name becomes an ignored name, not an error
+    code, j = _call(monkeypatch, state, rt_mod.comp_match_remove,
+                    {"match_id": 11, "actor_name": "Intruder"})
+    assert code == 200, j
+    assert j["ignored"] == "Intruder"
+    assert state["bngc_ranked_tourney_matches"][0]["removed_discord_ids"] == ["name:intruder"]
+    # unmapped hides it, ignored lists it
+    code, j = _call(monkeypatch, state, rt_mod.comp_match_unmapped,
+                    params={"match_id": "11"})
+    assert code == 200, j
+    assert j["unmapped"] == []
+    assert j["ignored"] == ["Intruder"]
+    # linking an ignored name is refused
+    code, j = _call(monkeypatch, state, rt_mod.comp_match_link,
+                    {"match_id": 11, "actor_name": "Intruder", "discord_id": "Z"})
+    assert code == 400 and "ignored" in j["error"]
+    # un-ignore restores the mapping flow
+    code, j = _call(monkeypatch, state, rt_mod.comp_match_add_back,
+                    {"match_id": 11, "actor_name": "Intruder"})
+    assert code == 200, j
+    assert state["bngc_ranked_tourney_matches"][0]["removed_discord_ids"] == []
+    code, j = _call(monkeypatch, state, rt_mod.comp_match_unmapped,
+                    params={"match_id": "11"})
+    assert code == 200 and len(j["unmapped"]) == 1
+    assert j["unmapped"][0]["name"] == "Intruder"
+
+
+def test_ignored_names_unit():
+    assert rt_mod._ignored_names({"removed_discord_ids": ["A", "name:foo bar", "name:"]}) == {"foo bar"}
+    assert rt_mod._ignored_names({}) == set()
+    assert rt_mod._norm_ignored_name("<color>DC: Foo Bar </color>") == "foo bar"

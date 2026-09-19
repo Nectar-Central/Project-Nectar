@@ -290,8 +290,21 @@ function renderHead(j) {
   if (!el) return;
   const t = (j && j.tourney) || {};
   el.innerHTML = `<b style="font-size:14px">#${t.id} ${esc(t.name)}</b> ` +
-    `<span class="dim">${esc(t.status)}${t.mode && t.mode !== 'solo' ? ' · ' + esc(t.mode) : ''} · series ${t.sealed || 0}/${t.series_len || '∞'} · code ${esc(t.code || '—')}</span>` +
+    `<span class="dim">${esc(t.status)}${t.mode && t.mode !== 'solo' ? ' · ' + esc(t.mode) : ''} · series ${t.sealed || 0}/${t.series_len || '∞'}</span>` +
+    `<div class="gap" style="margin-top:4px">Room code: <input size="7" id="codeBox" value="${esc(t.code || '')}" placeholder="—————" style="text-transform:uppercase"> ` +
+    `<button id="codeSave">Save code</button> <span class="dim">manual override — auto-set not required</span></div>` +
     `<div class="dim" style="margin-top:3px">RANK · avg ${esc(t.rank_avg != null ? t.rank_avg : '—')} pts${t.rank_milestone ? ' (' + esc(t.rank_milestone) + ')' : ''} (ladder snapshot, display only)</div>`;
+  const save = $('codeSave');
+  if (save) save.onclick = async () => {
+    save.disabled = true;
+    try {
+      const v = (($('codeBox') && $('codeBox').value) || '').trim();
+      const r = await api('/api/ranked/tourney/code', post({ tourney_id: selTid, code: v }));
+      if (r && r.error) throw new Error(r.error);
+      log(v ? 'code set to ' + (r.code || v).toUpperCase() : 'code cleared');
+      refreshDetail();
+    } catch (e) { log('code: ' + e.message, true); save.disabled = false; }
+  };
 }
 function renderBoard(j) {
   // Ranked-session economy: no aggregate standings — every sealed match
@@ -459,8 +472,12 @@ async function refreshRegs(j) {
       `<div class="muted" style="margin-bottom:4px">PLAYERS (${accDids.length})</div>` +
       (accDids.length ? accDids.map((d) =>
         `<div data-reg="${esc(d)}"><b title="${esc(d)}">${esc(nameOf(d))}</b> ` +
-        `<button class="danger" data-ban="${esc(d)}">Ban</button></div>`).join('')
+        `<button class="danger" data-ban="${esc(d)}">Ban</button> ` +
+        `<button data-rm="${esc(d)}">Remove</button></div>`).join('')
         : '<span class="dim">No players yet.</span>') +
+      `<div class="gap" style="margin-top:6px"><input size="16" id="regAddDid" placeholder="discord id"> ` +
+      `<input size="14" id="regAddName" placeholder="name (optional)"> ` +
+      `<button id="regAddGo">Add player</button></div>` +
       `<div class="muted" style="margin:8px 0 4px">BANNED (${banDids.length})</div>` +
       (banDids.length ? banDids.map((d) =>
         `<div data-reg="${esc(d)}"><b title="${esc(d)}">${esc(nameOf(d))}</b> ` +
@@ -493,6 +510,26 @@ async function refreshRegs(j) {
     };
     box.querySelectorAll('[data-ban]').forEach((b) => { b.onclick = () => setBan(b.dataset.ban, true, b); });
     box.querySelectorAll('[data-unban]').forEach((b) => { b.onclick = () => setBan(b.dataset.unban, false, b); });
+    box.querySelectorAll('[data-rm]').forEach((b) => { b.onclick = async () => {
+      b.disabled = true;
+      try {
+        const r = await api('/api/ranked/reg/remove', post({ tourney_id: selTid, discord_id: b.dataset.rm }));
+        if (r && r.error) throw new Error(r.error);
+        log('removed ' + String(b.dataset.rm).slice(0, 6)); refreshRegs();
+      } catch (e) { log('remove: ' + e.message, true); refreshRegs(); }
+    }; });
+    const addGo = $('regAddGo');
+    if (addGo) addGo.onclick = async () => {
+      addGo.disabled = true;
+      try {
+        const did = (($('regAddDid') && $('regAddDid').value) || '').trim();
+        const nm = (($('regAddName') && $('regAddName').value) || '').trim();
+        if (!did) throw new Error('enter a discord id');
+        const r = await api('/api/ranked/reg/add', post({ tourney_id: selTid, discord_id: did, display_name: nm }));
+        if (r && r.error) throw new Error(r.error);
+        log(r && r.present ? 'already in session' : 'player added'); refreshRegs(); refreshDetail();
+      } catch (e) { log('add player: ' + e.message, true); addGo.disabled = false; }
+    };
   } catch (e) { box.innerHTML = '<span class="bad">Failed: ' + esc(e.message) + '</span>'; }
 }
 async function refreshMatch() {
@@ -1165,16 +1202,28 @@ async function refreshUnmapped(t) {
     };
     let html = '<div style="margin:4px 0"><input id="unmap-q" size="18" placeholder="filter names…"> ' +
       '<label class="dim"><input type="checkbox" id="link-all" checked> apply to all matches</label></div><div id="unmap-rows">';
+    const ignoredByMatch = {};
     for (const m of matches) {
       const u = await api('/api/ranked/match/unmapped?match_id=' + encodeURIComponent(m.id)).catch(() => null);
       const rows = ((u && u.unmapped) || []).filter((r) => (r.kills || 0) > 0 || (r.deaths || 0) > 0);
+      if (u && u.ignored && u.ignored.length) ignoredByMatch[m.id] = u.ignored;
       if (!rows.length) continue;
       html += `<div style="margin:4px 0" data-ver="${m.version}"><b>v${m.version}</b> ` + rows.map((r, i) => {
         const an = String(r.name || '').replace(/"/g, '&quot;');
         return `<div data-aname="${an.toLowerCase()}">${esc(r.name)} <span class="dim">${r.kills}K/${r.deaths}D</span> ` +
         `<select id="link-${m.id}-${i}">${optsFor(r.name)}</select> ` +
-        `<button data-link="${m.id}:${i}" data-aname="${an}">Link</button></div>`;
+        `<button data-link="${m.id}:${i}" data-aname="${an}">Link</button> ` +
+        `<button data-ignore="${m.id}" data-aname="${an}">Ignore</button></div>`;
       }).join('') + `</div>`;
+    }
+    const ignMids = Object.keys(ignoredByMatch).filter((k) => (ignoredByMatch[k] || []).length);
+    if (ignMids.length) {
+      html += `<div class="dim" style="margin:6px 0 2px">IGNORED (never map, place or score)</div>` + ignMids.map((mid) =>
+        `<div><b>v${((matches.find((m) => String(m.id) === String(mid)) || {}).version ?? '?')}</b> ` +
+        ignoredByMatch[mid].map((nm) => {
+          const an = String(nm || '').replace(/"/g, '&quot;');
+          return `${esc(nm)} <button data-unignore="${mid}" data-aname="${an}">Un-ignore</button>`;
+        }).join(' · ') + `</div>`).join('');
     }
     html += '</div>';
     box.innerHTML = html || '<span class="dim">Everything mapped.</span>';
@@ -1203,6 +1252,30 @@ async function refreshUnmapped(t) {
           cacheLink(b.dataset.aname, did);
           log('linked ' + b.dataset.aname); refreshDetail();
         } catch (e) { log('link: ' + e.message, true); b.disabled = false; }
+      };
+    });
+    box.querySelectorAll('[data-ignore]').forEach((b) => {
+      b.onclick = async () => {
+        b.disabled = true;
+        try {
+          const r = await api('/api/ranked/match/remove', post({
+            match_id: Number(b.dataset.ignore), actor_name: b.dataset.aname,
+          }));
+          if (r && r.error) throw new Error(r.error);
+          log('ignored ' + b.dataset.aname); refreshDetail();
+        } catch (e) { log('ignore: ' + e.message, true); b.disabled = false; }
+      };
+    });
+    box.querySelectorAll('[data-unignore]').forEach((b) => {
+      b.onclick = async () => {
+        b.disabled = true;
+        try {
+          const r = await api('/api/ranked/match/add-back', post({
+            match_id: Number(b.dataset.unignore), actor_name: b.dataset.aname,
+          }));
+          if (r && r.error) throw new Error(r.error);
+          log('un-ignored ' + b.dataset.aname); refreshDetail();
+        } catch (e) { log('un-ignore: ' + e.message, true); b.disabled = false; }
       };
     });
   } catch (e) { box.innerHTML = '<span class="bad">Failed: ' + esc(e.message) + '</span>'; }

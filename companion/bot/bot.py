@@ -5797,6 +5797,12 @@ async def _rt_dm_roster(tid: int, text: str) -> int:
 # Seeded on boot; refreshed by every broadcast (manual or watcher-driven),
 # so only genuinely new transitions announce. Never persisted — a restart
 # re-seeds silently instead of replaying history.
+# Per-seal match embeds are OFF: the thread stays quiet on every seal
+# (boards live on the dashboard + session command). The series counter on
+# the lobby message still refreshes. Flip to True to restore the embed.
+RT_SEAL_RESULTS_POST = False
+
+
 _rt_watch_state: dict = {}
 
 
@@ -6031,7 +6037,13 @@ async def ranked_session_watch_loop():
                 except Exception:
                     continue
                 if smax > int(st.get("sealed", -1)):
-                    await _rt_post_seal_board(tid, smax)
+                    if RT_SEAL_RESULTS_POST:
+                        await _rt_post_seal_board(tid, smax)
+                    else:
+                        try:
+                            await _rt_refresh_lobby_live(int(tid))
+                        except Exception:
+                            pass
                     st["sealed"] = smax
             for tid in [k for k in _rt_watch_state if k not in seen]:
                 _rt_watch_state.pop(tid, None)

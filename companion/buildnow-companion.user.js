@@ -3318,24 +3318,6 @@
   }
   function updateRankedStart(){
     return;  // v1: "This is a Ranked Match" panel removed — no pre-match popup.
-    if(!IS_GAME_FRAME) return;
-    const rk=liveRanked();
-    const inMatch=effInMatch()===true;
-    if(!rk || !inMatch) return;
-    const rid=String(rk.rid||'');
-    if(!rid || _rankedStartShown[rid]) return;
-    _rankedStartShown[rid]=true;
-    const mver=Number(rk.match_version)||0;
-    if(mver>1) return;  // joined mid-session: first match already passed
-    if(document.getElementById('bnc-ranked-start')) return;
-    try{ logInfo(`[RANKED] start-overlay SHOW rid=${rid}`); }catch{}
-    const ov=document.createElement('div');
-    ov.id='bnc-ranked-start';
-    Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483643', background:'rgba(0,0,0,0.72)', display:'flex', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif', cursor:'pointer'});
-    ov.innerHTML=`<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:16px;padding:28px;width:420px;max-width:92vw;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,0.5)"><div style="font-size:20px;font-weight:800;color:#fff">This is a Ranked Match</div><div style="font-size:13px;color:#e5e7eb;line-height:1.6;margin-top:10px">Kills 1–8 by opponent strength · Win 8–20 by lobby · Losses scale by killer · Match clamp −50/+30</div><div style="font-size:11px;color:#6b7280;margin-top:14px">click anywhere to close</div></div>`;
-    ov.addEventListener('click', ()=> _dismissRankedStart());
-    try{ (document.body||document.documentElement).appendChild(ov); }catch{ return; }
-    _rankedStartTimer=setTimeout(()=> _dismissRankedStart(), 5000);
   }
 
   function getRankedKeybind(){
@@ -4508,7 +4490,7 @@
     }catch{ try{ done(); }catch{} }
   }
   let lbPanel=null, lbSort='points', lbOrder='desc', lbOffset=0, lbRows=[], lbCount=0, lbLoading=false, _lbFadeT=null;
-  let lbTab='board', lbIns=null, lbInsLoading=false; // 'board' | 'insights' | 'friends' | 'events' | 'graphics' | 'presence'
+  let lbTab='board', lbIns=null, lbInsLoading=false; // 'board' | 'insights' | 'friends' | 'events' | 'ranked' | 'graphics' | 'presence'
   let lbEvents=null, lbEventsLoading=false, lbEventFilter='all', lbEventDetail=null, lbEventLoading=false;
   let lbProfile=null, lbProfileIns=null, lbProfileLoading=false; // open player profile (within panel)
   let lbFriends=null, lbFriendsLoading=false, lbInvites=null, lbSearch=[], lbSearchLoading=false;
@@ -4520,7 +4502,7 @@
     const ov=document.createElement('div');
     ov.id='bnc-lb';
     Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483646', background:'rgba(0,0,0,0.64)', display:'none', opacity:'0', transition:'opacity 180ms ease-out', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif'});
-    ov.innerHTML=`<div id="bnc-lb-card" style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:14px;width:700px;max-width:94vw;height:500px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden"><div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.08)"><div><b style="font-size:16px;color:#fff">Leaderboard</b><div id="bnc-lb-sub" style="font-size:11px;color:#9ca3af;margin-top:2px">All players</div></div><button id="bnc-lb-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px">Close</button></div><div id="bnc-lb-tabs" style="display:flex;flex-wrap:wrap;gap:8px;padding:12px 18px 0 18px"><button id="bnc-lb-tab-board" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Leaderboard</button><button id="bnc-lb-tab-ins" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Insights</button><button id="bnc-lb-tab-fr" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Friends</button><button id="bnc-lb-tab-ev" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Events</button><button id="bnc-lb-tab-gfx" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Graphics</button><button id="bnc-lb-tab-rpc" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Presence</button></div><div id="bnc-lb-sorts" style="display:flex;gap:8px;padding:12px 18px 0 18px;flex-wrap:wrap"></div><div id="bnc-lb-body" style="flex:1;overflow:auto;padding:16px 18px"></div><div id="bnc-lb-foot" style="display:flex;justify-content:space-between;align-items:center;padding:10px 18px;border-top:1px solid rgba(255,255,255,0.08)"><button id="bnc-lb-prev" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px">‹ Prev</button><span id="bnc-lb-page" style="font-size:11px;color:#9ca3af"></span><button id="bnc-lb-next" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px">Next ›</button></div></div>`;
+    ov.innerHTML=`<div id="bnc-lb-card" style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:14px;width:700px;max-width:94vw;height:500px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden"><div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.08)"><div><b style="font-size:16px;color:#fff">Leaderboard</b><div id="bnc-lb-sub" style="font-size:11px;color:#9ca3af;margin-top:2px">All players</div></div><button id="bnc-lb-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px">Close</button></div><div id="bnc-lb-tabs" style="display:flex;flex-wrap:wrap;gap:8px;padding:12px 18px 0 18px"><button id="bnc-lb-tab-board" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Leaderboard</button><button id="bnc-lb-tab-ins" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Insights</button><button id="bnc-lb-tab-fr" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Friends</button><button id="bnc-lb-tab-ev" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Events</button><button id="bnc-lb-tab-ranked" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Ranked</button><button id="bnc-lb-tab-gfx" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Graphics</button><button id="bnc-lb-tab-rpc" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Presence</button></div><div id="bnc-lb-sorts" style="display:flex;gap:8px;padding:12px 18px 0 18px;flex-wrap:wrap"></div><div id="bnc-lb-body" style="flex:1;overflow:auto;padding:16px 18px"></div><div id="bnc-lb-foot" style="display:flex;justify-content:space-between;align-items:center;padding:10px 18px;border-top:1px solid rgba(255,255,255,0.08)"><button id="bnc-lb-prev" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px">‹ Prev</button><span id="bnc-lb-page" style="font-size:11px;color:#9ca3af"></span><button id="bnc-lb-next" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px">Next ›</button></div></div>`;
     (document.body||document.documentElement).appendChild(ov);
     // visible focus ring on panel text inputs (proves focus landed)
     try{
@@ -4542,6 +4524,7 @@
     ov.querySelector('#bnc-lb-tab-ins').onclick=()=>{ lbTab='insights'; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); fetchLbIns(); };
     ov.querySelector('#bnc-lb-tab-fr').onclick=()=>{ lbTab='friends'; renderLbPanel(); fetchLbFriends(); };
     ov.querySelector('#bnc-lb-tab-ev').onclick=()=>{ lbTab='events'; lbEventDetail=null; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); fetchLbEvents(); };
+    ov.querySelector('#bnc-lb-tab-ranked').onclick=()=>{ lbTab='ranked'; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); fetchLbRanked(); };
     ov.querySelector('#bnc-lb-tab-gfx').onclick=()=>{ lbTab='graphics'; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); };
     ov.querySelector('#bnc-lb-tab-rpc').onclick=()=>{ lbTab='presence'; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); try{ if(rpcCfg().enabled) rpcProbe(()=>{ renderLbRpc(); startRpcView(); }); else { renderLbRpc(); startRpcView(); } }catch{} };
     // Presence tab hidden for the ranked launch (Discord tray bridge retired
@@ -4559,7 +4542,7 @@
     if(show){
       lbPanel.style.display='flex';
       requestAnimationFrame(()=>{ requestAnimationFrame(()=>{ try{ lbPanel.style.opacity='1'; }catch{} }); });
-      if(lbTab==='insights') fetchLbIns(); else if(lbTab==='friends') fetchLbFriends(); else if(lbTab==='events') fetchLbEvents(); else if(lbTab==='presence'){ renderLbRpc(); startRpcView(); } else fetchLb();
+      if(lbTab==='insights') fetchLbIns(); else if(lbTab==='friends') fetchLbFriends(); else if(lbTab==='events') fetchLbEvents(); else if(lbTab==='ranked') fetchLbRanked(); else if(lbTab==='presence'){ renderLbRpc(); startRpcView(); } else fetchLb();
     } else {
       try{ lbPanel.style.opacity='0'; }catch{}
       try{ stopLbChat(); }catch{}
@@ -4592,6 +4575,7 @@
     tabBtn('bnc-lb-tab-ins', lbTab==='insights');
     tabBtn('bnc-lb-tab-fr', lbTab==='friends');
     tabBtn('bnc-lb-tab-ev', lbTab==='events');
+    tabBtn('bnc-lb-tab-ranked', lbTab==='ranked');
     tabBtn('bnc-lb-tab-gfx', lbTab==='graphics');
     tabBtn('bnc-lb-tab-rpc', lbTab==='presence');
     if(lbTab!=='presence'){ try{ stopRpcView(); }catch{} }
@@ -4604,6 +4588,7 @@
     if(lbTab==='insights'){ renderLbIns(); return; }
     if(lbTab==='friends'){ renderLbFriends(); return; }
     if(lbTab==='events'){ renderLbEvents(); return; }
+    if(lbTab==='ranked'){ renderLbRanked(); return; }
     if(lbTab==='graphics'){ renderLbGfx(); return; }
     if(lbTab==='presence'){ renderLbRpc(); startRpcView(); return; }
     if(sorts){
@@ -5022,8 +5007,35 @@
       if(lbTab==='events' && !lbEventDetail) renderLbEvents();
     });
   }
-  function fetchLbEventDetail(id){
-    if(!lbPanel) return;
+  let lbRanked=null, lbRankedLoading=false;
+  function fetchLbRanked(){
+    if(!lbPanel || lbTab!=='ranked') return;
+    lbRankedLoading=true; renderLbRanked();
+    rankedApiGet('/api/leaderboard?ranked=true&limit=20', (j)=>{
+      lbRankedLoading=false;
+      lbRanked=(j && !j.error && j.results) ? j.results : [];
+      if(lbTab==='ranked') renderLbRanked();
+    });
+  }
+  function renderLbRanked(){
+    const body=document.getElementById('bnc-lb-body');
+    if(!body) return;
+    const sub=document.getElementById('bnc-lb-sub');
+    const esc=(v)=> String(v==null?'—':v).replace(/</g,'&lt;');
+    if(sub) sub.textContent='Ranked ladder · top 20';
+    if(lbRankedLoading){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Loading ranked…</div>`; return; }
+    const rows=lbRanked||[];
+    if(!rows.length){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">No ranked points yet — play a ranked match first.</div>`; return; }
+    const medals=['🥇','🥈','🥉'];
+    body.innerHTML=rows.map((r,i)=>{
+      const nm=r.game_username||r.discord_username||('…'+String(r.discord_id||'').slice(-4));
+      const ms=r.milestone||'Unranked';
+      const dot=r.milestone_color?`<span style="width:9px;height:9px;border-radius:50%;background:${esc(r.milestone_color)};flex-shrink:0"></span>`:'';
+      const left=medals[i]||`${i+1}.`;
+      return `<div style="display:flex;gap:10px;align-items:center;padding:9px 12px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;font-size:12px;margin-bottom:6px"><span style="width:26px;text-align:center;flex-shrink:0">${left}</span>${dot}<div style="flex:1;min-width:0"><div style="color:#fff;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(nm)}</div><div style="color:#6b7280;font-size:11px">${esc(ms)}</div></div><span style="color:#fff;font-weight:800">${Number(r.points||0).toLocaleString('en-US')} pts</span></div>`;
+    }).join('');
+  }
+  function fetchLbEventDetail(id){    if(!lbPanel) return;
     lbEventLoading=true; renderLbEvents();
     rankedApiGet(`/api/comp/tourney?id=${encodeURIComponent(id)}`, (j)=>{
       lbEventLoading=false;
