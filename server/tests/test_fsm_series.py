@@ -158,3 +158,106 @@ def test_combat_enter_keeps_existing_gm():
     r.game_mode = GameMode.ZW_LG
     assert room_enter_on_combat(r, v, "sess_test", "killer", "victim", GameMode.DF) is True
     assert r.game_mode == GameMode.ZW_LG
+
+
+class _Pkt:
+    """Minimal stand-in for EnginePacket (only what the FSM reads)."""
+
+    def __init__(self, ptype, name=None):
+        self.packet_type = ptype
+        self.player_name = name
+        self.cur_scn = None
+        self.game_mode = None
+
+
+def _scene_transition(r, v, cur_scn):
+    from server.lib.photon_engine.enums import PacketType as _PT
+    return RoomFSM.transition(r, v, _Pkt(_PT.SCENE), {}, cur_scn, "sess_test")
+
+
+def _endless_room(gm, code="ABCDE"):
+    r, v = _room(state=State.MATCH, code=code)
+    r.game_mode = gm
+    return r, v
+
+
+def test_transition_executes_lobby_to_match():
+    # Regression: the transition body was once stranded as dead code after
+    # reenter_match_for_series, so transition() returned None on every real
+    # flip (engine.py swallowed the unpack TypeError as "fsm error").
+    r, v = _room(state=State.LOBBY)
+    did, old, new, via = _scene_transition(r, v, "Game")
+    assert did is True
+    assert (old, new) == (State.LOBBY, State.MATCH)
+    assert r.state == State.MATCH
+
+
+def test_transition_executes_match_to_lobby_on_auth():
+    from server.lib.photon_engine.enums import PacketType as _PT
+    r, v = _room(state=State.MATCH)
+    did, old, new, via = RoomFSM.transition(
+        r, v, _Pkt(_PT.UNKNOWN), {"opName": "Authenticate"}, None, "sess_test")
+    assert did is True
+    assert (old, new) == (State.MATCH, State.LOBBY)
+    assert via == "authenticate"
+    assert r.state == State.LOBBY
+
+
+def test_transition_no_trigger_returns_false_tuple():
+    from server.lib.photon_engine.enums import PacketType as _PT
+    r, v = _room(state=State.MATCH)
+    assert RoomFSM.transition(r, v, _Pkt(_PT.UNKNOWN), {}, None, "sess_test") == (
+        False, State.MATCH, State.MATCH, None)
+
+
+def test_endless_hold_private_zwlg_ignores_lobby_scene():
+    # Private zw_lg room, infinite matches, stG=3 intermission reads as a
+    # MainLobby scene: state must stay MATCH (details lines keep "In Match").
+    r, v = _endless_room(GameMode.ZW_LG)
+    did, old, new, via = _scene_transition(r, v, "MainLobby")
+    assert did is False
+    assert r.state == State.MATCH
+
+
+def test_endless_hold_private_wwzw_ignores_lobby_scene():
+    r, v = _endless_room(GameMode.WWZW)
+    did, old, new, via = _scene_transition(r, v, "MainLobby")
+    assert did is False
+    assert r.state == State.MATCH
+
+
+def test_endless_hold_public_room_still_exits():
+    # No code (public matchmaking): unchanged behavior, scene exits to lobby.
+    r, v = _endless_room(GameMode.ZW_LG, code=None)
+    did, old, new, via = _scene_transition(r, v, "MainLobby")
+    assert did is True
+    assert r.state == State.LOBBY
+
+
+def test_endless_hold_other_mode_still_exits():
+    # Private but not an endless-series mode: unchanged behavior.
+    r, v = _endless_room(GameMode.BF)
+    did, old, new, via = _scene_transition(r, v, "MainLobby")
+    assert did is True
+    assert r.state == State.LOBBY
+
+
+def test_endless_hold_auth_still_exits():
+    # Authenticate is the series end: the hold must never trap it.
+    from server.lib.photon_engine.enums import PacketType as _PT
+    r, v = _endless_room(GameMode.ZW_LG)
+    did, old, new, via = RoomFSM.transition(
+        r, v, _Pkt(_PT.UNKNOWN), {"opName": "Authenticate"}, None, "sess_test")
+    assert did is True
+    assert r.state == State.LOBBY
+    assert via == "authenticate"
+
+
+def test_endless_hold_self_leave_still_exits():
+    # Proven self-leave (Leave naming me) ends the series like an auth.
+    from server.lib.photon_engine.enums import PacketType as _PT
+    r, v = _endless_room(GameMode.ZW_LG)
+    did, old, new, via = RoomFSM.transition(
+        r, v, _Pkt(_PT.LEAVE, "me"), {}, None, "sess_test")
+    assert did is True
+    assert r.state == State.LOBBY

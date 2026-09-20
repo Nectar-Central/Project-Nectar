@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Nectar Buildnow Companion
 // @namespace    https://github.com/Nectar-Central
-// @version      2.31.0
-// @description  Nectar Buildnow Companion v2.31.0 — leaderboard panel, insights, friends & chat, graphics filters, Discord rich presence, FPS chip, session refresh modal.
+// @version      2.34.0
+// @description  Nectar Buildnow Companion v2.34.0 — leaderboard panel, insights, friends & chat, graphics filters, Discord rich presence, FPS chip, session refresh modal.
 // @author       Nectar Labs
 // @match        https://buildnow-gg.game-files.crazygames.com/*
 // @match        https://*.crazygames.com/*
@@ -31,7 +31,7 @@
 
 (function () {
   'use strict';
-  const BNC_VERSION = '2.31.0';
+  const BNC_VERSION = '2.34.0';
   const HREF = (() => { try { return location.href; } catch { return ''; } })();
   const IS_GAME_FRAME = HREF.includes('buildnow-gg.game-files.crazygames.com');
   // Loading shell lives inside an intermediate iframe (games.crazygames.com),
@@ -821,6 +821,22 @@
   function _normScn(v){ return String(v==null?'':v).trim().toLowerCase(); }
   function _isLobbyScene(scn){ const s=_normScn(scn); return s==='mainlobby' || s==='lobby'; }
   function _isSceneLike(scn){ return /[a-z]/i.test(String(scn==null?'':scn).trim()); }
+  // Endless-series hold (private zw_lg/wwzw): those rooms run infinite matches
+  // back-to-back under one room code — the victory/intermission screen at every
+  // stG=3 reads as a MainLobby scene while the player never left. Flipping to
+  // lobby there swaps every details line (drawer, presence, Discord card, music)
+  // mid-series. While the live session still holds the same private code in one
+  // of those modes, a lobby scene is a breather, not a leave. Auth/leave stamps
+  // bypass via opts.via (authenticate is the series end). Never throws.
+  function _privateEndlessHold(){
+    try{
+      const sess=statsCache&&statsCache.session;
+      const code=sess&&sess.short_code?String(sess.short_code).trim().toUpperCase():'';
+      if(!/^[A-Z0-9]{5}$/.test(code)) return false;
+      const gm=sess&&sess.game_mode?String(sess.game_mode).trim().toLowerCase():'';
+      return gm==='zw_lg'||gm==='wwzw';
+    }catch{ return false; }
+  }
 
   function _applyOptimisticCurScn(curScn, opts) {
     if (!curScn) return;
@@ -832,12 +848,18 @@
     // coded ranked room, proven by liveRanked()'s block+session agreement
     // right now) = victory breather, not a leave. Leave/auth have their own
     // paths that clear intent first, so they can never take this branch.
-    // Holding match mode keeps the overlay (with its pending-seal honesty),
-    // music and Discord steady; the 25s server reconcile still flips a
-    // genuinely abandoned victory screen, and the next match scene is a noop.
+    // Private endless-series rooms (zw_lg/wwzw under one room code) hold the
+    // same way via _privateEndlessHold — except auth/leave stamps (opts.via),
+    // which always end the series. Holding match mode keeps the overlay (with
+    // its pending-seal honesty), music and Discord steady; the 25s server
+    // reconcile still flips a genuinely abandoned victory screen, and the
+    // next match scene is a noop.
     let _holdMatch = false;
     try{
-      if(!inMatch && wasInMatch && typeof liveRanked==='function' && liveRanked()) _holdMatch = true;
+      if(!inMatch && wasInMatch){
+        if(typeof liveRanked==='function' && liveRanked()) _holdMatch = true;
+        else if(!(opts&&(opts.via==='auth'||opts.via==='leave')) && typeof _privateEndlessHold==='function' && _privateEndlessHold()) _holdMatch = true;
+      }
     }catch{}
     _optimisticState.curScn = curScn;
     _optimisticState.inMatch = _holdMatch ? true : inMatch;
@@ -3407,14 +3429,148 @@
       return effInMatch()===true;
     }catch{ return false; }
   }
+  // ---- RANKED CODE RECHECK MODAL (F9 fallback) ---------------------------
+  // Missed the join sniff (late inject, host started the ranked/tourney room
+  // before we tracked it, pID never seen): F9 would just say "only available
+  // during a ranked session" and leave the player stuck. Instead F9 opens
+  // this modal asking for the room code, then re-runs the exact join-time
+  // path (comp resolve + ranked-tourney resolve + rankedTrack) and a fast
+  // stats pull so the session is picked up and tracking continues. Never
+  // throws.
+  function hideRankedCodeModal(){
+    try{ const w=document.getElementById('bnc-ranked-code'); if(w && w._bncCleanup) w._bncCleanup(); if(w) w.remove(); }catch{}
+  }
+  function rankedCodeStatus(msg, tone){
+    try{
+      const el=document.getElementById('bnc-ranked-code-status');
+      if(!el) return;
+      el.textContent=msg||'';
+      el.style.color = tone==='bad' ? '#fca5a5' : (tone==='ok' ? '#6ee7b7' : '#9ca3af');
+    }catch{}
+  }
+  function currentSessionCode(){
+    try{
+      const sess=statsCache && statsCache.session;
+      const c=sess && sess.short_code ? String(sess.short_code).trim().toUpperCase() : '';
+      if(/^[A-Z0-9]{5}$/.test(c)) return c;
+    }catch{}
+    try{
+      if(typeof _rankedRoom!=='undefined' && _rankedRoom && _rankedRoom.code && /^[A-Z0-9]{5}$/.test(String(_rankedRoom.code).toUpperCase())) return String(_rankedRoom.code).toUpperCase();
+    }catch{}
+    return '';
+  }
+  // The join-time path, replayed with a hand-entered code: comp resolve +
+  // ranked-tourney resolve + rankedTrack (which itself resolves the ranked
+  // room, clears the leave guard, kicks a stats pull + transition burst).
+  // Mode (comp tourney / ranked tourney / ranked) is decided server-side by
+  // whichever resolve hits — the client just tracks all three and lets the
+  // live blocks + HUD priority sort it out. Never throws.
+  function recheckRankedCode(code){
+    try{
+      code=String(code||'').trim().toUpperCase();
+      if(!/^[A-Z0-9]{5}$/.test(code)) return false;
+      try{ _publicRoom=false; }catch{}
+      try{ _rankedLeaveGuard=false; }catch{}
+      try{ fetchCompRoom(code); }catch{}
+      try{ fetchRtRoom(code); }catch{}
+      try{ rankedTrack(code); }catch{}
+      try{ fetchStats(false); }catch{}
+      try{ startTransitionBurst('ranked-code-recheck'); }catch{}
+      try{ updateTourneyHud(); }catch{}
+      try{ updateRtHud(); }catch{}
+      try{ logInfo(`[RANKED] code recheck ${code}`); }catch{}
+      return true;
+    }catch{ return false; }
+  }
+  function showRankedCodeModal(prefill){
+    if(document.getElementById('bnc-ranked-code')) return;
+    const wrap=document.createElement('div');
+    wrap.id='bnc-ranked-code';
+    Object.assign(wrap.style,{position:'fixed',inset:'0',zIndex:'2147483647',background:'rgba(0,0,0,0.82)',display:'flex',alignItems:'center',justifyContent:'center',padding:'24px',fontFamily:'Inter, system-ui, sans-serif'});
+    const card=document.createElement('div');
+    Object.assign(card.style,{background:'#0a0a0a',border:'1px solid rgba(255,255,255,0.16)',borderRadius:'14px',padding:'26px',width:'440px',boxSizing:'border-box',boxShadow:'0 8px 32px rgba(0,0,0,0.55)'});
+    card.innerHTML='<div style="font-size:30px;margin-bottom:6px">🏆</div>'
+      + '<div style="font-size:18px;font-weight:800;color:#fff;margin-bottom:6px">Join ranked / tourney tracking</div>'
+      + '<div style="font-size:13px;color:#9ca3af;line-height:1.6;margin-bottom:14px">No ranked/tourney session tracked yet — the host already started one, or the join was missed. Enter the 5-letter room code to recheck and keep tracking.</div>'
+      + '<input id="bnc-ranked-code-input" type="text" placeholder="Room code (ABC12)" autocomplete="off" spellcheck="false" maxlength="5" style="width:100%;height:40px;padding:0 12px;border:1px solid #374151;border-radius:8px;background:#111;color:#fff;font-size:15px;font-family:monospace;letter-spacing:1.5px;box-sizing:border-box;outline:none;text-transform:uppercase">'
+      + '<div style="display:flex;gap:8px;margin-top:12px">'
+      +   '<button id="bnc-ranked-code-go" style="flex:1;height:40px;border:0;border-radius:8px;background:#fff;color:#000;font-weight:700;cursor:pointer">Recheck &amp; track</button>'
+      +   '<button id="bnc-ranked-code-later" style="flex:1;height:40px;border:1px solid #374151;border-radius:8px;background:#1f2937;color:#e5e7eb;font-weight:600;cursor:pointer">Not now</button>'
+      + '</div>'
+      + '<div id="bnc-ranked-code-status" style="margin-top:10px;font-size:12px;color:#9ca3af;min-height:16px"></div>';
+    wrap.appendChild(card);
+    (document.body||document.documentElement).appendChild(wrap);
+    wrap.addEventListener('click', e=> e.stopPropagation());
+    const input=card.querySelector('#bnc-ranked-code-input');
+    // Same capture-phase guard as the session modal: the game installs
+    // window-level capture listeners first, so kill the event for the game
+    // without preventDefault (the input needs every key).
+    const guard=(e)=>{ try{ if(input && (e.target===input || card.contains(e.target) || card.contains(document.activeElement))) { e.stopPropagation(); if(e.stopImmediatePropagation) e.stopImmediatePropagation(); } }catch{} };
+    const events=['keydown','keyup','keypress','input','paste','cut','compositionstart','compositionupdate','compositionend'];
+    const targets=[window, document, document.documentElement];
+    try{ if(typeof unsafeWindow!=='undefined' && unsafeWindow!==window) targets.push(unsafeWindow); }catch{}
+    events.forEach(ev=> targets.forEach(t=>{ try{ t.addEventListener(ev, guard, true); }catch{} }));
+    wrap._bncCleanup=()=>{ events.forEach(ev=> targets.forEach(t=>{ try{ t.removeEventListener(ev, guard, true); }catch{} })); };
+    let busy=false;
+    const submit=()=>{
+      if(busy) return;
+      const code=String(input && input.value || '').trim().toUpperCase();
+      if(!/^[A-Z0-9]{5}$/.test(code)){ rankedCodeStatus('Enter the 5-letter room code (ask the host).', 'bad'); return; }
+      busy=true;
+      const go=card.querySelector('#bnc-ranked-code-go');
+      if(go) go.textContent='Rechecking…';
+      rankedCodeStatus('Rechecking ranked / tourney session…');
+      recheckRankedCode(code);
+      // Give the by-code resolves + stats poll a moment, then report what
+      // the session actually is. A hit opens the panel (lobby) or just
+      // tracks quietly (mid-match lock keeps the panel shut).
+      setTimeout(()=>{
+        try{
+          busy=false;
+          if(go) go.textContent='Recheck & track';
+          let hit=null;
+          try{ hit=liveRanked(); }catch{}
+          let comp=false, rt=false;
+          try{ comp=typeof _inCompRoom==='function' ? !!_inCompRoom(code) : !!(statsCache&&statsCache.comp_tourney); }catch{}
+          try{ rt=!!(statsCache&&statsCache.ranked_tourney); }catch{}
+          if(hit || comp || rt){
+            const what=comp?'tourney':(hit?'ranked':'ranked tourney');
+            rankedCodeStatus(`Tracked as ${what} — keep playing.`, 'ok');
+            try{ showToast(`Tracking ${what} session ${code}`, false); }catch{}
+            setTimeout(()=>{ try{ hideRankedCodeModal(); }catch{} try{ toggleRankedPanel(true); }catch{} }, 600);
+          } else {
+            rankedCodeStatus('Still no ranked/tourney session for that code — check the code or ask the host to re-set it.', 'bad');
+          }
+        }catch{}
+      }, 2500);
+    };
+    const go=card.querySelector('#bnc-ranked-code-go');
+    if(go) go.onclick=submit;
+    const later=card.querySelector('#bnc-ranked-code-later');
+    if(later) later.onclick=()=>{ hideRankedCodeModal(); };
+    if(input){
+      try{ input.value=String(prefill||currentSessionCode()||'').toUpperCase(); }catch{}
+      input.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); submit(); } });
+    }
+    setTimeout(()=>{ try{ if(input){ input.focus(); input.select(); } }catch{} }, 80);
+  }
   function toggleRankedPanel(force){
     if(typeof rankedEnabled==='function' && !rankedEnabled()){ showToast('Ranked is sleeping - streaks are live', false); try{ logInfo('[RANKED] panel sleeping'); }catch{} return; }
     createRankedPanel();
     const isHidden=rankedPanel.style.display==='none' || !rankedPanel.style.display;
     const show=typeof force==='boolean' ? force : isHidden;
     // Panel is ranked-session only: blocked outside one, and locked mid-match
-    // inside one (leaderboard/milestones would be a live aid).
-    if(show && !liveRanked()){ showToast('Ranked panel is only available during a ranked session', true); try{ logInfo('[RANKED] panel blocked - not in ranked session'); }catch{} return; }
+    // inside one (leaderboard/milestones would be a live aid). The blocked
+    // path opens the code-recheck modal instead of dead-ending: the host may
+    // have started a ranked/tourney room we never sniffed (late inject,
+    // missed pID) — entering the code re-runs the join path and tracking
+    // continues.
+    if(show && !liveRanked()){
+      showToast('No ranked session tracked - enter the room code', true);
+      try{ logInfo('[RANKED] panel blocked - not in ranked session (code modal)'); }catch{}
+      try{ showRankedCodeModal(currentSessionCode()); }catch{}
+      return;
+    }
     if(show && rankedLocked()){ showToast('Ranked panel is locked during a ranked match', true); return; }
     try{ clearTimeout(_rankedFadeT); }catch{}
     if(show){
@@ -4527,9 +4683,6 @@
     ov.querySelector('#bnc-lb-tab-ranked').onclick=()=>{ lbTab='ranked'; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); fetchLbRanked(); };
     ov.querySelector('#bnc-lb-tab-gfx').onclick=()=>{ lbTab='graphics'; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); };
     ov.querySelector('#bnc-lb-tab-rpc').onclick=()=>{ lbTab='presence'; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); try{ if(rpcCfg().enabled) rpcProbe(()=>{ renderLbRpc(); startRpcView(); }); else { renderLbRpc(); startRpcView(); } }catch{} };
-    // Presence tab hidden for the ranked launch (Discord tray bridge retired
-    // from the panel — the tab code stays dormant, never rendered).
-    try{ const _rpcBtn=ov.querySelector('#bnc-lb-tab-rpc'); if(_rpcBtn) _rpcBtn.style.display='none'; }catch{}
     ov.querySelector('#bnc-lb-prev').onclick=()=>{ if(lbOffset>0){ lbOffset=Math.max(0, lbOffset-LB_LIMIT); fetchLb(); } };
     ov.querySelector('#bnc-lb-next').onclick=()=>{ lbOffset+=LB_LIMIT; fetchLb(); };
     lbPanel=ov;
@@ -5689,7 +5842,10 @@
   // 127.0.0.1:8765 and falls back to 8766-8769 when the decryptor already owns
   // 8765; rpcProbe() asks each candidate /health and keeps the one that
   // answers as the presence bridge, so both services run side by side.
-  const RPC_DEF={ enabled:false, port:8765, auto:true };
+  // On by default: the boot rpcStart() below probes the tray bridge and the
+  // 15s push loop keeps the card live with the panel closed. The Presence
+  // tab's toggle (bnc_rpc_enabled) still opts out per user.
+  const RPC_DEF={ enabled:true, port:8765, auto:true };
   const RPC_PORTS=[8765,8766,8767,8768,8769];
   const RPC_SERVICE='nectar-rich-presence';
   // 15s: fast enough that a scene flip lands on the card while it still
@@ -5846,6 +6002,30 @@
       rpcHttp(port, '/clear', { method:'POST', body:{} }, ()=>{ _rpc.lastSig=''; _rpc.activity=null; _rpc.activityMode='cleared'; _rpc.activityAt=Date.now(); try{ if(lbTab==='presence') renderLbRpc(); }catch{} });
     }catch{}
   }
+  // Tab closing (game quit): fire a best-effort /clear so the profile drops
+  // the card immediately instead of lingering until the bridge's stale window
+  // (45s) clears it. sendBeacon/fetch-keepalive survive pagehide where the
+  // GM request bridge may not; anything missed here is still covered by the
+  // stale timer, so this can never break the steady state.
+  function rpcClearBeacon(){
+    try{
+      if(!rpcCfg().enabled) return;
+      const port=_rpc.port||rpcCfg().port;
+      const url=rpcUrl(port, '/clear');
+      const body=JSON.stringify({});
+      try{
+        if(typeof navigator!=='undefined' && typeof navigator.sendBeacon==='function'){
+          const blob=new Blob([body], {type:'application/json'});
+          if(navigator.sendBeacon(url, blob)) return;
+        }
+      }catch{}
+      try{ fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body, keepalive:true}); }catch{}
+    }catch{}
+  }
+  try{
+    window.addEventListener('pagehide', ()=>{ try{ rpcClearBeacon(); }catch{} });
+    document.addEventListener('visibilitychange', ()=>{ try{ if(document.visibilityState==='hidden') rpcClearBeacon(); }catch{} });
+  }catch{}
   // Keeps the panel's status fresh while it is open: /health reports whether
   // the bridge reached Discord (the tray's answer, not our guess at it).
   function rpcFetchActivity(cb){
@@ -6055,6 +6235,7 @@
     // this dispatcher is repeat-meaningful — every action is a toggle/menu.
     if(e.repeat) return;
     if (isModalOrInputFocused() || isTypingKey()) return;
+    if((e.key||'')==='Escape' && document.getElementById('bnc-ranked-code')){ e.preventDefault(); try{ hideRankedCodeModal(); }catch{} return; }
     if((e.key||'')==='Escape' && typeof lbPanel!=='undefined' && lbPanel && lbPanel.style.display!=='none' && lbPanel.style.display){ e.preventDefault(); try{ untrapRelease(); }catch{} toggleLbPanel(false); return; }
     if((e.key||'')==='Escape' && typeof rankedPanel!=='undefined' && rankedPanel && rankedPanel.style.display!=='none' && rankedPanel.style.display){ e.preventDefault(); toggleRankedPanel(false); return; }
     if((e.key||'')==='Escape' && typeof host11Panel!=='undefined' && host11Panel && host11Panel.style.display!=='none' && host11Panel.style.display){ e.preventDefault(); toggleHost11Panel(false); return; }
@@ -6188,8 +6369,9 @@
     // MY leave is a LOBBY trigger, exactly like an auth: the game goes back to
     // the lobby without ever re-sending a scene, so waiting for a curScn left
     // the client "in match" for the whole lobby (paused music, match UI up,
-    // wrong Discord card). Stamp the scene as lobby here.
-    try{ _applyOptimisticCurScn('MainLobby'); }catch{}
+    // wrong Discord card). Stamp the scene as lobby here. via:'leave' ends any
+    // endless-series hold: a proven self-leave is the series end.
+    try{ _applyOptimisticCurScn('MainLobby', {via:'leave'}); }catch{}
     try{ noteLocalRoom(false); }catch{}
     try{ _publicRoom=false; _compRoom=null; _compHudData=null; updateTourneyHud(); resetRtRoomLocal(); }catch{}
     try{ disableRanked(why); }catch{}
@@ -6326,12 +6508,13 @@
     // First auth = login: set lobby state silently (never touch audio — it's
     // either already starting or will start via stats). Later auths = back to
     // lobby → normal path, which unpauses if we flipped out of a match.
+    // via:'auth' ends any endless-series hold: authenticate is the series end.
     if(dir==='out' && type===2 && (code===230 || code===231)) {   // both auth ops send us to the lobby
       _authCount++;
       if(_authCount === 1) {
-        _applyOptimisticCurScn('MainLobby', {silent:true});
+        _applyOptimisticCurScn('MainLobby', {silent:true, via:'auth'});
       } else {
-        _applyOptimisticCurScn('MainLobby');
+        _applyOptimisticCurScn('MainLobby', {via:'auth'});
       }
     }
 
