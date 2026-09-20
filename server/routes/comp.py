@@ -301,12 +301,13 @@ async def list_tourneys(request: Request):
         return JSONResponse({"error": "status must be all|created|scheduled|running|ended"}, status_code=400)
     try:
         tres = supabase.table("bngc_comp_tourneys").select(
-            "id,code,name,status,series_len,scheduled_at,started_at,ended_at,created_at"
+            "id,code,name,status,mode,series_len,scheduled_at,started_at,ended_at,created_at"
         ).order("created_at", desc=False).limit(100).execute()
         rows = tres.data or []
         tids = [r["id"] for r in rows]
         sealed_by: dict = {}
         players_by: dict = {}
+        teams_by: dict = {}
         if tids:
             try:
                 mres = supabase.table("bngc_comp_matches").select(
@@ -318,9 +319,15 @@ async def list_tourneys(request: Request):
                 pass
             try:
                 rres = supabase.table("bngc_comp_registrations").select(
-                    "tourney_id").eq("status", "accepted").in_("tourney_id", tids).limit(2000).execute()
+                    "tourney_id,member_ids").eq("status", "accepted").in_("tourney_id", tids).limit(2000).execute()
                 for r in (rres.data or []):
-                    players_by[r["tourney_id"]] = players_by.get(r["tourney_id"], 0) + 1
+                    try:
+                        tid = (r or {}).get("tourney_id")
+                        members = ((r or {}).get("member_ids") or [])
+                        players_by[tid] = players_by.get(tid, 0) + len(members)
+                        teams_by[tid] = teams_by.get(tid, 0) + 1
+                    except Exception:
+                        continue
             except Exception:
                 pass
         out = []
@@ -329,9 +336,11 @@ async def list_tourneys(request: Request):
             if want != "all" and st != want:
                 continue
             out.append({"id": t["id"], "code": t.get("code"), "name": t.get("name"),
-                        "status": st, "series_len": t.get("series_len") or 0,
+                        "status": st, "mode": str(t.get("mode") or "solo").lower(),
+                        "series_len": t.get("series_len") or 0,
                         "sealed": sealed_by.get(t["id"], 0),
                         "players": players_by.get(t["id"], 0),
+                        "teams": teams_by.get(t["id"], 0),
                         "scheduled_at": t.get("scheduled_at"),
                         "started_at": t.get("started_at"),
                         "ended_at": t.get("ended_at")})

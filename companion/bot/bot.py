@@ -2000,6 +2000,9 @@ async def tourney_create_cmd(interaction: discord.Interaction, name: str,
         maxp = max(0, int(max_players or 0))
     except Exception:
         maxp = 0
+    if mode_c == "duo" and maxp % 2 == 1:
+        return await interaction.followup.send(
+            "Duo tourneys need an even `max_players` (full teams of 2).", ephemeral=True)
     sched_iso = None
     if (start_time or "").strip():
         try:
@@ -2198,6 +2201,21 @@ async def _comp_set_banned(tourney_id: int, user_id: str, banned: bool, guild=No
             return False, "Supabase not configured."
         did = str(user_id)
         if banned:
+            # Drop any active roster rows containing this player first so a
+            # banned duo member doesn't stay counted via their old team.
+            try:
+                _active = sb.table("bngc_comp_registrations").select(
+                    "id,member_ids,status").eq("tourney_id", int(tourney_id)).neq(
+                    "status", "banned").limit(1000).execute()
+                for _r in ((_active.data or [])):
+                    try:
+                        if did in [str(x) for x in (((_r or {}).get("member_ids")) or [])]:
+                            sb.table("bngc_comp_registrations").delete().eq(
+                                "id", (_r or {}).get("id")).execute()
+                    except Exception:
+                        continue
+            except Exception:
+                pass
             try:
                 sb.table("bngc_comp_registrations").insert({
                     "tourney_id": int(tourney_id), "team_label": f"<@{did}>",
@@ -2229,12 +2247,26 @@ async def _comp_set_banned(tourney_id: int, user_id: str, banned: bool, guild=No
                 and did in ((r or {}).get("member_ids") or [])]
         if not mine:
             return False, "No ban row for that user in this tourney."
+        try:
+            _trow = sb.table("bngc_comp_tourneys").select("mode").eq(
+                "id", int(tourney_id)).limit(1).execute()
+            _is_duo = str((((_trow.data or [{}])[0] or {}).get("mode")) or "solo").lower() == "duo"
+        except Exception:
+            _is_duo = False
         for r in mine:
             try:
-                sb.table("bngc_comp_registrations").update(
-                    {"status": "accepted"}).eq("id", r["id"]).execute()
+                if _is_duo:
+                    # Duo: never flip a 1-person ban row into a solo
+                    # accepted team — delete so the player re-registers
+                    # with a teammate and counts stay in pairs.
+                    sb.table("bngc_comp_registrations").delete().eq("id", r["id"]).execute()
+                else:
+                    sb.table("bngc_comp_registrations").update(
+                        {"status": "accepted"}).eq("id", r["id"]).execute()
             except Exception:
                 pass
+        if _is_duo:
+            return True, f"✅ <@{did}> unbanned in tourney **#{tourney_id}** — re-register with a teammate."
         return True, f"✅ <@{did}> unbanned (accepted) in tourney **#{tourney_id}**."
     except Exception as e:
         return False, f"Couldn't update ban: {e}"
@@ -2325,8 +2357,10 @@ async def tourney_remove_host_cmd(interaction: discord.Interaction, tourney_id: 
 
 
 @bot.tree.command(name="tourney-add-player", description="Add a player to a tourney roster (host)")
-@app_commands.describe(tourney_id="Numeric session ID (from 0)", user="Player to add")
-async def tourney_add_player_cmd(interaction: discord.Interaction, tourney_id: int, user: discord.User):
+@app_commands.describe(tourney_id="Numeric session ID (from 0)", user="Player to add",
+                       teammate="Duo teammate (required for duo tourneys)")
+async def tourney_add_player_cmd(interaction: discord.Interaction, tourney_id: int, user: discord.User,
+                                 teammate: discord.User | None = None):
     await interaction.response.defer(ephemeral=True)
     sb, me = await _comp_require_manager(interaction, tourney_id)
     if sb is None:
@@ -2337,8 +2371,58 @@ async def tourney_add_player_cmd(interaction: discord.Interaction, tourney_id: i
         if not trow.data:
             return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
         t = trow.data[0] or {}
+        is_duo = str((t or {}).get("mode") or "solo").lower() == "duo"
         did = str(user.id)
         rows = await _comp_reg_rows(int(tourney_id))
+        if is_duo:
+            if teammate is None or getattr(teammate, "bot", False):
+                return await interaction.followup.send(
+                    "Duo tourney: pass both players (`user` + `teammate`).", ephemeral=True)
+            mate_id = str(teammate.id)
+            if mate_id == did:
+                return await interaction.followup.send("Duo needs two different players.", ephemeral=True)
+            members = [did, mate_id]
+            for _m, _u in ((did, user), (mate_id, teammate)):
+                if any((r or {}).get("status") != "banned" and _m in ((r or {}).get("member_ids") or []) for r in rows):
+                    return await interaction.followup.send(f"<@{_m}> is already on the roster.", ephemeral=True)
+            team_idx = sum(1 for r in rows if (r or {}).get("status") != "banned")
+            _add_row = {
+                "tourney_id": int(tourney_id),
+                "team_label": f"<@{did}> <@{mate_id}>",
+                "member_ids": members,
+                "captain_id": did,
+                "source_message_id": None,
+                "status": "accepted",
+                "team_color": _comp_team_color(team_idx),
+                "member_names": {
+                    did: {
+                        "username": str(getattr(user, "name", "") or "")[:32],
+                        "display_name": str(getattr(user, "display_name", "") or getattr(user, "name", "") or "")[:32],
+                    },
+                    mate_id: {
+                        "username": str(getattr(teammate, "name", "") or "")[:32],
+                        "display_name": str(getattr(teammate, "display_name", "") or getattr(teammate, "name", "") or "")[:32],
+                    },
+                },
+            }
+            try:
+                sb.table("bngc_comp_registrations").insert(_add_row).execute()
+            except Exception:
+                _add_row.pop("member_names", None)  # pre-migration safe
+                sb.table("bngc_comp_registrations").insert(_add_row).execute()
+            try:
+                _rid = (t or {}).get("player_role_id") or COMP_PLAYER_ROLE_ID
+                await _comp_grant_role(interaction.guild, did, _rid)
+                await _comp_grant_role(interaction.guild, mate_id, _rid)
+            except Exception:
+                pass
+            try:
+                _comp_reg_cache["at"] = 0.0
+            except Exception:
+                pass
+            return await interaction.followup.send(
+                f"{user.mention} + {teammate.mention} added to tourney **#{tourney_id}** roster (duo).",
+                ephemeral=True)
         if any((r or {}).get("status") != "banned" and did in ((r or {}).get("member_ids") or []) for r in rows):
             return await interaction.followup.send(f"{user.mention} is already on the roster.", ephemeral=True)
         _add_row = {
@@ -2381,20 +2465,30 @@ async def tourney_remove_player_cmd(interaction: discord.Interaction, tourney_id
         return
     try:
         trow = sb.table("bngc_comp_tourneys").select(
-            "id,player_role_id").eq("id", int(tourney_id)).limit(1).execute()
+            "id,mode,player_role_id").eq("id", int(tourney_id)).limit(1).execute()
         if not trow.data:
             return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
+        is_duo = str(((trow.data[0] or {}).get("mode")) or "solo").lower() == "duo"
         did = str(user.id)
         rows = sb.table("bngc_comp_registrations").select(
             "id,member_ids").eq("tourney_id", int(tourney_id)).neq("status", "banned").limit(1000).execute()
         hit = [r for r in (rows.data or []) if did in ((r or {}).get("member_ids") or [])]
+        removed_ids: list = []
         for r in hit:
             try:
-                remaining = [m for m in ((r or {}).get("member_ids") or []) if m != did]
-                if not remaining:
+                members = [str(m) for m in ((r or {}).get("member_ids") or []) if m]
+                if is_duo:
+                    # Duo: a player never leaves a half-team behind — drop the
+                    # whole team so counts/standings stay in pairs.
+                    removed_ids.extend(members)
                     sb.table("bngc_comp_registrations").delete().eq("id", (r or {}).get("id")).execute()
                 else:
-                    sb.table("bngc_comp_registrations").update({"member_ids": remaining}).eq("id", (r or {}).get("id")).execute()
+                    remaining = [m for m in ((r or {}).get("member_ids") or []) if m != did]
+                    if not remaining:
+                        sb.table("bngc_comp_registrations").delete().eq("id", (r or {}).get("id")).execute()
+                    else:
+                        sb.table("bngc_comp_registrations").update({"member_ids": remaining}).eq("id", (r or {}).get("id")).execute()
+                    removed_ids.append(did)
             except Exception:
                 continue
         try:
@@ -2403,14 +2497,15 @@ async def tourney_remove_player_cmd(interaction: discord.Interaction, tourney_id
             if _rid and interaction.guild is not None:
                 role = _dget(interaction.guild.roles, id=int(_rid)) if str(_rid).isdigit() else None
                 if role is not None:
-                    try:
-                        m = interaction.guild.get_member(int(did))
-                        if m is None:
-                            m = await interaction.guild.fetch_member(int(did))
-                        if m is not None:
-                            await m.remove_roles(role, reason=f"tourney #{tourney_id} roster removal")
-                    except Exception:
-                        pass
+                    for _rdid in (sorted(set(removed_ids)) or [did]):
+                        try:
+                            m = interaction.guild.get_member(int(_rdid))
+                            if m is None:
+                                m = await interaction.guild.fetch_member(int(_rdid))
+                            if m is not None:
+                                await m.remove_roles(role, reason=f"tourney #{tourney_id} roster removal")
+                        except Exception:
+                            continue
         except Exception:
             pass
         try:
@@ -4064,7 +4159,8 @@ async def stop_reg_cmd(interaction: discord.Interaction, tourney_id: int):
         except Exception:
             pass
         return await interaction.followup.send(
-            f"🔇 Registration closed for tourney **#{tourney_id}** ({players} players / {teams} teams).",
+            f"🔇 Registration closed for tourney **#{tourney_id}** ({players} players"
+            f"{f' / {teams} teams' if str((t or {}).get('mode') or 'solo').lower() == 'duo' else ''}).",
             ephemeral=True)
     except Exception as e:
         return await interaction.followup.send(f"Couldn't stop: {e}", ephemeral=True)
@@ -4214,10 +4310,18 @@ def _comp_team_color(index: int) -> str:
 def _comp_open_text(mode: str, ping_role_id: str | None = None, name: str = "Tourney") -> str:
     """Registration-open announcement. Pure. Ping role mention prepended."""
     try:
-        head = (f"## {str(name).upper()} SIGNUPS REGISTRATIONS OPEN:\n\n"
-                f"*@yourself to register (type @ and pick your name from the popup — "
-                f"typed-out names don't count).*\n"
-                f"*Then press **Create comp profile** below so kills map to you.*")
+        is_duo = str(mode or "").lower() == "duo"
+        if is_duo:
+            head = (f"## {str(name).upper()} SIGNUPS REGISTRATIONS OPEN:\n\n"
+                    f"*@yourself AND your teammate to register — one message with both mentions, "
+                    f"your own mention first (type @ and pick from the popup — "
+                    f"typed-out names don't count).*\n"
+                    f"*Both players then press **Create comp profile** below so kills map to you.*")
+        else:
+            head = (f"## {str(name).upper()} SIGNUPS REGISTRATIONS OPEN:\n\n"
+                    f"*@yourself to register (type @ and pick your name from the popup — "
+                    f"typed-out names don't count).*\n"
+                    f"*Then press **Create comp profile** below so kills map to you.*")
         ping = str(ping_role_id or "").strip()
         return (f"<@&{ping}>\n" if ping else "") + head
     except Exception:
@@ -4227,8 +4331,11 @@ def _comp_open_text(mode: str, ping_role_id: str | None = None, name: str = "Tou
 def _comp_closed_text(mode: str, players: int, teams: int, name: str) -> str:
     """Registration-closed announcement. Pure."""
     try:
+        if str(mode or "").lower() == "duo":
+            return (f"## {str(name).upper()} SIGNUPS CLOSED:\n\n"
+                    f"{int(players or 0)} Players / {int(teams or 0)} Teams")
         return (f"## {str(name).upper()} SIGNUPS CLOSED:\n\n"
-                f"{int(players or 0)} Players/ {int(teams or 0)} Teams")
+                f"{int(players or 0)} Players")
     except Exception:
         return "SIGNUPS CLOSED"
 
