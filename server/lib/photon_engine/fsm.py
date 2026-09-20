@@ -134,6 +134,28 @@ class RoomFSM:
                 # strict: scene MainLobby is also a valid match exit (return to lobby)
                 # scene !=MainLobby while already in MATCH -> no transition (stay)
                 if cs == "MainLobby":
+                    # Endless-series hold: private zw_lg/wwzw rooms run infinite
+                    # matches back-to-back in one coded room — the victory /
+                    # intermission screen reads as a MainLobby scene at every
+                    # stG=3, but the player never left. Flipping to LOBBY here
+                    # swaps every details line (drawer, presence, Discord card)
+                    # to lobby mid-series. Hold MATCH; only an authenticate
+                    # (or a proven self-leave above) may end it. Never raises.
+                    try:
+                        _hold = (
+                            bool(getattr(room, "short_code", None))
+                            and getattr(room, "game_mode", None) in (GameMode.ZW_LG, GameMode.WWZW)
+                        )
+                    except Exception:
+                        _hold = False
+                    if _hold:
+                        try:
+                            log_engine("debug", session_id[:13],
+                                       msg="endless-series hold (private zw_lg/wwzw, still in match)",
+                                       room=getattr(room, "room_id", "?")[:8])
+                        except Exception:
+                            pass
+                        return False, cur, cur, None
                     target = State.LOBBY
                     via = f"scene:{cs}"
                 else:
@@ -141,6 +163,26 @@ class RoomFSM:
 
         if target is None or target == cur:
             return False, cur, cur, None
+
+        # ---- guards passed: perform on_exit + on_enter atomically ----
+        old = cur
+        # on_exit for old state
+        RoomFSM._on_exit(room, view, old, target, via, session_id, packet, gpb)
+        # flip
+        room.state = target
+        # on_enter for new state
+        RoomFSM._on_enter(room, view, old, target, via, session_id, packet, gpb, cur_scn)
+
+        log_engine("state", session_id[:13], old=old.value, new=target.value, room=room.room_id[:8], via=via,
+                   curScn=cur_scn or packet.cur_scn or "-")
+        # keep playtime last_state in sync — engine tick reads this
+        try:
+            room.match_playtime.last_state = target.value
+            view.playtime.last_state = target.value
+        except Exception:
+            pass
+
+        return True, old, target, via
 
     @staticmethod
     def reenter_match_for_series(room, view, session_id: str) -> bool:
@@ -208,26 +250,6 @@ class RoomFSM:
             return True
         except Exception:
             return False
-
-        # ---- guards passed: perform on_exit + on_enter atomically ----
-        old = cur
-        # on_exit for old state
-        RoomFSM._on_exit(room, view, old, target, via, session_id, packet, gpb)
-        # flip
-        room.state = target
-        # on_enter for new state
-        RoomFSM._on_enter(room, view, old, target, via, session_id, packet, gpb, cur_scn)
-
-        log_engine("state", session_id[:13], old=old.value, new=target.value, room=room.room_id[:8], via=via,
-                   curScn=cur_scn or packet.cur_scn or "-")
-        # keep playtime last_state in sync — engine tick reads this
-        try:
-            room.match_playtime.last_state = target.value
-            view.playtime.last_state = target.value
-        except Exception:
-            pass
-
-        return True, old, target, via
 
     @staticmethod
     def _on_exit(room, view, old: State, new: State, via, session_id, packet, gpb):
