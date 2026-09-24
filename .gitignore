@@ -197,5 +197,16 @@ __marimo__/
 .streamlit/secrets.toml
 tempCodeRunnerFile.py
 __pycache__/
-scripts/
+# Windows virtualenvs put executables in a "Scripts" folder. Ignore that,
+# but NOT this repo's own scripts/ — the release toolchain lives there
+# (obfuscate.mjs = `npm run obfs`, publish_cdn.py, build-lite.js,
+# build-competitive.js). A blanket `scripts/` rule silently untracked all of
+# it, so a fresh clone could not build or publish a release.
+Scripts/
+!scripts/
+!scripts/**
+# ...but never compiled bytecode. These must come AFTER the negation above,
+# because the last matching rule wins.
+scripts/**/__pycache__/
+scripts/**/*.py[cod]
 *.db

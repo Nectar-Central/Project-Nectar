@@ -11,6 +11,9 @@
     "decode": "node decode.js",
     "debug": "node debug-collector.js",
     "build": "node tools/bundle.js",
+    "obfs": "node scripts/obfuscate.mjs",
+    "lite": "node scripts/build-lite.js",
+    "competitive": "node scripts/build-lite.js && node scripts/build-competitive.js",
     "test": "node test/debug-collector.test.mjs && node test/decoder.test.mjs && node test/detector.test.mjs && node test/sender.test.mjs && node test/bundle.test.mjs"
   },
   "dependencies": {
@@ -19,6 +22,7 @@
   },
   "devDependencies": {
     "concurrently": "^10.0.5",
-    "dotenv": "^17.4.2"
+    "dotenv": "^17.4.2",
+    "javascript-obfuscator": "^5.8.0"
   }
 }

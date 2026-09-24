@@ -574,11 +574,21 @@ def parse_gpbinary(hex_str: str) -> dict | None:
             "raw": msg,
         }
 
-        # Operation request
+        # Operation request AND response (responses carry the RoomName for
+        # CreateRoom/JoinRoom — e.g. an inbound CreateRoom response holds
+        # Address + RoomName — without this the room is never created and
+        # every later packet routes to the lobby pseudo-room as unknown).
+        _op_msg = None
         if "req" in msg:
-            req = msg["req"]
+            _op_msg = msg["req"]
+        elif "resp" in msg:
+            _op_msg = msg["resp"]
+        if _op_msg is not None:
+            req = _op_msg
             result["op"] = req["opCode"]
             result["opName"] = req["opName"]
+            if "returnCode" in req:
+                result["returnCode"] = req["returnCode"]
             result["params"] = {}
             for param in req["params"]:
                 result["params"][param["keyName"]] = param["value"]

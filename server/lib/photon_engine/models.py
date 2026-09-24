@@ -41,7 +41,9 @@ class Player:
     is_alive: bool = True      # alv
     is_self: bool = False      # true if this is the session's own player (me)
     pt: str | None = None      # _pt / pt — team id for duos (wwzw/BF2V2/DF duo), maps to RoomView.teams
-    late_join: bool = False    # joined while room.state == MATCH (mid-match join, not pre-match lobby)
+    late_join: bool = False       # joined while room.state == MATCH (mid-match join, not pre-match lobby)
+    last_seen_at: float | None = None  # epoch of the last packet mentioning this player (a crash stops it)
+
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -63,6 +65,8 @@ class Player:
                 is_self=bool(d.get("is_self", False)),
                 pt=d.get("pt"),
                 late_join=bool(d.get("late_join", False)),
+                last_seen_at=(float(d["last_seen_at"])
+                              if d.get("last_seen_at") is not None else None),
             )
         except Exception:
             return None
@@ -325,6 +329,11 @@ class RoomView:
     room_id: str                                    # RoomName UUID e.g. 3a0596a5-f50c-45ef-bbdb-ef4842e89c6d
     code: str | None = None                          # full RoomName UUID
     short_code: str | None = None                    # 5-char pID e.g. PBS05 — private party join code (players type this)
+    created_by_me: bool = False                   # True when OUR client sent CreateRoom for
+    # this room (vs JoinRoom/JoinRandomRoom into someone else's). Set by the
+    # engine from the op name — CreateRoom is client→server only, so it can
+    # only be our own creation. Used by the ranked auto-tag (tag my tourney
+    # with the code of a room I created, never a room I joined).
     me: Player | None = None                         # per-room me (not session-wide)
     players: dict[int, Player] = field(default_factory=dict)
     actor_map: dict[int, str] = field(default_factory=dict)  # actorNr -> username, built from ActorList + Join 255 (for alv without 255)
@@ -347,6 +356,7 @@ class RoomView:
     recent_kills: list[KillInfo] = field(default_factory=list)
     recent_knocks: list[KillInfo] = field(default_factory=list)
     proc_kill_seen: dict[str, float] = field(default_factory=dict)  # processor kill-count dedup: content key -> server ms (retransmit window, survives batches)
+    proc_alive_at: dict[str, float] = field(default_factory=dict)  # player (normalized name) -> ms of last revive; lets the kill dedup tell a new life from an echo
     my_kills_by_version: dict[str, int] = field(default_factory=dict)  # self kills per match_version key "room_id:vN" (best_match_kills source, survives batches)
     match_version: int = 0                           # increments on stG 3→1 for private zw_lg multi-match per room
     match_playtime: Playtime = field(default_factory=lambda: Playtime())  # per-room playtime (ticks per match_version)
@@ -449,6 +459,7 @@ class RoomView:
             "room_id": self.room_id,
             "code": self.code,
             "short_code": self.short_code,
+            "created_by_me": bool(self.created_by_me),
             "me": self.me.to_dict() if self.me else None,
             "players": {str(k): v.to_dict() for k, v in self.players.items()},
             "actor_map": {str(k): v for k, v in self.actor_map.items()},
@@ -465,6 +476,7 @@ class RoomView:
             "recent_kills": [k.to_dict() for k in self.recent_kills[-100:]],
             "recent_knocks": [k.to_dict() for k in self.recent_knocks[-100:]],
             "proc_kill_seen": {str(k): float(v) for k, v in list(self.proc_kill_seen.items())[-500:]},
+            "proc_alive_at": {str(k): float(v) for k, v in list(self.proc_alive_at.items())[-200:]},
             "my_kills_by_version": {str(k): int(v) for k, v in list(self.my_kills_by_version.items())[-50:]},
             "match_version": self.match_version,
             "match_playtime": self.match_playtime.to_dict(),
@@ -493,6 +505,7 @@ class RoomView:
         try:
             r = cls(room_id=str(d["room_id"]), code=d.get("code"))
             r.short_code = d.get("short_code")
+            r.created_by_me = bool(d.get("created_by_me", False))
             me = Player.from_dict(d.get("me"))
             r.me = me
             players = d.get("players") or {}
@@ -550,6 +563,11 @@ class RoomView:
             except Exception:
                 pass
             try:
+                for k, v in (d.get("proc_alive_at") or {}).items():
+                    r.proc_alive_at[str(k)] = float(v)
+            except Exception:
+                pass
+            try:
                 for k, v in (d.get("my_kills_by_version") or {}).items():
                     r.my_kills_by_version[str(k)] = int(v)
             except Exception:
@@ -559,6 +577,16 @@ class RoomView:
             except Exception:
                 pass
             r.match_playtime = Playtime.from_dict(d.get("match_playtime"))
+            # Heal stale snapshots: the lobby pseudo-room is not a real room
+            # and must never carry a mode or join code (old builds let it
+            # adopt gm=zw_lg, which then poisoned every lobby batch's
+            # fallback chain: PROCESSOR pkt gm=zw_lg room=lobby).
+            try:
+                if str(getattr(r, "room_id", "") or "") == "lobby":
+                    r.game_mode = None
+                    r.short_code = None
+            except Exception:
+                pass
             r.stg_is_phase_end = bool(d.get("stg_is_phase_end", False))
             try:
                 r.last_win_version = int(d.get("last_win_version", -1))
@@ -648,6 +676,10 @@ class SessionView:
     host_mode: bool = False  # set from capture payload; true = server-room host (collaborative replay)
     # philosophy: individualist by default (public/friendly private) -> only self stats;
     # host_mode + short_code -> also track others for comp replay
+    _cached_at: float | None = None  # last capture batch seen (ANY batch incl.
+    # heartbeats): presence signal so an idle-but-connected lobby doesn't go
+    # stale. Stamped by capture.py on the VIEW (not the response dict) so
+    # stats' _session_fresh sees it on the in-memory path too.
 
     # Back-compat proxies — point to current room or empty defaults
     @property
@@ -756,6 +788,7 @@ class SessionView:
             "me": self.me.to_dict() if self.me else None,
             "current_room_id": self.current_room_id,
             "host_mode": self.host_mode,
+            "_cached_at": self._cached_at,
             "rooms": {rid: rv.to_dict() for rid, rv in self.rooms.items()},
             "playtime": self.playtime.to_dict(),
             # back-compat top-level (current room)
@@ -796,6 +829,10 @@ class SessionView:
                 pass
             v.playtime = Playtime.from_dict(d.get("playtime"))
             v.host_mode = bool(d.get("host_mode", False))
+            try:
+                v._cached_at = float(d.get("_cached_at")) if d.get("_cached_at") is not None else None
+            except Exception:
+                v._cached_at = None
             return v
         except Exception:
             return None

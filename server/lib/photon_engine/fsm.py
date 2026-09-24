@@ -257,6 +257,15 @@ class RoomFSM:
         # do NOT clear game_mode here — processor drains win/defeat after exit; clear on next MATCH enter
         if old == State.MATCH and new == State.LOBBY:
             room.zone_match_active = False
+            # Lobby-bucket exception: it never drains (the processor skips
+            # the pseudo-room unconditionally), so keeping its gm only
+            # poisons the next match's fallback chain and idle display.
+            # Real rooms keep gm for their drains.
+            try:
+                if str(getattr(room, "room_id", "") or "") == "lobby":
+                    room.game_mode = None
+            except Exception:
+                pass
             # usernameChangeCount reset is handled on AUTH/SCENE MainLobby; keep here for leave
             # do not bump match_version here — stG 3 bumps it in engine's stG handler
 
@@ -264,6 +273,17 @@ class RoomFSM:
     def _on_enter(room, view, old: State, new: State, via, session_id, packet, gpb, cur_scn):
         # LOBBY -> MATCH : lock GM exactly once
         if old == State.LOBBY and new == State.MATCH:
+            # Lobby bucket has no continuity: a new match means a new mode.
+            # Without this, a stale concrete gm (previous match, or a restored
+            # Upstash snapshot) blocks DF forever — adopt_game_mode never lets
+            # DF clobber concrete, so DF matches stay invisible (wrong mode on
+            # playtime/kills/drawer, flicker-suppressed logs). Drains are safe:
+            # the lobby pseudo-room never drains wins, and real rooms keep gm.
+            try:
+                if str(getattr(room, "room_id", "") or "") == "lobby":
+                    room.game_mode = None
+            except Exception:
+                pass
             # Prefer packet.game_mode (from gm param) else infer from curScn.
             # curScn is ground truth: join/matchmaking packets default gm=DF, so a
             # DF/blank room adopts the scene mode (ZoneWars_LateGame -> zw_lg).
@@ -328,7 +348,16 @@ class RoomFSM:
             except Exception:
                 pass
             log_engine("debug", session_id[:13], msg="room reset for new match (map/kills cleared)", room=room.room_id[:8])
-        elif new == State.LOBBY and via and via.startswith("scene:"):
-            # SCENE MainLobby enter -> reset cur_scn and optionally clear pending stg
-            room.cur_scn = cur_scn
+        elif new == State.LOBBY:
+            # Any LOBBY enter -> reset cur_scn/zone; the lobby pseudo-room
+            # additionally drops gm + join code (it never drains, so keeping
+            # them only poisons idle display + the processor fallback chain).
+            if via and via.startswith("scene:"):
+                room.cur_scn = cur_scn
             room.zone_match_active = False
+            try:
+                if str(getattr(room, "room_id", "") or "") == "lobby":
+                    room.game_mode = None
+                    room.short_code = None
+            except Exception:
+                pass

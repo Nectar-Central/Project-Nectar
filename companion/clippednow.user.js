@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ClippedNow.gg - BuildNow GG Clipper
 // @namespace    https://github.com/jaredv2
-// @version      1.3.8
-// @description  ClippedNow.gg v1.3.2 - auto-clip your BuildNow GG kills, deaths and wins. 100% local: no account, no server, nothing leaves your PC.
+// @version      2.36
+// @description  ClippedNow.gg v1.5.1 - auto-clip your BuildNow GG kills, deaths and wins. 100% local: no account, no server, nothing leaves your PC.
 // @author       @cis6led
 // @match        https://buildnow-gg.game-files.crazygames.com/*
 // @match        https://*.crazygames.com/*
@@ -23,7 +23,7 @@
 
 (function () {
   'use strict';
-  const CN_VERSION = '1.3.8';
+  const CN_VERSION = '2.36';
   const HREF = (() => { try { return location.href; } catch { return ''; } })();
   const IS_GAME_FRAME = HREF.includes('buildnow-gg.game-files.crazygames.com');
   if (!IS_GAME_FRAME) return; // game frame only: lean, no shell-frame overhead
@@ -36,15 +36,28 @@
   function dbg(tag, data) { try { console.log(`%c[CN][DEBUG]%c ${tag}`, 'color:#f472b6;font-weight:900', '', data !== undefined ? data : ''); } catch {} }
 
   // ---- DOM-only toasts (no CDN: zero external requests, ever) ----
-  function toast(text, isError) {
+  function toast(text, isError, action) {
+    // action = { label, fn } renders an inline button (e.g. Watch). Stays
+    // 6s when actionable so it can actually be tapped mid-fight.
     try {
       document.querySelectorAll('.cn-toast').forEach(el => el.remove());
       const d = document.createElement('div');
       d.className = 'cn-toast';
-      d.textContent = text;
-      Object.assign(d.style, { position: 'fixed', top: '16px', right: '16px', zIndex: '2147483647', background: isError ? '#991b1b' : '#000', color: '#fff', borderRadius: '8px', border: '1px solid rgb(255 255 255 / 12%)', boxShadow: '0 4px 16px rgb(0 0 0 / 40%)', fontFamily: 'Inter, system-ui, sans-serif', fontSize: '14px', fontWeight: '500', padding: '12px 16px', maxWidth: '320px' });
+      Object.assign(d.style, { position: 'fixed', top: '16px', right: '16px', zIndex: '2147483647', background: isError ? '#991b1b' : '#000', color: '#fff', borderRadius: '8px', border: '1px solid rgb(255 255 255 / 12%)', boxShadow: '0 4px 16px rgb(0 0 0 / 40%)', fontFamily: 'Inter,"Segoe UI",system-ui,-apple-system,sans-serif', fontSize: '14px', fontWeight: '500', padding: '12px 16px', maxWidth: '320px' });
+      const span = document.createElement('span');
+      span.textContent = text;
+      d.appendChild(span);
+      let ms = 3000;
+      if (action && action.label && typeof action.fn === 'function') {
+        const b = document.createElement('button');
+        b.textContent = String(action.label).slice(0, 20);
+        Object.assign(b.style, { marginLeft: '10px', background: '#fff', color: '#000', border: '0', borderRadius: '6px', padding: '4px 10px', fontSize: '12px', fontWeight: '800', cursor: 'pointer', fontFamily: 'inherit' });
+        b.onclick = (e) => { try { if (e && e.stopPropagation) e.stopPropagation(); } catch {} try { d.remove(); } catch {} try { action.fn(); } catch {} };
+        d.appendChild(b);
+        ms = 6000;
+      }
       (document.body || document.documentElement).appendChild(d);
-      setTimeout(() => { try { d.remove(); } catch {} }, 3000);
+      setTimeout(() => { try { d.remove(); } catch {} }, ms);
     } catch {}
   }
 
@@ -248,8 +261,14 @@
       try { logInfo(`scene -> ${cur} inMatch=${cnScene.inMatch}`); } catch {}
       const inferred = cnGmFromCurScn(cur);
       if (cur === 'MainLobby') { cnMode.code = 'lobby'; cnMode.at = now; try { cnMe.actorNr = null; cnFirstJoinSeen = false; cnJoinRespAt = 0; } catch {} return; }
-      if (inferred && inferred !== 'DF' && inferred !== 'unknown') { cnMode.code = inferred; cnMode.at = now; return; }
-      if (inferred && !cnMode.code) { cnMode.code = inferred; cnMode.at = now; return; }
+      // DF (Free Mode / MainWorld) scenes also show up inside other flows,
+      // so DF may claim lobby/empty but never overwrite a real mode. The
+      // old code excluded DF from the main branch entirely, which pinned
+      // Free Mode on 'lobby' forever once you'd visited the lobby.
+      if (inferred && inferred !== 'unknown') {
+        if (inferred === 'DF' && cnMode.code && cnMode.code !== 'lobby') return;
+        cnMode.code = inferred; cnMode.at = now; return;
+      }
       if (!inferred && cnScene.inMatch && !cnMode.code) { cnMode.code = cur; cnMode.at = now; }
     } catch {}
   }
@@ -497,9 +516,15 @@
       const sep = kfStr.includes('killed') ? 'killed' : (kfStr.includes('eliminated') ? 'eliminated' : 'knocked');
       const parts = kfStr.split(sep);
       if (parts.length < 2) return;
-      const killer = parts[0].replace(/<[^>]*>/g, '').trim();
-      const victim = parts[1].replace(/<[^>]*>/g, '').trim();
-      if (!killer || !victim) return;
+      const rawKiller = parts[0].replace(/<[^>]*>/g, '').trim();
+      const rawVictim = parts[1].replace(/<[^>]*>/g, '').trim();
+      // Empty names are real events, not garbage: zone/fall deaths have no
+      // killer, and some kills arrive with a blank victim. Old code dropped
+      // them, so your own zone death or a kill on an unnamed player never
+      // clipped. Display them as '?' but match on the raw value (empty
+      // never equals your name, so no false self-matches).
+      if (!rawKiller && !rawVictim) return;
+      const killer = rawKiller || '?', victim = rawVictim || '?';
       try { clipKickSoon(); } catch {}
       try {
         const key = killer + '>' + victim, now = Date.now();
@@ -613,14 +638,25 @@
 
   // ---- recorder (segmented, local-first) ----
   const CN_DEF = { enabled: true, len: 30, fps: 15, bitrate: 1500000, autoKill: true, autoDeath: true, autoWin: true, after: 5, audio: true, mic: false, watermark: true, wmName: true, wmMode: true, wmBrand: true, wmPos: 'br', fab: true, layout: 'landscape', keyClip: 'F8', keyPanel: 'F4', keyLib: 'F9', sounds: true };
-  function clipCfg() {
+  // ---- config cache (v1.3.9 / Phase 1: zero per-frame GM IPC) ----
+  // clipCfg() used to hit GM_getValue ~20x per call, and it is called on
+  // every rAF meter frame, every watermark draw, every 2.5s tick and every
+  // packet log. GM IPC per frame is the #1 FPS killer. Now: read once,
+  // serve from memory, patch the cache on every write path. Same GM keys,
+  // same defaults, same validation - only the read path changes.
+  let _cfgCache = null;
+  function clipCfgRead() {
     try {
       const lenRaw = Number(GMGet('cn_clip_len', CN_DEF.len));
       const layoutRaw = String(GMGet('cn_clip_layout', CN_DEF.layout) || 'landscape');
+      const fpsRaw = GMGet('cn_clip_fps', CN_DEF.fps);
+      // fps is a number, or 'unlimited' = capture at source rate (no
+      // frame cap: captureStream() with no rate arg + uncapped paint).
+      const fpsVal = (fpsRaw === 'unlimited') ? 'unlimited' : (Number(fpsRaw) || CN_DEF.fps);
       return {
         enabled: GMGet('cn_clip_enabled', CN_DEF.enabled),
         len: [8, 15, 30, 45, 60].includes(lenRaw) ? lenRaw : CN_DEF.len,
-        fps: Number(GMGet('cn_clip_fps', CN_DEF.fps)) || CN_DEF.fps,
+        fps: fpsVal,
         bitrate: Number(GMGet('cn_clip_bitrate', CN_DEF.bitrate)) || CN_DEF.bitrate,
         autoKill: GMGet('cn_clip_autokill', CN_DEF.autoKill),
         autoDeath: GMGet('cn_clip_autodeath', CN_DEF.autoDeath),
@@ -636,6 +672,10 @@
         wmPos: ['tl', 'tc', 'tr', 'bl', 'bc', 'br'].includes(GMGet('cn_wm_pos', CN_DEF.wmPos)) ? GMGet('cn_wm_pos', CN_DEF.wmPos) : CN_DEF.wmPos,
         fab: GMGet('cn_fab_visible', CN_DEF.fab) !== false,
         layout: layoutRaw === 'vertical' ? 'vertical' : 'landscape',
+        // Container: mp4 = smooth hardware-decoded playback, weak seeking
+        // (Chrome's fragmented MP4 seeks land mid-GOP -> blocky frames).
+        // webm = precise seeking + heavier software decode. User's choice.
+        format: GMGet('cn_clip_format', 'mp4') === 'webm' ? 'webm' : 'mp4',
         sounds: GMGet('cn_sounds', CN_DEF.sounds) !== false,
         keyClip: String(GMGet('cn_key_clip', CN_DEF.keyClip) || 'F8'),
         keyPanel: String(GMGet('cn_key_panel', CN_DEF.keyPanel) || 'F4'),
@@ -644,9 +684,51 @@
       };
     } catch { return Object.assign({}, CN_DEF); }
   }
+  function clipCfg() {
+    try {
+      if (!_cfgCache) _cfgCache = clipCfgRead();
+      return _cfgCache;
+    } catch { return Object.assign({}, CN_DEF); }
+  }
+  function clipCfgReload() {
+    try { _cfgCache = clipCfgRead(); } catch {}
+    return _cfgCache;
+  }
+  function clipCfgApplyKey(k, v) {
+    // Mirror clipCfgRead validation so cache == fresh read, always.
+    try {
+      if (!_cfgCache) _cfgCache = clipCfgRead();
+      const c = _cfgCache;
+      if (k === 'cn_clip_enabled') c.enabled = v;
+      else if (k === 'cn_clip_len') { const n = Number(v); c.len = [8, 15, 30, 45, 60].includes(n) ? n : CN_DEF.len; }
+      else if (k === 'cn_clip_fps') c.fps = (v === 'unlimited') ? 'unlimited' : (Number(v) || CN_DEF.fps);
+      else if (k === 'cn_clip_bitrate') c.bitrate = Number(v) || CN_DEF.bitrate;
+      else if (k === 'cn_clip_autokill') c.autoKill = v;
+      else if (k === 'cn_clip_autodeath') c.autoDeath = v;
+      else if (k === 'cn_clip_autowin') c.autoWin = v;
+      else if (k === 'cn_clip_after') c.after = Number(v) || 0;
+      else if (k === 'cn_clip_audio') c.audio = v !== false;
+      else if (k === 'cn_clip_mic') c.mic = v === true;
+      else if (k === 'cn_mic_device') c.micDevice = String(v || 'default');
+      else if (k === 'cn_clip_watermark') c.watermark = v !== false;
+      else if (k === 'cn_wm_name') c.wmName = v !== false;
+      else if (k === 'cn_wm_mode') c.wmMode = v !== false;
+      else if (k === 'cn_wm_brand') c.wmBrand = v !== false;
+      else if (k === 'cn_wm_pos') c.wmPos = ['tl', 'tc', 'tr', 'bl', 'bc', 'br'].includes(v) ? v : CN_DEF.wmPos;
+      else if (k === 'cn_fab_visible') c.fab = v !== false;
+      else if (k === 'cn_clip_layout') c.layout = String(v) === 'vertical' ? 'vertical' : 'landscape';
+      else if (k === 'cn_clip_format') c.format = String(v) === 'webm' ? 'webm' : 'mp4';
+      else if (k === 'cn_sounds') c.sounds = v !== false;
+      else if (k === 'cn_key_clip') c.keyClip = String(v || 'F8');
+      else if (k === 'cn_key_panel') c.keyPanel = String(v || 'F4');
+      else if (k === 'cn_key_lib') c.keyLib = String(v || 'F9');
+      else if (k === 'cn_debug') c.debug = v === true;
+    } catch {}
+  }
   function clipSet(k, v) {
     try { GMSet(k, v); } catch {}
-    try { if (k === 'cn_clip_len' || k === 'cn_clip_fps' || k === 'cn_clip_bitrate' || k === 'cn_clip_enabled' || k === 'cn_clip_audio' || k === 'cn_clip_mic' || k === 'cn_clip_watermark' || k === 'cn_clip_layout') { try { clipEnsureMic(); } catch {} rsReboot('settings:' + k); } } catch {}
+    try { clipCfgApplyKey(k, v); } catch {}
+    try { if (k === 'cn_clip_len' || k === 'cn_clip_fps' || k === 'cn_clip_bitrate' || k === 'cn_clip_enabled' || k === 'cn_clip_audio' || k === 'cn_clip_mic' || k === 'cn_clip_watermark' || k === 'cn_clip_layout' || k === 'cn_clip_format') { try { clipEnsureMic(); } catch {} rsReboot('settings:' + k); } } catch {}
     try { if (k === 'cn_fab_visible') cnApplyFab(); } catch {}
     try { if (typeof cnRenderCurrent === 'function') cnRenderCurrent(); } catch {}
   }
@@ -654,16 +736,40 @@
     try { if (rsState === RS_IDLE) rsEnter(RS_STARTING); } catch {}
   }
   function clipPickMime(withAudio) {
+    // Container follows the Format setting (mp4 unless explicitly webm).
+    // MP4/H264 = smooth hardware-decoded playback everywhere, but Chrome's
+    // fragmented MP4 seeks can land mid-GOP (blocky frames after scrubbing).
+    // WebM/VP8 = precise seeking, heavier software decode. MP4 stays the
+    // default (matches the proven 1.3.x pipeline); WebM is one click away.
+    // The old stitch fragility is gone independently (continuous sessions).
     try {
-      const cands = withAudio
-        ? ['video/mp4;codecs="avc1.42E01E,mp4a.40.2"', 'video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus', 'video/webm', 'video/mp4']
-        : ['video/mp4;codecs="avc1.42E01E"', 'video/mp4', 'video/webm;codecs=vp8', 'video/webm', 'video/webm;codecs=vp9'];
+      let webmFirst = false;
+      try { webmFirst = clipCfg().format === 'webm'; } catch {}
+      const mp4A = ['video/mp4;codecs="avc1.42E01E,mp4a.40.2"', 'video/mp4'];
+      const mp4V = ['video/mp4;codecs="avc1.42E01E"', 'video/mp4'];
+      const webmA = ['video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus', 'video/webm'];
+      const webmV = ['video/webm;codecs=vp8', 'video/webm;codecs=vp9', 'video/webm'];
+      const cands = withAudio ? (webmFirst ? [...webmA, ...mp4A] : [...mp4A, ...webmA]) : (webmFirst ? [...webmV, ...mp4V] : [...mp4V, ...webmV]);
       for (const m of cands) { try { if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m)) return m; } catch {} }
     } catch {}
     return '';
   }
   function clipExt(mime) { try { if (String(mime || '').includes('mp4')) return 'mp4'; } catch {} return 'webm'; }
-  let _clip = { rec: null, stream: null, chunks: [], prev: null, segTimer: null, segStartedAt: 0, finalizing: false, started: false, lastErr: '', mime: '', withAudio: false, wmActive: false, recStartedAt: 0, killAt: 0, deathAt: 0, winAt: 0, pendingTimer: null, pendingTrigger: null, lastKill: null, cw: 0, ch: 0 };
+  function clipPickMimeExport(withAudio) {
+    // Trim/export mime: WebM FIRST, always. The recorder prefers MP4 when
+    // available, but Chrome's MP4 muxer output (fragmented MP4, short
+    // re-captured clips) is exactly what VLC and even Chrome previews
+    // glitch on. WebM via MediaRecorder is the decade-old reliable path.
+    try {
+      const cands = withAudio
+        ? ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm']
+        : ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+      for (const m of cands) { try { if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m)) return m; } catch {} }
+    } catch {}
+    try { return clipPickMime(withAudio); } catch {}
+    return '';
+  }
+  let _clip = { rec: null, stream: null, chunks: [], segStartedAt: 0, finalizing: false, started: false, lastErr: '', mime: '', withAudio: false, wmActive: false, recStartedAt: 0, killAt: 0, deathAt: 0, winAt: 0, pendingTimer: null, pendingTrigger: null, lastKill: null, cw: 0, ch: 0 };
   let _clipCanvasCache = null;
   function clipFindCanvas() {
     try {
@@ -677,12 +783,20 @@
       return best;
     } catch { return null; }
   }
+  let _clipSizeFlaps = 0;
   function clipCanvasChanged() {
+    // Watchdog runs every 15s: require the new size on TWO consecutive
+    // passes before believing it, so transient flaps (loading screens,
+    // resolution transitions) don't wipe the rolling window.
     try {
       const c = clipFindCanvas();
-      if (!c || !_clip.cw || !_clip.ch) return false;
+      if (!c || !_clip.cw || !_clip.ch) { _clipSizeFlaps = 0; return false; }
       const w = c.width || 0, h = c.height || 0;
-      return w > 0 && h > 0 && (w !== _clip.cw || h !== _clip.ch);
+      if (!(w > 0 && h > 0 && (w !== _clip.cw || h !== _clip.ch))) { _clipSizeFlaps = 0; return false; }
+      _clipSizeFlaps++;
+      if (_clipSizeFlaps < 2) return false;
+      _clipSizeFlaps = 0;
+      return true;
     } catch { return false; }
   }
 
@@ -839,17 +953,6 @@
     } catch {}
     return null;
   }
-  function clipStashForUpgrade(reason) {
-    try {
-      const chunks = (_clip.chunks || []).slice();
-      let bytes = 0;
-      for (const c of chunks) bytes += (c && c.size) || 0;
-      if (chunks.length && bytes > 0) {
-        try { clipStashPrev(chunks, _clip.mime, Date.now() - (_clip.segStartedAt || Date.now())); } catch {}
-        try { logInfo(`audio upgrade (${reason}) - stashed ${(bytes / 1024).toFixed(0)}KB for stitch`); } catch {}
-      }
-    } catch {}
-  }
   function clipGameAudioTracks() {
     const out = [];
     try {
@@ -988,6 +1091,7 @@
     try {
       id = String(id || 'default');
       try { GMSet('cn_mic_device', id); } catch {}
+      try { clipCfgApplyKey('cn_mic_device', id); } catch {}
       try { if (_micStream) { _micStream.getTracks().forEach((t) => { try { t.stop(); } catch {} }); } } catch {}
       _micStream = null; _micTrack = null; _micErr = ''; _micToasted = false;
       try { logInfo(`mic input -> ${id === 'default' ? 'default' : id.slice(0, 8) + '…'} (${(_micDevices.find((d) => d.id === id) || {}).label || 'default mic'})`); } catch {}
@@ -1046,11 +1150,21 @@
     game: { track: null, src: null, gain: null, meter: null },
     mic: { track: null, src: null, gain: null, meter: null },
   };
+  // Volume cache: clipVol() is called per tick + per save + per attach.
+  // Same keys (cn_vol_game / cn_vol_mic), same 0..2 clamp, memory-served.
+  const _volCache = { game: 1, mic: 1, loaded: false };
+  function clipVolLoad() {
+    try {
+      const g = Number(GMGet('cn_vol_game', 1)), m = Number(GMGet('cn_vol_mic', 1));
+      _volCache.game = (isNaN(g) || g < 0) ? 1 : Math.max(0, Math.min(2, g));
+      _volCache.mic = (isNaN(m) || m < 0) ? 1 : Math.max(0, Math.min(2, m));
+      _volCache.loaded = true;
+    } catch {}
+  }
   function clipVol(lane) {
     try {
-      const v = Number(GMGet(lane === 'mic' ? 'cn_vol_mic' : 'cn_vol_game', 1));
-      if (isNaN(v) || v < 0) return 1;
-      return Math.max(0, Math.min(2, v));
+      if (!_volCache.loaded) clipVolLoad();
+      return lane === 'mic' ? _volCache.mic : _volCache.game;
     } catch { return 1; }
   }
   function clipSetVol(lane, v) {
@@ -1058,6 +1172,7 @@
       v = Math.max(0, Math.min(2, Number(v)));
       if (isNaN(v)) return;
       GMSet(lane === 'mic' ? 'cn_vol_mic' : 'cn_vol_game', v);
+      try { _volCache[lane === 'mic' ? 'mic' : 'game'] = v; _volCache.loaded = true; } catch {}
       const node = _mixLane[lane] && _mixLane[lane].gain;
       if (node) {
         try { node.gain.setTargetAtTime(v, (_mixCtx && _mixCtx.currentTime) || 0, 0.01); }
@@ -1234,12 +1349,18 @@
       return game || mic || null;
     } catch (e) { dbg('clipMixedAudioTrack: threw', e); return null; }
   }
+  // Phase 3: analyser buffer reuse - one cached Uint8Array per fftSize,
+  // zero per-read allocation. clipAnLevel is hit by the meter loop, the
+  // audio diag line and every save/boot log; allocating a fresh buffer per
+  // read was pure GC pressure on the game thread.
+  const _cnAnBufs = {};
   function clipAnLevel(an) {
     // 0.00 = digital silence .. ~0.5 = loud. Never throws.
     try {
       if (!an) return null;
       const n = (an.fftSize && an.fftSize > 0) ? an.fftSize : 256;
-      const buf = new Uint8Array(n);
+      let buf = _cnAnBufs[n];
+      if (!buf) { buf = new Uint8Array(n); _cnAnBufs[n] = buf; }
       try { an.getByteTimeDomainData(buf); } catch { return null; }
       let peak = 0;
       for (let i = 0; i < buf.length; i++) {
@@ -1284,7 +1405,7 @@
   function cnCompositeStop() {
     try {
       _cnComp.last = 0;
-      if (_cnComp.raf) { try { cancelAnimationFrame(_cnComp.raf); } catch {} _cnComp.raf = 0; }
+      if (_cnComp.raf) { try { cancelAnimationFrame(_cnComp.raf); } catch {} try { clearInterval(_cnComp.raf); } catch {} _cnComp.raf = 0; }
       _cnComp.canvas = null; _cnComp.ctx = null; _cnComp.label = null; _cnComp.labelKey = '';
     } catch {}
   }
@@ -1308,7 +1429,7 @@
       const meas = document.createElement('canvas').getContext('2d');
       let wMax = 0, hTot = 0;
       for (const L of lines) {
-        meas.font = (L.big ? '800 ' + fs : '700 ' + fs2) + 'px Inter,system-ui,sans-serif';
+        meas.font = (L.big ? '800 ' + fs : '700 ' + fs2) + 'px Inter,"Segoe UI",system-ui,-apple-system,sans-serif';
         wMax = Math.max(wMax, meas.measureText(L.t).width);
         hTot += L.big ? fs : fs2;
       }
@@ -1324,7 +1445,7 @@
       let y = pad;
       for (const L of lines) {
         const f = L.big ? fs : fs2;
-        g.font = (L.big ? '800 ' : '700 ') + f + 'px Inter,system-ui,sans-serif';
+        g.font = (L.big ? '800 ' : '700 ') + f + 'px Inter,"Segoe UI",system-ui,-apple-system,sans-serif';
         g.strokeText(L.t, pad, y);
         g.fillText(L.t, pad, y);
         y += f + Math.round(pad * 0.5);
@@ -1360,9 +1481,24 @@
       if (!ctx) { try { ctx = c.getContext('2d'); } catch {} }
       if (!ctx) return null;
       _cnComp.canvas = c; _cnComp.ctx = ctx; _cnComp.vert = !!vertical;
-      const interval = 1000 / Math.max(5, Math.min(60, Number(fps) || 15));
-      const loop = () => {
+      try { _cnComp.pn = 0; _cnComp.pt0 = 0; _cnComp.pfps = 0; _cnComp.pema = 0; _cnComp.pwarn = false; } catch {}
+      // Phase 2 throttle: paint on an interval at the TARGET fps, not on
+      // every display refresh. rAF woke this callback ~60x/sec just to skip
+      // 3 of 4 wakeups via the `last` gate - at 15fps capture that is 45
+      // Cadence: rAF loop + interval gate, exactly like the proven 1.3.x
+      // pipeline. A setInterval throttle was tried (fewer wakeups) but in
+      // loaded game tabs timers get deprioritized while rAF stays
+      // vsync-locked, so captures came out sparse. rAF wakes every vsync;
+      // the gate paints at most at the target fps. 'unlimited' paints
+      // every frame. Stats count gated paints = real capture fps.
+      const uncapped = (fps === 'unlimited');
+      const rate = uncapped ? 0 : Math.max(5, Math.min(120, Number(fps) || 15));
+      const interval = uncapped ? 0 : 1000 / rate;
+      const paint = () => {
         if (!_cnComp.canvas) return;
+        try { if (typeof document !== 'undefined' && document.hidden) return; } catch {}
+        let p0 = 0;
+        try { p0 = performance.now(); } catch {}
         try {
           const gw = gameCanvas.width || 0, gh = gameCanvas.height || 0;
           if (vertical && gw > 0 && gh > 0) {
@@ -1370,48 +1506,69 @@
             if (gw / gh > 9 / 16) { ew = Math.max(2, Math.round(gh * 9 / 16)); eh = gh; }
             else { ew = gw; eh = Math.max(2, Math.round(gw * 16 / 9)); }
             if (c.width !== ew || c.height !== eh) { c.width = ew; c.height = eh; _cnComp.labelKey = ''; }
-            const now = performance.now();
-            if (now - _cnComp.last >= interval) {
-              _cnComp.last = now;
-              try {
-                if (gw / gh > 9 / 16) { const cw = gh * 9 / 16, sx = (gw - cw) / 2; ctx.drawImage(gameCanvas, sx, 0, cw, gh, 0, 0, c.width, c.height); }
-                else { const chh = gw * 16 / 9, sy = (gh - chh) / 2; ctx.drawImage(gameCanvas, 0, sy, gw, chh, 0, 0, c.width, c.height); }
-              } catch {}
-              try {
-                const nm = (cnMe.name || '').trim(), md = cnGmLabel(cnMode.code);
-                const L = cnLabelCanvas(nm, md, c.height);
-                if (L) {
-                  const pad = Math.max(6, Math.round(c.height * 0.02));
-                  const [lx, ly] = cnWatermarkXY(c.width, c.height, L.width, L.height, pad);
-                  ctx.drawImage(L, lx, ly);
-                }
-              } catch {}
-            }
+            try {
+              if (gw / gh > 9 / 16) { const cw = gh * 9 / 16, sx = (gw - cw) / 2; ctx.drawImage(gameCanvas, sx, 0, cw, gh, 0, 0, c.width, c.height); }
+              else { const chh = gw * 16 / 9, sy = (gh - chh) / 2; ctx.drawImage(gameCanvas, 0, sy, gw, chh, 0, 0, c.width, c.height); }
+            } catch {}
           } else {
             if (gw > 0 && gh > 0 && (c.width !== gw || c.height !== gh)) { c.width = gw; c.height = gh; _cnComp.labelKey = ''; }
-            const now = performance.now();
-            if (now - _cnComp.last >= interval) {
-              _cnComp.last = now;
-              try { ctx.drawImage(gameCanvas, 0, 0, c.width, c.height); } catch {}
-              try {
-                const nm = (cnMe.name || '').trim(), md = cnGmLabel(cnMode.code);
-                const L = cnLabelCanvas(nm, md, c.height);
-                if (L) {
-                  const pad = Math.max(6, Math.round(c.height * 0.02));
-                  const [lx, ly] = cnWatermarkXY(c.width, c.height, L.width, L.height, pad);
-                  ctx.drawImage(L, lx, ly);
-                }
-              } catch {}
-            }
+            try { ctx.drawImage(gameCanvas, 0, 0, c.width, c.height); } catch {}
           }
+          try {
+            const nm = (cnMe.name || '').trim(), md = cnGmLabel(cnMode.code);
+            const L = cnLabelCanvas(nm, md, c.height);
+            if (L) {
+              const pad = Math.max(6, Math.round(c.height * 0.02));
+              const [lx, ly] = cnWatermarkXY(c.width, c.height, L.width, L.height, pad);
+              ctx.drawImage(L, lx, ly);
+            }
+          } catch {}
+          // Paint stats: cadence (paints/sec) + cost EMA. If paints cost
+          // more than their slot, the composite IS the dropped-frames
+          // culprit - log once per session so the user gets told, not
+          // just a choppy file.
+          try {
+            if (p0) {
+              const dt = performance.now() - p0;
+              _cnComp.pema = _cnComp.pema ? _cnComp.pema * 0.9 + dt * 0.1 : dt;
+              _cnComp.pn = (_cnComp.pn || 0) + 1;
+              const nowMs = performance.now();
+              if (!_cnComp.pt0) _cnComp.pt0 = nowMs;
+              if (nowMs - _cnComp.pt0 >= 2000) {
+                _cnComp.pfps = Math.round(_cnComp.pn * 1000 / Math.max(1, nowMs - _cnComp.pt0));
+                _cnComp.pn = 0; _cnComp.pt0 = nowMs;
+                if (!uncapped && !_cnComp.pwarn && interval > 0 && _cnComp.pema > interval * 1.5 && _cnComp.pfps > 0) {
+                  _cnComp.pwarn = true;
+                  try { logInfo(`composite overloaded: paint=${_cnComp.pema.toFixed(0)}ms vs ${interval.toFixed(0)}ms slot at ${rate}fps - lower FPS or disable watermark`); } catch {}
+                }
+              }
+            }
+          } catch {}
         } catch {}
-        _cnComp.raf = requestAnimationFrame(loop);
       };
-      _cnComp.raf = requestAnimationFrame(loop);
-      return c.captureStream(Number(fps) || 15);
+      try { paint(); } catch {} // first frame sync: recorder never starts blank
+      try {
+        const loop = () => {
+          if (!_cnComp.canvas) return;
+          try {
+            let doPaint = uncapped;
+            if (!doPaint) {
+              try {
+                const nowMs = performance.now();
+                if (nowMs - _cnComp.last >= interval) { _cnComp.last = nowMs; doPaint = true; }
+              } catch { doPaint = true; }
+            }
+            if (doPaint) paint();
+          } catch {}
+          try { _cnComp.raf = requestAnimationFrame(loop); } catch {}
+        };
+        _cnComp.raf = requestAnimationFrame(loop);
+      } catch {}
+      try { return uncapped ? c.captureStream() : c.captureStream(rate); } catch { return c.captureStream(); }
     } catch { try { cnCompositeStop(); } catch {} return null; }
   }
   let _clipRO = null;
+  let _clipResizeT = 0;
   function clipWatchResize(canvas) {
     try {
       if (_clipRO) { try { _clipRO.disconnect(); } catch {} _clipRO = null; }
@@ -1423,35 +1580,76 @@
           if (!(w > 0 && h > 0)) return;
           if (w === lastW && h === lastH) return;
           lastW = w; lastH = h;
-          try { _clip.cw = w; _clip.ch = h; } catch {}
           if (rsState === RS_IDLE || rsState === RS_STARTING) return;
           if (rsState === RS_SAVING) { try { rsCutNow(); } catch {} return; }
-          logInfo('canvas resized - rebooting recorder');
-          try { rsReboot('resize'); } catch {}
+          // Debounce: game canvases flap size during loads and transitions,
+          // and every reboot wipes the rolling window. Reboot only if the
+          // new size is still current after 1.5s of quiet AND differs from
+          // what the session was booted with (_clip.cw/ch untouched here).
+          try { if (_clipResizeT) clearTimeout(_clipResizeT); } catch {}
+          _clipResizeT = setTimeout(() => {
+            try {
+              _clipResizeT = 0;
+              const w2 = canvas.width || 0, h2 = canvas.height || 0;
+              if (!(w2 > 0 && h2 > 0)) return;
+              if (w2 !== lastW || h2 !== lastH) return; // still flapping
+              if (w2 === (_clip.cw || 0) && h2 === (_clip.ch || 0)) {
+                try { logInfo('canvas resize was transient - session continues'); } catch {}
+                return;
+              }
+              logInfo('canvas resized - rebooting recorder');
+              try { rsReboot('resize'); } catch {}
+            } catch {}
+          }, 1500);
         } catch {}
       });
       try { _clipRO.observe(canvas); } catch {}
     } catch {}
   }
-  function clipVerifyPlayable(blob) {
+  function clipProbeBlob(blob, ms) {
+    // Single probe round: 'ok' (first frame decoded), 'timeout' (slow -
+    // timeouts lie under load) or 'error' (decoder rejected it).
     return new Promise((res) => {
       let done = false, url = '', v = null;
-      const finish = (ok) => {
+      const finish = (how) => {
         if (done) return; done = true;
         try { if (v) { try { v.pause(); } catch {} try { v.removeAttribute('src'); } catch {} try { v.load(); } catch {} try { v.remove(); } catch {} } } catch {}
         try { if (url) URL.revokeObjectURL(url); } catch {}
-        res(ok);
+        res(how);
       };
       try {
         url = URL.createObjectURL(blob);
         v = document.createElement('video');
         v.muted = true; v.preload = 'auto';
-        v.onloadeddata = () => finish(true);
-        v.onerror = () => finish(false);
+        v.onloadeddata = () => finish('ok');
+        v.onerror = () => finish('error');
         v.src = url;
-        setTimeout(() => finish(false), 6000);
-      } catch (e) { finish(false); }
+        setTimeout(() => finish('timeout'), Math.max(2000, Math.min(25000, Number(ms) || 6000)));
+      } catch (e) { finish('error'); }
     });
+  }
+  function clipHeadSlice(blob) {
+    try {
+      if (blob && blob.size > 16 * 1024 * 1024) return new Blob([blob.slice(0, 16 * 1024 * 1024)], { type: blob.type || 'video/webm' });
+    } catch {}
+    return blob;
+  }
+  async function clipVerifyPlayable(blob) {
+    // Two-stage verify. Fast path: 16MB head probe (loadeddata fires on the
+    // first decodable frame, size-independent). Trap this fixed: a sliced
+    // MP4 head can lack its moov box and ERROR while the full file is
+    // perfectly playable - that false-error discarded ~90% of big MP4
+    // clips as "corrupted". So a head ERROR falls back to one full-file
+    // probe (longer timeout) before anything is discarded. Timeout at
+    // either stage means slow, not broken.
+    try {
+      if (!blob || !blob.size) return 'error';
+      const first = await clipProbeBlob(clipHeadSlice(blob), 6000);
+      if (first === 'ok') return 'ok';
+      if (first === 'timeout') return 'timeout';
+      try { logInfo(`head probe rejected (${((blob.size || 0) / 1048576).toFixed(1)}MB) - retrying full file before discarding`); } catch {}
+      return await clipProbeBlob(blob, 20000);
+    } catch { return 'error'; }
   }
   function clipProbeDuration(blob) {
     return new Promise((res) => {
@@ -1495,65 +1693,35 @@
       } catch (e) { finish(null); }
     });
   }
-  const PREV_MAX_BYTES = 48 * 1024 * 1024, STITCH_MAX_BYTES = 80 * 1024 * 1024;
-  function clipStashPrev(chunks, mime, durMs) {
-    try {
-      chunks = (chunks || []).filter(c => c && c.size > 0);
-      if (!chunks.length) return;
-      let bytes = 0;
-      for (const c of chunks) bytes += c.size || 0;
-      if (bytes <= 0 || bytes > PREV_MAX_BYTES) return;
-      _clip.prev = { chunks: chunks.slice(), bytes, mime: mime || 'video/webm', durMs: Math.max(0, Number(durMs) || 0), withAudio: !!_clip.withAudio, layout: (function () { try { return clipCfg().layout || 'landscape'; } catch { return 'landscape'; } })(), w: _clip.cw || 0, h: _clip.ch || 0, at: Date.now() };
-    } catch {}
-  }
-  function clipPickStitch(sDur, cDur, pDurMs, needMs) {
-    try {
-      if (sDur == null || !(sDur > 0)) return false;
-      const c = Number(cDur) || 0;
-      const want = Math.max(c, c + Math.max(0, Math.min(Number(pDurMs) || 0, Number(needMs) || 0)) / 1000);
-      return sDur + 1.0 >= want;
-    } catch { return false; }
-  }
-  async function clipStitchedBlob(curChunks, mime, curDurMs, cfg) {
-    try {
-      // MP4 concat is attempted, not banned: Chrome writes fragmented MP4 so
-      // init+tail can play, and acceptance below is purely duration-PROBED -
-      // a bad stitch falls back to current alone. Zero risk either way.
-      const isMp4 = /mp4/i.test(String(mime || ''));
-      const lenMs = Math.max(8000, Math.min(90000, (Number((cfg || {}).len) || 30) * 1000));
-      curDurMs = Math.max(0, Number(curDurMs) || 0);
-      if (curDurMs >= lenMs) return null;
-      const needMs = lenMs - curDurMs;
-      if (needMs <= 500) return null;
-      const p = _clip.prev;
-      if (!p || !p.chunks || !p.chunks.length) return null;
-      if (p.mime !== mime) return null;
-      if (p.withAudio !== !!_clip.withAudio) return null;
-      if (p.w !== (_clip.cw || 0) || p.h !== (_clip.ch || 0)) return null;
-      try { if (p.layout !== (clipCfg().layout || 'landscape')) return null; } catch {}
-      if ((Date.now() - (p.at || 0)) > lenMs + 30000) return null;
-      let curBytes = 0;
-      for (const c of curChunks) curBytes += (c && c.size) || 0;
-      if ((p.bytes || 0) + curBytes > STITCH_MAX_BYTES) return null;
-      const curBlob = new Blob(curChunks, { type: mime });
-      const stitched = new Blob([...p.chunks, ...curChunks], { type: mime });
-      const [sDur, cDur] = await Promise.all([clipProbeDuration(stitched), clipProbeDuration(curBlob)]);
-      if (clipPickStitch(sDur, cDur, p.durMs, needMs)) {
-        try { if (isMp4) logInfo(`clip stitched MP4 cur=${cDur == null ? '?' : cDur.toFixed(1)}s -> ${sDur == null ? '?' : sDur.toFixed(1)}s`); } catch {}
-        return { blob: stitched, sDur, cDur };
-      }
-      try { logInfo(`stitch rejected (stitched=${sDur == null ? '?' : sDur.toFixed(1)}s cur=${cDur == null ? '?' : cDur.toFixed(1)}s) - saving current`); } catch {}
-    } catch {}
-    return null;
-  }
-  // ---- recorder FSM ----
-  const RS_IDLE = 'idle', RS_STARTING = 'starting', RS_RECORDING = 'recording', RS_ROTATING = 'rotating', RS_SAVING = 'saving';
+  // ---- recorder FSM (one continuous session + rolling window) ----
+  // Why no rotation/stitching anymore: every MediaRecorder restart resets
+  // timestamps, so raw-concatenating a previous segment with the current
+  // one produced files with overlapping timestamps - players showed them
+  // as 2-3fps stutter even though 30fps was recorded. Now a single session
+  // runs until reboot/save, chunks carry wall-clock times, old chunks are
+  // pruned, and every saved clip is one continuous timestamp run.
+  // BOUND: a session never outlives the rolling window (segment roll at
+  // keepMs). Otherwise the pruned middle leaves a timestamp HOLE: the file
+  // reports full span (76s) but only head+tail frames exist, so players
+  // show a long timeline that stalls after seconds. Rolls restart cleanly
+  // with no stitching and no carry-over - a kill right after a roll gets a
+  // shorter clip, same honest tradeoff as 1.3.x.
+  const RS_IDLE = 'idle', RS_STARTING = 'starting', RS_RECORDING = 'recording', RS_SAVING = 'saving';
   const RS_READY_BYTES = 48 * 1024, RS_READY_AGE = 1200, RS_IDLE_RETRY = 2500;
-  let rsState = RS_IDLE, rsGen = 0, rsSaveQ = null, rsRetryT = null, rsRotT = null, rsCutT = null;
-  function rsActive() { try { return rsState === RS_RECORDING || rsState === RS_ROTATING || rsState === RS_SAVING; } catch { return false; } }
+  const RS_WIN_MAX_BYTES = 160 * 1024 * 1024;
+  let rsState = RS_IDLE, rsGen = 0, rsSaveQ = null, rsRetryT = null, rsCutT = null, rsSegT = 0;
+  function rsKeepMs() {
+    // Rolling window span: longest possible clip + margin. Sessions roll
+    // at exactly this age, so the window always lies inside one session.
+    try {
+      const cfg = clipCfg();
+      return (Math.max(8, Math.min(90, Number(cfg.len) || 30)) + Math.max(0, Math.min(10, Number(cfg.after) || 0)) + 15) * 1000;
+    } catch { return 50000; }
+  }
+  function rsActive() { try { return rsState === RS_RECORDING || rsState === RS_SAVING; } catch { return false; } }
   function rsDataReady() {
     try {
-      if (rsState !== RS_RECORDING && rsState !== RS_ROTATING && rsState !== RS_SAVING) return false;
+      if (rsState !== RS_RECORDING && rsState !== RS_SAVING) return false;
       const r = _clip.rec;
       if (!r || r.state !== 'recording') return false;
       if ((_clip.chunkBytes || 0) < RS_READY_BYTES) return false;
@@ -1562,10 +1730,10 @@
     } catch { return false; }
   }
   function rsClearTimers() {
-    try { if (_clip.segTimer) { clearTimeout(_clip.segTimer); _clip.segTimer = null; } } catch {}
+    try { if (_clipResizeT) { clearTimeout(_clipResizeT); _clipResizeT = 0; } } catch {}
+    try { if (rsSegT) { clearTimeout(rsSegT); rsSegT = 0; } } catch {}
     try { if (_clip.pendingTimer) { clearTimeout(_clip.pendingTimer); _clip.pendingTimer = null; } } catch {}
     try { if (rsRetryT) { clearTimeout(rsRetryT); rsRetryT = null; } } catch {}
-    try { if (rsRotT) { clearTimeout(rsRotT); rsRotT = null; } } catch {}
     try { if (rsCutT) { clearTimeout(rsCutT); rsCutT = null; } } catch {}
   }
   function rsCleanup() {
@@ -1582,8 +1750,8 @@
     try {
       rsClearTimers();
       rsState = next;
-      _clip.started = (next === RS_RECORDING || next === RS_ROTATING || next === RS_SAVING);
-      _clip.finalizing = (next === RS_ROTATING || next === RS_SAVING);
+      _clip.started = (next === RS_RECORDING || next === RS_SAVING);
+      _clip.finalizing = (next === RS_SAVING);
       if (next === RS_IDLE) {
         rsCleanup();
         _clip.pendingTrigger = null;
@@ -1594,12 +1762,8 @@
         if (!rsBoot()) rsEnter(RS_IDLE);
         else rsEnter(RS_RECORDING);
       } else if (next === RS_RECORDING) {
-        if (!rsSegment('enter')) rsEnter(RS_IDLE);
+        if (!rsRecordStart('enter')) rsEnter(RS_IDLE);
         else {
-          try {
-            const cfg = clipCfg();
-            _clip.segTimer = setTimeout(() => { try { if (rsState === RS_RECORDING) rsEnter(RS_ROTATING); } catch {} }, Math.max(8, Math.min(90, Number(cfg.len) || 30)) * 1000);
-          } catch {}
           try {
             if (rsSaveQ && (Date.now() - rsSaveQ.at) < 12000) {
               const q = rsSaveQ; rsSaveQ = null;
@@ -1607,8 +1771,6 @@
             } else rsSaveQ = null;
           } catch {}
         }
-      } else if (next === RS_ROTATING) {
-        rsRotateStep();
       } else if (next === RS_SAVING) {
         rsSaveStep(arg || 'manual');
       }
@@ -1620,9 +1782,18 @@
   }
   function rsReboot(why) {
     // why names the trigger (settings/resize/watchdog/preset/mic-ready):
-    // every reboot resets segment age, so a chatty reason here is the
-    // reason clips come out shorter than the buffer.
+    // every reboot starts a fresh session (fresh rolling window), so a
+    // chatty reason here is the reason clips come out shorter than the
+    // buffer. Reboots are expected and cheap - the alternative (stitching
+    // across sessions) produced timestamp-broken files.
     try { logInfo(`rec reboot why=${why || '?'}`); } catch {}
+    try {
+      const w = String(why || '');
+      if ((w.indexOf('settings:') === 0 || w.indexOf('preset') === 0) && _rsWebmFallback) {
+        _rsWebmFallback = false;
+        try { logInfo('capture settings changed - WebM fallback cleared, re-evaluating'); } catch {}
+      }
+    } catch {}
     try { rsEnter(RS_STARTING); } catch {}
   }
   function rsBoot() {
@@ -1637,10 +1808,10 @@
       try { clipWatchResize(canvas); } catch {}
       let stream = null, wmActive = false;
       const needComp = cfg.watermark || cfg.layout === 'vertical';
-      try { if (needComp) { try { stream = cnCompositeStream(canvas, Number(cfg.fps) || 15, cfg.layout === 'vertical') || null; } catch {} } } catch {}
+      try { if (needComp) { try { stream = cnCompositeStream(canvas, cfg.fps, cfg.layout === 'vertical') || null; } catch {} } } catch {}
       if (stream) wmActive = !!cfg.watermark;
       else {
-        try { stream = canvas.captureStream(Number(cfg.fps) || 15); }
+        try { stream = (cfg.fps === 'unlimited') ? canvas.captureStream() : canvas.captureStream(Number(cfg.fps) || 15); }
         catch (e) { try { stream = canvas.captureStream(); } catch (e2) { _clip.lastErr = 'captureStream failed'; return false; } }
       }
       if (!stream) { _clip.lastErr = 'captureStream empty'; return false; }
@@ -1731,18 +1902,19 @@
       try { curA = (_clip.stream.getAudioTracks() || [])[0] || null; } catch {}
       const swapTo = (track, why) => {
         try {
-          const s = _clip.stream;
-          if (curA && curA !== track) { try { s.removeTrack(curA); } catch {} }
-          try {
-            if ((s.getAudioTracks() || []).indexOf(track) < 0) s.addTrack(track);
-          } catch { return false; }
+          try { if (!rsSwapGate()) return false; } catch {}
           // Fresh tap may hold a stale recGain value: push the slider now.
           try { if (typeof clipTapSetGameVol === 'function') clipTapSetGameVol(); } catch {}
-          try { clipStashForUpgrade(why); } catch {}
-          try { if (_clip.rec) { try { _clip.rec.onstop = null; } catch {} try { if (_clip.rec.state !== 'inactive') _clip.rec.stop(); } catch {} } } catch {}
           _clip.withAudio = true;
-          try { logInfo(`audio route: ${why}`); } catch {}
-          try { rsSegment('swap:' + why); } catch {}
+          try { logInfo(`audio route: ${why} - session restart`); } catch {}
+          try {
+            const s = _clip.stream;
+            if (curA && curA !== track) { try { s.removeTrack(curA); } catch {} }
+            try {
+              if ((s.getAudioTracks() || []).indexOf(track) < 0) s.addTrack(track);
+            } catch { return false; }
+          } catch { return false; }
+          try { rsRecordRestart('swap:' + why); } catch {}
           return true;
         } catch { return false; }
       };
@@ -1820,11 +1992,10 @@
       let ns = null;
       try { ns = clipAttachAudio(_clip.stream, mixed); } catch { return; }
       if (!ns) return;
-      try { clipStashForUpgrade('game+mic mix'); } catch {}
-      try { if (_clip.rec) { try { _clip.rec.onstop = null; } catch {} try { if (_clip.rec.state !== 'inactive') _clip.rec.stop(); } catch {} } } catch {}
+      try { if (!rsSwapGate()) return; } catch {}
       _clip.stream = ns; _clip.withAudio = true; _mixActive = true;
-      try { logInfo('audio appeared mid-roll - continuing with audio (mix)'); } catch {}
-      try { rsSegment('mix-attach'); } catch {}
+      try { logInfo('audio appeared mid-roll - new session with audio (mix)'); } catch {}
+      try { rsRecordRestart('mix-attach'); } catch {}
     } catch (e) { dbg('rsAudioCheck: threw', e); }
   }
   function clipPause(p) {
@@ -1835,14 +2006,20 @@
       else if (!p && r.state === 'paused') { try { r.resume(); } catch {} }
     } catch {}
   }
-  function rsSegment(why) {
-    // why = short restart reason for the log (rotation, audio swap, reboot…).
-    // Every restart resets segment age, so frequent reasons here explain
-    // clips shorter than the buffer.
+  // WebM fallback for starved encoders: set once we SEE a session deliver
+  // <0.4 chunks/sec (software H264 while gaming emits so sparsely the MP4
+  // is undecodable, not just choppy - WebM tolerates the gaps and still
+  // plays). Cleared when the user touches capture settings.
+  let _rsWebmFallback = false;
+  function rsRecordStart(why) {
+    // Starts ONE continuous session on the live stream. Chunks accumulate
+    // with wall timestamps (1s timeslice); rsPruneWindow keeps the rolling
+    // buffer. Restarts happen ONLY on reboot / audio-route change /
+    // post-save - each restart begins a fresh session and fresh window.
     try {
       if (!_clip.stream) { _clip.lastErr = 'captureStream empty'; return false; }
       const cfg = clipCfg();
-      const mime = clipPickMime(!!_clip.withAudio);
+      const mime = _rsWebmFallback ? clipPickMimeExport(!!_clip.withAudio) : clipPickMime(!!_clip.withAudio);
       const opts = { videoBitsPerSecond: Number(cfg.bitrate) || 1500000 };
       if (_clip.withAudio) opts.audioBitsPerSecond = 128000;
       if (mime) opts.mimeType = mime;
@@ -1850,47 +2027,164 @@
       let rec = null;
       try { rec = new MediaRecorder(_clip.stream, opts); } catch (e) { try { rec = new MediaRecorder(_clip.stream); } catch (e2) { _clip.lastErr = 'Recorder init failed'; return false; } }
       _clip.rec = rec; _clip.chunks = []; _clip.chunkBytes = 0; _clip.mime = mime || ''; _clip.segStartedAt = Date.now();
-      rec.ondataavailable = (e) => { try { if (e.data && e.data.size > 0 && g === rsGen) { _clip.chunks.push(e.data); _clip.chunkBytes += e.data.size; } } catch {} };
+      _clip.cadChecked = false; _clip.cadN = 0;
+      _clip.sessHead = null; _clip.sessHeadBytes = 0; _clip.sessHeadDone = false;
+      rec.ondataavailable = (e) => {
+        try {
+          if (e.data && e.data.size > 0 && g === rsGen) {
+            const nowE = Date.now();
+            _clip.chunks.push({ b: e.data, t: nowE });
+            _clip.chunkBytes += e.data.size;
+            // Pin the session head (first ~256KB carry the EBML/moov header
+            // + track info). Long sessions prune it out of the rolling
+            // window; without it the saved slice is undecodable. Pinned
+            // refs survive pruning; finish() prepends the non-overlapping
+            // part. 256KB/session is negligible.
+            try {
+              if (!_clip.sessHeadDone) {
+                (_clip.sessHead = _clip.sessHead || []).push({ b: e.data, t: nowE });
+                _clip.sessHeadBytes = (_clip.sessHeadBytes || 0) + e.data.size;
+                if (_clip.sessHeadBytes >= 256 * 1024) _clip.sessHeadDone = true;
+              }
+            } catch {}
+            try { rsPruneWindow(); } catch {}
+            try { rsCadenceWatch(); } catch {}
+          }
+        } catch {}
+      };
       rec.onerror = () => { try { _clip.lastErr = 'Recorder error'; } catch {} };
       try { rec.start(1000); } catch (e) { _clip.lastErr = 'Recorder start failed'; return false; }
+      // Segment roll: bound the session to the window span so saves never
+      // outlive their headers (timestamp holes). Skipped mid-save; the next
+      // session starts fresh right after the store.
+      try {
+        if (rsSegT) clearTimeout(rsSegT);
+        rsSegT = 0;
+        const rollMs = rsKeepMs();
+        rsSegT = setTimeout(() => {
+          try {
+            rsSegT = 0;
+            if (rsState === RS_RECORDING) {
+              try { logInfo('segment roll - fresh session, window stays headed'); } catch {}
+              try { rsRecordRestart('segment-roll'); } catch {}
+            }
+          } catch {}
+        }, rollMs);
+      } catch {}
       // Assertion: proves the recorder actually holds an audio track. If
       // aTracks=0 here after a "yes audio" boot, the track object was
       // silently dropped (realm/container) - the file can never have sound.
       try {
         const vN = (_clip.stream.getVideoTracks() || []).length;
         const aT = _clip.stream.getAudioTracks() || [];
-        logInfo(`rec seg mime=${rec.mimeType || mime || '?'} vTracks=${vN} aTracks=${aT.length} aLive=${aT.map(t => t.readyState).join(',') || '-'} withAudioFlag=${!!_clip.withAudio} why=${why || '?'}`);
+        logInfo(`rec session mime=${rec.mimeType || mime || '?'} vTracks=${vN} aTracks=${aT.length} aLive=${aT.map(t => t.readyState).join(',') || '-'} withAudioFlag=${!!_clip.withAudio} why=${why || '?'}`);
       } catch {}
       return true;
     } catch { return false; }
   }
-  function rsRotateStep() {
+  function rsCadenceWatch() {
+    // Once per session, ~7s in: if the encoder delivered <0.4 chunks/sec on
+    // MP4, it is starved and the file will be undecodable (not just choppy).
+    // Flip this machine to WebM for reliability and restart the session.
+    // Runs once per session; cleared settings re-arm it.
     try {
-      const r = _clip.rec, g = rsGen;
-      if (!r || r.state === 'inactive') { rsEnter(RS_RECORDING); return; }
-      try {
-        r.onstop = () => {
-          try { if (g !== rsGen || rsState !== RS_ROTATING) return; } catch { return; }
-          try { clipStashPrev(_clip.chunks.slice(), _clip.mime, Date.now() - (_clip.segStartedAt || Date.now())); } catch {}
-          try { _clip.rec = null; _clip.chunks = []; _clip.chunkBytes = 0; } catch {}
-          rsEnter(RS_RECORDING);
-        };
-      } catch { rsEnter(RS_RECORDING); return; }
-      try { r.requestData(); } catch {}
-      try { r.stop(); } catch { rsEnter(RS_RECORDING); return; }
-      try { rsRotT = setTimeout(() => { try { if (rsState === RS_ROTATING) rsEnter(RS_RECORDING); } catch {} }, 3000); } catch {}
-    } catch { try { rsEnter(RS_RECORDING); } catch {} }
+      if (_clip.cadChecked) return;
+      const age = Date.now() - (_clip.segStartedAt || Date.now());
+      if (age < 7000) return;
+      _clip.cadChecked = true;
+      if (_rsWebmFallback) return;
+      const mime = String(_clip.mime || '');
+      if (!mime.includes('mp4')) return;
+      const n = (_clip.chunks || []).length;
+      const rate = n / Math.max(1, age / 1000);
+      if (rate >= 0.4) return;
+      _rsWebmFallback = true;
+      try { logInfo(`encoder starved (${rate.toFixed(2)} chunks/s on MP4) - WebM fallback for reliable files`); } catch {}
+      try { toast('Encoder struggling - WebM for reliable clips (lower bitrate for MP4)', true); } catch {}
+      try { rsRecordRestart('cadence-fallback-webm'); } catch {}
+    } catch {}
+  }
+  function rsPruneWindow() {
+    // Rolling window: keep enough for the longest possible clip (buffer +
+    // aftermath + margin) and cap memory so Beast bitrates can't OOM the
+    // tab (~160MB ~= 40s at 30Mbps, full 75s+ at Ultra and below).
+    try {
+      const keepMs = rsKeepMs();
+      const now = Date.now();
+      const ch = _clip.chunks || [];
+      let cut = 0;
+      while (cut < ch.length && (now - ch[cut].t > keepMs)) cut++;
+      if (cut > 0) {
+        let freed = 0;
+        for (let i = 0; i < cut; i++) freed += ((ch[i].b && ch[i].b.size) || 0);
+        ch.splice(0, cut);
+        _clip.chunkBytes = Math.max(0, (_clip.chunkBytes || 0) - freed);
+      }
+      let total = _clip.chunkBytes || 0, drop = 0;
+      while ((ch.length - drop) > 0 && total > RS_WIN_MAX_BYTES) { total -= (((ch[drop] || {}).b && ch[drop].b.size) || 0); drop++; }
+      if (drop > 0) { ch.splice(0, drop); _clip.chunkBytes = Math.max(0, total); }
+    } catch {}
+  }
+  function clipTrackFps() {
+    // What the capture track actually delivers (0 = unknown/not flowing).
+    // This is the number that settles "recorded at 30 but plays at 3":
+    // if src reads 3, frames never reached the encoder.
+    try {
+      const vt = (_clip.stream && _clip.stream.getVideoTracks && _clip.stream.getVideoTracks()[0]) || null;
+      if (!vt) return 0;
+      const st = vt.getSettings ? vt.getSettings() : null;
+      const f = st && st.frameRate;
+      return (f && isFinite(f)) ? Math.round(f) : 0;
+    } catch { return 0; }
+  }
+  function rsRecordRestart(why) {
+    // Audio route changed (tracks are immutable) or save-grab: stop this
+    // session dead (no save, onstop detached) and start a fresh one. The
+    // window resets - the new session covers from here with correct audio.
+    try { logInfo(`rec session restart why=${why || '?'}`); } catch {}
+    try { if (_clip.rec) { try { _clip.rec.onstop = null; } catch {} try { if (_clip.rec.state !== 'inactive') _clip.rec.stop(); } catch {} } } catch {}
+    _clip.rec = null; _clip.chunks = []; _clip.chunkBytes = 0;
+    _clip.sessHead = null; _clip.sessHeadBytes = 0; _clip.sessHeadDone = false;
+    try { rsRecordStart(why); } catch {}
+  }
+  let _rsStorm = [];
+  function rsSwapGate() {
+    // Audio taps flap (game recreates contexts on scene changes). Without a
+    // gate, every flap restarts the session and clears the window, so the
+    // buffer never accumulates AND every clip comes from a seconds-old
+    // session. Cap: 3 swaps per 10s; excess waits for the next ticker pass.
+    try {
+      const now = Date.now();
+      _rsStorm = _rsStorm.filter((t) => now - t < 10000);
+      if (_rsStorm.length >= 3) {
+        try { logInfo('audio swap throttled (storm) - retrying on next pass'); } catch {}
+        return false;
+      }
+      _rsStorm.push(now);
+      return true;
+    } catch { return true; }
+  }
+  function rsWindowSlice(ms) {
+    // Newest entries covering ~ms of wall time. Single session means
+    // continuous timestamps, so the assembled blob plays buttery smooth.
+    try {
+      const ch = _clip.chunks || [];
+      if (!ch.length) return [];
+      const endT = ch[ch.length - 1].t;
+      let i = ch.length;
+      while (i > 0 && endT - ch[i - 1].t <= ms) i--;
+      return ch.slice(i);
+    } catch { return []; }
   }
   function rsSaveStep(trigger) {
     try {
       const cfg = clipCfg();
       _clip.pendingTrigger = trigger;
       if (trigger !== 'manual') { try { cnSfx('tick'); } catch {} }
-      // Last-chance audio grab: segment rolled video-only but a tap/mic is
-      // available NOW - restart with audio BEFORE the aftermath wait, so the
-      // saved file has a real audio track instead of silent video-only.
-      // (Pre-roll video is stashed as prev; MP4 can't stitch it back, but an
-      // audible aftermath beats a silent full clip.)
+      // Last-chance audio grab: rolling window is video-only but a tap/mic
+      // is available NOW - restart the session BEFORE the aftermath wait so
+      // the aftermath carries real audio. Pre-roll stays video-only in this
+      // rare case; an audible aftermath beats a silent full clip.
       try {
         if (!_clip.withAudio && trigger !== 'manual' && rsState === RS_SAVING && _clip.stream) {
           let at = null;
@@ -1898,11 +2192,9 @@
           if (at) {
             const ns = clipAttachAudio(_clip.stream, at);
             if (ns) {
-              try { clipStashForUpgrade('save-time audio grab'); } catch {}
-              try { if (_clip.rec) { try { _clip.rec.onstop = null; } catch {} try { if (_clip.rec.state !== 'inactive') _clip.rec.stop(); } catch {} } } catch {}
               _clip.stream = ns; _clip.withAudio = true;
-              try { logInfo('save-time audio grab - aftermath will carry audio'); } catch {}
-              try { rsSegment('save-grab'); } catch {}
+              try { logInfo('save-time audio grab - aftermath records with audio (new session)'); } catch {}
+              try { rsRecordRestart('save-grab'); } catch {}
             }
           } else {
             try { logInfo(`save-time: no audio source (cfgA=${cfg.audio ? 1 : 0} cfgM=${cfg.mic ? 1 : 0}) - clip will be video-only`); } catch {}
@@ -1938,49 +2230,73 @@
       if (!r || r.state === 'inactive') return fail('');
       const mime = (r.mimeType) || _clip.mime || clipPickMime(!!_clip.withAudio) || 'video/webm';
       let done = false;
-      const finish = (curChunks, curDurMs) => {
+      const finish = () => {
         if (done) return; done = true;
-        const cur = (curChunks || []).slice();
+        const cfg2 = clipCfg();
+        const wantMs = (Math.max(8, Math.min(90, Number(cfg2.len) || 30)) + Math.max(0, Math.min(10, Number(cfg2.after) || 0)) + 2) * 1000;
+        const win = rsWindowSlice(wantMs);
+        // Prepend pinned session-head chunks the window pruned away (but
+        // only the part strictly older than the window - overlapping
+        // clusters would rewind timestamps and corrupt the file again).
+        let sel = win;
+        try {
+          const head = _clip.sessHead || [];
+          if (head.length && win.length && head[0].t < win[0].t) {
+            const pre = head.filter((h) => h && h.t < win[0].t);
+            if (pre.length) {
+              sel = [...pre, ...win];
+              try { logInfo(`clip prepended ${pre.length} header chunk(s) for decodability`); } catch {}
+            }
+          }
+        } catch {}
         try {
           if (g !== rsGen || _clip.rec !== r) { rsEnter(RS_RECORDING); return null; }
           _clip.rec = null;
-          try { clipStashPrev(cur, mime, curDurMs); } catch {}
           _clip.chunks = []; _clip.chunkBytes = 0;
+          _clip.sessHead = null; _clip.sessHeadBytes = 0; _clip.sessHeadDone = false;
         } catch {}
-        rsStoreClip(trigger, cur, mime, curDurMs, cfg);
-        return cur;
+        const spanMs = sel.length > 1 ? Math.max(0, sel[sel.length - 1].t - sel[0].t) : 0;
+        rsStoreClip(trigger, sel, mime, spanMs, cfg);
+        return sel;
       };
       try {
         r.onstop = () => {
           try {
             if (g !== rsGen) return;
-            finish(_clip.chunks.slice(), Date.now() - (_clip.segStartedAt || Date.now()));
-          } catch { try { finish(null, 0); } catch {} }
+            finish();
+          } catch { try { finish(); } catch {} }
         };
       } catch { return fail(''); }
       try { r.requestData(); } catch {}
-      setTimeout(() => { try { if (g === rsGen && rsState === RS_SAVING) r.stop(); } catch { finish(null, 0); } }, 250);
-      try { rsCutT = setTimeout(() => { try { if (!done) finish(null, 0); } catch {} }, 5000); } catch {}
+      setTimeout(() => { try { if (g === rsGen && rsState === RS_SAVING) r.stop(); } catch { finish(); } }, 250);
+      try { rsCutT = setTimeout(() => { try { if (!done) finish(); } catch {} }, 5000); } catch {}
     } catch { try { rsEnter(RS_RECORDING); } catch {} return null; }
   }
-  async function rsStoreClip(trigger, curChunks, mime, curDurMs, cfg) {
+  async function rsStoreClip(trigger, entries, mime, spanMs, cfg) {
     try {
-      curChunks = curChunks || [];
+      entries = entries || [];
       cfg = cfg || clipCfg();
-      let blob = curChunks.length ? new Blob(curChunks, { type: mime }) : null;
-      let how = 'current', stitchedDur = null;
-      try { logInfo(`clip cut ${trigger} mime=${mime} withAudio=${!!_clip.withAudio} ${clipAudioLevels()}`); } catch {}
+      const parts = [];
+      for (const e of entries) { try { if (e && e.b && e.b.size > 0) parts.push(e.b); } catch {} }
+      let blob = parts.length ? new Blob(parts, { type: mime }) : null;
+      const secs = Math.max(0, (Number(spanMs) || 0) / 1000);
+      // Chunk cadence: ~1 chunk/sec is healthy (1s timeslice). Far below
+      // that, the encoder was starved - the file will play choppy no
+      // matter what the fps setting says.
+      let cadBit = '';
       try {
-        const st = await clipStitchedBlob(curChunks, mime, curDurMs, cfg);
-        if (st && st.blob && st.blob.size) {
-          blob = st.blob; how = 'stitched'; stitchedDur = st.sDur;
-          try { logInfo(`clip stitched cur=${st.cDur == null ? '?' : st.cDur.toFixed(1)}s -> ${st.sDur == null ? '?' : st.sDur.toFixed(1)}s`); } catch {}
-        } else {
-          // No stitch (rejected by probe, or no usable prev): clip length =
-          // current segment age + aftermath. Short of the buffer usually
-          // means the segment restarted recently - see 'rec seg ... why='.
-          try { logInfo(`clip unstitched: seg was ${(Number(curDurMs) / 1000).toFixed(1)}s of ${cfg.len}s buffer`); } catch {}
+        if (secs > 2 && parts.length) {
+          const cad = parts.length / secs;
+          cadBit = ` cad=${cad.toFixed(1)}/s`;
+          if (cad < 0.5) {
+            try { toast('Clip recorded with dropped frames - lower FPS/quality if it repeats', true); } catch {}
+          }
         }
+      } catch {}
+      try {
+        let srcFps = 0;
+        try { srcFps = clipTrackFps(); } catch {}
+        logInfo(`clip cut ${trigger} mime=${mime} withAudio=${!!_clip.withAudio} window=${secs.toFixed(1)}s of ${cfg.len}s buffer${srcFps ? ' src=' + srcFps + 'fps' : ''}${cadBit} ${clipAudioLevels()}`);
       } catch {}
       if (!blob || !blob.size) {
         try { toast('Clip not ready - try again in a few seconds', true); } catch {}
@@ -1989,13 +2305,15 @@
         return null;
       }
       const plays = await clipVerifyPlayable(blob);
-      if (!plays) {        try { toast('Clip corrupted - discarded, keep playing', true); } catch {}
-        try { cnSfx('err'); } catch {}
-        try { if (_clip.lastKill && trigger !== 'manual') _clip.lastKill.decision = 'corrupted'; } catch {}
-        try { rsEnter(RS_RECORDING); } catch {}
-        try { if (cnOpen) fetchCnClips(); } catch {}
-        return null;
-      }
+      // Policy: missing headers are now prepended at cut time, so a probe
+      // ERROR means the bytes genuinely don't decode. But verdicts have
+      // lied before (slow machines, decoder exhaustion), and a discarded
+      // clip is unrecoverable while a kept one can still play in VLC or
+      // after re-download. So: SAVE it, flagged suspect, toast honestly.
+      const suspect = plays !== 'ok';
+      if (plays === 'error') {
+        try { logInfo(`clip failed decode probe (${((blob.size || 0) / 1048576).toFixed(1)}MB) - saving flagged SUSPECT, check playback`); } catch {}
+      } else if (suspect) { try { logInfo('decode probe timed out under load - saving anyway (file is likely fine)'); } catch {} }
       // Persist who the clip is about (kill/death only, fresh feed only) so
       // the library can search by victim/killer name later.
       let kvKiller = null, kvVictim = null;
@@ -2006,14 +2324,23 @@
           kvVictim = String(lk.victim || '').slice(0, 32) || null;
         }
       } catch {}
-      const row = await clipStore({ trigger, mode: cnMode.code || null, layout: (cfg || clipCfg()).layout || null, killer: kvKiller, victim: kvVictim }, blob);
-      let secs = null;
-      try { secs = (how === 'stitched' && stitchedDur) ? stitchedDur : (Number(curDurMs) || 0) / 1000; } catch {}
-      try { toast(`Clip saved (${how}${secs ? ', ' + Math.round(secs) + 's' : ''}) - open My clips to watch`, false); } catch {}
-      try { cnSfx('ok'); } catch {}
-      try { if (row && _clip.lastKill && trigger !== 'manual') _clip.lastKill.decision = 'saved'; } catch {}
+      const row = await clipStore({ trigger, mode: cnMode.code || null, layout: (cfg || clipCfg()).layout || null, killer: kvKiller, victim: kvVictim, suspect: !!suspect }, blob);
+      if (!row) {
+        // Storage write failed (quota/full) - say so LOUDLY instead of a
+        // fake "saved" toast over a missing clip.
+        try { logInfo('clip library write failed (storage full?)'); } catch {}
+        try { toast('Could not save clip - browser storage full? Free space and retry', true); } catch {}
+        try { cnSfx('err'); } catch {}
+        try { rsEnter(RS_RECORDING); } catch {}
+        try { if (cnOpen) fetchCnClips(); } catch {}
+        return null;
+      }
+      try { toast(suspect ? `Clip saved (check playback, ${secs ? Math.round(secs) + 's' : 'clip'})` : `Clip saved (${secs ? Math.round(secs) + 's' : 'clip'})`, suspect, { label: 'Watch', fn: () => { try { cnShow('lib'); } catch {} } }); } catch {}
+      try { if (suspect) cnSfx('err'); else cnSfx('ok'); } catch {}
+      try { if (row && _clip.lastKill && trigger !== 'manual') _clip.lastKill.decision = suspect ? 'saved-suspect' : 'saved'; } catch {}
       try { rsEnter(RS_RECORDING); } catch {}
       try { if (cnOpen) fetchCnClips(); } catch {}
+      try { if (row) cnWhMaybeAuto(row, blob); } catch {}
       return row;
     } catch { try { rsEnter(RS_RECORDING); } catch {} return null; }
   }
@@ -2029,7 +2356,7 @@
         if (trigger === 'manual') { try { toast('Clipping is off - enable it in the panel', true); } catch {} }
         return Promise.resolve(null);
       }
-      if (rsState === RS_SAVING || rsState === RS_ROTATING) {
+      if (rsState === RS_SAVING) {
         if (trigger === 'manual') { try { toast('Finishing current clip - one sec…', true); } catch {} return Promise.resolve(null); }
         try { rsSaveQ = { trigger, at: Date.now() }; } catch {}
         try { if (cnOpen) cnRenderCurrent(); } catch {}
@@ -2067,14 +2394,29 @@
     try {
       const db = await clipDb();
       if (!db) return null;
-      const row = { id: 'c' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36), ts: Date.now(), trigger: meta.trigger || 'manual', mode: meta.mode || null, layout: meta.layout || null, fav: false, mime: blob.type || 'video/webm', size: blob.size || 0, killer: meta.killer || null, victim: meta.victim || null, blob };
+      const row = { id: 'c' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36), ts: Date.now(), trigger: meta.trigger || 'manual', mode: meta.mode || null, layout: meta.layout || null, fav: false, mime: blob.type || 'video/webm', size: blob.size || 0, killer: meta.killer || null, victim: meta.victim || null, suspect: !!meta.suspect, blob };
       await new Promise((ok, no) => { try { const tx = db.transaction('clips', 'readwrite'); tx.objectStore('clips').put(row); tx.oncomplete = ok; tx.onerror = no; } catch (e) { no(e); } });
       try {
         const all = await new Promise((rs) => { try { const tx = db.transaction('clips', 'readonly'); const q = tx.objectStore('clips').getAll(); q.onsuccess = () => rs(q.result || []); q.onerror = () => rs([]); } catch { rs([]); } });
-        if (all.length > 20) {
-          all.sort((a, b) => (a.ts || 0) - (b.ts || 0));
-          const drop = all.slice(0, all.length - 20);
+        // Evict oldest-first while over EITHER cap: 20 clips or ~600MB.
+        // Beast bitrates (30Mbps ≈ 225MB per minute) would otherwise blow
+        // the browser storage quota and every later save would fail.
+        all.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+        let total = 0;
+        for (const r of all) total += Number(r.size) || 0;
+        const drop = [];
+        while ((all.length - drop.length > 20 || total > 600 * 1024 * 1024) && drop.length < all.length) {
+          const v = all[drop.length];
+          // Never evict the clip we just saved, nor favorites, unless the
+          // count cap forces it (count cap ignores fav to bound growth).
+          if (v.id !== row.id && v.fav && (all.length - drop.length <= 20)) break;
+          if (v.id === row.id) break;
+          total -= Number(v.size) || 0;
+          drop.push(v);
+        }
+        if (drop.length) {
           await new Promise((rs) => { try { const tx = db.transaction('clips', 'readwrite'); const st = tx.objectStore('clips'); drop.forEach(r => { try { st.delete(r.id); } catch {} }); tx.oncomplete = rs; tx.onerror = rs; } catch { rs(); } });
+          try { logInfo(`library evicted ${drop.length} old clip(s)`); } catch {}
         }
       } catch {}
       try { db.close(); } catch {}
@@ -2136,28 +2478,63 @@
   async function saveClip(trigger) {
     try { return await rsSaveReq(trigger); } catch { return null; }
   }
+  const CN_STREAK_WINDOW = 12000, CN_CONFIRM_WINDOW = 15000;
+  function cnStreakName(n) {
+    try {
+      if (n === 2) return 'DOUBLE KILL';
+      if (n === 3) return 'TRIPLE KILL';
+      if (n === 4) return 'QUAD KILL';
+      return n + 'x RAMPAGE';
+    } catch { return 'MULTI KILL'; }
+  }
   function clipOnKill(killer, victim, isKill) {
     try {
       const stored = (cnMe.name || '').trim();
       const note = (decision) => { try { _clip.lastKill = { killer: String(killer || '?'), victim: String(victim || '?'), me: stored || '?', at: Date.now(), decision }; } catch {} };
-      if (!isKill) { note('knock-ignored'); return; }
-      const cfg = clipCfg();
-      if (!cfg.enabled) { note('clipping-off'); return; }
       const rawMe = stored.toLowerCase();
       const rawK = String(killer || '').replace(/<[^>]*>/g, '').trim().toLowerCase();
       const rawV = String(victim || '').replace(/<[^>]*>/g, '').trim().toLowerCase();
       const meN = cnNormName(stored).trim().toLowerCase();
       const kN = cnNormName(killer || '').trim().toLowerCase();
       const vN = cnNormName(victim || '').trim().toLowerCase();
-      const amKiller = ((meN && kN && meN === kN) || (rawMe && rawK && rawMe === rawK)) || !stored;
-      const amVictim = ((meN && vN && meN === vN) || (rawMe && rawV && rawMe === rawV));
+      const iDid = (xN, rawX) => !!((meN && xN && meN === xN) || (rawMe && rawX && rawMe === rawX));
+      if (!isKill) {
+        // Knock: stash mine so a later confirm (anyone finishes my victim)
+        // still clips. Previously knocks were pure-ignored: knocking two
+        // players and having a teammate finish both saved nothing.
+        try {
+          if (iDid(kN, rawK) && vN) {
+            const ks = (_clip.knocks || []).filter((k) => Date.now() - k.at < CN_CONFIRM_WINDOW);
+            ks.push({ victim: vN, at: Date.now() });
+            _clip.knocks = ks.slice(-5);
+            note('knock-stashed');
+            return;
+          }
+        } catch {}
+        note('knock-ignored'); return;
+      }
+      const cfg = clipCfg();
+      if (!cfg.enabled) { note('clipping-off'); return; }
+      const amKiller = iDid(kN, rawK) || !stored;
+      const amVictim = iDid(vN, rawV);
       const now = Date.now();
       if (amKiller) {
         if (!cfg.autoKill) { note('auto-off'); return; }
-        if (now - _clip.killAt < 8000) { note('debounced'); return; }
+        // Streak: 2+ of MY kills inside the window share one celebration.
+        // Bypass for streaks skips the 8s debounce (a double 3s apart is
+        // exactly what we want two clips of) and saves trigger 'streak'.
+        let n = 1;
+        try {
+          const st = _clip.streak || { n: 0, firstAt: 0 };
+          n = (now - st.firstAt < CN_STREAK_WINDOW) ? st.n + 1 : 1;
+          _clip.streak = { n, firstAt: n === 1 ? now : st.firstAt };
+        } catch {}
+        const trig = n >= 2 ? 'streak' : 'kill';
+        if (trig === 'kill' && now - _clip.killAt < 8000) { note('debounced'); return; }
         _clip.killAt = now;
         note('queued');
-        clipScheduleAuto('kill');
+        if (n >= 2) { try { toast(`${cnStreakName(n)} - clip saving`, false); } catch {} }
+        clipScheduleAuto(trig);
         return;
       }
       if (amVictim) {
@@ -2168,6 +2545,22 @@
         clipScheduleAuto('death');
         return;
       }
+      // Confirm: someone finished a player I knocked within the window.
+      // Consume the stash entry so one knock confirms exactly one clip.
+      try {
+        const ks = (_clip.knocks || []).filter((k) => now - k.at < CN_CONFIRM_WINDOW);
+        const hit = vN ? ks.findIndex((k) => k.victim === vN) : -1;
+        _clip.knocks = hit >= 0 ? ks.slice(0, hit).concat(ks.slice(hit + 1)) : ks;
+        if (hit >= 0) {
+          if (!cfg.autoKill) { note('auto-off'); return; }
+          if (now - _clip.killAt < 8000) { note('debounced'); return; }
+          _clip.killAt = now;
+          note('confirm-queued');
+          try { toast('Confirmed your knock - clip saving', false); } catch {}
+          clipScheduleAuto('kill');
+          return;
+        }
+      } catch {}
       note('not-your-kill');
     } catch {}
   }
@@ -2192,14 +2585,46 @@
       _cnObjUrls.clear();
     } catch {}
   }
+  // Inter, loaded once from Google Fonts with display=swap: if it can't
+  // load (offline, blocked), every stack falls back to Segoe UI / system-ui
+  // with zero breakage. One stylesheet request, cached by the browser.
+  function cnEnsureFont() {
+    try {
+      if (document.getElementById('cn-inter-font')) return;
+      const head = document.head || document.documentElement;
+      if (!head) return;
+      try {
+        const pre = document.createElement('link');
+        pre.rel = 'preconnect';
+        pre.href = 'https://fonts.gstatic.com';
+        pre.crossOrigin = 'anonymous';
+        head.appendChild(pre);
+      } catch {}
+      const link = document.createElement('link');
+      link.id = 'cn-inter-font';
+      link.rel = 'stylesheet';
+      link.href = 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700;800&display=swap';
+      head.appendChild(link);
+      // Warm the faces early so the watermark canvas picks up real Inter
+      // instead of fallback on its first paint.
+      try { if (document.fonts && document.fonts.load) { document.fonts.load('800 20px Inter'); document.fonts.load('700 14px Inter'); } } catch {}
+    } catch {}
+  }
   function cnEnsureStyle() {
     try {
-      if (document.getElementById('cn-style')) return;
+      const ex = document.getElementById('cn-style');
+      if (ex) {
+        // Rebuild once per version so new rules (timeline, editor) actually
+        // apply for updaters stuck with the old cached stylesheet.
+        try { if (ex.dataset && ex.dataset.v === CN_VERSION) return; } catch {}
+        try { ex.remove(); } catch {}
+      }
       const st = document.createElement('style');
       st.id = 'cn-style';
-      st.textContent = '#cn-fab{position:fixed;right:14px;bottom:14px;width:34px;height:34px;border-radius:50%;border:2px solid rgba(255,255,255,.25);background:#111;color:#fff;font-size:15px;cursor:pointer;z-index:2147483645;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(0,0,0,.5);font-family:Inter,system-ui,sans-serif;transition:transform 120ms ease-out}'
+      try { st.dataset.v = CN_VERSION; } catch {}
+      st.textContent = '#cn-fab{position:fixed;right:14px;bottom:14px;width:34px;height:34px;border-radius:50%;border:2px solid rgba(255,255,255,.25);background:#111;color:#fff;font-size:15px;cursor:pointer;z-index:2147483645;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(0,0,0,.5);font-family:Inter,"Segoe UI",system-ui,-apple-system,sans-serif;transition:transform 120ms ease-out}'
         + '#cn-fab:hover{transform:scale(1.1)}'
-        + '#cn-panel{position:fixed;right:14px;bottom:58px;width:360px;max-width:92vw;max-height:80vh;display:none;flex-direction:column;background:#111;border:1px solid rgba(255,255,255,.12);border-radius:14px;z-index:2147483646;overflow:hidden;font-family:Inter,system-ui,sans-serif;box-shadow:0 12px 48px rgba(0,0,0,.6);opacity:0;transform:scale(.94);transform-origin:bottom right;transition:opacity 160ms ease-out,transform 160ms ease-out}'
+        + '#cn-panel{position:fixed;right:14px;bottom:58px;width:400px;max-width:94vw;max-height:82vh;display:none;flex-direction:column;background:#111;border:1px solid rgba(255,255,255,.12);border-radius:14px;z-index:2147483646;overflow:hidden;font-family:Inter,"Segoe UI",system-ui,-apple-system,sans-serif;box-shadow:0 12px 48px rgba(0,0,0,.6);opacity:0;transform:scale(.94);transform-origin:bottom right;transition:opacity 160ms ease-out,transform 160ms ease-out}'
         + '#cn-panel.cn-show{opacity:1;transform:scale(1)}'
         + '#cn-body{overflow:auto;padding:12px 14px}'
         + '.cn-rowbtn{flex:1;min-width:120px;background:#fff;color:#000;border:0;border-radius:8px;padding:8px 0;font-size:12px;font-weight:800;cursor:pointer}'
@@ -2209,7 +2634,15 @@
         + '.cn-sel{background:#0f0f0f;color:#e5e7eb;border:1px solid rgba(255,255,255,.12);border-radius:6px;font-size:11px;padding:4px 6px}'
         + '#cn-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:2147483646;display:none;opacity:0;transition:opacity 160ms ease-out}'
         + '#cn-backdrop.cn-show{opacity:1}'
-        + '.cn-modal{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%) scale(.96);width:min(640px,94vw);aspect-ratio:4/3;max-height:86vh;display:none;flex-direction:column;background:#111;border:1px solid rgba(255,255,255,.12);border-radius:16px;z-index:2147483647;overflow:hidden;font-family:Inter,system-ui,sans-serif;box-shadow:0 12px 48px rgba(0,0,0,.6);opacity:0;transition:opacity 160ms ease-out,transform 160ms ease-out}'
+        + '.cn-modal{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%) scale(.96);width:min(720px,96vw);aspect-ratio:4/3;max-height:88vh;display:none;flex-direction:column;background:#111;border:1px solid rgba(255,255,255,.12);border-radius:16px;z-index:2147483647;overflow:hidden;font-family:Inter,"Segoe UI",system-ui,-apple-system,sans-serif;box-shadow:0 12px 48px rgba(0,0,0,.6);opacity:0;transition:opacity 160ms ease-out,transform 160ms ease-out}'
+        + '#cn-edit{width:min(780px,96vw);aspect-ratio:auto;max-height:92vh}'
+        + '#cn-set{width:min(560px,94vw);aspect-ratio:auto;max-height:90vh}'
+        + '.cn-tl{position:relative;height:84px;background:#0a0a0a;border:1px solid rgba(255,255,255,.1);border-radius:8px;overflow:hidden;touch-action:none;cursor:crosshair}'
+        + '#cn-tl-film{position:absolute;inset:0;display:flex;gap:1px;opacity:.85;pointer-events:none}'
+        + '#cn-tl-sel{position:absolute;top:0;bottom:0;background:rgb(34 211 238 / .18);border-left:2px solid #22d3ee;border-right:2px solid #22d3ee;pointer-events:none}'
+        + '.cn-tl-h{position:absolute;top:0;bottom:0;width:16px;margin-left:-8px;cursor:ew-resize;touch-action:none;z-index:2}'
+        + '.cn-tl-h:after{content:"";position:absolute;left:6px;top:0;bottom:0;width:4px;border-radius:2px;background:#22d3ee}'
+        + '#cn-tl-ph{position:absolute;top:0;bottom:0;width:2px;background:#fff;pointer-events:none;box-shadow:0 0 4px #000;z-index:1}'
         + '.cn-modal.cn-show{opacity:1;transform:translate(-50%,-50%) scale(1)}'
         + '.cn-mbody{overflow:auto;padding:12px 14px;flex:1;min-height:0}'
         + '.cn-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}'
@@ -2236,6 +2669,8 @@
         main: document.getElementById('cn-panel'),
         lib: document.getElementById('cn-lib'),
         prev: document.getElementById('cn-prev'),
+        edit: document.getElementById('cn-edit'),
+        set: document.getElementById('cn-set'),
         onb: document.getElementById('cn-onb'),
       };
     } catch { return {}; }
@@ -2247,7 +2682,7 @@
       try { if (_cnAnimT) clearTimeout(_cnAnimT); } catch {}
       cnView = view;
       cnOpen = !!view;
-      const modal = view === 'lib' || view === 'prev' || view === 'onb';
+      const modal = view === 'lib' || view === 'prev' || view === 'edit' || view === 'set' || view === 'onb';
       try {
         if (e.bd) {
           if (modal) {
@@ -2256,7 +2691,7 @@
           } else { try { e.bd.classList.remove('cn-show'); } catch {} e.bd.style.display = 'none'; }
         }
       } catch {}
-      const pairs = [[e.main, 'main'], [e.lib, 'lib'], [e.prev, 'prev'], [e.onb, 'onb']];
+      const pairs = [[e.main, 'main'], [e.lib, 'lib'], [e.prev, 'prev'], [e.edit, 'edit'], [e.set, 'set'], [e.onb, 'onb']];
       for (const [el, name] of pairs) {
         try {
           if (!el) continue;
@@ -2269,7 +2704,9 @@
           }
         } catch {}
       }
-      try { if (view !== 'main' && _cnMeterRaf) { cancelAnimationFrame(_cnMeterRaf); _cnMeterRaf = 0; } } catch {}
+      try { if (view !== 'main' && view !== 'set') cnStopMeters(); } catch {}
+      try { if (view === 'prev' || view === 'edit') cnThumbStop(); } catch {}
+      try { if (view !== 'edit') cnEditLeave(); } catch {}
       try { cnRenderCurrent(); } catch {}
       try { if (view === 'lib') fetchCnClips(); } catch {}
     } catch {}
@@ -2283,7 +2720,7 @@
       cnView = null; cnOpen = false; cnPrevId = null;
       try { if (typeof cnUntrapRelease === 'function') cnUntrapRelease(); } catch {}
       try { if (e.bd) e.bd.classList.remove('cn-show'); } catch {}
-      for (const el of [e.main, e.lib, e.prev, e.onb]) {
+      for (const el of [e.main, e.lib, e.prev, e.edit, e.set, e.onb]) {
         try { if (!el) continue; el.classList.remove('cn-show'); } catch {}
       }
       try { if (_cnAnimT) clearTimeout(_cnAnimT); } catch {}
@@ -2294,19 +2731,23 @@
             if (cnView !== null) return; // reopened meanwhile: leave it alone
             const x = cnEls();
             try { if (x.bd) x.bd.style.display = 'none'; } catch {}
-            for (const el of [x.main, x.lib, x.prev, x.onb]) {
+            for (const el of [x.main, x.lib, x.prev, x.edit, x.set, x.onb]) {
               try { if (!el) continue; el.style.display = 'none'; } catch {}
             }
           } catch {}
         }, 180);
       } catch {}
-      try { if (_cnMeterRaf) { cancelAnimationFrame(_cnMeterRaf); _cnMeterRaf = 0; } } catch {}
+      try { cnStopMeters(); } catch {}
+      try { cnEditLeave(); } catch {}
+      try { cnThumbStop(); } catch {}
       try { cnRevokeUrls(); } catch {}
     } catch {}
   }
   function cnBack() {
     try {
       if (cnView === 'prev') cnShow('lib');
+      else if (cnView === 'edit') cnShow('prev');
+      else if (cnView === 'set') cnShow('main');
       else cnHideAll();
     } catch {}
   }
@@ -2315,6 +2756,8 @@
       if (cnView === 'main') renderMain();
       else if (cnView === 'lib') renderLib();
       else if (cnView === 'prev') renderPrev();
+      else if (cnView === 'edit') renderEdit();
+      else if (cnView === 'set') renderSet();
       else if (cnView === 'onb') renderOnb();
       try { cnRefreshFab(); } catch {}
     } catch {}
@@ -2427,6 +2870,7 @@
   function cnEnsureFab() {
     try {
       cnEnsureStyle();
+      try { cnEnsureFont(); } catch {}
       if (!cnFab) {
         cnFab = document.createElement('button');
         cnFab.id = 'cn-fab';
@@ -2453,6 +2897,8 @@
       } catch {}
       try { cnEnsureModal('cn-lib'); } catch {}
       try { cnEnsureModal('cn-prev'); } catch {}
+      try { cnEnsureModal('cn-edit'); } catch {}
+      try { cnEnsureModal('cn-set'); } catch {}
       try { cnEnsureModal('cn-onb'); } catch {}
       try {
         const cfg = clipCfg();
@@ -2480,7 +2926,7 @@
   // ---- shared view helpers ----
   function cnSel(id, val, opts) { try { return `<select id="${id}" class="cn-sel">` + opts.map(([v, l]) => `<option value="${v}"${String(v) === String(val) ? ' selected' : ''}>${l}</option>`).join('') + `</select>`; } catch { return ''; } }
   function cnChk(id, on, label) { try { return `<label style="display:flex;align-items:center;gap:6px;font-size:11px;color:#e5e7eb;cursor:pointer"><input type="checkbox" id="${id}"${on ? ' checked' : ''} style="accent-color:#fff"> ${label}</label>`; } catch { return ''; } }
-  function cnBadge(t) { try { return { kill: '#ef4444', death: '#f59e0b', win: '#10b981', manual: '#6b7280' }[t] || '#6b7280'; } catch { return '#6b7280'; } }
+  function cnBadge(t) { try { return { kill: '#ef4444', death: '#f59e0b', win: '#10b981', manual: '#6b7280', trim: '#22d3ee', streak: '#a855f7' }[t] || '#6b7280'; } catch { return '#6b7280'; } }
   function cnWhen(ts) { try { return new Date(ts || Date.now()).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }); } catch { return ''; } }
   function cnKB(n) { try { return ((Number(n) || 0) / 1024).toFixed(0) + ' KB'; } catch { return ''; } }
   function cnMimeShort() {
@@ -2513,9 +2959,16 @@
       const wmBit = _clip.wmActive ? ' · WM' : (cfg.watermark ? ' · no-WM' : '');
       const layBit = cfg.layout === 'vertical' ? ' · 9:16' : '';
       if (rsState === RS_SAVING) return `Saving ${(_clip.pendingTrigger || 'clip')} clip…`;
-      if (rsState === RS_ROTATING) return 'switching segment…';
       if (rsState === RS_RECORDING) {
-        if (rsDataReady()) return `REC seg ${segAge}/${cfg.len}s · ${cfg.fps}fps ${cnMimeShort()}${audioBit}${wmBit}${layBit}`;
+        if (rsDataReady()) {
+          let srcBit = '';
+          try { const sf = clipTrackFps(); if (sf > 0) srcBit = ` · src ${sf}fps`; } catch {}
+          let paintBit = '';
+          try { if (_clip.wmActive && _cnComp.pfps > 0) paintBit = ` · paint ${_cnComp.pfps}fps`; } catch {}
+          let gameBit = '';
+          try { if (_cnFpsAvg > 0) gameBit = ` · game ${Math.round(_cnFpsAvg)}fps`; } catch {}
+          return `REC ${segAge}/${cfg.len}s window · ${cnFpsLabel(cfg.fps)}fps${srcBit}${paintBit}${gameBit} ${cnMimeShort()}${audioBit}${wmBit}${layBit}`;
+        }
         return 'buffering…';
       }
       return (_clip.lastErr || 'starting…');
@@ -2578,29 +3031,134 @@
       on('fab-visible', (e) => clipSet('cn_fab_visible', e.target.checked));
       on('sounds', (e) => clipSet('cn_sounds', e.target.checked));
       on('clip-len', (e) => clipSet('cn_clip_len', Number(e.target.value) || 30));
-      on('clip-fps', (e) => clipSet('cn_clip_fps', Number(e.target.value) || 15));
+      on('clip-fps', (e) => { const v = e.target.value; clipSet('cn_clip_fps', v === 'unlimited' ? 'unlimited' : (Number(v) || 15)); });
       on('clip-bitrate', (e) => clipSet('cn_clip_bitrate', Number(e.target.value) || 1500000));
       on('clip-after', (e) => { const v = Number(e.target.value); clipSet('cn_clip_after', isNaN(v) ? 5 : Math.max(0, Math.min(10, v))); });
       on('clip-layout', (e) => clipSet('cn_clip_layout', e.target.value === 'vertical' ? 'vertical' : 'landscape'));
+      on('clip-format', (e) => clipSet('cn_clip_format', e.target.value === 'webm' ? 'webm' : 'mp4'));
       on('clip-preset', (e) => { try { cnApplyPreset(e.target.value); } catch {} });
-      const wm = (id, key) => { const el = g(id); if (el) el.onchange = (e) => { try { GMSet(key, e.target.checked); } catch {} try { _cnComp.labelKey = ''; } catch {} try { if (typeof cnRenderCurrent === 'function') cnRenderCurrent(); } catch {} }; };
+      const wm = (id, key) => { const el = g(id); if (el) el.onchange = (e) => { try { GMSet(key, e.target.checked); } catch {} try { clipCfgApplyKey(key, e.target.checked); } catch {} try { _cnComp.labelKey = ''; } catch {} try { if (typeof cnRenderCurrent === 'function') cnRenderCurrent(); } catch {} }; };
       wm('wm-name', 'cn_wm_name'); wm('wm-mode', 'cn_wm_mode'); wm('wm-brand', 'cn_wm_brand');
-      on('wm-pos', (e) => { const v = String(e.target.value || 'br'); try { GMSet('cn_wm_pos', ['tl', 'tc', 'tr', 'bl', 'bc', 'br'].includes(v) ? v : 'br'); } catch {} try { if (typeof cnRenderCurrent === 'function') cnRenderCurrent(); } catch {} });
+      on('wm-pos', (e) => { const v = String(e.target.value || 'br'); const vv = ['tl', 'tc', 'tr', 'bl', 'bc', 'br'].includes(v) ? v : 'br'; try { GMSet('cn_wm_pos', vv); } catch {} try { clipCfgApplyKey('cn_wm_pos', vv); } catch {} try { _cnComp.labelKey = ''; } catch {} try { if (typeof cnRenderCurrent === 'function') cnRenderCurrent(); } catch {} });
+    } catch {}
+  }
+  // ---- hardware auto-detect: recommend (never force) a preset ----
+  // Cores via hardwareConcurrency, RAM via deviceMemory (Chrome caps it at
+  // 8, so 8 means "8 or more"), GPU via the WebGL debug renderer string.
+  // SwiftShader/llvmpipe = no hardware acceleration = software encode, so
+  // lowend is the only sane pick and we say why. Detection is cached per
+  // page load (one throwaway canvas) and the recommendation is one click -
+  // user settings are never overwritten silently.
+  let _cnHw = null;
+  function cnHwDetect() {
+    try {
+      if (_cnHw) return _cnHw;
+      const hw = { cores: 0, ram: 0, gpu: '', sw: false };
+      try { hw.cores = Number(navigator.hardwareConcurrency) || 0; } catch {}
+      try { hw.ram = Number(navigator.deviceMemory) || 0; } catch {}
+      try {
+        const cv = document.createElement('canvas');
+        const gl = cv.getContext('webgl2') || cv.getContext('webgl');
+        if (!gl) { hw.sw = true; }
+        else {
+          let dbg = null;
+          try { dbg = gl.getExtension('WEBGL_debug_renderer_info'); } catch {}
+          let r = '';
+          try { r = dbg ? String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || '') : String(gl.getParameter(gl.RENDERER) || ''); } catch {}
+          hw.gpu = r.slice(0, 96);
+          if (!r || /swiftshader|llvmpipe|software|basic render/i.test(r)) hw.sw = true;
+        }
+      } catch { hw.sw = true; }
+      _cnHw = hw;
+      return hw;
+    } catch { return { cores: 0, ram: 0, gpu: '', sw: false }; }
+  }
+  function cnHwShortGpu(g) {
+    try {
+      const m = String(g || '').match(/(GeForce[^,(]*|Radeon[^,(]*|Arc[^,(]*|Iris[^,(]*|UHD Graphics[^,(]*|Apple M\d[^,(]*)/i);
+      if (m) return m[1].trim().slice(0, 40);
+      return String(g || '').slice(0, 40) || 'unknown GPU';
+    } catch { return 'unknown GPU'; }
+  }
+  function cnHwTier() {
+    try {
+      const hw = cnHwDetect();
+      const g = hw.gpu || '';
+      const m = (re) => { try { return re.test(g); } catch { return false; } };
+      let key = 'medium', why = 'balanced default';
+      if (hw.sw) { key = 'lowend'; why = 'no GPU acceleration (software rendering)'; }
+      else if (m(/rtx\s*(50|40)/i)) { key = 'beast'; why = 'RTX 40/50-class GPU'; }
+      else if (m(/rx\s*(9070|9060|7900|7800|7700)/i)) { key = 'beast'; why = 'RX 7000/9000-class GPU'; }
+      else if (m(/rtx\s*30/i) || m(/rx\s*6[789]00/i) || m(/arc\s*a7/i)) { key = (hw.cores >= 10) ? 'beast' : 'max'; why = 'strong GPU' + (hw.cores >= 10 ? ' + 10+ CPU threads' : ''); }
+      else if (m(/rtx\s*20/i) || m(/gtx\s*16/i) || m(/rx\s*6[046]00/i) || m(/arc\s*a[35]/i) || m(/apple\s*m[1-4]/i)) { key = 'max'; why = 'mid-range GPU'; }
+      else if (m(/nvidia/i)) { key = 'max'; why = 'NVIDIA GPU'; }
+      else if (m(/radeon|amd/i)) { key = 'medium'; why = 'older AMD GPU'; }
+      else if (m(/intel/i)) { key = /iris|arc/i.test(g) ? 'max' : 'medium'; why = 'integrated Intel GPU'; }
+      if (!hw.sw) {
+        if (hw.cores > 0 && hw.cores <= 4 && key !== 'lowend') { key = 'medium'; why += ' · ≤4 CPU threads'; }
+        if (hw.ram > 0 && hw.ram <= 2) { key = 'lowend'; why += ' · ≤2GB RAM'; }
+      }
+      try { if (!CN_PRESETS.find(([k]) => k === key)) key = 'medium'; } catch {}
+      return { key, why, hw };
+    } catch { return { key: 'medium', why: 'detection failed', hw: {} }; }
+  }
+  function cnHwPresetLabel(key) {
+    try {
+      const p = CN_PRESETS.find(([k]) => k === key);
+      return p ? p[1] : key;
+    } catch { return key; }
+  }
+  function cnHwRowHtml() {
+    try {
+      const t = cnHwTier();
+      const hw = t.hw || {};
+      const bits = [];
+      if (hw.cores) bits.push(hw.cores + '-thread CPU');
+      if (hw.ram) bits.push((hw.ram >= 8 ? '8+GB' : hw.ram + 'GB') + ' RAM');
+      bits.push(cnHwShortGpu(hw.gpu));
+      let cur = 'custom';
+      try { cur = cnPresetOf(clipCfg().fps, clipCfg().bitrate); } catch {}
+      const already = cur === t.key;
+      const warn = t.hw && t.hw.sw ? `<div style="font-size:10px;color:#eab308">Software rendering detected - enable hardware acceleration in the browser for smooth recording.</div>` : '';
+      return `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:11px;color:#9ca3af"><span>This PC</span><span style="color:#e5e7eb">${esc(bits.join(' · '))}</span><span>→ recommended: <b style="color:#fff">${esc(cnHwPresetLabel(t.key))}</b> <span style="color:#6b7280">(${esc(t.why)})</span></span><button id="cn-hw-apply" class="cn-keybtn">${already ? '✓ Using it' : 'Apply'}</button></div>`
+        + warn;
+    } catch { return ''; }
+  }
+  function cnHwBind() {
+    try {
+      const b = document.getElementById('cn-hw-apply');
+      if (b) b.onclick = (e) => {
+        try { if (e && e.stopPropagation) e.stopPropagation(); } catch {}
+        try {
+          const t = cnHwTier();
+          cnApplyPreset(t.key);
+          try { toast(`Applied ${cnHwPresetLabel(t.key)} for this PC`, false); } catch {}
+        } catch {}
+      };
     } catch {}
   }
   // ---- capture presets: named fps+bitrate bundles ----
   // Low-end PC (light encoder load), Medium (balanced default), Discord
-  // clips (smooth 30fps under Discord's free upload limits), Max quality.
+  // clips (smooth 30fps under Discord's free upload limits), Max quality,
+  // Beast (120fps + 30Mbps for i9 + 4080/5070-class rigs: Chrome encodes
+  // H264/VP9 on the GPU when hardware acceleration is on, so a strong GPU
+  // directly buys headroom here), Source (uncapped fps + ~20Mbps: as close
+  // to the game feed as a browser encoder gets - big files).
   // Applying a preset writes fps+bitrate and reboots the recorder once.
   const CN_PRESETS = [
     ['lowend', 'Low-end PC', 10, 1000000],
     ['medium', 'Medium', 15, 2500000],
     ['discord', 'Discord clips', 30, 2500000],
     ['max', 'Max quality', 60, 8000000],
+    ['beast', 'Beast mode (high-end)', 120, 30000000],
+    ['source', 'Source quality', 'unlimited', 20000000],
   ];
+  function cnFpsLabel(fps) {
+    try { return fps === 'unlimited' ? 'max' : String(Number(fps) || CN_DEF.fps); } catch { return '15'; }
+  }
   function cnPresetOf(fps, bitrate) {
     try {
-      for (const [k, , f, b] of CN_PRESETS) { if (Number(fps) === f && Number(bitrate) === b) return k; }
+      for (const [k, , f, b] of CN_PRESETS) { if (String(fps) === String(f) && Number(bitrate) === b) return k; }
     } catch {}
     return 'custom';
   }
@@ -2610,9 +3168,11 @@
       if (!p) return;
       try { GMSet('cn_clip_fps', p[2]); } catch {}
       try { GMSet('cn_clip_bitrate', p[3]); } catch {}
+      try { clipCfgApplyKey('cn_clip_fps', p[2]); } catch {}
+      try { clipCfgApplyKey('cn_clip_bitrate', p[3]); } catch {}
       try { clipEnsureMic(); } catch {}
       try { rsReboot('preset'); } catch {}
-      try { logInfo(`preset -> ${p[1]} (${p[2]}fps, ${(p[3] / 1000000).toFixed(1)}Mbps)`); } catch {}
+      try { logInfo(`preset -> ${p[1]} (${cnFpsLabel(p[2])}fps, ${(p[3] / 1000000).toFixed(1)}Mbps)`); } catch {}
       try { if (typeof cnRenderCurrent === 'function') cnRenderCurrent(); } catch {}
     } catch {}
   }
@@ -2621,12 +3181,14 @@
       return `<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:10px 0 4px">SETTINGS</div>`
         + `<div class="cn-set">`
         + `<div style="display:flex;gap:12px;flex-wrap:wrap">${cnChk(prefix + '-clip-enabled', cfg.enabled, 'Enable')}${cnChk(prefix + '-clip-autokill', cfg.autoKill, 'My kills')}${cnChk(prefix + '-clip-autodeath', cfg.autoDeath, 'My deaths')}${cnChk(prefix + '-clip-autowin', cfg.autoWin, 'Wins')}${cnChk(prefix + '-clip-audio', cfg.audio, 'Game audio')}${cnChk(prefix + '-clip-mic', cfg.mic, 'Mic')}${cnChk(prefix + '-clip-watermark', cfg.watermark, 'Watermark')}${cnChk(prefix + '-fab-visible', cfg.fab, 'Show button')}${cnChk(prefix + '-sounds', cfg.sounds, 'Sounds')}</div>`
-        + `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:11px;color:#9ca3af"><span>Buffer</span>${cnSel(prefix + '-clip-len', cfg.len, [[8, '8s'], [15, '15s'], [30, '30s ✓'], [45, '45s'], [60, '60s']])}<span>FPS</span>${cnSel(prefix + '-clip-fps', cfg.fps, [[10, '10'], [15, '15 ✓'], [30, '30'], [60, '60']])}</div>`
-        + `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:11px;color:#9ca3af"><span>Quality</span>${cnSel(prefix + '-clip-bitrate', cfg.bitrate, [[1500000, 'Low ✓'], [2500000, 'Medium'], [5000000, 'High'], [8000000, 'Ultra']])}<span>Aftermath</span>${cnSel(prefix + '-clip-after', cfg.after, [[0, '0s'], [3, '3s'], [5, '5s ✓'], [8, '8s']])}</div>`
-        + `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:11px;color:#9ca3af"><span>Layout</span>${cnSel(prefix + '-clip-layout', cfg.layout, [['landscape', 'Landscape 16:9'], ['vertical', 'Vertical 9:16']])}<span>Preset</span>${cnSel(prefix + '-clip-preset', cnPresetOf(cfg.fps, cfg.bitrate), [['custom', 'Custom'], ...CN_PRESETS.map(([k, l]) => [k, l])])}</div>`
+        + `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:11px;color:#9ca3af"><span>Buffer</span>${cnSel(prefix + '-clip-len', cfg.len, [[8, '8s'], [15, '15s'], [30, '30s ✓'], [45, '45s'], [60, '60s']])}<span>FPS</span>${cnSel(prefix + '-clip-fps', cfg.fps, [[10, '10'], [15, '15 ✓'], [30, '30'], [60, '60'], [120, '120'], ['unlimited', 'Unlimited']])}</div>`
+        + `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:11px;color:#9ca3af"><span>Quality</span>${cnSel(prefix + '-clip-bitrate', cfg.bitrate, [[1500000, 'Low ✓'], [2500000, 'Medium'], [5000000, 'High'], [8000000, 'Ultra'], [20000000, 'Source'], [30000000, 'Pro']])}<span>Aftermath</span>${cnSel(prefix + '-clip-after', cfg.after, [[0, '0s'], [3, '3s'], [5, '5s ✓'], [8, '8s']])}</div>`
+        + `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:11px;color:#9ca3af"><span>Layout</span>${cnSel(prefix + '-clip-layout', cfg.layout, [['landscape', 'Landscape 16:9'], ['vertical', 'Vertical 9:16']])}<span>Format</span>${cnSel(prefix + '-clip-format', cfg.format || 'mp4', [['mp4', 'MP4 (smooth)'], ['webm', 'WebM (seeking)']])}<span>Preset</span>${cnSel(prefix + '-clip-preset', cnPresetOf(cfg.fps, cfg.bitrate), [['custom', 'Custom'], ...CN_PRESETS.map(([k, l]) => [k, l])])}</div>`
+        + (cfg.format === 'webm' ? '' : `<div style="font-size:10px;color:#6b7280">MP4 plays smoothest but seeking can show blocky frames - switch to WebM if you scrub a lot.</div>`)
+        + cnHwRowHtml()
         + `<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:11px;color:#e5e7eb"><span style="color:#9ca3af">Watermark</span>${cnChk(prefix + '-wm-name', cfg.wmName, 'Name')}${cnChk(prefix + '-wm-mode', cfg.wmMode, 'Mode')}${cnChk(prefix + '-wm-brand', cfg.wmBrand, 'Brand')}</div>`
         + `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:11px;color:#9ca3af"><span>Watermark spot</span>${cnSel(prefix + '-wm-pos', cfg.wmPos, [['tl', 'Top left'], ['tc', 'Top center'], ['tr', 'Top right'], ['bl', 'Bottom left'], ['bc', 'Bottom center'], ['br', 'Bottom right']])}</div>`
-        + ((cfg.fps >= 30 && cfg.bitrate >= 2500000) ? `<div style="font-size:11px;color:#eab308">High FPS + quality can drop game FPS - try 15 FPS / Low if the game stutters.</div>` : '')
+        + ((cfg.fps === 'unlimited' || cfg.fps >= 60 || (cfg.fps >= 30 && cfg.bitrate >= 2500000)) ? `<div style="font-size:11px;color:#eab308">High FPS + quality can drop game FPS - try 15 FPS / Low if the game stutters. Unlimited captures at the game's own frame rate.</div>` : '')
         + `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:11px;color:#9ca3af"><span>Clip key</span><button id="${prefix}-key-clip" class="cn-keybtn">${esc(cfg.keyClip)}</button><span>Panel key</span><button id="${prefix}-key-panel" class="cn-keybtn">${esc(cfg.keyPanel)}</button><span>Clips key</span><button id="${prefix}-key-lib" class="cn-keybtn">${esc(cfg.keyLib)}</button></div>`
         + `</div>`;
     } catch { return ''; }
@@ -2704,16 +3266,33 @@
       } catch {}
     } catch {}
   }
-  let _cnMeterRaf = 0;
-  function cnTickMeters() {
-    // rAF loop, only while the main panel is visible. Reads the per-lane
-    // POST-GAIN AnalyserNodes so the bars reflect the current slider
-    // position, not just raw source level.
+  // Phase 3 throttle: meters paint on a 10Hz interval, not rAF. Two bars
+  // don't need 60fps - the CSS width transition already smooths motion -
+  // and each tick used to cost 2 DOM lookups + up to N analyser reads with
+  // a fresh buffer alloc each. Now: cached elements, shared buffers, and
+  // 6x fewer ticks. Loop runs only while the main panel is visible.
+  let _cnMeterT = 0;
+  let _cnMeterEls = { game: null, mic: null };
+  function cnMeterEls() {
+    // Bar nodes die on every panel re-render (innerHTML rebuild), so the
+    // cache is validated with document.contains and refreshed on miss.
     try {
-      if (cnView !== 'main') { _cnMeterRaf = 0; return; }
+      const g = _cnMeterEls.game, m = _cnMeterEls.mic;
+      if (g && m && document.contains(g) && document.contains(m)) return _cnMeterEls;
+      _cnMeterEls = { game: document.getElementById('cn-meter-game'), mic: document.getElementById('cn-meter-mic') };
+      return _cnMeterEls;
+    } catch { return _cnMeterEls; }
+  }
+  function cnTickMeters() {
+    // Reads the per-lane POST-GAIN AnalyserNodes so the bars reflect the
+    // current slider position, not just raw source level.
+    try {
+      if (cnView !== 'main' && cnView !== 'set') { try { cnStopMeters(); } catch {} return; }
+      try { if (typeof document !== 'undefined' && document.hidden) return; } catch {}
+      const els = cnMeterEls();
       ['game', 'mic'].forEach((lane) => {
         try {
-          const el = document.getElementById(`cn-meter-${lane}`);
+          const el = els[lane];
           if (!el) return;
           const L = _mixLane[lane];
           let lvl = (L && L.meter) ? clipAnLevel(L.meter) : null;
@@ -2738,12 +3317,274 @@
         } catch {}
       });
     } catch {}
-    try { _cnMeterRaf = requestAnimationFrame(cnTickMeters); } catch { _cnMeterRaf = 0; }
   }
   function cnStartMeters() {
-    try { if (!_cnMeterRaf) _cnMeterRaf = requestAnimationFrame(cnTickMeters); } catch {}
+    try {
+      _cnMeterEls = { game: null, mic: null }; // fresh render = fresh nodes
+      if (!_cnMeterT) _cnMeterT = setInterval(cnTickMeters, 100);
+      try { cnTickMeters(); } catch {} // first paint sync, no 100ms lag
+    } catch {}
   }
-  // ---- main panel: slim - status + audio mix + settings + entry points ----
+  function cnStopMeters() {
+    try { if (_cnMeterT) { clearInterval(_cnMeterT); _cnMeterT = 0; } } catch {}
+    try { _cnMeterEls = { game: null, mic: null }; } catch {}
+  }
+  // ---- Discord webhook delivery (opt-in: these bytes DO leave the PC) ----
+  // Paste a channel webhook URL -> Save checks the format, then GETs the
+  // webhook (name/avatar/channel) for the status row: green = online,
+  // red = unreachable. Auto-send watches freshly saved clips through the
+  // trigger filter; the ⇪ button in preview sends one clip on demand.
+  // Upload cap is 20MB (Discord allows >10MB only on boosted servers, so
+  // oversize-for-the-server posts fail with the HTTP status shown).
+  // Ordering guarantee: the clip is stored in the local library FIRST -
+  // a failed upload never loses the clip.
+  const CN_WH_MAX = 20 * 1024 * 1024;
+  const CN_WH_TRIGGERS = [['kill', 'Kills'], ['death', 'Deaths'], ['win', 'Wins'], ['streak', 'Streaks'], ['trim', 'Trims'], ['manual', 'Manual']];
+  let _whBusy = false;
+  const _whQueue = [];
+  function cnWhUrl() {
+    try { return String(GMGet('cn_wh_url', '') || '').trim(); } catch { return ''; }
+  }
+  function cnWhValid(u) {
+    try { return /^https:\/\/(discord\.com|discordapp\.com)\/api\/webhooks\/\d+\/[\w-]+/.test(String(u || '')); } catch { return false; }
+  }
+  function cnWhUser() {
+    // Custom name wins; falls back to the learned player name.
+    try {
+      const c = String(GMGet('cn_wh_user', '') || '').trim().slice(0, 32);
+      if (c) return c;
+    } catch {}
+    try { return String((cnMe.name || '').trim() || 'clippednow').slice(0, 32); } catch {}
+    return 'clippednow';
+  }
+  function cnWhAuto() {
+    try { return GMGet('cn_wh_auto', false) === true; } catch { return false; }
+  }
+  function cnWhTrigs() {
+    try {
+      const raw = String(GMGet('cn_wh_trigs', 'kill,streak,win') || '');
+      return raw.split(',').map((s) => s.trim()).filter(Boolean);
+    } catch { return ['kill', 'streak', 'win']; }
+  }
+  function cnWhFileName(row, blob) {
+    try {
+      const user = cnWhUser().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24) || 'clip';
+      const ext = String((blob && blob.type) || '').includes('gif') ? 'gif' : clipExt((row && row.mime) || (blob && blob.type));
+      return `clip-by-${user}-${(row && row.trigger) || 'clip'}-${(row && row.ts) || Date.now()}.${ext}`;
+    } catch { return `clip-${Date.now()}.webm`; }
+  }
+  function cnWhContent(row) {
+    // Plain and simple: "clip from Username - Date". No username override
+    // in the payload, so Discord shows the webhook's own created name.
+    try {
+      const user = cnWhUser();
+      let date = '';
+      try { date = cnWhen((row && row.ts) || Date.now()); } catch {}
+      return `clip from ${user}${date ? ' - ' + date : ''}`.slice(0, 1500);
+    } catch { return 'clip from clippednow'; }
+  }
+  function cnWhFetch(url, ms) {
+    // fetch with a hard timeout (AbortController may not exist everywhere).
+    try {
+      let timer = null;
+      let ctrl = null;
+      try { if (typeof AbortController !== 'undefined') { ctrl = new AbortController(); timer = setTimeout(() => { try { ctrl.abort(); } catch {} }, ms || 12000); } } catch {}
+      const opts = {};
+      try { if (ctrl) opts.signal = ctrl.signal; } catch {}
+      return fetch(url, opts).then((r) => { try { if (timer) clearTimeout(timer); } catch {} return r; })
+        .catch((e) => { try { if (timer) clearTimeout(timer); } catch {} throw e; });
+    } catch (e) { return Promise.reject(e); }
+  }
+  async function cnWhInfo(url) {
+    // { ok, name, avatarUrl } or { ok:false, err }. Never throws.
+    try {
+      if (!cnWhValid(url)) return { ok: false, err: 'bad-url' };
+      const r = await cnWhFetch(url, 12000);
+      if (!r || !r.ok) return { ok: false, err: 'http-' + ((r && r.status) || '?') };
+      const j = await r.json();
+      if (!j || !j.id) return { ok: false, err: 'bad-resp' };
+      const av = j.avatar ? `https://cdn.discordapp.com/avatars/${j.id}/${j.avatar}.png` : 'https://cdn.discordapp.com/embed/avatars/0.png';
+      return { ok: true, name: j.name || 'webhook', avatarUrl: av, channel: j.channel_id ? '#' + String(j.channel_id).slice(-4) : '' };
+    } catch { return { ok: false, err: 'network' }; }
+  }
+  function cnWhUpload(blob, filename, content) {
+    // Multipart POST via XHR (fetch can't report upload progress).
+    return new Promise((res) => {
+      const done = (o) => { try { res(o); } catch {} };
+      try {
+        const url = cnWhUrl();
+        if (!cnWhValid(url)) { done({ ok: false, err: 'no-webhook' }); return; }
+        const fd = new FormData();
+        try { fd.append('payload_json', JSON.stringify({ content })); } catch {}
+        try { fd.append('file', blob, filename); } catch { done({ ok: false, err: 'form' }); return; }
+        const x = new XMLHttpRequest();
+        try { x.timeout = 90000; } catch {}
+        x.open('POST', url);
+        x.onload = () => { try { done({ ok: x.status >= 200 && x.status < 300, status: x.status }); } catch { done({ ok: false, err: 'load' }); } };
+        x.onerror = () => done({ ok: false, err: 'network' });
+        x.ontimeout = () => done({ ok: false, err: 'timeout' });
+        try { x.send(fd); } catch { done({ ok: false, err: 'send' }); }
+      } catch { done({ ok: false, err: 'throw' }); }
+    });
+  }
+  function cnWhMaybeAuto(row, blob) {
+    // Called once per saved clip. Cheap gate, then queue.
+    try {
+      if (!cnWhAuto()) return;
+      if (!row || !blob || !blob.size) return;
+      if (!cnWhValid(cnWhUrl())) return;
+      if (!cnWhTrigs().includes(row.trigger)) return;
+      if (blob.size > CN_WH_MAX) { try { toast('Clip too big for Discord (20MB) - trim it shorter', true); } catch {} return; }
+      _whQueue.push({ row, blob });
+      if (_whQueue.length > 3) _whQueue.splice(0, _whQueue.length - 3); // don't spam a backlog
+      cnWhPump();
+    } catch {}
+  }
+  async function cnWhPump() {
+    if (_whBusy) return;
+    _whBusy = true;
+    try {
+      while (_whQueue.length) {
+        const j = _whQueue.shift();
+        try {
+          try { toast(`Sending ${j.row.trigger} clip to Discord…`); } catch {}
+          const r = await cnWhUpload(j.blob, cnWhFileName(j.row, j.blob), cnWhContent(j.row));
+          if (r.ok) { try { toast('Clip sent to Discord', false); } catch {} try { cnSfx('ok'); } catch {} }
+          else { try { toast(`Discord send failed (${r.status || r.err || '?'}) - clip kept in library`, true); } catch {} try { cnSfx('err'); } catch {} }
+        } catch {}
+      }
+    } catch {}
+    _whBusy = false;
+  }
+  async function cnWhSendOne(row, blob) {
+    // Manual ⇪ send from preview. Never throws.
+    try {
+      if (!cnWhValid(cnWhUrl())) { try { toast('Set a Discord webhook first (panel settings)', true); } catch {} return; }
+      if (!blob || !blob.size) { try { toast('Nothing to send', true); } catch {} return; }
+      if (blob.size > CN_WH_MAX) { try { toast('Too big for Discord (20MB) - trim it shorter first', true); } catch {} return; }
+      try { toast('Sending clip to Discord…'); } catch {}
+      const r = await cnWhUpload(blob, cnWhFileName(row, blob), cnWhContent(row));
+      if (r.ok) { try { toast('Clip sent to Discord', false); } catch {} try { cnSfx('ok'); } catch {} }
+      else { try { toast(`Discord send failed (${r.status || r.err || '?'}) - clip kept in library, check webhook`, true); } catch {} try { cnSfx('err'); } catch {} }
+    } catch {}
+  }
+  function cnWhHtml() {
+    try {
+      const has = cnWhValid(cnWhUrl());
+      // Keep unsaved drafts: renderMain rebuilds on any toggle, which would
+      // otherwise wipe a half-pasted URL.
+      let draftUrl = '', draftUser = '';
+      try { const cur = document.getElementById('cn-wh-url'); if (cur && document.contains(cur) && cur.value) draftUrl = cur.value; } catch {}
+      try { const cu = document.getElementById('cn-wh-user'); if (cu && document.contains(cu) && cu.value) draftUser = cu.value; } catch {}
+      return `<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:10px 0 4px">DISCORD WEBHOOK</div>`
+        + `<div class="cn-set">`
+        + `<div id="cn-wh-status" style="display:flex;align-items:center;gap:8px;font-size:11px;color:#9ca3af"><span id="cn-wh-dot" style="width:8px;height:8px;border-radius:50%;background:#4b5563;flex-shrink:0"></span><span id="cn-wh-info">${has ? 'checking…' : 'not set'}</span></div>`
+        + `<input id="cn-wh-url" class="cn-search" placeholder="https://discord.com/api/webhooks/…  (paste here)" value="${esc(draftUrl || cnWhUrl())}" autocomplete="off" spellcheck="false">`
+        + `<div style="display:flex;gap:8px;flex-wrap:wrap"><button id="cn-wh-save" class="cn-rowbtn">Save webhook</button><button id="cn-wh-test" class="cn-ghost">Test</button><button id="cn-wh-clear" class="cn-ghost">Remove</button></div>`
+        + `<label style="display:flex;align-items:center;gap:6px;font-size:11px;color:#e5e7eb;cursor:pointer"><input type="checkbox" id="cn-wh-auto"${cnWhAuto() ? ' checked' : ''} style="accent-color:#fff"> Auto-send new clips</label>`
+        + `<div id="cn-wh-trigs" style="display:flex;gap:12px;flex-wrap:wrap">${CN_WH_TRIGGERS.map(([v, l]) => `<label style="display:flex;align-items:center;gap:6px;font-size:11px;color:#e5e7eb;cursor:pointer"><input type="checkbox" data-cn-wh-trig="${v}"${cnWhTrigs().includes(v) ? ' checked' : ''} style="accent-color:#fff"> ${l}</label>`).join('')}</div>`
+        + `<div style="display:flex;gap:8px;align-items:center;font-size:11px;color:#9ca3af"><span>Post as</span><input id="cn-wh-user" class="cn-search" style="flex:1" placeholder="${esc(String((cnMe.name || 'player').slice(0, 32)))}" value="${esc(draftUser || String(GMGet('cn_wh_user', '') || ''))}" autocomplete="off" spellcheck="false"></div>`
+        + `<div style="font-size:10px;color:#6b7280">Sent clips leave this PC through YOUR webhook. 20MB cap (Discord allows >10MB only on boosted servers) - oversize clips are skipped with a hint. Failed uploads keep the clip in your library.</div>`
+        + `</div>`;
+    } catch { return ''; }
+  }
+  function cnWhBind() {
+    try {
+      const url = document.getElementById('cn-wh-url');
+      if (url) { try { cnUntrapInput(url); } catch {} }
+      const user = document.getElementById('cn-wh-user');
+      if (user) {
+        try { cnUntrapInput(user); } catch {}
+        user.onchange = () => { try { GMSet('cn_wh_user', String(user.value || '').trim().slice(0, 32)); } catch {} };
+      }
+      const save = document.getElementById('cn-wh-save');
+      if (save) save.onclick = () => {
+        try {
+          const u = String((document.getElementById('cn-wh-url') || {}).value || '').trim();
+          if (!cnWhValid(u)) { try { toast('That does not look like a webhook URL', true); } catch {} return; }
+          try { GMSet('cn_wh_url', u); } catch {}
+          try { toast('Webhook saved - checking…'); } catch {}
+          cnWhRefresh();
+        } catch {}
+      };
+      const clear = document.getElementById('cn-wh-clear');
+      if (clear) clear.onclick = () => {
+        try { GMSet('cn_wh_url', ''); } catch {}
+        try { GMSet('cn_wh_auto', false); } catch {}
+        try { cnRenderCurrent(); } catch {}
+      };
+      const test = document.getElementById('cn-wh-test');
+      if (test) test.onclick = async () => {
+        try {
+          if (!cnWhValid(cnWhUrl())) { try { toast('Save a webhook first', true); } catch {} return; }
+          try { toast('Sending test message…'); } catch {}
+          const fd = new FormData();
+          try { fd.append('payload_json', JSON.stringify({ content: `clip from ${cnWhUser()} - test message, webhook is live` })); } catch {}
+          try {
+            const rr = await fetch(cnWhUrl(), { method: 'POST', body: fd });
+            if (rr && rr.ok) { try { toast('Test posted - check the channel', false); } catch {} try { cnSfx('ok'); } catch {} }
+            else { try { toast(`Test failed (${(rr && rr.status) || '?'})`, true); } catch {} }
+          } catch { try { toast('Test failed - network?', true); } catch {} }
+          cnWhRefresh();
+        } catch {}
+      };
+      const auto = document.getElementById('cn-wh-auto');
+      if (auto) auto.onchange = () => {
+        try {
+          const on = !!auto.checked;
+          if (on && !cnWhValid(cnWhUrl())) { try { toast('Save a webhook first', true); } catch {} auto.checked = false; return; }
+          try { GMSet('cn_wh_auto', on); } catch {}
+          try { toast(on ? 'Auto-send on' : 'Auto-send off'); } catch {}
+        } catch {}
+      };
+      try {
+        document.querySelectorAll('[data-cn-wh-trig]').forEach((box) => {
+          box.onchange = () => {
+            try {
+              const all = Array.from(document.querySelectorAll('[data-cn-wh-trig]')).filter((b) => b.checked).map((b) => b.dataset.cnWhTrig);
+              try { GMSet('cn_wh_trigs', all.join(',')); } catch {}
+            } catch {}
+          };
+        });
+      } catch {}
+      cnWhRefresh();
+    } catch {}
+  }
+  async function cnWhRefresh() {
+    // Re-read the webhook for the status row. Stale renders bail via id.
+    try {
+      const dot = document.getElementById('cn-wh-dot'), info = document.getElementById('cn-wh-info');
+      const url = cnWhUrl();
+      if (!cnWhValid(url)) {
+        try { if (dot) dot.style.background = '#4b5563'; } catch {}
+        try { if (info) info.textContent = url ? 'invalid URL' : 'not set'; } catch {}
+        return;
+      }
+      try { if (info) info.textContent = 'checking…'; } catch {}
+      const w = await cnWhInfo(url);
+      try {
+        if (!document.getElementById('cn-wh-info')) return; // panel moved on
+        if (w.ok) {
+          if (dot) dot.style.background = '#10b981';
+          if (info) {
+            info.textContent = '';
+            try {
+              const img = document.createElement('img');
+              img.src = w.avatarUrl; img.alt = '';
+              Object.assign(img.style, { width: '16px', height: '16px', borderRadius: '50%', verticalAlign: '-3px', marginRight: '4px' });
+              img.onerror = () => { try { img.remove(); } catch {} };
+              info.appendChild(img);
+            } catch {}
+            try { info.appendChild(document.createTextNode(`${w.name} ● online`)); } catch {}
+          }
+        } else {
+          if (dot) dot.style.background = '#ef4444';
+          if (info) info.textContent = `offline (${w.err || '?'}) - check URL / channel`;
+        }
+      } catch {}
+    } catch {}
+  }
+  // ---- main panel: recorder essentials only (settings live in ⚙ view) ----
   function renderMain() {
     try {
       if (!cnPanel) return;
@@ -2757,17 +3598,17 @@
         + `<button id="cn-close" class="cn-ghost">Close</button></div>`
         + `<div id="cn-body">`
         + `<button id="cn-clip-now" class="cn-rowbtn" style="width:100%;margin-bottom:8px">● Clip now (${esc(cfg.keyClip)})</button>`
-        + `<button id="cn-open-lib" class="cn-rowbtn" style="width:100%;margin-bottom:10px;background:#171717;color:#fff;border:1px solid rgba(255,255,255,.12)">▦ Open clips (<span id="cn-open-count">…</span>)</button>`;
+        + `<button id="cn-open-lib" class="cn-rowbtn" style="width:100%;margin-bottom:8px;background:#171717;color:#fff;border:1px solid rgba(255,255,255,.12)">▦ Open clips (<span id="cn-open-count">…</span>)</button>`
+        + `<button id="cn-open-set" class="cn-ghost" style="width:100%;margin-bottom:10px">⚙ Settings & audio</button>`;
       try {
         const lk = _clip.lastKill;
         if (lk && lk.at) {
           const ago = Math.max(0, Math.round((Date.now() - lk.at) / 1000));
-          const why = { queued: 'clip queued', saved: 'clip saved', 'not-your-kill': 'skipped (not your kill)', 'knock-ignored': 'skipped (knock)', debounced: 'skipped (too soon)', 'auto-off': 'auto-clip off', 'clipping-off': 'clipping off', corrupted: 'discarded (corrupted)' }[lk.decision] || lk.decision || '';
+          const why = { queued: 'clip queued', saved: 'clip saved', 'saved-suspect': 'clip saved - check playback', 'not-your-kill': 'skipped (not your kill)', 'knock-ignored': 'skipped (knock)', 'knock-stashed': 'knock noted - clips if confirmed', 'confirm-queued': 'confirm clip queued', debounced: 'skipped (too soon)', 'auto-off': 'auto-clip off', 'clipping-off': 'clipping off', corrupted: 'discarded (corrupted)' }[lk.decision] || lk.decision || '';
           html += `<div style="font-size:11px;color:#6b7280;margin:-2px 0 10px">Last killfeed: ${esc(lk.killer)} → ${esc(lk.victim)} · ${ago}s ago · ${esc(why)}</div>`;
         }
       } catch {}
-      html += cnAudioMixHtml()
-        + cnSettingsHtml(cfg, 'cn')
+      html += `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:11px;color:#9ca3af"><span>Preset</span>${cnSel('cn-main-preset', cnPresetOf(cfg.fps, cfg.bitrate), [['custom', 'Custom'], ...CN_PRESETS.map(([k, l]) => [k, l])])}<span>${cnFpsLabel(cfg.fps)}fps · ${(cfg.bitrate / 1000000).toFixed(1)}Mbps · ${cfg.len}s</span></div>`
         + `<div style="font-size:11px;color:#6b7280;padding:10px 2px 2px;line-height:1.6">100% local - clips never leave this PC.<br>made with love by @cisled</div>`
         + `</div>`;
       cnRevokeUrls();
@@ -2778,10 +3619,10 @@
       if (now) now.onclick = () => { try { cnSfx('tap'); } catch {} try { saveClip('manual'); } catch {} };
       const open = document.getElementById('cn-open-lib');
       if (open) open.onclick = () => { try { cnShow('lib'); } catch {} };
-      try { cnBindSettings('cn'); } catch {}
-      try { cnBindKeys('cn'); } catch {}
-      try { cnBindMeters('cn'); } catch {}
-      try { cnStartMeters(); } catch {}
+      const set = document.getElementById('cn-open-set');
+      if (set) set.onclick = () => { try { cnShow('set'); } catch {} };
+      const pre = document.getElementById('cn-main-preset');
+      if (pre) pre.onchange = () => { try { cnApplyPreset(pre.value); } catch {} };
       try {
         clipList().then((rows) => {
           try {
@@ -2793,6 +3634,32 @@
         }).catch(() => {});
       } catch {}
       cnRefreshFab();
+    } catch {}
+  }
+  // ---- settings view: full capture/audio/discord settings, away from record --
+  function renderSet() {
+    try {
+      const e = cnEls();
+      if (!e.set) return;
+      const cfg = clipCfg();
+      e.set.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-bottom:1px solid rgba(255,255,255,.08)">`
+        + `<div><b style="font-size:15px;color:#fff">⚙ Settings</b><div style="font-size:11px;color:#6b7280;margin-top:2px">applies live · recorder keeps running</div></div>`
+        + `<button id="cn-set-back" class="cn-ghost">← Recorder</button></div>`
+        + `<div class="cn-mbody">`
+        + cnAudioMixHtml()
+        + cnSettingsHtml(cfg, 'cn')
+        + cnWhHtml()
+        + `<div style="font-size:11px;color:#6b7280;padding:10px 2px 2px;line-height:1.6">Capture stays 100% local - only clips you send leave via your webhook.</div>`
+        + `</div>`;
+      const back = document.getElementById('cn-set-back');
+      if (back) back.onclick = () => { try { cnShow('main'); } catch {} };
+      try { cnBindSettings('cn'); } catch {}
+      try { cnBindKeys('cn'); } catch {}
+      try { cnBindMeters('cn'); } catch {}
+      try { cnWhBind(); } catch {}
+      try { cnHwBind(); } catch {}
+      try { cnStartMeters(); } catch {}
+      try { cnRefreshFab(); } catch {}
     } catch {}
   }
 
@@ -2808,7 +3675,7 @@
   let _cnUntrapEl = null, _cnUntrapUntil = 0, _cnUntrapTimer = null, _cnUntrapFwdOn = false;
   function cnUntrapActive() {
     try {
-      return !!(_cnUntrapEl && document.contains(_cnUntrapEl) && Date.now() <= _cnUntrapUntil && cnView === 'lib');
+      return !!(_cnUntrapEl && document.contains(_cnUntrapEl) && Date.now() <= _cnUntrapUntil && (cnView === 'lib' || cnView === 'set'));
     } catch { return false; }
   }
   function cnUntrapRelease() { try { _cnUntrapEl = null; _cnUntrapUntil = 0; } catch {} }
@@ -2882,7 +3749,7 @@
               if (!cur || !cnUntrapActive()) {
                 // Releasing here would drop mid-typing after 60s; the active
                 // gate already expired, just stop polling until re-engaged.
-                if (!cur || !document.contains(cur) || cnView !== 'lib') { try { clearInterval(_cnUntrapTimer); } catch {} _cnUntrapTimer = null; }
+                if (!cur || !document.contains(cur) || (cnView !== 'lib' && cnView !== 'set')) { try { clearInterval(_cnUntrapTimer); } catch {} _cnUntrapTimer = null; }
                 return;
               }
               if (document.activeElement === cur) return;
@@ -2890,7 +3757,8 @@
               try {
                 const e = cnEls();
                 const ae = document.activeElement;
-                if (ae && ae !== document.body && e.lib && e.lib.contains(ae)) { cnUntrapRelease(); return; }
+                const inPanel = (p) => { try { return ae && ae !== document.body && p && p.contains(ae); } catch { return false; } };
+                if (inPanel(e.lib) || inPanel(e.set)) { cnUntrapRelease(); return; }
               } catch {}
               try { cur.focus(); } catch {}
             } catch {}
@@ -2949,6 +3817,72 @@
       } else cnLibBody();
     } catch {}
   }
+  // ---- lazy thumbnails (library grid used to decode all 20 videos at once) ----
+  // Old path assigned src to every grid video on render: up to 20 blob URLs
+  // decoding simultaneously = the library lag. Now: preload="none", load on
+  // visibility with a 240px prefetch margin, cap 8 live decoders FIFO
+  // (preferring to evict off-screen thumbs so scroll-back stays instant).
+  let _cnThumbObs = null;
+  const _cnThumbLive = [];
+  function cnThumbUnload(v) {
+    try {
+      const u = v.__cnUrl || '';
+      try { v.removeAttribute('src'); } catch {}
+      try { v.load(); } catch {}
+      if (u) { try { URL.revokeObjectURL(u); } catch {} try { _cnObjUrls.delete(u); } catch {} }
+      try { v.__cnUrl = ''; } catch {}
+      const ix = _cnThumbLive.indexOf(v);
+      if (ix >= 0) _cnThumbLive.splice(ix, 1);
+    } catch {}
+  }
+  function cnThumbLoad(v, r) {
+    try {
+      if (!v || !r || !r.blob || v.__cnUrl) return;
+      while (_cnThumbLive.length >= 8) {
+        let victim = -1;
+        for (let i = 0; i < _cnThumbLive.length; i++) {
+          if (_cnThumbLive[i] === v) continue;
+          if (!_cnThumbLive[i].__cnVis) { victim = i; break; }
+          if (victim < 0) victim = i;
+        }
+        if (victim < 0) break;
+        cnThumbUnload(_cnThumbLive[victim]);
+      }
+      const u = cnTrackUrl(URL.createObjectURL(r.blob));
+      try { v.__cnUrl = u; } catch {}
+      try { v.preload = 'metadata'; } catch {}
+      v.src = u;
+      _cnThumbLive.push(v);
+    } catch {}
+  }
+  function cnThumbObserve(body, byId) {
+    try {
+      try { if (_cnThumbObs) _cnThumbObs.disconnect(); } catch {}
+      _cnThumbObs = null;
+      _cnThumbLive.length = 0; // new render = new nodes; old URLs die with renderLib's revoke
+      const loadFor = (v) => { try { cnThumbLoad(v, byId[v.dataset.cnVid]); } catch {} };
+      let scroller = null;
+      try { scroller = (body.closest && body.closest('.cn-mbody')) || null; } catch {}
+      if (typeof IntersectionObserver === 'undefined' || !scroller) {
+        body.querySelectorAll('video[data-cn-vid]').forEach(loadFor);
+        return;
+      }
+      _cnThumbObs = new IntersectionObserver((ents) => {
+        try {
+          for (const en of ents) {
+            try { en.target.__cnVis = !!en.isIntersecting; } catch {}
+            if (en.isIntersecting) loadFor(en.target);
+          }
+        } catch {}
+      }, { root: scroller, rootMargin: '240px 0px', threshold: 0 });
+      body.querySelectorAll('video[data-cn-vid]').forEach((v) => { try { _cnThumbObs.observe(v); } catch {} });
+    } catch {}
+  }
+  function cnThumbStop() {
+    try { if (_cnThumbObs) _cnThumbObs.disconnect(); } catch {}
+    _cnThumbObs = null;
+    try { _cnThumbLive.length = 0; } catch {}
+  }
   function cnLibBody() {
     try {
       const body = document.getElementById('cn-lib-body');
@@ -2961,6 +3895,18 @@
         try {
           const mb = ((cnClips || []).reduce((a, r) => a + (r.size || 0), 0) / 1048576).toFixed(1);
           sub.textContent = `${rows.length} of ${(cnClips || []).length} · ${mb} MB`;
+          try {
+            if (navigator.storage && navigator.storage.estimate) {
+              navigator.storage.estimate().then((est) => {
+                try {
+                  if (!est || !est.quota) return;
+                  const el = document.getElementById('cn-lib-sub');
+                  if (!el) return;
+                  el.textContent += ` / ~${(est.quota / 1048576).toFixed(0)} MB`;
+                } catch {}
+              }).catch(() => {});
+            }
+          } catch {}
         } catch {}
       }
       if (!body) return;
@@ -2974,20 +3920,18 @@
         const lay = r.layout === 'vertical' ? ' · 9:16' : '';
         const vs = (r.trigger !== 'manual' && (r.killer || r.victim)) ? ` · ${esc(r.killer || '?')} → ${esc(r.victim || '?')}` : '';
         const head = `<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px"><span style="font-size:10px;font-weight:800;color:#fff;background:${cnBadge(r.trigger)};border-radius:4px;padding:2px 6px">${esc((r.trigger || 'manual').toUpperCase())}</span>`
+          + (r.suspect ? `<span style="font-size:10px;font-weight:800;color:#000;background:#eab308;border-radius:4px;padding:2px 6px" title="Decode check failed - may not play in browser, try VLC">⚠ CHECK</span>` : '')
           + `<span style="font-size:11px;color:#9ca3af;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(cnWhen(r.ts))} · ${cnKB(r.size)}${r.mode ? ' · ' + esc(cnGmLabel(r.mode)) : ''}${lay}${vs}</span>`
           + `<button data-cn-fav="${r.id}" class="cn-star" title="Favorite">${star}</button></div>`;
         if (mode === 'grid') {
-          return `<div class="cn-card" data-cn-open="${r.id}" style="cursor:pointer;margin-bottom:0;${vert ? 'grid-column:span 1' : ''}">${head}<video data-cn-vid="${r.id}" preload="metadata" muted playsinline class="cn-thumb"></video></div>`;
+          return `<div class="cn-card" data-cn-open="${r.id}" style="cursor:pointer;margin-bottom:0;${vert ? 'grid-column:span 1' : ''}">${head}<video data-cn-vid="${r.id}" preload="none" muted playsinline class="cn-thumb"></video></div>`;
         }
-        return `<div class="cn-card" data-cn-open="${r.id}" style="cursor:pointer;display:flex;gap:10px;align-items:center">${head.split('</div>')[0]}</div><div style="flex:1;min-width:0"><video data-cn-vid="${r.id}" preload="metadata" muted playsinline style="width:100%;aspect-ratio:16/9;background:#000;border-radius:6px;object-fit:cover"></video></div><button data-cn-fav="${r.id}" class="cn-star" title="Favorite" style="font-size:18px">${star}</button></div>`;
+        return `<div class="cn-card" data-cn-open="${r.id}" style="cursor:pointer;display:flex;gap:10px;align-items:center">${head.split('</div>')[0]}</div><div style="flex:1;min-width:0"><video data-cn-vid="${r.id}" preload="none" muted playsinline style="width:100%;aspect-ratio:16/9;background:#000;border-radius:6px;object-fit:cover"></video></div><button data-cn-fav="${r.id}" class="cn-star" title="Favorite" style="font-size:18px">${star}</button></div>`;
       };
       body.innerHTML = (mode === 'grid' ? `<div class="cn-grid${vert ? ' cn-vert' : ''}">` : `<div style="display:flex;flex-direction:column;gap:8px">`)
         + rows.map(card).join('') + `</div>`;
       try {
-        body.querySelectorAll('video[data-cn-vid]').forEach(v => {
-          const r = byId[v.dataset.cnVid];
-          if (r && r.blob) { try { v.src = cnTrackUrl(URL.createObjectURL(r.blob)); } catch {} }
-        });
+        cnThumbObserve(body, byId);
       } catch {}
       try {
         body.querySelectorAll('[data-cn-open]').forEach(el => {
@@ -3012,6 +3956,771 @@
       } catch {}
     } catch {}
   }
+  // ---- trim & GIF export (preview panel, 100% local) ----
+  // Trimming re-records the selected range through a hidden video element
+  // (captureStream + MediaRecorder, same mime picker as the recorder), so
+  // no muxer/transcoder is needed and it works for webm + mp4 alike. GIF
+  // export seeks through the range at 10fps/320px, median-cut quantizes
+  // each frame to 256 colors and encodes animated GIF89a with an inline
+  // LZW compressor - zero libraries, zero network, all on-device.
+  const CN_TRIM_GIF_MAX = 6, CN_GIF_FPS = 10, CN_GIF_W = 320, CN_TRIM_MIN = 0.3;
+  let _cnTrim = { id: null, dur: 0, start: 0, end: 0, busy: false, seq: 0 };
+  let _cnExportErr = '';
+  const _cnTrimDurCache = {};
+  function cnTrimStatus(txt) {
+    try { const el = document.getElementById('cn-trim-status'); if (el) el.textContent = txt; } catch {}
+  }
+  function cnDownloadBlob(blob, filename, label) {
+    try {
+      if (!blob || !blob.size) { try { toast('Export failed - try again', true); } catch {} return; }
+      const u = cnTrackUrl(URL.createObjectURL(blob));
+      const a = document.createElement('a');
+      a.href = u; a.download = filename;
+      (document.body || document.documentElement).appendChild(a); a.click(); a.remove();
+      try { toast(`Downloading ${label || 'clip'}`, false); } catch {}
+      try { cnSfx('ok'); } catch {}
+      setTimeout(() => { try { URL.revokeObjectURL(u); _cnObjUrls.delete(u); } catch {} }, 30000);
+    } catch {}
+  }
+  function cnTrimHtml() {
+    try {
+      return `<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:10px 0 4px">TRIM & EXPORT</div>`
+        + `<div class="cn-set" id="cn-trim-box">`
+        + `<div id="cn-trim-status" style="font-size:11px;color:#9ca3af">Loading duration…</div>`
+        + `<div class="cn-vol-row"><div style="display:flex;justify-content:space-between;font-size:10px;color:#9ca3af"><span>Start</span><span id="cn-trim-start-val">0.0s</span></div>`
+        + `<input id="cn-trim-start" type="range" min="0" max="1" step="0.1" value="0" disabled></div>`
+        + `<div class="cn-vol-row"><div style="display:flex;justify-content:space-between;font-size:10px;color:#9ca3af"><span>End</span><span id="cn-trim-end-val">…</span></div>`
+        + `<input id="cn-trim-end" type="range" min="0" max="1" step="0.1" value="1" disabled></div>`
+        + `<div style="display:flex;gap:8px;flex-wrap:wrap"><button id="cn-trim-dl" class="cn-rowbtn" disabled>⤓ Trimmed video</button>`
+        + `<button id="cn-trim-copy" class="cn-rowbtn" disabled title="Copy the trimmed clip, paste straight into Discord">⧉ Copy</button>`
+        + `<button id="cn-trim-gif" class="cn-rowbtn" disabled title="Best for 1-5s moments">⤓ GIF (≤${CN_TRIM_GIF_MAX}s)</button></div>`
+        + `<button id="cn-trim-save" class="cn-ghost" style="width:100%" disabled>＋ Save trim to library</button>`
+        + `</div>`;
+    } catch { return ''; }
+  }
+  function cnTrimRefresh() {
+    // Push state into the sliders + labels. Never throws.
+    try {
+      const t = _cnTrim;
+      const sS = document.getElementById('cn-trim-start'), sE = document.getElementById('cn-trim-end');
+      const vS = document.getElementById('cn-trim-start-val'), vE = document.getElementById('cn-trim-end-val');
+      if (sS) { sS.max = String(t.dur); sS.value = String(t.start); }
+      if (sE) { sE.max = String(t.dur); sE.value = String(t.end); }
+      if (vS) vS.textContent = Number(t.start).toFixed(1) + 's';
+      if (vE) vE.textContent = Number(t.end).toFixed(1) + 's';
+      if (!t.busy && t.dur > 0) {
+        const span = Math.max(0, t.end - t.start);
+        cnTrimStatus(`Selected ${span.toFixed(1)}s of ${Number(t.dur).toFixed(1)}s`);
+      }
+    } catch {}
+  }
+  function cnTrimBind(r) {
+    // (Re)wire the trim box for this clip; resolves duration async, then
+    // enables the controls. seq-guarded so a fav-toggle re-render can't let
+    // a stale probe enable another clip's buttons.
+    try {
+      const seq = ++_cnTrim.seq;
+      _cnTrim = { id: r.id, dur: 0, start: 0, end: 0, busy: false, seq };
+      const enable = (on) => {
+        try {
+          ['cn-trim-start', 'cn-trim-end', 'cn-trim-dl', 'cn-trim-copy', 'cn-trim-gif', 'cn-trim-save'].forEach((id) => {
+            const el = document.getElementById(id);
+            if (el) el.disabled = !on;
+          });
+        } catch {}
+      };
+      const paint = () => { try { if (_cnTrim.seq === seq) cnTrimRefresh(); } catch {} };
+      const sS = document.getElementById('cn-trim-start'), sE = document.getElementById('cn-trim-end');
+      if (sS) sS.oninput = () => {
+        try {
+          if (_cnTrim.seq !== seq || _cnTrim.busy) return;
+          _cnTrim.start = Math.max(0, Math.min(Number(sS.value) || 0, _cnTrim.end - CN_TRIM_MIN));
+          paint();
+          try { const v = document.getElementById('cn-edit-vid') || document.getElementById('cn-prev-vid'); if (v) v.currentTime = _cnTrim.start; } catch {}
+        } catch {}
+      };
+      if (sE) sE.oninput = () => {
+        try {
+          if (_cnTrim.seq !== seq || _cnTrim.busy) return;
+          _cnTrim.end = Math.min(_cnTrim.dur, Math.max(Number(sE.value) || 0, _cnTrim.start + CN_TRIM_MIN));
+          paint();
+          try { const v = document.getElementById('cn-edit-vid') || document.getElementById('cn-prev-vid'); if (v) v.currentTime = Math.max(0, _cnTrim.end - 0.5); } catch {}
+        } catch {}
+      };
+      const dl = document.getElementById('cn-trim-dl');
+      if (dl) dl.onclick = () => { try { cnTrimAction(r, seq, 'video'); } catch {} };
+      const cp = document.getElementById('cn-trim-copy');
+      if (cp) cp.onclick = () => { try { cnTrimAction(r, seq, 'copy'); } catch {} };
+      const gf = document.getElementById('cn-trim-gif');
+      if (gf) gf.onclick = () => { try { cnTrimAction(r, seq, 'gif'); } catch {} };
+      const sv = document.getElementById('cn-trim-save');
+      if (sv) sv.onclick = () => { try { cnTrimAction(r, seq, 'save'); } catch {} };
+      const cached = _cnTrimDurCache[r.id];
+      const gotDur = (d) => {
+        try {
+          if (_cnTrim.seq !== seq) return;
+          if (!(d && isFinite(d) && d > CN_TRIM_MIN)) { cnTrimStatus('Duration unknown - trim unavailable'); return; }
+          try { _cnTrimDurCache[r.id] = d; } catch {}
+          _cnTrim.dur = d; _cnTrim.start = 0; _cnTrim.end = d;
+          enable(true); paint();
+        } catch {}
+      };
+      if (cached && isFinite(cached) && cached > 0) gotDur(cached);
+      else if (r.blob) { try { clipProbeDuration(r.blob).then(gotDur).catch(() => { try { if (_cnTrim.seq === seq) cnTrimStatus('Duration unknown - trim unavailable'); } catch {} }); } catch {} }
+      else cnTrimStatus('No video data');
+    } catch {}
+  }
+  // ---- export progress overlay (floats above everything, cancellable) ----
+  let _cnExpOn = false, _cnExpCancel = false;
+  function cnExportShow(title) {
+    try {
+      _cnExpOn = true; _cnExpCancel = false;
+      let ov = document.getElementById('cn-export');
+      if (!ov) {
+        ov = document.createElement('div');
+        ov.id = 'cn-export';
+        Object.assign(ov.style, { position: 'fixed', left: '50%', top: '18px', transform: 'translateX(-50%)', zIndex: '2147483647', display: 'none', flexDirection: 'column', gap: '8px', background: '#111', color: '#fff', border: '1px solid rgb(255 255 255 / 14%)', borderRadius: '12px', boxShadow: '0 12px 48px rgb(0 0 0 / 60%)', fontFamily: 'Inter,"Segoe UI",system-ui,-apple-system,sans-serif', padding: '12px 14px', width: '300px', maxWidth: '90vw' });
+        ov.innerHTML = `<b id="cn-exp-title" style="font-size:13px">Exporting…</b>`
+          + `<div class="cn-meter" style="height:10px"><div id="cn-exp-fill" class="cn-meter-fill"></div></div>`
+          + `<div id="cn-exp-label" style="font-size:11px;color:#9ca3af">starting…</div>`
+          + `<button id="cn-exp-cancel" class="cn-ghost" style="align-self:flex-end">Cancel</button>`;
+        ['mousedown', 'click', 'keydown'].forEach((ev) => { try { ov.addEventListener(ev, (e) => e.stopPropagation()); } catch {} });
+        (document.body || document.documentElement).appendChild(ov);
+        const c = ov.querySelector('#cn-exp-cancel');
+        if (c) c.onclick = (e) => { try { if (e && e.stopPropagation) e.stopPropagation(); } catch {} try { _cnExpCancel = true; cnExportProg(null, 'Cancelling…'); } catch {} };
+      }
+      ov.style.display = 'flex';
+      cnExportProg(0, title || 'Exporting…');
+      try { const t = document.getElementById('cn-exp-title'); if (t) t.textContent = title || 'Exporting…'; } catch {}
+    } catch {}
+  }
+  function cnExportProg(pct, label) {
+    try {
+      if (!_cnExpOn) return;
+      const f = document.getElementById('cn-exp-fill');
+      if (f && pct != null && isFinite(pct)) f.style.width = Math.max(0, Math.min(100, Math.round(pct * 100))) + '%';
+      const l = document.getElementById('cn-exp-label');
+      if (l && label != null) l.textContent = String(label);
+    } catch {}
+  }
+  function cnExportHide() {
+    try {
+      _cnExpOn = false;
+      const ov = document.getElementById('cn-export');
+      if (ov) ov.style.display = 'none';
+    } catch {}
+  }
+  async function cnTrimAction(r, seq, kind) {
+    // Shared export flow: lock UI, produce blob via the chosen path, then
+    // download or store. Stale renders (seq mismatch) abort silently.
+    try {
+      if (_cnTrim.seq !== seq || _cnTrim.busy || _cnTrim.id !== r.id) return;
+      const start = Math.max(0, Number(_cnTrim.start) || 0);
+      const end = Math.min(_cnTrim.dur, Math.max(Number(_cnTrim.end) || 0, start + CN_TRIM_MIN));
+      if (!(end - start >= CN_TRIM_MIN)) { try { toast('Trim range too short', true); } catch {} return; }
+      if (kind === 'gif' && end - start > CN_TRIM_GIF_MAX) { try { toast(`GIF limited to ${CN_TRIM_GIF_MAX}s - shorten the range`, true); } catch {} return; }
+      _cnTrim.busy = true;
+      try { _cnExportErr = ''; } catch {}
+      try { cnExportShow(kind === 'gif' ? 'Encoding GIF' : (kind === 'copy' ? 'Copying clip' : 'Exporting video')); cnExportProg(0, 'starting…'); } catch {}
+      try {
+        ['cn-trim-start', 'cn-trim-end', 'cn-trim-dl', 'cn-trim-copy', 'cn-trim-gif', 'cn-trim-save'].forEach((id) => {
+          const el = document.getElementById(id);
+          if (el) el.disabled = true;
+        });
+      } catch {}
+      try { cnSfx('tap'); } catch {}
+      let blob = null;
+      try {
+        if (kind === 'gif') {
+          cnTrimStatus(`Encoding GIF… 0/${Math.round((end - start) * CN_GIF_FPS)} frames`);
+          blob = await cnTrimExportGif(r, start, end, seq);
+        } else {
+          cnTrimStatus('Exporting video - keep this tab audible, you will hear the clip…');
+          blob = await cnTrimExportVideo(r, start, end);
+        }
+      } catch { blob = null; }
+      try { cnExportHide(); } catch {}
+      try { if (_cnExpCancel) { try { toast('Export cancelled'); } catch {} paint0(); return; } } catch { paint0(); return; }
+      try { if (_cnTrim.seq !== seq) return; } catch { return; }
+      _cnTrim.busy = false;
+      try {
+        ['cn-trim-start', 'cn-trim-end', 'cn-trim-dl', 'cn-trim-copy', 'cn-trim-gif', 'cn-trim-save'].forEach((id) => {
+          const el = document.getElementById(id);
+          if (el) el.disabled = false;
+        });
+      } catch {}
+      if (!blob || !blob.size) { try { toast(_cnExportErr || 'Export failed - try again', true); } catch {} paint0(); return; }
+      const stamp = r.ts || Date.now();
+      if (kind === 'copy') {
+        try {
+          if (typeof ClipboardItem !== 'undefined' && navigator.clipboard && navigator.clipboard.write) {
+            await navigator.clipboard.write([new ClipboardItem({ [blob.type || 'video/webm']: blob })]);
+            try { toast('Copied - paste it into Discord', false); } catch {}
+            try { cnSfx('ok'); } catch {}
+          } else { try { toast('Copy not supported here - download instead', true); } catch {} }
+        } catch { try { toast('Copy blocked by the browser - download instead', true); } catch {} }
+        paint0();
+        return;
+      }
+      if (kind === 'save') {
+        try {
+          const row = await clipStore({ trigger: 'trim', mode: r.mode || null, layout: r.layout || null }, blob);
+          if (row) {
+            try { cnClips.unshift(row); } catch {}
+            try { toast('Trim saved to library', false); } catch {}
+            try { cnSfx('ok'); } catch {}
+            try { if (cnView === 'lib') fetchCnClips(); } catch {}
+          } else { try { toast('Could not save trim', true); } catch {} }
+        } catch { try { toast('Could not save trim', true); } catch {} }
+        paint0();
+        return;
+      }
+      const secs = Number(end - start).toFixed(1);
+      if (kind === 'gif') cnDownloadBlob(blob, `clippednow-trim-${stamp}.gif`, `GIF (${secs}s)`);
+      else cnDownloadBlob(blob, `clippednow-trim-${stamp}.${clipExt(blob.type)}`, `trimmed clip (${secs}s)`);
+      paint0();
+      function paint0() { try { if (_cnTrim.seq === seq) cnTrimRefresh(); } catch {} }
+    } catch {}
+  }
+  function cnTrimExportVideo(r, start, end) {
+    // Realtime re-record of [start, end) through a hidden media element.
+    // Audible by design: muting the element would mute the captured track
+    // in Chromium, so we warn and let the clip play out loud. Always 1x
+    // speed. Play/stall failures fail fast with a reason instead of a
+    // silent frozen-frame clip.
+    return new Promise((res) => {
+      const done = (b) => { try { res(b); } catch {} };
+      try {
+        const url = URL.createObjectURL(r.blob);
+        const v = document.createElement('video');
+        v.preload = 'auto';
+        try { v.playsInline = true; } catch {}
+        try { v.style.cssText = 'position:fixed;left:-9999px;top:0;width:320px;height:240px;'; } catch {}
+        (document.body || document.documentElement).appendChild(v);
+        let rec = null;
+        const chunks = [];
+        let finished = false;
+        const cleanup = () => {
+          try { v.pause(); } catch {}
+          try { v.removeAttribute('src'); } catch {}
+          try { v.load(); } catch {}
+          try { v.remove(); } catch {}
+          try { URL.revokeObjectURL(url); } catch {}
+        };
+        const fail = (msg) => { if (finished) return; finished = true; try { if (msg) _cnExportErr = String(msg).slice(0, 120); } catch {} try { if (rec && rec.state !== 'inactive') rec.stop(); } catch {} cleanup(); done(null); };
+        let safetyT = null, watchT = null;
+        try {
+          v.onloadedmetadata = () => {
+            try {
+              const stream = v.captureStream ? v.captureStream() : (v.mozCaptureStream ? v.mozCaptureStream() : null);
+              if (!stream) { fail(); return; }
+              let mime = clipPickMimeExport((stream.getAudioTracks() || []).length > 0);
+              const recStream = stream;
+              const opts = { videoBitsPerSecond: 5000000 };
+              if ((recStream.getAudioTracks() || []).length > 0) opts.audioBitsPerSecond = 128000;
+              if (mime) opts.mimeType = mime;
+              try { rec = new MediaRecorder(recStream, opts); } catch (e) { try { rec = new MediaRecorder(recStream); } catch (e2) { fail(); return; } }
+              rec.ondataavailable = (e) => { try { if (e.data && e.data.size) chunks.push(e.data); } catch {} };
+              rec.onstop = () => {
+                if (finished) return; finished = true;
+                try { if (watchT) clearInterval(watchT); } catch {}
+                try { if (safetyT) clearTimeout(safetyT); } catch {}
+                try {
+                  const type = rec.mimeType || mime || 'video/webm';
+                  const blob = chunks.length ? new Blob(chunks, { type }) : null;
+                  // A few KB means the encoder never got real frames (play
+                  // blocked, black track, muxer hiccup) - say so instead of
+                  // handing over a file that glitches in VLC/Chrome.
+                  if (!blob || blob.size < 4096) { cleanup(); done(null); _cnExportErr = _cnExportErr || 'Export came out empty - retry'; return; }
+                  done(blob);
+                } catch { done(null); }
+                try { stream.getTracks().forEach((t) => { try { t.stop(); } catch {} }); } catch {}
+                cleanup();
+              };
+              const begin = () => {
+                // Order matters: play FIRST, start the recorder only once
+                // frames actually flow ('playing'). Starting the recorder on
+                // a not-yet-playing element writes leader garbage that some
+                // players never recover from. No timeslice either: one blob
+                // on stop, no chunk-boundary tails on short clips.
+                let started = false;
+                const startRec = () => {
+                  try {
+                    if (finished || started) return;
+                    started = true;
+                    if (!rec || rec.state !== 'inactive') { fail(); return; }
+                    rec.start();
+                  } catch { fail(); return; }
+                };
+                try {
+                  const onPlaying = () => { try { v.removeEventListener('playing', onPlaying); } catch {} startRec(); };
+                  v.addEventListener('playing', onPlaying);
+                } catch {}
+                try {
+                  const pr = v.play();
+                  if (pr && pr.then) {
+                    pr.then(() => { /* 'playing' event starts the recorder */ }).catch(() => { fail('Playback blocked - click the game page once, then retry'); });
+                    setTimeout(() => { try { if (!finished && !started && !v.paused) startRec(); } catch {} }, 2500);
+                  } else { startRec(); }
+                } catch { fail('Playback blocked - click the game page once, then retry'); return; }
+                try {
+                  let lastT = -1, stallN = 0, ticks = 0;
+                  const t0 = Date.now();
+                  const expectMs = (end - start) * 1000;
+                  watchT = setInterval(() => {
+                    try {
+                      if (finished || _cnExpCancel) { try { clearInterval(watchT); } catch {} if (_cnExpCancel && !finished) fail(); return; }
+                      ticks++;
+                      if (v.paused && !v.ended && ticks > 30) { fail('Playback blocked - click the game page once, then retry'); return; }
+                      if (!v.paused && !v.ended) {
+                        if (lastT >= 0 && Math.abs(v.currentTime - lastT) < 0.0005) {
+                          if (++stallN >= 25) { fail('Export stalled - retry'); return; }
+                        } else { stallN = 0; lastT = v.currentTime; }
+                      }
+                      try {
+                        if (cnView === 'edit' || _cnExpOn) cnExportProg(Math.min(0.99, (Date.now() - t0) / Math.max(1, expectMs)), 'Recording…');
+                      } catch {}
+                      if (started && (v.currentTime >= end || v.ended)) {
+                        try { clearInterval(watchT); } catch {}
+                        try { v.pause(); } catch {}
+                        // Audio tail: give the encoder a beat to flush or
+                        // the last ~200ms goes silent/choppy in some players.
+                        setTimeout(() => { try { if (!finished && rec && rec.state === 'recording') rec.stop(); } catch {} }, 300);
+                      }
+                    } catch {}
+                  }, 100);
+                } catch {}
+                try { safetyT = setTimeout(() => { try { if (!finished && rec && rec.state !== 'inactive') rec.stop(); } catch {} }, Math.max(8000, (end - start) * 1000 + 10000)); } catch {}
+              };
+              try {
+                let seeked = false;
+                const onSeek = () => { if (seeked) return; seeked = true; try { v.removeEventListener('seeked', onSeek); } catch {} begin(); };
+                v.addEventListener('seeked', onSeek);
+                try { v.currentTime = Math.max(0, start); } catch { begin(); return; }
+                setTimeout(() => { if (!seeked) { seeked = true; try { v.removeEventListener('seeked', onSeek); } catch {} begin(); } }, 3000);
+              } catch { begin(); }
+            } catch { fail(); }
+          };
+        } catch { fail(); return; }
+        v.onerror = () => fail();
+        v.src = url;
+        setTimeout(() => fail(), 120000);
+      } catch { done(null); }
+    });
+  }
+  function cnSeekTo(v, t) {
+    // Resolve once the media element lands on t (or after a timeout, with
+    // whatever frame is showing - a slightly-off frame beats a stuck export).
+    return new Promise((res) => {
+      let out = false;
+      const fin = () => { if (out) return; out = true; try { v.removeEventListener('seeked', fin); } catch {} res(); };
+      try {
+        v.addEventListener('seeked', fin);
+        try { v.currentTime = t; } catch { fin(); return; }
+        setTimeout(fin, 2000);
+      } catch { fin(); }
+    });
+  }
+  function cnGifQuantize(px, npix) {
+    // Median-cut to <=256 colors on a pixel sample, then nearest-color map
+    // with an exact-hit cache (game footage has big flat areas: high hits).
+    // Returns { pal, idx, nPal } or null. Pure math, no DOM.
+    try {
+      const step = Math.max(1, Math.floor(npix / 9000));
+      const samples = [];
+      for (let i = 0; i < npix; i += step) samples.push([px[i * 4], px[i * 4 + 1], px[i * 4 + 2]]);
+      if (!samples.length) return null;
+      let boxes = [samples];
+      let guard = 0;
+      while (boxes.length < 256 && guard++ < 300) {
+        let bi = -1, bc = 0, br = -1;
+        for (let b = 0; b < boxes.length; b++) {
+          const s = boxes[b];
+          if (s.length < 2) continue;
+          const mn = [255, 255, 255], mx = [0, 0, 0];
+          for (let k = 0; k < s.length; k++) {
+            const p = s[k];
+            for (let c = 0; c < 3; c++) { if (p[c] < mn[c]) mn[c] = p[c]; if (p[c] > mx[c]) mx[c] = p[c]; }
+          }
+          for (let c = 0; c < 3; c++) { const rg = mx[c] - mn[c]; if (rg > br) { br = rg; bi = b; bc = c; } }
+        }
+        if (bi < 0 || br <= 0) break;
+        const s = boxes[bi].slice().sort((a, b) => a[bc] - b[bc]);
+        const mid = Math.max(1, s.length >> 1);
+        boxes[bi] = s.slice(0, mid);
+        boxes.push(s.slice(mid));
+      }
+      const pal = [];
+      for (const s of boxes) {
+        if (!s.length) continue;
+        let R = 0, G = 0, B = 0;
+        for (let k = 0; k < s.length; k++) { R += s[k][0]; G += s[k][1]; B += s[k][2]; }
+        pal.push([Math.round(R / s.length), Math.round(G / s.length), Math.round(B / s.length)]);
+      }
+      if (!pal.length) return null;
+      const nPal = pal.length;
+      while (pal.length < 256) pal.push([0, 0, 0]);
+      const cache = new Map();
+      const idx = new Uint8Array(npix);
+      for (let i = 0; i < npix; i++) {
+        const R = px[i * 4], G = px[i * 4 + 1], B = px[i * 4 + 2];
+        const key = (R << 16) | (G << 8) | B;
+        let m = cache.get(key);
+        if (m === undefined) {
+          let best = 0, bd = 1073741824;
+          for (let p = 0; p < nPal; p++) {
+            const c = pal[p];
+            const dr = R - c[0], dg = G - c[1], db = B - c[2];
+            const d = dr * dr + dg * dg + db * db;
+            if (d < bd) { bd = d; best = p; if (!d) break; }
+          }
+          m = best;
+          if (cache.size < 20000) cache.set(key, m);
+        }
+        idx[i] = m;
+      }
+      return { pal, idx, nPal };
+    } catch { return null; }
+  }
+  function cnGifLzw(minSize, idx) {
+    // GIF-spec LZW compressor: clear at start, DEFERRED code-size growth
+    // (bump after next passes 2^size, not when it reaches it - the decoder
+    // only learns each new table entry one code later than the encoder, so
+    // bumping early emits a wide code the decoder still reads narrow),
+    // clear + reset on table-full. Returns a plain byte array.
+    try {
+      const clear = 1 << minSize, eoi = clear + 1;
+      let codeSize = minSize + 1;
+      let next = eoi + 1;
+      const dict = new Map();
+      const out = [];
+      let acc = 0, bits = 0;
+      const emit = (code) => {
+        acc |= code << bits; bits += codeSize;
+        while (bits >= 8) { out.push(acc & 255); acc >>= 8; bits -= 8; }
+      };
+      emit(clear);
+      let prefix = idx[0];
+      for (let i = 1; i < idx.length; i++) {
+        const k = idx[i];
+        const key = prefix * 256 + k;
+        const hit = dict.get(key);
+        if (hit !== undefined) { prefix = hit; continue; }
+        emit(prefix);
+        if (next >= 4096) {
+          emit(clear);
+          dict.clear(); next = eoi + 1; codeSize = minSize + 1;
+        } else {
+          dict.set(key, next); next++;
+          if (next === (1 << codeSize) + 1 && codeSize < 12) codeSize++;
+        }
+        prefix = k;
+      }
+      emit(prefix); emit(eoi);
+      if (bits > 0) out.push(acc & 255);
+      return out;
+    } catch { return null; }
+  }
+  function cnGifEncode(frames, w, h, delayCs) {
+    // frames: [{ pal (256 entries), idx }]. Global table = frame 0 palette,
+    // each frame also carries its exact local table. Loop forever.
+    try {
+      if (!frames || !frames.length) return null;
+      const out = [];
+      const wstr = (v) => { out.push(v & 255, (v >> 8) & 255); };
+      out.push(0x47, 0x49, 0x46, 0x38, 0x39, 0x61); // GIF89a
+      wstr(w); wstr(h);
+      out.push(0xF7, 0x00, 0x00); // GCT flag, 8-bit color, 256-entry table
+      const g0 = frames[0].pal;
+      for (let i = 0; i < 256; i++) { const c = g0[i] || [0, 0, 0]; out.push(c[0] & 255, c[1] & 255, c[2] & 255); }
+      out.push(0x21, 0xFF, 0x0B); // NETSCAPE2.0 loop extension
+      const app = 'NETSCAPE2.0';
+      for (let i = 0; i < app.length; i++) out.push(app.charCodeAt(i));
+      out.push(0x03, 0x01, 0x00, 0x00, 0x00);
+      for (const f of frames) {
+        out.push(0x21, 0xF9, 0x04, 0x04); // GCE: no disposal
+        wstr(delayCs);
+        out.push(0x00, 0x00);
+        out.push(0x2C); // image descriptor, full frame
+        wstr(0); wstr(0); wstr(w); wstr(h);
+        out.push(0x87); // local table flag + 256 entries
+        for (let i = 0; i < 256; i++) { const c = f.pal[i] || [0, 0, 0]; out.push(c[0] & 255, c[1] & 255, c[2] & 255); }
+        out.push(0x08); // LZW min code size (8-bit indices)
+        const comp = cnGifLzw(8, f.idx);
+        if (!comp) return null;
+        for (let i = 0; i < comp.length; i += 255) {
+          const n = Math.min(255, comp.length - i);
+          out.push(n);
+          for (let j = 0; j < n; j++) out.push(comp[i + j]);
+        }
+        out.push(0x00);
+      }
+      out.push(0x3B);
+      return new Blob([new Uint8Array(out)], { type: 'image/gif' });
+    } catch { return null; }
+  }
+  async function cnTrimExportGif(r, start, end, seq) {
+    // Seek-step the range at CN_GIF_FPS, downscale to CN_GIF_W, quantize +
+    // encode. Aborts (null) if the preview moved on to another clip.
+    try {
+      const fps = CN_GIF_FPS;
+      const span = Math.min(end - start, CN_TRIM_GIF_MAX);
+      if (!(span > 0)) return null;
+      const url = URL.createObjectURL(r.blob);
+      const v = document.createElement('video');
+      v.muted = true; v.preload = 'auto';
+      try { v.playsInline = true; } catch {}
+      (document.body || document.documentElement).appendChild(v);
+      const cleanup = () => {
+        try { v.pause(); } catch {}
+        try { v.removeAttribute('src'); } catch {}
+        try { v.load(); } catch {}
+        try { v.remove(); } catch {}
+        try { URL.revokeObjectURL(url); } catch {}
+      };
+      const meta = await new Promise((ok) => {
+        let done = false;
+        const fin = (good) => { if (done) return; done = true; ok(good); };
+        try {
+          v.onloadedmetadata = () => fin(true);
+          v.onerror = () => fin(false);
+          v.src = url;
+          setTimeout(() => fin(false), 15000);
+        } catch { fin(false); }
+      });
+      if (!meta) { cleanup(); return null; }
+      const vw = v.videoWidth || 640, vh = v.videoHeight || 360;
+      const w = Math.max(2, Math.min(CN_GIF_W, vw));
+      const h = Math.max(2, Math.round((vh * w) / vw));
+      const cv = document.createElement('canvas');
+      cv.width = w; cv.height = h;
+      let gx = null;
+      try { gx = cv.getContext('2d', { willReadFrequently: true }); } catch {}
+      if (!gx) { try { gx = cv.getContext('2d'); } catch {} }
+      if (!gx) { cleanup(); return null; }
+      const n = Math.max(1, Math.round(span * fps));
+      const frames = [];
+      for (let k = 0; k < n; k++) {
+        try { if (_cnTrim.seq !== seq) { cleanup(); return null; } } catch { cleanup(); return null; }
+        try { if (_cnExpCancel) { cleanup(); return null; } } catch { cleanup(); return null; }
+        const t = Math.min(start + k / fps, start + span - 0.05);
+        try { await cnSeekTo(v, Math.max(0, t)); } catch {}
+        try { gx.drawImage(v, 0, 0, w, h); } catch { continue; }
+        let d = null;
+        try { d = gx.getImageData(0, 0, w, h); } catch { continue; }
+        if (!d) continue;
+        const q = cnGifQuantize(d.data, w * h);
+        if (q) frames.push(q);
+        try {
+          if (k % 5 === 4 || k === n - 1) cnTrimStatus(`Encoding GIF… ${k + 1}/${n} frames`);
+          try { cnExportProg((k + 1) / n, `Encoding GIF… ${k + 1}/${n} frames`); } catch {}
+          await new Promise((rr) => setTimeout(rr, 0)); // let the panel breathe
+        } catch {}
+      }
+      cleanup();
+      if (!frames.length) return null;
+      return cnGifEncode(frames, w, h, Math.round(100 / fps));
+    } catch { return null; }
+  }
+  // ---- editor view (timeline + filmstrip + trim + export) ----
+  // Timeline with draggable handles over a seek-built filmstrip, the same
+  // start/end sliders as fallback, and all four export actions (video,
+  // copy, GIF, save to library). Trim state (_cnTrim) is shared, so
+  // cnTrimBind/cnTrimAction work here unchanged.
+  let _cnEditId = null, _cnFilmSeq = 0, _cnTlT = 0;
+  const _cnFilmCache = new Map();
+  function cnFilmPaint(box, thumbs) {
+    try {
+      if (!box) return;
+      box.innerHTML = (thumbs || []).map((t) => `<img src="${t}" style="flex:1;min-width:0;height:100%;object-fit:cover" draggable="false">`).join('');
+    } catch {}
+  }
+  async function cnFilmBuild(r, dur, seq) {
+    // 10 thumbnails via a hidden video: seek, draw small, JPEG dataURL.
+    // Cached per clip (max 3) so reopening is instant.
+    try {
+      const box = document.getElementById('cn-tl-film');
+      if (!box) return;
+      const key = r.id + ':' + Math.round(dur);
+      if (_cnFilmCache.has(key)) { cnFilmPaint(box, _cnFilmCache.get(key)); return; }
+      box.innerHTML = `<div style="font-size:10px;color:#6b7280;margin:auto">building filmstrip…</div>`;
+      const url = URL.createObjectURL(r.blob);
+      const v = document.createElement('video');
+      v.muted = true; v.preload = 'auto';
+      try { v.style.cssText = 'position:fixed;left:-9999px;top:0;width:160px;height:90px;'; } catch {}
+      (document.body || document.documentElement).appendChild(v);
+      const cleanup = () => {
+        try { v.pause(); } catch {}
+        try { v.removeAttribute('src'); } catch {}
+        try { v.load(); } catch {}
+        try { v.remove(); } catch {}
+        try { URL.revokeObjectURL(url); } catch {}
+      };
+      const metaOk = await new Promise((ok) => {
+        let done = false;
+        const fin = (g) => { if (done) return; done = true; ok(g); };
+        try {
+          v.onloadedmetadata = () => fin(true);
+          v.onerror = () => fin(false);
+          v.src = url;
+          setTimeout(() => fin(false), 12000);
+        } catch { fin(false); }
+      });
+      if (!metaOk || seq !== _cnFilmSeq) { cleanup(); return; }
+      const N = 10, tw = 96, th = 54;
+      const cv = document.createElement('canvas');
+      cv.width = tw; cv.height = th;
+      const gx = cv.getContext('2d');
+      if (!gx) { cleanup(); return; }
+      const thumbs = [];
+      for (let k = 0; k < N; k++) {
+        if (seq !== _cnFilmSeq) { cleanup(); return; }
+        try { await cnSeekTo(v, Math.min(Math.max(0, (dur * (k + 0.5)) / N), Math.max(0, dur - 0.1))); } catch {}
+        try { gx.drawImage(v, 0, 0, tw, th); } catch { continue; }
+        try { thumbs.push(cv.toDataURL('image/jpeg', 0.55)); } catch {}
+        try { await new Promise((rr) => setTimeout(rr, 0)); } catch {}
+      }
+      cleanup();
+      if (seq !== _cnFilmSeq || !thumbs.length) return;
+      try {
+        _cnFilmCache.set(key, thumbs);
+        if (_cnFilmCache.size > 3) { try { _cnFilmCache.delete(_cnFilmCache.keys().next().value); } catch {} }
+      } catch {}
+      try { const b2 = document.getElementById('cn-tl-film'); if (b2) cnFilmPaint(b2, thumbs); } catch {}
+    } catch {}
+  }
+  function cnTlPaint() {
+    // Handles + selection + playhead from _cnTrim + editor video time.
+    try {
+      const t = _cnTrim, dur = t.dur;
+      if (!(dur > 0)) return;
+      const bar = document.getElementById('cn-tl-bar');
+      if (!bar || !document.contains(bar)) return;
+      const pct = (x) => Math.max(0, Math.min(100, (x / dur) * 100));
+      const s = pct(t.start), e = pct(t.end);
+      const h0 = document.getElementById('cn-tl-h0'), h1 = document.getElementById('cn-tl-h1');
+      const sel = document.getElementById('cn-tl-sel'), ph = document.getElementById('cn-tl-ph');
+      if (h0) h0.style.left = s + '%';
+      if (h1) h1.style.left = e + '%';
+      if (sel) { sel.style.left = s + '%'; sel.style.width = Math.max(0, e - s) + '%'; }
+      const tm = document.getElementById('cn-tl-times');
+      if (tm) tm.textContent = `${Number(t.start).toFixed(1)}s → ${Number(t.end).toFixed(1)}s (${Math.max(0, t.end - t.start).toFixed(1)}s)`;
+      try {
+        const v = document.getElementById('cn-edit-vid');
+        if (v && ph && isFinite(v.currentTime)) ph.style.left = pct(v.currentTime) + '%';
+      } catch {}
+    } catch {}
+  }
+  function cnTlBind() {
+    try {
+      try { if (_cnTlT) clearInterval(_cnTlT); } catch {}
+      _cnTlT = 0;
+      const bar = document.getElementById('cn-tl-bar');
+      if (!bar) return;
+      const tOf = (clientX) => {
+        try {
+          const rc = bar.getBoundingClientRect();
+          const f = Math.max(0, Math.min(1, (clientX - rc.left) / Math.max(1, rc.width)));
+          return f * (_cnTrim.dur || 0);
+        } catch { return 0; }
+      };
+      const seekV = (t) => { try { const v = document.getElementById('cn-edit-vid'); if (v) { try { v.pause(); } catch {} v.currentTime = Math.max(0, t); } } catch {} };
+      const dragWire = (id, isStart) => {
+        const h = document.getElementById(id);
+        if (!h || h.__cnTl) return;
+        try { h.__cnTl = true; } catch {}
+        h.addEventListener('pointerdown', (e) => {
+          try { e.stopPropagation(); e.preventDefault(); } catch {}
+          try { h.setPointerCapture(e.pointerId); } catch {}
+          const move = (ev) => {
+            try {
+              const t = tOf(ev.clientX);
+              if (!(_cnTrim.dur > 0) || _cnTrim.busy) return;
+              if (isStart) _cnTrim.start = Math.max(0, Math.min(t, _cnTrim.end - CN_TRIM_MIN));
+              else _cnTrim.end = Math.min(_cnTrim.dur, Math.max(t, _cnTrim.start + CN_TRIM_MIN));
+              try { cnTrimRefresh(); } catch {}
+              try { cnTlPaint(); } catch {}
+              seekV(isStart ? _cnTrim.start : Math.max(0, _cnTrim.end - 0.3));
+            } catch {}
+          };
+          const up = () => {
+            try { h.removeEventListener('pointermove', move); } catch {}
+            try { h.removeEventListener('pointerup', up); } catch {}
+            try { h.removeEventListener('pointercancel', up); } catch {}
+          };
+          try { h.addEventListener('pointermove', move); } catch {}
+          try { h.addEventListener('pointerup', up); } catch {}
+          try { h.addEventListener('pointercancel', up); } catch {}
+        });
+      };
+      dragWire('cn-tl-h0', true);
+      dragWire('cn-tl-h1', false);
+      if (!bar.__cnTl) {
+        try { bar.__cnTl = true; } catch {}
+        bar.addEventListener('pointerdown', (e) => {
+          try {
+            if (e.target && (e.target.id === 'cn-tl-h0' || e.target.id === 'cn-tl-h1')) return;
+            seekV(tOf(e.clientX));
+          } catch {}
+        });
+      }
+      _cnTlT = setInterval(() => { try { if (cnView !== 'edit') return; cnTlPaint(); } catch {} }, 250);
+    } catch {}
+  }
+  function cnEditLeave() {
+    try { if (_cnTlT) { clearInterval(_cnTlT); _cnTlT = 0; } } catch {}
+    try { _cnFilmSeq++; } catch {}
+  }
+  function renderEdit() {
+    try {
+      const e = cnEls();
+      if (!e.edit) return;
+      const r = (cnClips || []).find((x) => x.id === cnPrevId) || null;
+      if (!r) { cnShow('lib'); return; }
+      _cnEditId = r.id;
+      void _cnEditId;
+      e.edit.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-bottom:1px solid rgba(255,255,255,.08)">`
+        + `<div style="min-width:0"><b style="font-size:15px;color:#fff">✂ Editor</b><div style="font-size:11px;color:#6b7280;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc((r.trigger || 'clip').toUpperCase())} · ${esc(cnWhen(r.ts))} · ${cnKB(r.size)}</div></div>`
+        + `<button id="cn-edit-close" class="cn-ghost">← Preview</button></div>`
+        + `<div class="cn-mbody">`
+        + `<video id="cn-edit-vid" controls muted playsinline style="background:#000;border-radius:8px;${r.layout === 'vertical' ? 'aspect-ratio:9/16;max-height:34vh;width:auto;max-width:100%;margin:0 auto;display:block;' : 'width:100%;aspect-ratio:16/9;'}"></video>`
+        + `<div style="display:flex;gap:8px;align-items:center;margin-top:6px"><button id="cn-edit-mute" class="cn-ghost" style="flex:0 0 auto">🔇 muted</button><span style="font-size:10px;color:#6b7280">unmute to audition game audio</span></div>`
+        + `<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:10px 0 4px">TIMELINE</div>`
+        + `<div id="cn-tl-bar" class="cn-tl"><div id="cn-tl-film"></div><div id="cn-tl-sel"></div><div id="cn-tl-h0" class="cn-tl-h" title="Trim start"></div><div id="cn-tl-h1" class="cn-tl-h" title="Trim end"></div><div id="cn-tl-ph"></div></div>`
+        + `<div id="cn-tl-times" style="font-size:11px;color:#9ca3af;margin-top:4px">…</div>`
+        + `<div style="font-size:10px;color:#6b7280;margin-top:2px">drag handles · click bar to seek</div>`
+        + cnTrimHtml()
+        + `</div>`;
+      cnRevokeUrls();
+      try {
+        const v = document.getElementById('cn-edit-vid');
+        if (v && r.blob) v.src = cnTrackUrl(URL.createObjectURL(r.blob));
+        if (v) v.addEventListener('timeupdate', () => { try { if (cnView === 'edit') cnTlPaint(); } catch {} });
+      } catch {}
+      const mute = document.getElementById('cn-edit-mute');
+      if (mute) mute.onclick = (e) => {
+        try {
+          if (e && e.stopPropagation) e.stopPropagation();
+          const v = document.getElementById('cn-edit-vid');
+          if (!v) return;
+          v.muted = !v.muted;
+          mute.textContent = v.muted ? '🔇 muted' : '🔊 sound on';
+        } catch {}
+      };
+      const close = document.getElementById('cn-edit-close');
+      if (close) close.onclick = () => { try { cnShow('prev'); } catch {} };
+      try { cnTrimBind(r); } catch {}
+      try { cnTlBind(); } catch {}
+      try { cnTlPaint(); } catch {}
+      const fs = ++_cnFilmSeq;
+      const waitDur = setInterval(() => {
+        try {
+          if (fs !== _cnFilmSeq || cnView !== 'edit') { try { clearInterval(waitDur); } catch {} return; }
+          if (_cnTrim.dur > 0 && _cnTrim.id === r.id) { try { clearInterval(waitDur); } catch {} cnFilmBuild(r, _cnTrim.dur, fs); }
+        } catch { try { clearInterval(waitDur); } catch {} }
+      }, 400);
+    } catch {}
+  }
   // ---- preview panel: big preview + favorite / download / delete ----
   function renderPrev() {
     try {
@@ -3027,8 +4736,9 @@
         + `<button id="cn-prev-fav" class="cn-star" title="Favorite" style="font-size:18px">${star}</button></div>`
         + `<div class="cn-mbody">`
         + `<video id="cn-prev-vid" controls autoplay muted playsinline style="background:#000;border-radius:8px;${r.layout === 'vertical' ? 'aspect-ratio:9/16;max-height:46vh;width:auto;max-width:100%;margin:0 auto;display:block;' : 'width:100%;'}"></video>`
-        + `<div style="font-size:11px;color:#9ca3af;margin:8px 0">${r.mode ? esc(cnGmLabel(r.mode)) + ' · ' : ''}${cnKB(r.size)}${lay}${(r.trigger !== 'manual' && (r.killer || r.victim)) ? `<br>${esc(r.killer || '?')} → ${esc(r.victim || '?')}` : ''}</div>`
-        + `<div style="display:flex;gap:8px"><button id="cn-prev-dl" class="cn-rowbtn">Download</button><button id="cn-prev-del" class="cn-ghost">Delete</button></div>`
+        + `<div style="font-size:11px;color:#9ca3af;margin:8px 0">${r.mode ? esc(cnGmLabel(r.mode)) + ' · ' : ''}${cnKB(r.size)}${lay}${(r.trigger !== 'manual' && (r.killer || r.victim)) ? `<br>${esc(r.killer || '?')} → ${esc(r.victim || '?')}` : ''}${r.suspect ? `<br><span style="color:#eab308">⚠ decode check failed - try VLC / download</span>` : ''}</div>`
+        + `<div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap"><button id="cn-prev-edit" class="cn-rowbtn">✂ Edit clip</button></div>`
+        + `<div style="display:flex;gap:8px;margin-top:8px"><button id="cn-prev-dl" class="cn-rowbtn">Download</button><button id="cn-prev-wh" class="cn-rowbtn" title="Send this clip to Discord">⇪ Discord</button><button id="cn-prev-del" class="cn-ghost">Delete</button></div>`
         + `<button id="cn-prev-back" class="cn-ghost" style="width:100%;margin-top:8px">← Back to clips</button>`
         + `</div>`;
       cnRevokeUrls();
@@ -3037,6 +4747,8 @@
         const v = document.getElementById('cn-prev-vid');
         if (v && r.blob) v.src = cnTrackUrl(URL.createObjectURL(r.blob));
       } catch {}
+      const edt = document.getElementById('cn-prev-edit');
+      if (edt) edt.onclick = () => { try { cnSfx('tap'); } catch {} try { cnShow('edit'); } catch {} };
       const fav = document.getElementById('cn-prev-fav');
       if (fav) fav.onclick = () => {
         try { cnSfx('tap'); } catch {}
@@ -3049,6 +4761,8 @@
       };
       const dl = document.getElementById('cn-prev-dl');
       if (dl) dl.onclick = () => { try { cnSfx('tap'); } catch {} cnDownload(r); };
+      const wh = document.getElementById('cn-prev-wh');
+      if (wh) wh.onclick = () => { try { cnSfx('tap'); } catch {} try { cnWhSendOne(r, r.blob); } catch {} };
       const del = document.getElementById('cn-prev-del');
       if (del) del.onclick = () => {
         if (!confirm('Delete this clip?')) return;
@@ -3076,6 +4790,7 @@
         + `</div>`;
       try { cnBindSettings('ob'); } catch {}
       try { cnBindKeys('ob'); } catch {}
+      try { cnHwBind(); } catch {}
       const go = document.getElementById('cn-onb-go');
       if (go) go.onclick = () => { try { cnOnboardDone(false); } catch {} };
       const skip = document.getElementById('cn-onb-skip');
@@ -3103,7 +4818,7 @@
         try { if (e.stopImmediatePropagation) e.stopImmediatePropagation(); } catch {}
         const k = String(e.key || '');
         if (k && k !== 'Escape') {
-          try { GMSet(cnKeyCap === 'clip' ? 'cn_key_clip' : (cnKeyCap === 'lib' ? 'cn_key_lib' : 'cn_key_panel'), k); } catch {}
+          try { const gk = cnKeyCap === 'clip' ? 'cn_key_clip' : (cnKeyCap === 'lib' ? 'cn_key_lib' : 'cn_key_panel'); GMSet(gk, k); try { clipCfgApplyKey(gk, k); } catch {} } catch {}
           try { logInfo(`keybind ${cnKeyCap} -> ${k}`); } catch {}
         }
         try { cnKeyCap = null; } catch {}
@@ -3135,6 +4850,8 @@
     } catch {}
   }, true);
   setTimeout(() => {
+    try { clipCfg(); } catch {} // warm config cache off the hot path
+    try { clipVolLoad(); } catch {} // warm volume cache off the hot path
     try { cnEnsureFabWhenReady(); } catch {}
     try { clipEnsureMic(); } catch {}
     try { rsWant(); } catch {}
@@ -3152,14 +4869,56 @@
       else if (rsState === RS_RECORDING && clipCanvasChanged()) { try { rsReboot('watchdog-canvas'); } catch {} }
     } catch {}
   }, 15000);
+  // ---- game-FPS governor: notice sustained jank, suggest once ----
+  // One chained rAF callback (~5 lines per vsync, negligible): rAF slips
+  // exactly when the tab can't keep up, so its deltas ARE the visible
+  // framerate. Folded into an average every 2.5s tick; if the game holds
+  // under ~25fps for ~30s while capture settings are heavy, toast exactly
+  // what to lower - once per page load, never auto-changes settings.
+  let _cnFpsLast = 0, _cnFpsAcc = 0, _cnFpsN = 0, _cnFpsAvg = 0, _cnFpsLowWindows = 0, _cnFpsWarned = false;
+  function cnFpsTick() {
+    try {
+      let now = 0;
+      try { now = performance.now(); } catch {}
+      if (now > 0 && _cnFpsLast > 0 && now > _cnFpsLast && now - _cnFpsLast < 1000) {
+        _cnFpsAcc += now - _cnFpsLast; _cnFpsN++;
+      }
+      if (now > 0) _cnFpsLast = now;
+    } catch {}
+    try { requestAnimationFrame(cnFpsTick); } catch {}
+  }
+  function cnFpsGovern() {
+    try {
+      if (_cnFpsN > 0) {
+        _cnFpsAvg = _cnFpsN / Math.max(0.001, _cnFpsAcc / 1000);
+        _cnFpsAcc = 0; _cnFpsN = 0;
+      } else return;
+      if (rsState !== RS_RECORDING) { _cnFpsLowWindows = 0; return; }
+      if (!(_cnFpsAvg > 0) || _cnFpsAvg >= 25) { _cnFpsLowWindows = 0; return; }
+      _cnFpsLowWindows++;
+      if (_cnFpsLowWindows < 12 || _cnFpsWarned) return; // ~30s sustained
+      _cnFpsWarned = true;
+      let hint = 'lower FPS or Quality a notch';
+      try {
+        const c = clipCfg();
+        if (c.bitrate >= 20000000) hint = 'drop Quality to Ultra or lower';
+        else if (c.fps === 'unlimited' || c.fps >= 60) hint = 'drop FPS to 30';
+        else if (c.watermark) hint = 'turn off the watermark';
+      } catch {}
+      try { logInfo(`game running at ~${Math.round(_cnFpsAvg)}fps while recording - ${hint}`); } catch {}
+      try { toast(`Game at ~${Math.round(_cnFpsAvg)}fps - ${hint}`, true); } catch {}
+    } catch {}
+  }
   ['pointerdown', 'keydown', 'touchend'].forEach((ev) => {
     try { document.addEventListener(ev, () => { try { _mixGestureAt = Date.now(); } catch {} try { clipMixResume(); } catch {} }, true); } catch {}
   });
+  try { requestAnimationFrame(cnFpsTick); } catch {} // game-FPS governor sampler
   // Live indicator ticker: the dot + status line + audio hot-path track the
   // recorder without opening anything (full re-render would steal focus
   // from open inputs/sliders).
   setInterval(() => {
     try { cnRefreshFab(); } catch {}
+    try { cnFpsGovern(); } catch {}
     try { rsAudioCheck(); } catch {}
     try { clipMixRefresh(); } catch {}
     try { clipMixResume(); } catch {}

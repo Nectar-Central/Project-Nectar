@@ -27,10 +27,24 @@ except Exception:
 # ---------------------------------------------------------------------------
 
 import os as _os
+from dotenv import load_dotenv
 
 _struct_logger = logging.getLogger("engine.structured")
 _struct_logger.setLevel(logging.INFO)
 _struct_logger.propagate = False
+
+# ---------------------------------------------------------------------------
+# Verbose switch — ALL logs enabled by default.
+# Set BNC_QUIET=1 to re-enable the old gated behavior.
+# ---------------------------------------------------------------------------
+
+def _verbose() -> bool:
+    try:
+        if _os.getenv("BNC_QUIET") == "1":
+            return False
+    except Exception:
+        pass
+    return True
 
 try:
     # On Vercel use /tmp, otherwise project root /logs
@@ -104,6 +118,7 @@ TAG = {
     "ALV": _bg(59, 130, 246, _color(255, 255, 255, " ALV  ")),
     "ZONE": _bg(168, 85, 247, _color(255, 255, 255, " ZONE ")),
     "STG": _bg(249, 115, 22, _color(255, 255, 255, " STG  ")),
+    "MATCH": _bg(79, 70, 229, _color(255, 255, 255, "MATCH")),
     "STATE": _bg(124, 58, 237, _color(255, 255, 255, " STATE")),
 }
 
@@ -121,42 +136,39 @@ def _ts_iso() -> str:
 
 
 def log_sys(message: str) -> None:
-    """System/infrastructure chatter (violet). Gated behind BNC_DEBUG=1.
-
-    The console keeps exactly one clean line per meaningful event
-    (log_engine) plus ranked/error/request lines. Set BNC_DEBUG=1 in the
-    environment to see this chatter again for deep diagnostics.
-    """
+    """System/infrastructure chatter (violet). ALL logs enabled — always prints."""
 
     try:
-        if _os.getenv("BNC_DEBUG") != "1":
-            return
+        if not _verbose():
+            if _os.getenv("BNC_DEBUG") != "1":
+                return
     except Exception:
-        return
-    print(f"{_timestamp()} {TAG['SYS']} {COL['sys'](message)}")
+        pass
+    print(f"{_timestamp()} {TAG['SYS']} {COL['sys'](message)}", flush=True)
 
 
 def log_ok(message: str) -> None:
     """Success log (emerald)."""
 
-    print(f"{_timestamp()} {TAG['OK']} {COL['ok'](message)}")
+    print(f"{_timestamp()} {TAG['OK']} {COL['ok'](message)}", flush=True)
 
 
 def log_err(message: str) -> None:
     """Error log (red)."""
 
-    print(f"{_timestamp()} {TAG['ERR']} {COL['err'](message)}")
+    print(f"{_timestamp()} {TAG['ERR']} {COL['err'](message)}", flush=True)
 
 
 def log_info(message: str) -> None:
-    """Info log (gray). Same gate as log_sys (BNC_DEBUG=1)."""
+    """Info log (gray). ALL logs enabled — always prints."""
 
     try:
-        if _os.getenv("BNC_DEBUG") != "1":
-            return
+        if not _verbose():
+            if _os.getenv("BNC_DEBUG") != "1":
+                return
     except Exception:
-        return
-    print(f"{_timestamp()} {TAG['SYS']} {COL['info'](message)}")
+        pass
+    print(f"{_timestamp()} {TAG['SYS']} {COL['info'](message)}", flush=True)
 
 
 def log_human(message: str) -> None:
@@ -164,21 +176,18 @@ def log_human(message: str) -> None:
 
     if not message:
         return
-    print(f"{_timestamp()} {TAG['OK']} {message}")
+    print(f"{_timestamp()} {TAG['OK']} {message}", flush=True)
 
 
 def log_dbg(message: str) -> None:
-    """Per-batch/per-packet chatter: console only when BNC_DEBUG=1.
-
-    Keeps the normal console readable; hot-path call sites use this
-    instead of log_sys.
-    """
+    """Per-batch/per-packet chatter: ALL logs enabled — always prints."""
     try:
-        if _os.getenv("BNC_DEBUG") != "1":
-            return
+        if not _verbose():
+            if _os.getenv("BNC_DEBUG") != "1":
+                return
     except Exception:
-        return
-    print(f"{_timestamp()} {TAG['SYS']} {COL['dim'](message)}")
+        pass
+    print(f"{_timestamp()} {TAG['SYS']} {COL['dim'](message)}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -205,8 +214,7 @@ except (OSError, PermissionError):
 
 
 def log_ranked(message: str) -> None:
-    """Ranked stream: append to logs/ranked.log (always). Console line
-    gated behind BNC_RANKED_LOG=1 to keep the terminal clean."""
+    """Ranked stream: append to logs/ranked.log (always) + ALWAYS console."""
     try:
         line = f"{datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3]} {message}"
         try:
@@ -214,8 +222,10 @@ def log_ranked(message: str) -> None:
         except Exception:
             pass
         try:
-            if _os.getenv("BNC_RANKED_LOG") == "1":
-                print(f"{_timestamp()} {TAG['RANKED']} {message}")
+            if _verbose() or _os.getenv("BNC_RANKED_LOG") == "1":
+                print(f"{_timestamp()} {TAG['RANKED']} {message}", flush=True)
+            else:
+                print(f"{_timestamp()} {TAG['RANKED']} {message}", flush=True)
         except Exception:
             pass
     except Exception:
@@ -246,8 +256,7 @@ except (OSError, PermissionError):
 
 
 def log_comp(message: str) -> None:
-    """Comp stream: append to logs/comp.log (always). Console line
-    gated behind BNC_COMP_LOG=1 (or BNC_DEBUG=1) to keep terminal clean."""
+    """Comp stream: append to logs/comp.log (always) + ALWAYS console."""
     try:
         line = f"{datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3]} {message}"
         try:
@@ -255,10 +264,68 @@ def log_comp(message: str) -> None:
         except Exception:
             pass
         try:
-            if _os.getenv("BNC_COMP_LOG") == "1" or _os.getenv("BNC_DEBUG") == "1":
-                print(f"{_timestamp()} {TAG['COMP']} {message}")
+            print(f"{_timestamp()} {TAG['COMP']} {message}", flush=True)
         except Exception:
             pass
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Match file log — logs/match.log (rotating, 10MB, 3 backups)
+# MATCH START / MATCH END / WIN / DEFEAT — the four lines every duel, wager
+# and ranked seal is diagnosed from. Same shape as the RANK stream.
+# ---------------------------------------------------------------------------
+
+_match_logger = logging.getLogger("match.file")
+_match_logger.setLevel(logging.INFO)
+_match_logger.propagate = False
+
+try:
+    if _os.getenv("VERCEL"):
+        _match_dir = Path("/tmp/logs")
+    else:
+        _match_dir = Path(__file__).parent.parent.parent / "logs"
+    _match_dir.mkdir(parents=True, exist_ok=True)
+    _match_handler = RotatingFileHandler(
+        _match_dir / "match.log", maxBytes=10_000_000, backupCount=3, encoding="utf-8"
+    )
+    _match_handler.setFormatter(logging.Formatter("%(message)s"))
+    _match_logger.addHandler(_match_handler)
+except (OSError, PermissionError):
+    pass
+
+
+def log_match(verb: str, event: str = "", session: str = "", tag: str = "MATCH",
+              **fields) -> None:
+    """One match lifecycle / outcome line: logs/match.log + console + JSON.
+
+    `verb` is the short word shown first (START / END / new_version / WIN /
+    DEFEAT) and doubles as the JSON `action`; the keyword fields are rendered
+    as key=value. `tag` picks the console color block. Never raises — a
+    logging failure must not break a match.
+    """
+    try:
+        field_str = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+        line = f"[match] {verb} {field_str}".strip()
+        try:
+            _match_logger.info(
+                f"{datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3]} {line}")
+        except Exception:
+            pass
+        try:
+            session_part = f" session={session}" if session else ""
+            print(f"{_timestamp()} {TAG.get(tag, TAG['MATCH'])}{session_part} {line}",
+                  flush=True)
+        except Exception:
+            pass
+        if event:
+            try:
+                payload = {"ts": _ts_iso(), "event": event, "session": session,
+                           "action": verb, **fields}
+                _struct_logger.info(json.dumps(payload, separators=(",", ":")))
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -278,7 +345,8 @@ def log_req(ip: str, method: str, url: str, status: int, duration_ms: int) -> No
 
     print(
         f"{_timestamp()} {tag} {color(f'{method} {url}')} "
-        f"{COL['dim'](ip)} → {color(str(status))} {COL['dim'](f'{duration_ms}ms')}"
+        f"{COL['dim'](ip)} → {color(str(status))} {COL['dim'](f'{duration_ms}ms')}",
+        flush=True,
     )
 
 
@@ -291,9 +359,14 @@ def banner(port: int) -> None:
   {_color(124, 58, 237, '  ██████╔╝███████║██║   ██║   ██║   ██║   ██║██╔██╗ ██║')}   {DIM}Python · FastAPI · Supabase{RESET}
     """
 
-    print(art)
-    print(f"{TAG['SYS']} {COL['info']('Ready — waiting for packets…')}")
-    print(DIM + "─" * 88 + RESET)
+    print(art, flush=True)
+    print(f"{TAG['SYS']} {COL['info']('Ready — waiting for packets…')}", flush=True)
+    print(DIM + "─" * 88 + RESET, flush=True)
+    # The port above is the PORT env var, NOT the bound socket: uvicorn's
+    # --port flag wins. If the bot logs "Cannot connect", relaunch with
+    # --port <same> or point the bot's SERVER_URL at the real port.
+    print(f"{TAG['SYS']} {DIM}socket = uvicorn --port (must match PORT above; bot calls SERVER_URL){RESET}",
+          flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +377,7 @@ def log_engine_json(event: str, session: str = "", **fields) -> None:
     """Emit one-line JSON for log aggregation (console + file)."""
     payload = {"ts": _ts_iso(), "event": event, "session": session, **fields}
     line = json.dumps(payload, separators=(",", ":"))
-    print(line)
+    print(line, flush=True)
     _struct_logger.info(line)
 
 
@@ -312,7 +385,7 @@ def log_engine_yaml(event: str, session: str = "", **fields) -> None:
     """Emit YAML for human reading (console + file)."""
     payload = {"ts": _ts_iso(), "event": event, "session": session, **fields}
     line = yaml.dump(payload, default_flow_style=False).strip()
-    print(line)
+    print(line, flush=True)
     _struct_logger.info(line)
 
 
@@ -329,15 +402,15 @@ _EVENT_TAG = {
     "alv": TAG["ALV"],
     "zone": TAG["ZONE"],
     "stg": TAG["STG"],
+    "match": TAG["MATCH"],
     "state": TAG["STATE"],
     "name_change": TAG["SYS"],
     "proc": TAG["SYS"],
     "warn": TAG["SYS"],
 }
 
-# Per-packet detail events never reach the console (BNC_DEBUG=1 reveals
-# them via log_dbg). The console keeps exactly one clean line per meaningful
-# event: join/leave/killfeed/kill/win/defeat/alv/stg/state/room.
+# Per-packet detail events ALSO reach the console (ALL logs enabled).
+# Set BNC_QUIET=1 to hide them again behind log_dbg.
 _ENGINE_DEBUG_EVENTS = {"actor", "debug", "props", "zone", "team_pt", "unknown"}
 
 
@@ -345,12 +418,17 @@ def log_engine(event: str, session: str = "", **fields) -> None:
     """
     Pretty console log with color tag + key=value fields.
     JSON aggregation goes to logs/engine.jsonl only (never the console).
+    ALL events print — including actor/debug/props/zone/team_pt/unknown.
     """
     if event in _ENGINE_DEBUG_EVENTS:
         try:
             field_str = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
             session_part = f" session={session}" if session else ""
-            log_dbg(f"{event}{session_part} {field_str}")
+            if _verbose():
+                tag = _EVENT_TAG.get(event, TAG["SYS"])
+                print(f"{_timestamp()} {tag}{session_part} {field_str}", flush=True)
+            else:
+                log_dbg(f"{event}{session_part} {field_str}")
         except Exception:
             pass
         return
@@ -358,7 +436,7 @@ def log_engine(event: str, session: str = "", **fields) -> None:
     # Build compact key=value string
     field_str = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
     session_part = f" session={session}" if session else ""
-    print(f"{_timestamp()} {tag}{session_part} {field_str}")
+    print(f"{_timestamp()} {tag}{session_part} {field_str}", flush=True)
 
     # JSON for file aggregation only (no console print)
     try:

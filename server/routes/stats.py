@@ -64,6 +64,7 @@ _USER_COLS = (
     "discord_id,discord_username,game_username,game_id,skin,pickaxe,"
     "kills,deaths,wins,play_points,playtime_global,playtime_per_gm,"
     "daily_streak,win_streak,best_win_streak,best_match_kills,last_daily_claim,"
+    "nectar_coins,nectar_total_earned,nectar_total_wagered,"
     "is_dev,is_locked,lobby_music_url,lobby_music_volume,tourney_pr"
 )
 
@@ -257,13 +258,27 @@ async def get_stats(request: Request):
     except Exception as e:
         if "PGRST116" in str(e):
             return JSONResponse({"error": "user not found"}, status_code=404)
-        if is_transient_error(e):
+        # Pre-migration DBs lack nectar_coins columns: retry without them.
+        if "nectar_coins" in str(e) or "42703" in str(e):
             try:
-                log_err(f"STATS transient for {str(discord_id)[:8]} ({str(e)[:60]})")
-            except Exception:
-                pass
-            return JSONResponse({"error": "temporarily unavailable", "retry": True}, status_code=503)
-        return JSONResponse({"error": str(e)[:160]}, status_code=500)
+                _legacy = _USER_COLS.replace(
+                    ",nectar_coins,nectar_total_earned,nectar_total_wagered,", ",")
+                res = await db_io(lambda: supabase.table("bngc_users").select(_legacy).eq("discord_id", discord_id).single().execute())
+                user = res.data
+                user = {**user, "nectar_coins": 0,
+                        "nectar_total_earned": 0, "nectar_total_wagered": 0}
+            except Exception as e2:
+                if "PGRST116" in str(e2):
+                    return JSONResponse({"error": "user not found"}, status_code=404)
+                return JSONResponse({"error": str(e2)[:160]}, status_code=500)
+        else:
+            if is_transient_error(e):
+                try:
+                    log_err(f"STATS transient for {str(discord_id)[:8]} ({str(e)[:60]})")
+                except Exception:
+                    pass
+                return JSONResponse({"error": "temporarily unavailable", "retry": True}, status_code=503)
+            return JSONResponse({"error": str(e)[:160]}, status_code=500)
 
     if not user:
         return JSONResponse({"error": "user not found"}, status_code=404)
@@ -812,6 +827,12 @@ async def get_stats(request: Request):
         "deaths": deaths,
         "wins": wins,
         "play_points": int(user.get("play_points") or 0),
+        "nectar_coins": int(user.get("nectar_coins") or 0),
+        "coins": {
+            "balance": int(user.get("nectar_coins") or 0),
+            "total_earned": int(user.get("nectar_total_earned") or 0),
+            "total_wagered": int(user.get("nectar_total_wagered") or 0),
+        },
         "playtime_global": int(user.get("playtime_global") or 0),
         "playtime_per_gm": ppg or {},
         "kd": kd,

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BuildNow Tray — decryptor + rich presence in system tray, headless background.
+Nectar Buildnow Presence — decryptor + rich presence in system tray, headless background.
 Bundle with PyInstaller to .exe.
 """
 import os, sys, subprocess, threading, time, webbrowser, json
@@ -11,6 +11,19 @@ if sys.platform == "win32":
     import ctypes
     try: ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
     except: pass
+
+# Single instance: a second launch would fight over ports 8765+ and double-push
+# to Discord. The named mutex also lets the Inno Setup installer detect a
+# running tray on upgrade/uninstall (AppMutex=BuildNowTraySingleInstance).
+if sys.platform == "win32":
+    try:
+        _single = ctypes.windll.kernel32.CreateMutexW(None, False, "BuildNowTraySingleInstance")
+        if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            sys.exit(0)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
 
 try:
     import pystray
@@ -28,7 +41,10 @@ else:
     BASE = Path(__file__).resolve().parent.parent  # companion/
 ROOT = BASE
 DEC = ROOT / "decryptor.js"
-PRES = ROOT / "discord-presence.js"
+# Rich presence: the Python bridge the userscript pushes to (F4 > Presence).
+# The legacy node script stays on disk as a fallback if the import fails.
+PRES = ROOT / "rich_presence.py"
+PRES_NODE = ROOT / "discord-presence.js"
 LOG = Path.home() / ".buildnow-tray.log"
 ICON_SIZE = 64
 
@@ -85,6 +101,10 @@ def run_node(script, env_extra=None):
 
 dec_proc = None
 pres_proc = None
+pres_mod = None    # rich_presence module when the in-process bridge is running
+pres_bridge = None # Bridge instance
+pres_server = None # its ThreadingHTTPServer
+pres_port = None   # the port the bridge actually bound (it walks 8765->8769)
 
 def start_services():
     global dec_proc, pres_proc
@@ -106,14 +126,44 @@ def start_services():
         else: log("decryptor OK")
     except Exception as e:
         log(f"decryptor not reachable: {e} — check log at {LOG} and that node is installed")
+    if not start_presence():
+        try:
+            pres_proc = run_node(PRES_NODE)
+            log(f"presence start {pres_proc} (node fallback)")
+        except Exception as e:
+            log(f"presence start failed {e}")
+
+def start_presence():
+    """Run the rich presence bridge in-process.
+
+    In-process rather than subprocess: a PyInstaller build has no python
+    executable to spawn, and the bridge is a small stdlib HTTP server. It binds
+    8765 when free; if the decryptor already owns that port it walks forward to
+    8766+ and the userscript's auto-detect follows it.
+    """
+    global pres_mod, pres_bridge, pres_server, pres_port
     try:
-        pres_proc = run_node(PRES)
-        log(f"presence start {pres_proc}")
+        if str(ROOT) not in sys.path: sys.path.insert(0, str(ROOT))
+        import rich_presence as _rp
+        pres_bridge, pres_server, port = _rp.serve_in_thread()
+        pres_mod = _rp
+        pres_port = port
+        log(f"presence bridge listening on {_rp.http_url(port)}")
+        return True
     except Exception as e:
-        log(f"presence start failed {e}")
+        pres_mod, pres_bridge, pres_server = None, None, None
+        log(f"presence bridge failed: {e}")
+        return False
 
 def stop_services():
+    global pres_mod, pres_bridge, pres_server
     import signal
+    if pres_bridge is not None:
+        try: pres_bridge.clear("tray stop")          # clears the Discord activity
+        except Exception: pass
+        try: pres_mod.stop_server(pres_server)
+        except Exception: pass
+        pres_mod, pres_bridge, pres_server = None, None, None
     for p in (dec_proc, pres_proc):
         if not p: continue
         try:
@@ -130,24 +180,48 @@ def stop_services():
         requests.post("http://127.0.0.1:8765/clear", timeout=1)
     except: pass
 
-def fetch_presence():
-    try:
-        r = requests.get("http://127.0.0.1:8765/presence", timeout=2)
-        j = r.json()
-        p = j.get("presence") or j
-        return p
-    except: return None
+def fetch_presence(port=None):
+    """The bridge's own status: v2 answers with {activity, mode, discord, ...}.
+
+    Falls back to the legacy node bridge's flat shape so an older setup still
+    reports something useful instead of "-".
+    """
+    ports = [port] if port else ([pres_port] if pres_port else []) + [8765]
+    for p in ports:
+        try:
+            r = requests.get(f"http://127.0.0.1:{p}/presence", timeout=2)
+            j = r.json()
+            if not isinstance(j, dict):
+                continue
+            if j.get("service"):
+                return j
+            return j.get("presence") or j
+        except Exception:
+            continue
+    return None
+
+def presence_summary(j):
+    """Status line for the tray tooltip/notification."""
+    if not isinstance(j, dict):
+        return None
+    activity = j.get("activity") or {}
+    if activity:
+        return f"{activity.get('details','-')} | {activity.get('state','-')}"
+    if j.get("gameMode") is not None:   # legacy node bridge
+        return f"{j.get('gameMode','-')} | {j.get('status','-')} • {j.get('playersCount',0)}/{j.get('maxPlayers',12)}"
+    return "no activity (bridge idle)"
 
 def on_show(icon, item):
-    p = fetch_presence()
-    if p:
-        try: icon.notify(f"{p.get('gameMode','-')} | {p.get('status','-')} • {p.get('playersCount',0)}/{p.get('maxPlayers',12)}", "BuildNow Presence")
+    j = fetch_presence()
+    line = presence_summary(j)
+    if j and line:
+        try: icon.notify(line, "Nectar Buildnow Presence")
         except: pass
     else:
-        try: icon.notify(f"Decryptor not on 8765 — see {LOG}", "BuildNow Tray — error")
+        try: icon.notify(f"Presence bridge not answering on 8765 — see {LOG}", "Nectar Buildnow Presence — error")
         except: pass
     # also open log on status click if failed
-    if not p:
+    if not j:
         try: os.startfile(str(LOG))
         except: pass
 
@@ -165,10 +239,10 @@ def on_restart(icon, item):
     stop_services()
     time.sleep(0.5)
     start_services()
-    icon.notify("Restarted decryptor + presence", "BuildNow Tray")
+    icon.notify("Restarted decryptor + presence", "Nectar Buildnow Presence")
 
 def setup_tray():
-    icon = pystray.Icon("BuildNow Tray", make_icon(), "BuildNow — Tray (decryptor + presence headless)")
+    icon = pystray.Icon("Nectar Buildnow Presence", make_icon(), "Nectar Buildnow Presence")
     icon.menu = pystray.Menu(
         pystray.MenuItem("Status", on_show),
         pystray.MenuItem("Open captures", on_open_logs),
