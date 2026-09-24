@@ -16,10 +16,15 @@ async def fetch_unnotified(limit: int = 20):
     try:
         # Explicit columns only: select("*") ships every new column on every
         # poll (Service-Initiated egress 24/7). These are all build_embed needs.
-        r = db.supabase.table("bngc_alerts").select(
-            "id,discord_id,alert_type,discord_username,game_username,game_id,"
-            "country,details,created_at,notified"
-        ).eq("notified", False).order("created_at", desc=False).limit(limit).execute()
+        # MUST go through _sb_call: supabase-py is blocking, and this poll runs
+        # on the event loop every few seconds — inline .execute() here is what
+        # produced "heartbeat blocked for more than 10 seconds".
+        r = await db._sb_call(
+            lambda: db.supabase.table("bngc_alerts").select(
+                "id,discord_id,alert_type,discord_username,game_username,game_id,"
+                "country,details,created_at,notified"
+            ).eq("notified", False).order("created_at", desc=False)
+            .limit(limit).execute())
         return r.data or []
     except Exception as e:
         print(f"[alerts] fetch failed: {e}")
@@ -29,7 +34,9 @@ async def mark_notified(alert_id: int):
     if not db.USE_SUPABASE or not db.supabase:
         return
     try:
-        db.supabase.table("bngc_alerts").update({"notified": True}).eq("id", alert_id).execute()
+        await db._sb_call(
+            lambda: db.supabase.table("bngc_alerts").update(
+                {"notified": True}).eq("id", alert_id).execute())
     except Exception:
         pass
 

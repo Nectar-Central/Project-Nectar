@@ -42,7 +42,7 @@ for env_path in [
 app = FastAPI(
     title="BNGC Python API",
     description="Photon capture → Supabase, clean Python port of the Node backend",
-    version="1.0.0",
+    version="2.35.0",
 )
 
 # Allow all origins for local dev (userscript uses GM_xmlhttpRequest, so CORS is not strictly needed,
@@ -74,6 +74,8 @@ from server.routes.ranked_rooms import router as ranked_rooms_router
 from server.routes.comp_pages import router as comp_pages_router
 from server.routes.players import router as players_router
 from server.routes.health import router as health_router
+from server.routes.coins import router as coins_router
+from server.routes.bets import router as bets_router
 
 # ---------------------------------------------------------------------------
 # Health check
@@ -122,9 +124,24 @@ app.include_router(ranked_rooms_router)
 app.include_router(comp_pages_router)
 app.include_router(players_router)
 app.include_router(health_router)
+app.include_router(coins_router)
+app.include_router(bets_router)
 
 # TODO: Port remaining routes if needed (player_sync, event, playtime are now via capture + engine)
 # For now, GET /api/session/{id}/state is the poll endpoint for the photon-client SDK
+
+# ---------------------------------------------------------------------------
+# Startup — fires under `uvicorn server.main:app` too (not just __main__)
+# ---------------------------------------------------------------------------
+
+@app.on_event("startup")
+async def _startup_banner():
+    try:
+        from server.lib.logger import banner as _banner, log_sys as _lsys
+        _banner(int(os.getenv("PORT", "3000")))
+        _lsys("LOGGING VERBOSE — every request / capture / processor / ranked line ON")
+    except Exception:
+        print("PHOTON SERVER startup (banner failed)", flush=True)
 
 # ---------------------------------------------------------------------------
 # Request logging middleware (like logReq in Node)
@@ -167,9 +184,17 @@ async def head_to_get(request: Request, call_next):
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """Log every request with timing and status, like the Node logger."""
+    """Log EVERY request with timing, status, query, and body size — nothing quiet."""
 
     start = time.time()
+
+    # Log incoming call (method + full path + query)
+    try:
+        from server.lib.logger import log_sys as _log_in
+        _qs = f"?{request.url.query}" if request.url.query else ""
+        _log_in(f"REQ IN {request.method} {request.url.path}{_qs}")
+    except Exception:
+        pass
 
     response = await call_next(request)
 
@@ -177,27 +202,24 @@ async def log_requests(request: Request, call_next):
     ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "-")
 
     # Use the same logger as capture for consistency
-    from server.lib.logger import log_req
+    from server.lib.logger import log_req, log_ok, log_err
 
-    # log_req is not in the Python logger yet — we emulate it
+    # log EVERYTHING — no quiet paths (stats/players/capture poll spam included)
     status = response.status_code
-    if status >= 500:
-        log_err(f"{request.method} {request.url.path} → {status} {duration}ms ip={ip}")
-    elif status >= 400:
-        # Warn level (amber) — we reuse log_err for visibility
-        log_err(f"{request.method} {request.url.path} → {status} {duration}ms ip={ip}")
+    try:
+        _qs = f"?{request.url.query}" if request.url.query else ""
+        _full = f"{request.url.path}{_qs}"
+    except Exception:
+        _full = request.url.path
+    if status >= 400:
+        log_err(f"{request.method} {_full} → {status} {duration}ms ip={ip}")
     else:
-        # Poll spam off the console: stats/players/capture 2xx fire every
-        # few seconds per client (BNC_DEBUG=1 to see them).
-        _quiet = request.url.path in ("/api/stats", "/api/players", "/api/capture")
-        if _quiet:
-            try:
-                from server.lib.logger import log_dbg
-                log_dbg(f"{request.method} {request.url.path} → {status} {duration}ms ip={ip}")
-            except Exception:
-                pass
-        else:
-            log_ok(f"{request.method} {request.url.path} → {status} {duration}ms ip={ip}")
+        log_ok(f"{request.method} {_full} → {status} {duration}ms ip={ip}")
+    # Structured request line too (greppable)
+    try:
+        log_req(ip, request.method, _full, status, duration)
+    except Exception:
+        pass
 
     return response
 
@@ -218,5 +240,4 @@ if __name__ == "__main__":
         host="127.0.0.1",
         port=port,
         reload=True,
-        log_level="info",
     )

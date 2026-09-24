@@ -286,10 +286,10 @@ def test_scores_from_banked_events_kill_and_alv_order(monkeypatch):
     row = fake.results[0]
     assert row["winner_discord_id"] == "K"
     # static table, all from evidence: K = 2 banked kills (16) + win (50)
-    # + P1 (10) = 76; C died after V -> reverse alv death order gives C P2
-    # (7) - 5 = 2 and V P3 (5) - 5 = 0. The placement split proves the
-    # banked alv rows drove it (no placements were passed in).
-    assert res["points"] == {"K": 76, "C": 2, "V": 0}
+    # + P1 (10) = 76 -> clamp 30; C died after V -> reverse alv death order
+    # gives C P2 (7) - 5 = 2 and V P3 (5) - 5 = 0. The placement split proves
+    # the banked alv rows drove it (no placements were passed in).
+    assert res["points"] == {"K": 30, "C": 2, "V": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -307,8 +307,8 @@ def test_no_banked_events_synthesizes_legacy(monkeypatch):
                                 placements={"K": 1, "V": 2},
                                 kill_events=[("K", "V")])
     assert res["ok"] is True
-    # K = 1 kill (8) + win (50) + P1 (10) = 68; V = P2 (7) - 5 = 2
-    assert res["points"] == {"K": 68, "V": 2}
+    # K = 1 kill (8) + win (50) + P1 (10) = 68 -> clamp 30; V = P2 (7) - 5 = 2
+    assert res["points"] == {"K": 30, "V": 2}
     assert len(fake.results) == 1
 
 

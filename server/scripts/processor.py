@@ -15,11 +15,14 @@ happen async (~50ms). If DB is slow, POST still succeeds.
 # Use Python 3.10+ type hints like `str | None` without runtime errors on older versions
 from __future__ import annotations
 
+import os
+import time
+
 # Supabase client for DB queries (table inserts/updates/queries)
 from server.lib.supabase_client import supabase, db, db_io, is_transient_error
 
 # Logging helpers: log_sys for info, log_err for errors, log_engine for pretty event lines
-from server.lib.logger import log_sys, log_err, log_engine, log_ranked, log_dbg, log_comp
+from server.lib.logger import log_sys, log_err, log_engine, log_ranked, log_dbg, log_comp, log_match
 
 # Strip color tags from player names (e.g. "<color=red>Player</color>" → "Player")
 from server.lib.gpbinary import _strip_color_tags
@@ -30,6 +33,10 @@ from server.lib.photon_engine.engine import _KILL_DUP_WINDOW_MS
 
 # Precision tracking: each counted write is re-checked ~2s later (see precision.py)
 from server.lib import precision as _precision
+
+# A host whose own feed is this stale is not evidence of anything: nobody is
+# talking, so phase-end results must not be rewritten (crash guard).
+_STALE_HOST_SEC = 300.0
 
 # Play-points economy values + hourly helper (all-modes activity ledger)
 from server.lib.ranked import PLAY_KILL, PLAY_KNOCK, PLAY_WIN, hourly_play_points
@@ -497,6 +504,57 @@ def _self_death_evidence(room, view, me_name) -> bool:
     return False
 
 
+def _alive_now(room, p) -> bool:
+    """Is this roster player genuinely alive RIGHT NOW?
+
+    `is_alive` alone lies after a crash: the row keeps the last value forever
+    because the player stopped sending packets, so a phantom survivor would
+    win the phase end. A player is only trusted while their last_seen_at is
+    fresh. Unknown stamp (old cache) is trusted — never take a real win away —
+    and the rule switches off entirely when the host's own feed is dead.
+    Never raises.
+    """
+    try:
+        if p is None or not getattr(p, "is_alive", False):
+            return False
+        seen = getattr(p, "last_seen_at", None)
+        if seen is None:
+            return True
+        host = getattr(room, "last_packet_at", None)
+        if host is not None and (time.time() - float(host)) > _STALE_HOST_SEC:
+            return True  # nobody is talking: leave history alone
+        return (time.time() - float(seen)) <= _stale_alive_sec()
+    except Exception:
+        return bool(getattr(p, "is_alive", False))
+
+
+def _stale_alive_sec() -> float:
+    """Seconds a player may be silent before a phase end stops trusting them."""
+    try:
+        return float(os.getenv("PHASE_STALE_ALIVE_SEC", "180") or 180)
+    except Exception:
+        return 180.0
+
+
+def _stale_alive_evidence(room, me_name) -> bool:
+    """The roster says this player is alive, but their feed stopped (crash).
+
+    A crasher must not win the phase end, and they must not be treated as
+    "survived with no information" either — that fallback is what handed a
+    free round to somebody who was no longer in the game. Never raises.
+    """
+    try:
+        if room is None or not me_name:
+            return False
+        for p in (getattr(room, "players", None) or {}).values():
+            if not _names_equal(getattr(p, "username", None), me_name):
+                continue
+            return bool(getattr(p, "is_alive", False)) and not _alive_now(room, p)
+        return False
+    except Exception:
+        return False
+
+
 def _phase_end_result(room, view, me_name) -> str | None:
     """Decide a real phase end (stG=3): 'win' or None (no win).
 
@@ -512,7 +570,7 @@ def _phase_end_result(room, view, me_name) -> str | None:
         alive = False
         try:
             for p in room.players.values():
-                if _names_equal(p.username, me_name) and p.is_alive:
+                if _names_equal(p.username, me_name) and _alive_now(room, p):
                     alive = True
                     break
         except Exception:
@@ -521,6 +579,9 @@ def _phase_end_result(room, view, me_name) -> str | None:
         if alive or team is True:
             return "win"
         if _self_death_evidence(room, view, me_name):
+            return None
+        if _stale_alive_evidence(room, me_name):
+            # Roster says alive, feed says gone: a crash, not a survivor.
             return None
         if team is False:
             return None
@@ -561,9 +622,22 @@ def _phase_end_debug(room, view, me_name) -> str:
         except Exception:
             pass
         try:
-            alive = any(_names_equal(p.username, me_name) and p.is_alive
-                        for p in room.players.values())
+            me_p = None
+            for p in (getattr(room, "players", None) or {}).values():
+                if _names_equal(p.username, me_name):
+                    me_p = p
+                    break
+            alive = _alive_now(room, me_p)
             parts.append(f"alive_in_roster={alive}")
+            # A survivor whose feed stopped is the crash case: say so loudly.
+            try:
+                _stale = bool(me_p is not None and getattr(me_p, "is_alive", False)
+                              and not alive)
+                if _stale:
+                    parts.append(f"stale_alive=True seen_ago="
+                                 f"{int(time.time() - float(me_p.last_seen_at))}s")
+            except Exception:
+                pass
         except Exception:
             parts.append("alive_in_roster=?")
         try:
@@ -592,6 +666,42 @@ def _phase_end_debug(room, view, me_name) -> str:
         return " ".join(parts) if parts else "unknown"
     except Exception:
         return "debug-failed"
+
+
+def _defeat_fields(room, view, me_name, gm=None) -> dict | None:
+    """Field set for a DEFEAT line when the tracked player LOST a real match.
+
+    Wins-only by design: no defeat row is ever written, so without this the
+    console never said who lost a round — the denial just read "WIN denied".
+    Only a positive elimination counts (dead at the phase end with death
+    evidence): a leave, a walkover or an already-emptied room is unknown, not
+    a defeat. `killer` is the last player who killed us in this match, which
+    in a 1v1 is the opponent. Returns None when there is nothing to log.
+    Never raises.
+    """
+    try:
+        if not room or not me_name:
+            return None
+        alive = any(_names_equal(p.username, me_name) and p.is_alive
+                    for p in (getattr(room, "players", None) or {}).values())
+        if alive or not _self_death_evidence(room, view, me_name):
+            return None
+        killer = None
+        for k in (getattr(room, "recent_kills", None) or []):
+            if getattr(k, "event_type", None) != "killed":
+                continue
+            if _names_equal(getattr(k, "instigated", None), me_name):
+                killer = getattr(k, "instigator", None) or None
+        return {
+            "me": me_name,
+            "killer": killer,
+            "gm": gm or getattr(getattr(room, "game_mode", None), "value", None),
+            "room": str(getattr(room, "room_id", "") or "")[:8] or None,
+            "code": getattr(room, "short_code", None) or None,
+            "version": getattr(room, "match_version", None),
+        }
+    except Exception:
+        return None
 
 
 def _is_kd_only(gm) -> bool:
@@ -681,6 +791,18 @@ def _kill_count_dup(room, killer, victim, kind, pkt_t) -> bool:
         try:
             last = seen.get(key)
             if last is not None and abs(now_ms - float(last)) <= _KILL_DUP_WINDOW_MS:
+                # The victim respawning after the counted kill means this is a
+                # NEW life, not a retransmit. Without this, Free Mode (version
+                # never moves, ~3s respawns) silently dropped every second
+                # kill of the same victim.
+                try:
+                    _alive = getattr(room, "proc_alive_at", None)
+                    if isinstance(_alive, dict):
+                        _an = _norm_name(victim)
+                        if _an and float(_alive.get(_an) or 0) > float(last):
+                            return False
+                except Exception:
+                    pass
                 return True
         except Exception:
             pass
@@ -993,7 +1115,10 @@ def _write_win(discord_id, session_id, user, gm, room_id, short_code, match_ver,
         _duo = bool(room.is_duo) if room is not None else False
     except Exception:
         _duo = False
-    log_engine("win", session_id[:13], winner=winner, gm=gm, duo=_duo, room=str(room_id or "")[:8])
+    log_match("WIN", tag="WIN", event="win", session=session_id,
+              did=str(discord_id or "")[:9], winner=winner, gm=gm,
+              room=str(room_id or "")[:8], code=short_code or None,
+              version=match_ver, duo=_duo)
     log_sys(f"PROCESSOR WIN gm={gm} winner={winner} wins {user.get('wins',0)}->{new_wins}")
     user["wins"] = new_wins             # Update local cache
     if room is not None:
@@ -3533,6 +3658,13 @@ async def process_batch(
                             _dv = (room_id, getattr(room, "match_version", 0))
                             if getattr(room, "_win_deny_logged", None) != _dv:
                                 room._win_deny_logged = _dv
+                                # Wins-only: no defeat row exists, so the
+                                # DEFEAT line is the only record that the
+                                # tracked player actually lost this match.
+                                _df = _defeat_fields(room, view, me_name_local, gm)
+                                if _df:
+                                    log_match("DEFEAT", tag="DEFEAT", event="defeat",
+                                              session=session_id, **_df)
                                 log_sys(f"PROCESSOR WIN denied me={me_name_local} room={str(room_id or '')[:8]} gm={gm} { _phase_end_debug(room, view, me_name_local)}")
                         except Exception:
                             pass

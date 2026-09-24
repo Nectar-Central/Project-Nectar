@@ -9,6 +9,7 @@ retries never duplicate the alv snapshot.
 """
 from types import SimpleNamespace
 
+import server.lib.ranked as ranked_lib
 import server.scripts.processor as proc
 
 
@@ -220,3 +221,61 @@ def test_series_complete_blocks_auto_open(monkeypatch):
     assert not [r for r in sb.t["bngc_ranked_tourney_matches"] if r.get("status") == "open"]
 
 
+
+# ---------------------------------------------------------------------------
+# Per-seal stored deltas: the room seal IS the arena pay
+# ---------------------------------------------------------------------------
+
+_SEAL_BUNDLE = {
+    "mode": "room-seal-v1", "rid": "R-X", "room_match_version": 3,
+    "winner": "A",
+    "points": {"A": 20, "B": 2, "C": 0},
+    "kills": {"A": 2},
+    "placements": {"A": 1, "B": 2, "C": 3},
+    "breakdown": {"A": {"kills": 16, "win": 0, "placement": 10,
+                         "loss": 0, "total": 20, "capped": False}},
+}
+
+
+def _seal_cycle(monkeypatch, mver=3):
+    """stG 1 open + stG 3 seal with a room match_version. Returns the fake."""
+    sb = _bridge_sb(monkeypatch)
+    proc.seal_ranked_tourney_match("ses", "A", ROOM, "room-x", "zw_lg")
+    room3 = _room(PLAYERS, KILLS, last_stg=3)
+    room3.match_version = mver
+    proc.seal_ranked_tourney_match("ses", "A", room3, "room-x", "zw_lg")
+    return sb
+
+
+def _sealed_row(sb):
+    rows = [r for r in sb.t["bngc_ranked_tourney_matches"]
+            if r.get("status") == "sealed"]
+    assert len(rows) == 1
+    return rows[0]
+
+
+def test_seal_attaches_room_seal_bundle(monkeypatch):
+    monkeypatch.setattr(ranked_lib, "get_ranked_room",
+                        lambda code: {"id": "R-X"})
+    monkeypatch.setattr(ranked_lib, "seal_bundle_for",
+                        lambda rid, mver: dict(_SEAL_BUNDLE))
+    sb = _seal_cycle(monkeypatch)
+    assert _sealed_row(sb)["points_table"] == _SEAL_BUNDLE
+
+
+def test_seal_stores_pending_when_room_seal_missing(monkeypatch):
+    monkeypatch.setattr(ranked_lib, "get_ranked_room",
+                        lambda code: {"id": "R-X"})
+    monkeypatch.setattr(ranked_lib, "seal_bundle_for",
+                        lambda rid, mver: None)
+    sb = _seal_cycle(monkeypatch)
+    pending = _sealed_row(sb)["points_table"]
+    assert pending["mode"] == "room-seal-pending-v1"
+    assert (pending["rid"], pending["room_match_version"]) == ("R-X", 3)
+
+
+def test_seal_stores_nothing_without_join_keys(monkeypatch):
+    monkeypatch.setattr(ranked_lib, "get_ranked_room",
+                        lambda code: None)
+    sb = _seal_cycle(monkeypatch)
+    assert "points_table" not in _sealed_row(sb)

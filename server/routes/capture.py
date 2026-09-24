@@ -8,6 +8,8 @@ Now it just: validate token → engine.feed(session_id, hex) per record → retu
 No win/kills math here — caller does it from the returned packets/session.
 """
 
+import asyncio
+
 from fastapi import APIRouter, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 
@@ -25,6 +27,9 @@ engine = Engine()
 
 # Once-per-worker flag for the missing-Upstash warning (else it spams every batch)
 _logged_no_upstash = False
+
+# Once-per-worker flag for missing presence columns (pre-migration DBs)
+_logged_no_presence_cols = False
 
 # Bandwidth guard: ranked room lookup per capture batch was a Supabase
 # RT every few seconds per player. Cache 30s per short_code.
@@ -60,6 +65,26 @@ def _cached_ranked_room(code_r):
         except Exception:
             return None
 
+# A slow/timeout DB must never turn a capture into a 500 (see capture_handler).
+# The client requeues on a 5xx, but a failure AFTER the token rotation write
+# makes the retry fail validation, and the client then throws its queue away
+# and demands a re-link — so every DB wait here is bounded and degrades.
+SESSION_LOOKUP_TIMEOUT_SEC = 6.0
+
+
+async def _db_bounded(fn, *args, **kwargs):
+    """db_io with a hard deadline — a hanging database must not stall a capture.
+
+    The client's fetch gives up first, and the cancelled request surfaces as a
+    500 with a CancelledError through the ASGI middleware. Every DB wait in
+    this handler goes through here; callers already treat failures as
+    best-effort (they log and carry on), so a timeout degrades a capture
+    instead of breaking it.
+    """
+    return await asyncio.wait_for(db_io(fn, *args, **kwargs),
+                                  timeout=SESSION_LOOKUP_TIMEOUT_SEC)
+
+
 @router.post("/api/capture")
 async def capture_handler(request: Request, background_tasks: BackgroundTasks):
     body = await request.json()
@@ -93,11 +118,17 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
     if not auth_session_id and not token:
         return JSONResponse({"error": "Token not validated"}, status_code=401)
 
-    # Token validation (same as before, but no replay 401 — just validate window)
+    # Handled inline (not in a wrapper) so the deliberate 4xx returns below
+    # stay untouched and the handler cannot raise out of the ASGI app.
     new_token = None
     new_counter = None
     if auth_session_id:
-        res = await db_io(db.get_session_sync, auth_session_id)
+        try:
+            res = await _db_bounded(db.get_session_sync, auth_session_id)
+        except Exception as e:
+            res = {"data": None, "error": f"{type(e).__name__}: {e}"[:120]}
+            log_err(f"CAPTURE session lookup FAILED {auth_session_id[:13]} "
+                    f"{type(e).__name__}: {str(e)[:80]} — passing through")
         sess = res.get("data")
         db_err = res.get("error")
         # DB connection blip ("Server disconnected"): the session probably
@@ -112,7 +143,8 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
             return JSONResponse({"error": "Invalid auth session"}, status_code=401)
         if sess and is_session_expired(sess):
             try:
-                await db_io(db.update_session_sync, auth_session_id, {"is_active": False})
+                await _db_bounded(db.update_session_sync, auth_session_id,
+                                 {"is_active": False})
             except Exception:
                 pass
             log_sys(f"CAPTURE expired session {auth_session_id[:13]} — client must re-link")
@@ -142,7 +174,17 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
                 base = sess["token_counter"]
             new_counter = base + 1
             new_token = generate_request_token(sess["req_secret"], new_counter)
-            await db_io(db.update_session_sync, auth_session_id, {"current_token": new_token, "token_counter": new_counter})
+            try:
+                await _db_bounded(db.update_session_sync, auth_session_id,
+                                 {"current_token": new_token,
+                                  "token_counter": new_counter})
+            except Exception as e:
+                # The token is minted and the client needs it: a 500 here would
+                # cost the whole batch. Hand it over anyway — the DB counter
+                # simply lags by one and self-corrects via the 401 `expected`.
+                log_err(f"CAPTURE token rotate write FAILED "
+                        f"{auth_session_id[:13]} {type(e).__name__}: {str(e)[:60]}"
+                        f" — handing the new token to the client anyway")
             log_sys(f"CAPTURE token ok auth={str(auth_session_id)[:8]} req={req_token} → new {new_token} counter {sess['token_counter']}->{new_counter}")
     _ct["tok"] = _t.time()
 
@@ -234,7 +276,7 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
             log_err(f"CAPTURE identity adopt failed {e}")
         try:
             if discord_id and (body_game_username or body_game_id):
-                _u = await db_io(
+                _u = await _db_bounded(
                     lambda: supabase.table("bngc_users").select(
                         "game_username,game_id").eq("discord_id", discord_id).single().execute())
                 _row = _u.data if hasattr(_u, "data") else None
@@ -244,12 +286,34 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
                 if body_game_id and not ((_row or {}).get("game_id") or "").strip():
                     _upd["game_id"] = str(body_game_id).strip()
                 if _upd:
-                    await db_io(
+                    await _db_bounded(
                         lambda: supabase.table("bngc_users").update(
                             _upd).eq("discord_id", discord_id).execute())
                     log_sys(f"CAPTURE identity healed did={str(discord_id)[:6]} {sorted(_upd)} via client body")
         except Exception as e:
             log_err(f"CAPTURE identity heal failed {e}")
+
+    # Online + version stamp: EVERY batch incl. heartbeats. last_online
+    # drives is-online (wagers) and /presence; companion_version records
+    # the script build the player runs.
+    if discord_id:
+        try:
+            _touch = {"last_online": _t.strftime('%Y-%m-%dT%H:%M:%SZ', _t.gmtime())}
+            _cv = str(body.get("client_version") or "").strip()[:32] or None
+            if _cv:
+                _touch["companion_version"] = _cv
+            await _db_bounded(
+                lambda: supabase.table("bngc_users").update(
+                    _touch).eq("discord_id", discord_id).execute())
+        except Exception as e:
+            _msg = str(e)
+            if "last_online" in _msg or "companion_version" in _msg or "42703" in _msg:
+                global _logged_no_presence_cols
+                if not _logged_no_presence_cols:
+                    _logged_no_presence_cols = True
+                    log_err("CAPTURE presence columns missing — apply supabase/add_presence_v258.sql")
+            else:
+                log_err(f"CAPTURE online touch failed {e}")
 
     # Get session view after batch
     view = engine.get_session(auth_session_id) if auth_session_id else None

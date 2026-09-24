@@ -3,7 +3,7 @@ from typing import Any
 import time
 
 from ..gpbinary import parse_gpbinary, parse_killfeed_text, _strip_color_tags
-from ..logger import log_engine, log_ranked
+from ..logger import log_engine, log_ranked, log_match
 
 from .enums import GameMode, PacketType, State
 from .models import KillInfo, Player, SessionView
@@ -16,12 +16,20 @@ from .models import KillInfo, Player, SessionView
 _KILL_DUP_WINDOW_MS = 5000.0
 
 
-def _kill_content_dup(entries, killer: str | None, victim: str | None, kind: str, now_ms: float) -> bool:
+def _kill_content_dup(entries, killer: str | None, victim: str | None, kind: str,
+                      now_ms: float, alive_at: dict | None = None) -> bool:
     """True if the same killer->victim kill/knock was already recorded within
-    the window. Entries without timestamps (old caches) never match."""
+    the window. Entries without timestamps (old caches) never match.
+
+    `alive_at` maps a player name to when they were last seen alive again. A
+    kill recorded BEFORE that stamp is a different life, not a retransmit —
+    without this, Free Mode (stG pinned, version never moves) drops every
+    same-pair re-kill that lands inside the window after a ~3s respawn.
+    """
     try:
         if not killer or not victim:
             return False
+        _alive = _norm_name(victim) if isinstance(alive_at, dict) else None
         for k in reversed(entries[-50:]):
             try:
                 if k.event_type != kind:
@@ -31,6 +39,13 @@ def _kill_content_dup(entries, killer: str | None, victim: str | None, kind: str
                 if k.t is None:
                     continue
                 if abs(now_ms - float(k.t)) <= _KILL_DUP_WINDOW_MS:
+                    if _alive is not None:
+                        try:
+                            # Respawned after that kill -> new life, keep it.
+                            if float(alive_at.get(_alive) or 0) > float(k.t):
+                                continue
+                        except Exception:
+                            pass
                     return True
             except Exception:
                 continue
@@ -53,6 +68,22 @@ def _op_has_alv(gpb) -> bool:
         return isinstance(ppv, dict) and "alv" in ppv
     except Exception:
         return False
+
+
+def _touch_player(p, now: float | None = None) -> None:
+    """Stamp a player as seen — the crash signal.
+
+    Anything a packet proves about a player (their props, a killfeed line, a
+    join) refreshes `last_seen_at`. A player who stops sending (crash) keeps a
+    stale stamp, which is what lets a phase end refuse to call them alive.
+    Never raises.
+    """
+    try:
+        if p is None:
+            return
+        p.last_seen_at = float(now if now is not None else time.time())
+    except Exception:
+        pass
 
 
 def _norm_name(n: str | None) -> str:
@@ -132,6 +163,89 @@ def _apply_roster_pt(room, actor_nr, uname, pt_raw) -> bool:
     except Exception:
         pass
     return False
+
+
+def _unwrap_pending_gm(stored) -> "GameMode | None":
+    """Unwrap a stashed pending gm, tolerant of the legacy shapes.
+
+    Stored as (gm, source_op[, ts]); old in-memory entries (bare enum or
+    2-tuple) still read back correctly. Never raises.
+    """
+    try:
+        if isinstance(stored, tuple):
+            return stored[0] if stored else None
+        return stored
+    except Exception:
+        return None
+
+
+def _pending_ts(stored) -> float:
+    """Timestamp of a pending entry, 0.0 when absent/unreadable (=> stale)."""
+    try:
+        if isinstance(stored, tuple) and len(stored) > 2:
+            return float(stored[2] or 0)
+        if isinstance(stored, tuple) and len(stored) > 1 and isinstance(stored[1], (int, float)):
+            return float(stored[1])
+    except Exception:
+        pass
+    return 0.0
+
+
+def _scrub_stale_lobby(room, max_age_s: float = 120) -> bool:
+    """Clear gm/short_code on a STALE lobby pseudo-room. Returns True if cleared.
+
+    A fresh lobby is live play — a game running in the lobby bucket because
+    its CreateRoom response was lost in a reconnect — and its mode/code are
+    live truth that must survive (scene repair sets them; per-packet
+    scrubbing would erase them before presence/processor ever read them).
+    A stale lobby is a restored snapshot or dead bucket: scrub it so old
+    modes/codes can't poison lobby fallback chains. Never raises.
+    """
+    try:
+        if str(getattr(room, "room_id", "") or "") != "lobby":
+            return False
+        try:
+            _lp = float(getattr(room, "last_packet_at", None) or 0)
+        except Exception:
+            _lp = 0.0
+        try:
+            _fresh = (time.time() - _lp) <= float(max_age_s)
+        except Exception:
+            _fresh = False
+        if _fresh:
+            return False
+        _cleared = False
+        if getattr(room, "game_mode", None) is not None:
+            room.game_mode = None
+            _cleared = True
+        if getattr(room, "short_code", None) is not None:
+            room.short_code = None
+            _cleared = True
+        return _cleared
+    except Exception:
+        return False
+
+
+def _match_log_fields(room, **extra) -> dict:
+    """Field set for one MATCH stream line (START / END / new_version).
+
+    Room, party code, mode and version are the four things every consumer of
+    a match boundary needs (wager seals, ranked seals, duel scoring) — they
+    must be on the same line, not spread across packet dumps. The verb itself
+    is passed separately to log_match (it becomes the JSON `action`). Never
+    raises.
+    """
+    try:
+        f = {
+            "room": str(getattr(room, "room_id", "") or "")[:8] or None,
+            "gm": (getattr(getattr(room, "game_mode", None), "value", None)),
+            "code": getattr(room, "short_code", None) or None,
+            "version": getattr(room, "match_version", None),
+        }
+        f.update(extra)
+        return f
+    except Exception:
+        return {}
 
 
 def _stg_starts_new_life(stg, last_stg) -> bool:
@@ -500,7 +614,17 @@ class Engine:
     def __init__(self):
         self._sessions: dict[str, SessionView] = {}
         self._pending_pid: dict[str, tuple] = {}  # session_id -> (pID, ts) from JoinRandomRoom without RoomName (private join)
-        self._pending_gm: dict[str, GameMode] = {}  # session_id -> gm from JoinRandomRoom without RoomName
+        self._pending_gm: dict[str, tuple] = {}  # session_id -> (gm, source_op, ts);
+        # gm stashed from a room-less op (JoinRandomRoom filter, or an
+        # explicit CreateRoom mode incl. DF) for the next real room. DF is
+        # only ever stashed from CreateRoom — everywhere else it is the
+        # client default placeholder and must not pollute the next room.
+        # Timestamped: reconnect batches routinely flush out of order, so a
+        # late/duplicate stash must expire instead of stamping a later room.
+        self._pending_party: dict[str, tuple] = {}  # session_id -> (True, ts);
+        # Party flag from a room-less CreateRoom request. The response that
+        # births the room carries RoomName but no Party, so without this the
+        # flag (drawer "In Party", presence Context) is lost on every create.
 
     def _adopt_me_from_echo(self, view, room, killer: str | None,
                               actor_nr, session_id: str) -> bool:
@@ -635,7 +759,8 @@ class Engine:
                     if len(room.recent_kills) > 20:
                         room.recent_kills = room.recent_kills[-10:]
                     room.recent_knocks = []
-                    log_engine("match", session_id[:13], action="new_version", version=room.match_version, room=room.room_id[:8], via="stG 3")
+                    log_match("new_version", event="match", session=session_id,
+                              **_match_log_fields(room, via="stG 3"))
                     try:
                         code = getattr(room, "short_code", None)
                         if code:
@@ -722,6 +847,23 @@ class Engine:
                 if view.current_room_id != room_id:
                     view.current_room_id = room_id
                     log_engine("room", session_id[:13], action="switched", room=room_id[:8])
+                # The lobby pseudo-room is not a real room: scrub it only when
+                # STALE (restored snapshot / dead bucket leaking gm=zw_lg into
+                # lobby fallbacks). A fresh lobby is live play — a game running
+                # in the lobby bucket because its CreateRoom response was lost
+                # in a reconnect — and scrubbing it per-packet would erase the
+                # mode scene repair just set. Matchmaking mm-* rooms stay
+                # codeless unconditionally (ranked/comp are code-gated — a code
+                # here false-binds pubs to ranked).
+                try:
+                    _ret = view.rooms[room_id]
+                    _rid = str(getattr(_ret, "room_id", "") or "")
+                    if _rid == "lobby":
+                        _scrub_stale_lobby(_ret)
+                    elif _rid.startswith("mm-") and getattr(_ret, "short_code", None) is not None:
+                        _ret.short_code = None
+                except Exception:
+                    pass
                 return view.rooms[room_id]
             # no room_id — strict: route to current MATCH room if exists, else current, else lobby
             # this stops killfeeds (no RoomName) from landing in a throwaway lobby room
@@ -760,10 +902,20 @@ class Engine:
             except Exception:
                 pass
             if view.current_room_id and view.current_room_id in view.rooms:
-                return view.rooms[view.current_room_id]
+                _cur2 = view.rooms[view.current_room_id]
+                try:
+                    _scrub_stale_lobby(_cur2)
+                except Exception:
+                    pass
+                return _cur2
             if "lobby" not in view.rooms:
                 view.rooms["lobby"] = RoomView(room_id="lobby", code=None, created_at=datetime.now(timezone.utc).isoformat())
                 view.current_room_id = "lobby"
+            else:
+                try:
+                    _scrub_stale_lobby(view.rooms["lobby"])
+                except Exception:
+                    pass
             return view.rooms["lobby"]
 
         # Extract RoomName early to create/switch room on Create/Join
@@ -814,6 +966,19 @@ class Engine:
             room = _ensure_room(room_name)
         else:
             room = _ensure_room(None)
+
+        # Created-by-me marker: CreateRoom is client→server only, so any such
+        # op in our feed is our own creation (vs Join* into others' rooms).
+        # Drives the ranked auto-tag — never tag a room we merely joined.
+        # Guarded to a real named room so a nameless packet can never mark
+        # the lobby pseudo-room (or a routed-to MATCH room) by accident.
+        try:
+            if gpb and gpb.get("opName") == "CreateRoom" and room is not None:
+                _rid = str(getattr(room, "room_id", "") or "")
+                if _rid and _rid != "lobby" and (room_name or pkt_room_hint):
+                    room.created_by_me = True
+        except Exception:
+            pass
 
         # Ghost-room healer: silent MATCH rooms (missed self-leave, e.g.
         # null identity) freeze drawer/presence/tag on a dead match.
@@ -1009,21 +1174,53 @@ class Engine:
             log_engine("join", session_id[:13], name=new_name, skin=view.me.skin, gm=packet.game_mode.value if packet.game_mode else "?", max=room.max_players, count=room.players_count, room=room.room_id[:8])
             # Fill blank gm only (None/UNKNOWN) — DF is the client default placeholder
             # and must not lock the room; scene packets repair it via adopt_game_mode.
-            if packet.game_mode and room.game_mode in (None, GameMode.UNKNOWN):
+            # Lobby pseudo-room excluded: it is not a match and must stay gm=None.
+            if packet.game_mode and room.game_mode in (None, GameMode.UNKNOWN) and str(getattr(room, "room_id", "") or "") != "lobby":
                 room.game_mode = packet.game_mode
             # Debug: log gpb for first join to trace other player joins later
             log_engine("debug", session_id[:13], msg=f"first_join op={gpb.get('opName')} room={room_name} playerProps={list(gpb.get('playerProps', {}).keys())}", room=room.room_id[:8])
 
+        try:
+            _op = str((gpb.get("opName") if isinstance(gpb, dict) else "") or "")
+        except Exception:
+            _op = ""
         # Party — from ANY room join carrying Party info, not just the session's
         # first join: a player joining a friend's party mid-session must still get
         # the flag (drawer "In Party" depends on it). RoomName-gated so room-less
         # matchmaking packets can never clear/set the current room's flag.
+        # CreateRoom requests carry Party but no RoomName (the response births
+        # the room without Party) — stash it so the born room still gets the
+        # flag instead of reading as a pub in presence Context.
         if is_first_join and room_name:
             try:
                 party_val = gpb.get("Party") if gpb.get("Party") is not None else gpb.get("properties", {}).get("Party")
                 if party_val is not None:
                     room.party.is_party = bool(party_val)
                     room.party.code = room_name
+                elif _op == "CreateRoom":
+                    _pparty = self._pending_party.get(session_id)
+                    _pfresh = False
+                    if isinstance(_pparty, tuple) and _pparty and _pparty[0] is True:
+                        try:
+                            _pfresh = (time.time() - float(_pparty[1] if len(_pparty) > 1 else 0)) <= 120
+                        except Exception:
+                            _pfresh = False
+                    if _pfresh:
+                        room.party.is_party = True
+                        room.party.code = room_name
+                        log_engine("room", session_id[:13], action="party", room=room.room_id[:8], note="from pending (own create)")
+                    if _pparty is not None:
+                        try:
+                            self._pending_party.pop(session_id, None)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        elif is_first_join and not room_name and _op == "CreateRoom":
+            try:
+                _p0 = gpb.get("Party") if gpb.get("Party") is not None else gpb.get("properties", {}).get("Party")
+                if _p0 is True:
+                    self._pending_party[session_id] = (True, time.time())
             except Exception:
                 pass
 
@@ -1044,8 +1241,11 @@ class Engine:
             valid2 = _is_valid_pid(pID_val2)
             # never stamp the lobby pseudo-room: it isn't a real room, and a
             # code on it would serve a ghost BLOCK (v=0, no warnings) while
-            # the player sits in MainLobby matchmaking.
-            if valid2 and not room.short_code and room.room_id != "lobby":
+            # the player sits in MainLobby matchmaking. Matchmaking mm-*
+            # rooms are likewise codeless by design (ranked + comp are both
+            # code-gated) — a stale pending pID must never bind a pub.
+            _is_mm_room = str(getattr(room, "room_id", "") or "").startswith("mm-")
+            if valid2 and not room.short_code and room.room_id != "lobby" and not _is_mm_room:
                 room.short_code = valid2
                 log_engine("room", session_id[:13], action="pID", code=room.short_code, room=room.room_id[:8])
             elif pID_val2 and not valid2:
@@ -1055,6 +1255,14 @@ class Engine:
                 # (e.g. ranked attempt, then a public match joins in between)
                 self._pending_pid[session_id] = (valid2, time.time())
                 log_engine("debug", session_id[:13], msg=f"pending pID {valid2} for next room", room=room.room_id[:8])
+            elif room_name and str(room_name).startswith("mm-") and session_id in self._pending_pid:
+                # Matchmaking rooms stay codeless: a code pending while
+                # entering matchmaking predates it — drop, never inherit.
+                try:
+                    _dropped, _ = self._pending_pid.pop(session_id, (None, 0.0))
+                    log_engine("debug", session_id[:13], msg=f"pending pID {_dropped} dropped for matchmaking room", room=room.room_id[:8])
+                except Exception:
+                    pass
             elif room_name and not room.short_code and session_id in self._pending_pid:
                 pending, _pts = self._pending_pid.pop(session_id, (None, 0.0))
                 try:
@@ -1066,21 +1274,64 @@ class Engine:
                     log_engine("room", session_id[:13], action="pID", code=room.short_code, room=room.room_id[:8], note="from pending")
                 elif pending:
                     log_engine("debug", session_id[:13], msg=f"stale pending pID {pending} dropped", room=room.room_id[:8])
-            # Pending GM: JoinRandomRoom with gm but no real RoomName → next real room
-            # gets it (wwzw vs BF2V2 mix, public zw_lg -> JoinRoom flow). A synthetic
-            # mm-* room_name counts as "no real room": the gm must ALSO be stashed
-            # so the following real JoinRoom (gm=?) can inherit it. Only concrete
-            # modes are stashed (DF/UNKNOWN placeholders must not pollute next room).
+            # Pending GM: a room-less op carrying gm → next real room gets it.
+            # Two sources: JoinRandomRoom matchmaking filters (wwzw vs BF2V2
+            # mix, public zw_lg -> JoinRoom flow; a synthetic mm-* room_name
+            # counts as "no real room" so the following real JoinRoom (gm=?)
+            # can inherit it) and explicit CreateRoom modes. Only concrete
+            # modes are stashed — EXCEPT CreateRoom, whose gm is authoritative
+            # (the room the user just configured, DF included): it must survive
+            # the request→response hop, whose response carries no GameProperties.
+            # DF from anywhere else stays a placeholder and is never stashed.
+            # Timestamped: reconnect batches flush out of order (responses routinely
+            # arrive BEFORE their requests, or requests never arrive), so a stale
+            # stash must expire instead of stamping a much later room.
             _is_mm_name = isinstance(room_name, str) and room_name.startswith("mm-")
             _concrete_gm = (packet.game_mode and packet.game_mode not in (GameMode.DF, GameMode.UNKNOWN))
-            if packet.game_mode and (not room_name or _is_mm_name) and _concrete_gm:
-                self._pending_gm[session_id] = packet.game_mode
+            _create_df = (_op == "CreateRoom" and packet.game_mode == GameMode.DF)
+            if packet.game_mode and (not room_name or _is_mm_name) and (_concrete_gm or _create_df):
+                self._pending_gm[session_id] = (packet.game_mode, _op or "?", time.time())
                 log_engine("debug", session_id[:13], msg=f"pending gm {packet.game_mode.value} for next room", room=room.room_id[:8])
             elif room_name and not _is_mm_name and room.game_mode in (None, GameMode.UNKNOWN) and session_id in self._pending_gm:
-                pending_gm = self._pending_gm.pop(session_id, None)
-                if pending_gm:
-                    room.game_mode = pending_gm
-                    log_engine("room", session_id[:13], action="gm", gm=pending_gm.value, room=room.room_id[:8], note="from pending")
+                # Private creations start fresh: a stale matchmaking gm (e.g.
+                # zw_lg from the previous public match) must not stamp a new
+                # private room — except the room's OWN CreateRoom request,
+                # stashed seconds earlier on the request→response hop.
+                if _op == "CreateRoom":
+                    _stored = self._pending_gm.pop(session_id, None)
+                    _pgm = _unwrap_pending_gm(_stored)
+                    _psrc = _stored[1] if isinstance(_stored, tuple) and len(_stored) > 1 else "?"
+                    _pfresh = _pending_ts(_stored) > 0 and (time.time() - _pending_ts(_stored)) <= 120
+                    if _psrc == "CreateRoom" and _pgm is not None and _pfresh:
+                        room.game_mode = _pgm
+                        log_engine("room", session_id[:13], action="gm", gm=_pgm.value, room=room.room_id[:8], note="from pending (own create)")
+                    else:
+                        try:
+                            log_engine("debug", session_id[:13], msg="stale pending gm dropped for private CreateRoom", room=room.room_id[:8])
+                        except Exception:
+                            pass
+                else:
+                    _stored2 = self._pending_gm.pop(session_id, None)
+                    pending_gm = _unwrap_pending_gm(_stored2)
+                    _fresh2 = _pending_ts(_stored2) > 0 and (time.time() - _pending_ts(_stored2)) <= 120
+                    if pending_gm and _fresh2:
+                        room.game_mode = pending_gm
+                        log_engine("room", session_id[:13], action="gm", gm=pending_gm.value, room=room.room_id[:8], note="from pending")
+                    elif pending_gm:
+                        try:
+                            log_engine("debug", session_id[:13], msg=f"stale pending gm {pending_gm.value} dropped", room=room.room_id[:8])
+                        except Exception:
+                            pass
+            # Retro-fill: CreateRoom requests routinely arrive AFTER their
+            # response (reconnect batches flush out of order — responses birth
+            # blank rooms, requests land seconds later). Heal the young blank
+            # room the earlier response already born with this request's
+            # gm/pID/Party instead of leaving it modeless/codeless.
+            if _op == "CreateRoom" and not room_name:
+                try:
+                    self._retrofill_created_room(session_id, view, gpb, packet)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -1278,9 +1529,19 @@ class Engine:
                 # blanks/DF placeholders or corrects concrete-vs-concrete (never
                 # clobbers with DF), so lobby scenes are safe.
                 try:
+                    # A STALE lobby bucket gets scrubbed (snapshot poison); a
+                    # FRESH lobby is live play in the lobby bucket (its
+                    # CreateRoom response was lost in a reconnect) and its
+                    # scene repair runs like any real room. from_curscn never
+                    # guesses — MainLobby/Game without a concrete hint map to
+                    # None — so menu scenes can't re-poison it, while MainWorld
+                    # heals the DF the FSM just locked (previously erased on
+                    # this very packet, leaving lobby games permanently "—").
+                    if str(getattr(room, "room_id", "") or "") == "lobby":
+                        _scrub_stale_lobby(room)
                     _hint = getattr(packet, "game_mode", None) or getattr(room, "game_mode", None)
                     try:
-                        _pend = self._pending_gm.get(session_id)
+                        _pend = _unwrap_pending_gm(self._pending_gm.get(session_id))
                         if _hint in (None, GameMode.DF, GameMode.UNKNOWN) and _pend not in (None, GameMode.DF, GameMode.UNKNOWN):
                             _hint = _pend
                     except Exception:
@@ -1318,6 +1579,20 @@ class Engine:
                 # Log every stG change (match progress 1→2→3) like KILL lines
                 if stg != room.last_stg:
                     log_engine("stg", session_id[:13], stg=stg, gm=room.game_mode.value if room.game_mode else None, room=room.room_id[:8])
+                # MATCH START / MATCH END — the two boundaries every scoring
+                # consumer keys on (wager seals, ranked, phase drains). Logged
+                # loudly and once per transition so a missing match is
+                # diagnosable straight from the console.
+                if stg == 1 and room.last_stg != 1:
+                    log_match("START", event="match", session=session_id,
+                              **_match_log_fields(room,
+                                                  players=room.players_count,
+                                                  state=room.state.value))
+                if stg == 3 and room.last_stg != 3:
+                    log_match("END", event="match", session=session_id,
+                              **_match_log_fields(room,
+                                                  state=room.state.value,
+                                                  kills=len(room.recent_kills or [])))
                 # stG=1: new match starting = new life. Party rooms stay MATCH
                 # across versions, so without this deaths/defeats in later
                 # matches are wrongly skipped as "already counted this life".
@@ -1357,7 +1632,7 @@ class Engine:
                 # (gm=?) would otherwise ignore stG=3 entirely and lose the win.
                 if stg == 3 and room.last_stg != 3 and room.game_mode is None:
                     try:
-                        _sgm = self._pending_gm.get(session_id)
+                        _sgm = _unwrap_pending_gm(self._pending_gm.get(session_id))
                         if _sgm not in (None, GameMode.DF, GameMode.UNKNOWN) and room.adopt_game_mode(_sgm):
                             log_engine("room", session_id[:13], action="gm", gm=_sgm.value, room=room.room_id[:8], note="stg repair")
                     except Exception:
@@ -1591,20 +1866,59 @@ class Engine:
         except Exception:
             pass
 
-        # Fresh authenticate (new connection: reload, disconnect, room switch)
-        # means "in no room yet" — drop the stale current room the same way,
-        # or stats keeps serving the previous (possibly ranked) room as live.
-        # The following join/create re-points current within the same burst.
+        # Fresh authenticate USUALLY means "in no room yet" (reload, disconnect,
+        # back to menu) — drop the stale current room the same way, or stats
+        # keeps serving the previous (possibly ranked) room as live.
+        # BUT Photon re-authenticates on every game-server reconnect, including
+        # the handshake that follows a Create/Join (new connection, SAME room:
+        # the CLOSE/OPEN pair in the logs). Yanking there strands the newborn
+        # room (current=lobby, code cleared) and every later gameplay packet
+        # lands in the lobby bucket — real rooms sit ver=0 forever while duel
+        # seals and ranked drains starve. So keep current when a room is
+        # nascent (born seconds ago, handshake in flight) or live (MATCH with
+        # fresh packets, mid-match reconnect); the join/create/scene burst
+        # re-points current from there.
         try:
             if packet.packet_type == PacketType.AUTHENTICATE and view.current_room_id != "lobby":
+                _keep = False
                 try:
-                    _exited = view.rooms.get(view.current_room_id) or room
-                    if getattr(_exited, "room_id", None) != "lobby":
-                        _exited.short_code = None
+                    _now = time.time()
+                    for _rv in (getattr(view, "rooms", {}) or {}).values():
+                        _rid = str(getattr(_rv, "room_id", "") or "")
+                        if not _rid or _rid == "lobby" or _rid.startswith("mm-"):
+                            continue
+                        try:
+                            _lp = float(getattr(_rv, "last_packet_at", None) or 0)
+                        except Exception:
+                            _lp = 0.0
+                        _born = None
+                        try:
+                            from datetime import datetime as _dt
+                            _ca = getattr(_rv, "created_at", None)
+                            _born = _dt.fromisoformat(str(_ca)).timestamp() if _ca else None
+                        except Exception:
+                            _born = None
+                        _nascent = _born is not None and (_now - _born) <= 30
+                        _live = (getattr(_rv, "state", None) == State.MATCH) and (_now - _lp) <= 30
+                        if _nascent or _live:
+                            _keep = True
+                            break
                 except Exception:
-                    pass
-                _ensure_room("lobby")
-                log_engine("room", session_id[:13], action="auth-to-lobby", room=room.room_id[:8])
+                    _keep = False
+                if _keep:
+                    try:
+                        log_engine("debug", session_id[:13], msg="auth kept current room (nascent/live)", room=room.room_id[:8])
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        _exited = view.rooms.get(view.current_room_id) or room
+                        if getattr(_exited, "room_id", None) != "lobby":
+                            _exited.short_code = None
+                    except Exception:
+                        pass
+                    _ensure_room("lobby")
+                    log_engine("room", session_id[:13], action="auth-to-lobby", room=room.room_id[:8])
         except Exception:
             pass
 
@@ -1729,6 +2043,7 @@ class Engine:
                 except Exception:
                     pass
                 # fill skin/pickaxe/pt from this update (_pt ties to actorNr/TargetActorNr)
+                _touch_player(target)
                 skid, pid, pfid, pt = _other_props()
                 if skid: target.skin = skid
                 if pid: target.pickaxe = pid
@@ -1749,6 +2064,21 @@ class Engine:
                 elif target.is_alive and not was_alive:
                     room.players_count += 1
                     log_engine("alv", session_id[:13], name=target.username, alive=True, count=room.players_count, room=room.room_id[:8], actor=actor_nr, target=target_actor_nr, via=alv_via)
+                    # New life for this player: stamp it so the kill
+                    # retransmit guard can tell a fresh kill of them from an
+                    # echo of the previous one (critical in Free Mode, where
+                    # match_version never moves and respawns are ~3s).
+                    try:
+                        if not isinstance(getattr(room, "proc_alive_at", None), dict):
+                            room.proc_alive_at = {}
+                        _an = _norm_name(target.username)
+                        if _an:
+                            room.proc_alive_at[_an] = time.time() * 1000.0
+                            if len(room.proc_alive_at) > 200:
+                                for _k in list(room.proc_alive_at)[:-200]:
+                                    room.proc_alive_at.pop(_k, None)
+                    except Exception:
+                        pass
                     # revive/respawn/round-reset for self = new life: reset per-life flags
                     if target.is_self or (view.me and _names_equal(target.username, view.me.username)):
                         room.had_self_death = False
@@ -1836,7 +2166,7 @@ class Engine:
                 _cgm = getattr(packet, "game_mode", None)
                 if _cgm in (None, GameMode.DF, GameMode.UNKNOWN):
                     try:
-                        _pgm = self._pending_gm.get(session_id)
+                        _pgm = _unwrap_pending_gm(self._pending_gm.get(session_id))
                         if _pgm not in (None, GameMode.DF, GameMode.UNKNOWN):
                             _cgm = _pgm
                     except Exception:
@@ -1861,13 +2191,24 @@ class Engine:
                     _now = time.time() * 1000.0
                 except Exception:
                     _now = 0.0
-                if _kill_content_dup(room.recent_kills, killer, victim, "killed", _now):
+                # A killfeed line proves BOTH players are still connected.
+                for _n in (killer, victim):
+                    try:
+                        for _p in room.players.values():
+                            if _names_equal(_p.username, _n):
+                                _touch_player(_p, _now / 1000.0)
+                                break
+                    except Exception:
+                        continue
+                if _kill_content_dup(room.recent_kills, killer, victim, "killed", _now,
+                                     getattr(room, "proc_alive_at", None)):
                     log_engine("debug", session_id[:13], msg=f"kill dup ignored {killer}->{victim} (retransmit window)", room=room.room_id[:8])
                 else:
                     log_engine("killfeed", session_id[:13], killer=killer, victim=victim, room=room.room_id[:8])
                     room.recent_kills.append(KillInfo(instigator=killer, instigated=victim, event_type="killed", t=_now, hx=packet.raw_hex))
                     if len(room.recent_kills) > 100:
-                        room.recent_kills = room.recent_kills[-100:]
+                        room.recent_kills = room.recent_kills[-10:]
+
                     # Late join via killfeed — only for valid deduped kills
                     for name, is_target in [(killer, False), (victim, True)]:
                         if name:
@@ -1889,7 +2230,7 @@ class Engine:
                 _kgm = getattr(packet, "game_mode", None)
                 if _kgm in (None, GameMode.DF, GameMode.UNKNOWN):
                     try:
-                        _kpgm = self._pending_gm.get(session_id)
+                        _kpgm = _unwrap_pending_gm(self._pending_gm.get(session_id))
                         if _kpgm not in (None, GameMode.DF, GameMode.UNKNOWN):
                             _kgm = _kpgm
                     except Exception:
@@ -1904,7 +2245,8 @@ class Engine:
                     _now2 = time.time() * 1000.0
                 except Exception:
                     _now2 = 0.0
-                if _kill_content_dup(room.recent_knocks, str(packet.killer), str(packet.victim), "knocked", _now2):
+                if _kill_content_dup(room.recent_knocks, str(packet.killer), str(packet.victim), "knocked", _now2,
+                                     getattr(room, "proc_alive_at", None)):
                     log_engine("debug", session_id[:13], msg="knock dup ignored (retransmit window)", room=room.room_id[:8])
                 else:
                     room.recent_knocks.append(KillInfo(instigator=str(packet.killer), instigated=str(packet.victim), event_type="knocked", t=_now2, hx=packet.raw_hex))
@@ -1971,11 +2313,128 @@ class Engine:
 
     def put_session(self, session_id: str, view: "SessionView") -> None:
         """Store a hydrated SessionView (serverless restore from Upstash cache)."""
+        # Heal stale snapshots on the way in: lobby must never carry gm/code
+        # (see RoomView.from_dict). Belt-and-braces for in-memory views built
+        # before the from_dict guard existed.
+        try:
+            _lob = (getattr(view, "rooms", None) or {}).get("lobby")
+            if _lob is not None and str(getattr(_lob, "room_id", "") or "") == "lobby":
+                if getattr(_lob, "game_mode", None) is not None:
+                    _lob.game_mode = None
+                if getattr(_lob, "short_code", None) is not None:
+                    _lob.short_code = None
+        except Exception:
+            pass
         self._sessions[session_id] = view
 
     # -------------------------------------------------------------------
     # Helpers
     # -------------------------------------------------------------------
+
+    def _retrofill_created_room(self, session_id, view, gpb, packet) -> bool:
+        """Heal a young blank created_by_me room from a late CreateRoom request.
+
+        The request carries everything the response lacks (gm incl. DF, pID,
+        Party) but reconnect batches routinely deliver it AFTER the response
+        that already birthed the room — sometimes seconds later. Without this
+        the room stays modeless/codeless (presence "—"/"Pub") until a scene
+        repairs it. Fills only blank fields on the freshest created room
+        missing something; consumes matching pending entries so they can't
+        mis-stamp a later room. Never raises.
+        """
+        try:
+            now = time.time()
+            _gm = getattr(packet, "game_mode", None)
+            if _gm == GameMode.UNKNOWN:
+                _gm = None
+            _pid = None
+            try:
+                if isinstance(gpb, dict) and gpb.get("params", {}).get("GameProperties"):
+                    _gp = gpb["params"]["GameProperties"]
+                    from ..gpbinary import _unwrap as _uwr
+                    _gv = _uwr(_gp) if isinstance(_gp, dict) and "value" in _gp else _gp
+                    if isinstance(_gv, dict) and _is_valid_pid(_gv.get("pID")):
+                        _pid = _gv.get("pID")
+            except Exception:
+                pass
+            _party = False
+            try:
+                _pv = (gpb.get("Party") if isinstance(gpb, dict) and gpb.get("Party") is not None
+                       else (gpb.get("properties", {}) or {}).get("Party"))
+                _party = (_pv is True)
+            except Exception:
+                pass
+            if _gm is None and _pid is None and not _party:
+                return False
+            try:
+                _rooms = getattr(view, "rooms", {}) or {}
+            except Exception:
+                return False
+            _best, _best_lp = None, -1.0
+            for _rv in _rooms.values():
+                try:
+                    if not getattr(_rv, "created_by_me", False):
+                        continue
+                    _rid = str(getattr(_rv, "room_id", "") or "")
+                    if _rid == "lobby" or _rid.startswith("mm-"):
+                        continue
+                    try:
+                        _lp = float(getattr(_rv, "last_packet_at", None) or 0)
+                    except Exception:
+                        _lp = 0.0
+                    if (now - _lp) > 120:
+                        continue
+                    _needs = (
+                        getattr(_rv, "game_mode", None) in (None, GameMode.UNKNOWN)
+                        or not getattr(_rv, "short_code", None)
+                        or not getattr(getattr(_rv, "party", None), "is_party", False)
+                    )
+                    if _needs and _lp > _best_lp:
+                        _best, _best_lp = _rv, _lp
+                except Exception:
+                    continue
+            if _best is None:
+                return False
+            _rid8 = str(getattr(_best, "room_id", "") or "")[:8]
+            if _gm is not None and getattr(_best, "game_mode", None) in (None, GameMode.UNKNOWN):
+                try:
+                    if _best.adopt_game_mode(_gm):
+                        log_engine("room", session_id[:13], action="gm", gm=_gm.value, room=_rid8, note="retrofill late create")
+                        try:
+                            _pg = self._pending_gm.get(session_id)
+                            if (isinstance(_pg, tuple) and _pg and _pg[0] == _gm
+                                    and _pending_ts(_pg) > 0 and (now - _pending_ts(_pg)) <= 120):
+                                self._pending_gm.pop(session_id, None)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            if _pid is not None and not getattr(_best, "short_code", None):
+                try:
+                    _best.short_code = _pid
+                    log_engine("room", session_id[:13], action="pID", code=_pid, room=_rid8, note="retrofill late create")
+                    try:
+                        _pp = self._pending_pid.get(session_id)
+                        if isinstance(_pp, tuple) and _pp and _pp[0] == _pid:
+                            self._pending_pid.pop(session_id, None)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            if _party and not getattr(getattr(_best, "party", None), "is_party", False):
+                try:
+                    _best.party.is_party = True
+                    _best.party.code = getattr(_best, "room_id", None)
+                    log_engine("room", session_id[:13], action="party", room=_rid8, note="retrofill late create")
+                    try:
+                        self._pending_party.pop(session_id, None)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            return True
+        except Exception:
+            return False
 
     def _extract_actor_nr(self, gpb: dict | None) -> int | None:
         """Try to get ActorNr from gpb params."""

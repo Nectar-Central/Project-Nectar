@@ -1,3 +1,6 @@
 pystray>=0.19
 pillow>=10
 requests>=2.31
+# Rich presence: the tray runs companion/rich_presence.py in-process, so the
+# Discord client it drives has to be bundled into the exe.
+pypresence>=4.3

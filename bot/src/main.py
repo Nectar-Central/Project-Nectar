@@ -153,7 +153,6 @@ async def coinflip(interaction: discord.Interaction):
     embed = discord.Embed(
         title="Coin Flip",
         description=(
-            f"<:165460coin:1543709235278516374> "
             f"The coin landed on **{result}!**"
         ),
         color=discord.Color.gold()

@@ -3,19 +3,26 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 try:
     from dotenv import load_dotenv
-    load_dotenv()
-    load_dotenv(dotenv_path="../.env")
-    load_dotenv(dotenv_path="vercel-api/.env")
-    load_dotenv(dotenv_path="app/.env")
+    # Bot's own .env wins over any stale OS/parent-process env (override=True);
+    # the other paths stay fallback-only so they can never clobber it.
+    load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
+    load_dotenv(override=False)
+    load_dotenv(dotenv_path="../.env", override=False)
+    load_dotenv(dotenv_path="vercel-api/.env", override=False)
+    load_dotenv(dotenv_path="app/.env", override=False)
 except: pass
 from discord import app_commands
 from discord.ext import commands
+import asyncio
 import database as db
 import formatters as fmt
 import views
 import alerts as alert_mod
 import ranked as ranked_mod
 import ranked_tourney as rt_mod
+import duels as duels_mod
+import earn as earn_mod
+import comp_results
 try:
     import aiohttp
 except: aiohttp = None
@@ -27,6 +34,13 @@ SERVER_URL = os.getenv("SERVER_URL", "http://127.0.0.1:3000")
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Duel wagers (targeted + open) — commands registered here so they sync
+# in on_ready alongside everything else.
+try:
+    duels_mod.register(bot.tree, bot)
+except Exception as e:
+    print(f"[duels] register failed: {e}")
 
 def gen_token(): return secrets.token_hex(8).upper()  # 16-char hex, e.g. A1B2C3D4E5F6A7B8 (one-time login)
 
@@ -110,8 +124,8 @@ async def _seed_game_username(discord_id: str, handle: str) -> bool:
         row = await db.get_by_discord(str(discord_id))
         if row and (row.get("game_username") or "").strip():
             return False
-        db.supabase.table("bngc_users").update(
-            {"game_username": clean}).eq("discord_id", str(discord_id)).execute()
+        await db._sb_call(lambda: db.supabase.table("bngc_users").update(
+            {"game_username": clean}).eq("discord_id", str(discord_id)).execute())
         return True
     except Exception as e:
         print(f"[register] game_username seed failed: {e}")
@@ -132,12 +146,18 @@ def save_registered_player(discord_id: int, username: str, display_name: str, ga
     db.supabase.table("players").upsert(payload, on_conflict="id").execute()
 
 
+# Recently-404 session ids (unix ts): spares the engine + log spam while a
+# dead session is still flagged active in Supabase. Cleared on next 200.
+_dead_sessions: dict[str, float] = {}
+_DEAD_SESS_TTL = 60.0
+
+
 async def get_active_session(discord_id: str):
     """Get the user's most recent active session_id from bngc_sessions."""
     if not db.USE_SUPABASE or not db.supabase:
         return None
     try:
-        r = db.supabase.table("bngc_sessions").select("session_id, created_at").eq("discord_id", discord_id).eq("is_active", True).order("created_at", desc=True).limit(5).execute()
+        r = await db._sb_call(lambda: db.supabase.table("bngc_sessions").select("session_id, created_at").eq("discord_id", discord_id).eq("is_active", True).order("created_at", desc=True).limit(5).execute())
         if r.data:
             # Prefer most recent; caller can try others if engine 404
             return r.data[0].get("session_id")
@@ -154,7 +174,7 @@ async def get_active_sessions(discord_id: str, limit: int = 5):
     if not db.USE_SUPABASE or not db.supabase:
         return []
     try:
-        r = db.supabase.table("bngc_sessions").select("session_id, created_at").eq("discord_id", discord_id).eq("is_active", True).order("created_at", desc=True).limit(limit * 2).execute()
+        r = await db._sb_call(lambda: db.supabase.table("bngc_sessions").select("session_id, created_at").eq("discord_id", discord_id).eq("is_active", True).order("created_at", desc=True).limit(limit * 2).execute())
         out = []
         for x in (r.data or []):
             if not x.get("session_id"):
@@ -175,16 +195,36 @@ async def get_active_sessions(discord_id: str, limit: int = 5):
         return []
 
 async def get_session_state(session_id: str):
-    """Fetch live SessionView from the engine via GET /api/session/{id}/state."""
+    """Fetch live SessionView from the engine via GET /api/session/{id}/state.
+
+    404s (dead/unknown sessions) are cached 60s so loops stop spamming the
+    engine + logs; a later capture clears the entry on the next 200.
+    """
     if not session_id:
         return None
+    try:
+        import time as _t
+        if _t.time() - float(_dead_sessions.get(str(session_id)) or 0) < _DEAD_SESS_TTL:
+            return None
+    except Exception:
+        pass
     url = f"{SERVER_URL}/api/session/{session_id}/state"
     try:
         if aiohttp:
             async with aiohttp.ClientSession() as s:
                 async with s.get(url, timeout=aiohttp.ClientTimeout(total=3)) as r:
                     if r.status == 200:
+                        try:
+                            _dead_sessions.pop(str(session_id), None)
+                        except Exception:
+                            pass
                         return await r.json()
+                    if r.status == 404:
+                        try:
+                            import time as _t2
+                            _dead_sessions[str(session_id)] = _t2.time()
+                        except Exception:
+                            pass
         else:
             import urllib.request
             with urllib.request.urlopen(url, timeout=3) as r:
@@ -299,6 +339,30 @@ async def on_ready():
         bot.add_view(_CompPlayersView())
     except Exception as e:
         print(f"[comp] persistent view failed: {e}")
+    # persistent duel wager buttons (Join/Accept/Decline/Forfeit, fixed custom_ids)
+    try:
+        bot.add_view(duels_mod.DuelView())
+    except Exception as e:
+        print(f"[duels] persistent view failed: {e}")
+    # persistent duel THREAD buttons (Forfeit/Cancel on the live-duel embed)
+    try:
+        bot.add_view(duels_mod.DuelThreadView())
+    except Exception as e:
+        print(f"[duels] persistent thread view failed: {e}")
+    # duel wager expiry (15-min open/pending) + auto-resolver (60s scoring)
+    try:
+        bot.loop.create_task(duels_mod.duel_expiry_loop(bot))
+    except Exception as e:
+        print(f"[duels] failed to start expiry loop: {e}")
+    try:
+        bot.loop.create_task(duels_mod.duel_resolver_loop(bot))
+    except Exception as e:
+        print(f"[duels] failed to start resolver loop: {e}")
+    # play-to-earn auto-credit (kills/wins -> coins, daily-capped)
+    try:
+        bot.loop.create_task(earn_mod.earn_loop(bot))
+    except Exception as e:
+        print(f"[earn] failed to start loop: {e}")
     # start alert DM loop (login / locked / cheat / warning / blacklist)
     try:
         bot.loop.create_task(alert_mod.alert_loop(bot))
@@ -449,8 +513,8 @@ async def fix_empty_cmd(interaction: discord.Interaction, game_username: app_com
                 f"Already set — you are known as **{current}**. Future matches will attribute to that name.", ephemeral=True)
         # Duplicate guard: another linked account already using this name.
         try:
-            dup = db.supabase.table("bngc_users").select(
-                "discord_id,game_username").ilike("game_username", raw).limit(25).execute()
+            dup = await db._sb_call(lambda: db.supabase.table("bngc_users").select(
+                "discord_id,game_username").ilike("game_username", raw).limit(25).execute())
             for u in ((dup.data if hasattr(dup, "data") else []) or []):
                 try:
                     if str((u or {}).get("discord_id")) == str(interaction.user.id):
@@ -462,8 +526,8 @@ async def fix_empty_cmd(interaction: discord.Interaction, game_username: app_com
                     continue
         except Exception:
             pass
-        upd = db.supabase.table("bngc_users").update(
-            {"game_username": raw}).eq("discord_id", str(interaction.user.id)).execute()
+        upd = await db._sb_call(lambda: db.supabase.table("bngc_users").update(
+            {"game_username": raw}).eq("discord_id", str(interaction.user.id)).execute())
         wrote = bool(getattr(upd, "data", None))
         if not wrote:
             return await interaction.followup.send(
@@ -506,8 +570,8 @@ async def change_user_cmd(interaction: discord.Interaction, game_username: app_c
         return await interaction.followup.send("Supabase not configured.", ephemeral=True)
     me = str(interaction.user.id)
     try:
-        ures = sb.table("bngc_users").select(
-            "discord_id,game_username").eq("discord_id", me).limit(1).execute()
+        ures = await db._sb_call(lambda: sb.table("bngc_users").select(
+            "discord_id,game_username").eq("discord_id", me).limit(1).execute())
         cur = (((ures.data or [{}])[0] or {}).get("game_username") or "").strip()
     except Exception:
         cur = ""
@@ -528,8 +592,8 @@ async def change_user_cmd(interaction: discord.Interaction, game_username: app_c
     except Exception:
         pass
     try:
-        dup = sb.table("bngc_users").select(
-            "discord_id,game_username").ilike("game_username", raw).limit(25).execute()
+        dup = await db._sb_call(lambda: sb.table("bngc_users").select(
+            "discord_id,game_username").ilike("game_username", raw).limit(25).execute())
         for u in ((dup.data if hasattr(dup, "data") else []) or []):
             try:
                 if str((u or {}).get("discord_id")) == me:
@@ -542,7 +606,7 @@ async def change_user_cmd(interaction: discord.Interaction, game_username: app_c
     except Exception:
         pass
     try:
-        sb.table("bngc_users").update({"game_username": raw}).eq("discord_id", me).execute()
+        await db._sb_call(lambda: sb.table("bngc_users").update({"game_username": raw}).eq("discord_id", me).execute())
     except Exception as e:
         print(f"[change-user] save failed: {e}")
         return await interaction.followup.send("Couldn't save — try again later.", ephemeral=True)
@@ -572,15 +636,691 @@ async def view_dev_team_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="coinflip", description="Flip a coin")
-async def coinflip_cmd(interaction: discord.Interaction):
+@bot.tree.command(name="coinflip", description="Flip a coin (optional wager in Nectar Coins)")
+@app_commands.describe(bet="Coins to wager (1-10000, win 2x)",
+                       choice="Heads or Tails (required when betting)")
+@app_commands.choices(choice=[app_commands.Choice(name="Heads", value="Heads"),
+                              app_commands.Choice(name="Tails", value="Tails")])
+async def coinflip_cmd(interaction: discord.Interaction,
+                       bet: app_commands.Range[int, 1, 100000] | None = None,
+                       choice: str | None = None):
+    if not bet:
+        result = secrets.choice(["Heads", "Tails"])
+        embed = discord.Embed(
+            title="Coin Flip",
+            description=f"The coin landed on **{result}!**",
+            color=discord.Color.gold(),
+        )
+        await interaction.response.send_message(embed=embed)
+        return
+    if choice not in ("Heads", "Tails"):
+        return await interaction.response.send_message(
+            "Pick **Heads** or **Tails** when you bet.", ephemeral=True)
+    await interaction.response.defer()
+    me = str(interaction.user.id)
+    row = await db.get_by_discord(me)
+    if not row:
+        return await interaction.followup.send("You need **/register** first.")
+    try:
+        bal = int(row.get("nectar_coins") or 0)
+    except Exception:
+        return await interaction.followup.send(
+            "Database migration pending — ask a host to apply add_nectar_coins_v252.sql.")
+    if bet < 1:
+        return await interaction.followup.send("Minimum bet is **1** coin.")
+    if bet > 10000:
+        return await interaction.followup.send("Maximum bet is **10,000** coins.")
+    if bet > bal:
+        return await interaction.followup.send(f"Insufficient balance ({bal:,} Nectar Coins).")
     result = secrets.choice(["Heads", "Tails"])
+    won = (result == choice)
+    try:
+        new_bal = await db.add_coin_delta(me, bet if won else -bet,
+                                          "flip_win" if won else "flip_loss",
+                                          {"bet": int(bet), "choice": choice,
+                                           "result": result})
+    except Exception as e:
+        return await interaction.followup.send(str(e)[:160])
+    color = discord.Color.green() if won else discord.Color.red()
+    verb = f"won **+{bet:,}**" if won else f"lost **-{bet:,}**"
     embed = discord.Embed(
-        title="Coin Flip",
-        description=f"The coin landed on **{result}!**",
-        color=discord.Color.gold(),
+        title=f"Coin Flip — {result}",
+        description=f"You called **{choice}** and {verb} Nectar Coins\nBalance: **{new_bal:,}**",
+        color=color,
     )
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="balance", description="Show your Nectar Coin balance")
+async def balance_cmd(interaction: discord.Interaction, user: discord.User | None = None):
+    target = user or interaction.user
+    info = await db.get_coin_balance(str(target.id))
+    if not info:
+        return await interaction.response.send_message(
+            f"No data for {target.mention}. They need /register.", ephemeral=True)
+    e = discord.Embed(title=f"{target.display_name} — {info['balance']:,} Nectar Coins",
+                      color=discord.Color.gold())
+    e.add_field(name="Earned", value=f"{info['total_earned']:,}", inline=True)
+    e.add_field(name="Wagered", value=f"{info['total_wagered']:,}", inline=True)
+    e.add_field(name="Daily streak", value=f"x{info['daily_streak']}", inline=True)
+    await interaction.response.send_message(embed=e)
+
+
+@bot.tree.command(name="daily", description="Claim your daily Nectar Coins (streak bonus)")
+async def daily_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    me = str(interaction.user.id)
+    try:
+        out = await db.claim_daily_coins(me)
+    except LookupError:
+        return await interaction.followup.send("You need **/register** first.", ephemeral=True)
+    except Exception as e:
+        return await interaction.followup.send(str(e)[:180], ephemeral=True)
+    if not out.get("claimed"):
+        return await interaction.followup.send(
+            f"Already claimed today — streak x{out.get('streak', 0)}, "
+            f"balance **{out.get('balance', 0):,}** Nectar Coins. Come back tomorrow.", ephemeral=True)
+    await interaction.followup.send(
+        f"Claimed **+{out['payout']:,}** Nectar Coins (streak x{out['streak']}) — "
+        f"balance **{out['balance']:,}**.", ephemeral=True)
+
+
+@bot.tree.command(name="pay", description="Send Nectar Coins to another player")
+@app_commands.describe(user="Who to pay", amount="Coins to send (1-100000)")
+async def pay_cmd(interaction: discord.Interaction, user: discord.User,
+                  amount: app_commands.Range[int, 1, 100000]):
+    if user.bot:
+        return await interaction.response.send_message("You can't pay bots.", ephemeral=True)
+    if str(user.id) == str(interaction.user.id):
+        return await interaction.response.send_message("You can't pay yourself.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    me = str(interaction.user.id)
+    sender = await db.get_by_discord(me)
+    if not sender:
+        return await interaction.followup.send("You need **/register** first.", ephemeral=True)
+    dest = await db.get_by_discord(str(user.id))
+    if not dest:
+        return await interaction.followup.send(f"{user.mention} needs **/register** first.", ephemeral=True)
+    try:
+        bal = int(sender.get("nectar_coins") or 0)
+    except Exception:
+        return await interaction.followup.send(
+            "Database migration pending — ask a host to apply add_nectar_coins_v252.sql.", ephemeral=True)
+    if amount < 1:
+        return await interaction.followup.send("Minimum transfer is 1 coin.", ephemeral=True)
+    if amount > 100000:
+        return await interaction.followup.send("Maximum transfer is 100,000 coins.", ephemeral=True)
+    if amount > bal:
+        return await interaction.followup.send(f"Insufficient balance ({bal:,} Nectar Coins).", ephemeral=True)
+    try:
+        await db.add_coin_delta(me, -int(amount), "pay_sent", {"to": str(user.id)})
+        new_dest = await db.add_coin_delta(str(user.id), int(amount),
+                                           "pay_received", {"from": me})
+    except Exception as e:
+        return await interaction.followup.send(str(e)[:180], ephemeral=True)
+    await interaction.followup.send(
+        f"Sent **{amount:,}** Nectar Coins to {user.mention} (their balance **{new_dest:,}** Nectar Coins).",
+        ephemeral=True)
+
+
+@bot.tree.command(name="coins-leaderboard", description="Richest Nectar Coin holders")
+async def coins_leaderboard_cmd(interaction: discord.Interaction):
+    rows = await db.get_coin_leaderboard(10)
+    if not rows:
+        return await interaction.response.send_message("No coin holders yet — claim **/daily** first.")
+    lines = [f"{i}. <@{r.get('discord_id')}> — **{int(r.get('nectar_coins') or 0):,}** Nectar Coins"
+             for i, r in enumerate(rows, 1)]
+    e = discord.Embed(title="Nectar Coins Leaderboard", description="\n".join(lines),
+                      color=discord.Color.gold())
+    await interaction.response.send_message(embed=e)
+
+
+# /coin group (top/reset/remove) — one top-level slot: the tree sits at the
+# 100-command Discord cap, so coin moderation ships as subcommands.
+coin_group = app_commands.Group(name="coin", description="Nectar Coin standings and moderation")
+
+
+def _coin_admin(interaction: discord.Interaction) -> bool:
+    """Pure admin check for coin moderation subcommands. Never raises."""
+    try:
+        return bool(interaction.user.guild_permissions.administrator)
+    except Exception:
+        return False
+
+
+@coin_group.command(name="top", description="Top Nectar Coin holders")
+@app_commands.describe(limit="How many to show (1-25)")
+async def coin_top_cmd(interaction: discord.Interaction,
+                       limit: app_commands.Range[int, 1, 25] = 10):
+    rows = await db.get_coin_leaderboard(int(limit or 10))
+    if not rows:
+        return await interaction.response.send_message("No coin holders yet — claim **/daily** first.")
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [(medals[i] + " " if i < 3 else f"{i + 1}. ") +
+             f"<@{r.get('discord_id')}> — "
+             f"**{int(r.get('nectar_coins') or 0):,}** Nectar Coins"
+             for i, r in enumerate(rows)]
+    e = discord.Embed(title="Nectar Coins Top", description="\n".join(lines),
+                      color=discord.Color.gold())
+    await interaction.response.send_message(embed=e)
+
+
+@coin_group.command(name="reset", description="Zero a player's Nectar Coins (admin)")
+@app_commands.describe(user="Player whose balance returns to 0")
+@app_commands.default_permissions(administrator=True)
+async def coin_reset_cmd(interaction: discord.Interaction, user: discord.User):
+    if not _coin_admin(interaction):
+        return await interaction.response.send_message("Administrator only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        info = await db.get_coin_balance(str(user.id))
+    except Exception:
+        info = None
+    if not info:
+        return await interaction.followup.send(
+            f"No data for {user.mention}. They need /register.", ephemeral=True)
+    bal = int(info.get("balance") or 0)
+    if bal <= 0:
+        return await interaction.followup.send(
+            f"{user.mention} already holds **0** Nectar Coins.", ephemeral=True)
+    try:
+        await db.add_coin_delta(str(user.id), -bal, "coin_reset",
+                                {"by": str(interaction.user.id)})
+    except Exception as e:
+        return await interaction.followup.send(str(e)[:160], ephemeral=True)
+    print(f"[coins] reset {user.id} ({bal:,} -> 0) by {interaction.user.id}")
+    await interaction.followup.send(
+        f"Reset {user.mention}: **{bal:,}** → **0** Nectar Coins.", ephemeral=True)
+
+
+@coin_group.command(name="remove", description="Take Nectar Coins from a player (admin)")
+@app_commands.describe(user="Player to debit", amount="Coins to remove (1-100000)")
+@app_commands.default_permissions(administrator=True)
+async def coin_remove_cmd(interaction: discord.Interaction, user: discord.User,
+                          amount: app_commands.Range[int, 1, 100000]):
+    if not _coin_admin(interaction):
+        return await interaction.response.send_message("Administrator only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        info = await db.get_coin_balance(str(user.id))
+    except Exception:
+        info = None
+    if not info:
+        return await interaction.followup.send(
+            f"No data for {user.mention}. They need /register.", ephemeral=True)
+    bal = int(info.get("balance") or 0)
+    if int(amount) > bal:
+        return await interaction.followup.send(
+            f"They hold **{bal:,}** Nectar Coins — can't remove **{int(amount):,}**.", ephemeral=True)
+    try:
+        new_bal = await db.add_coin_delta(str(user.id), -int(amount), "coin_remove",
+                                          {"by": str(interaction.user.id)})
+    except Exception as e:
+        return await interaction.followup.send(str(e)[:160], ephemeral=True)
+    print(f"[coins] remove {amount:,} from {user.id} by {interaction.user.id}")
+    await interaction.followup.send(
+        f"Removed **{int(amount):,}** Nectar Coins from {user.mention} (balance **{new_bal:,}**).",
+        ephemeral=True)
+
+
+@coin_group.command(name="add", description="Grant Nectar Coins to a player (admin)")
+@app_commands.describe(user="Player to credit", amount="Coins to grant (1-100000)")
+@app_commands.default_permissions(administrator=True)
+async def coin_add_cmd(interaction: discord.Interaction, user: discord.User,
+                       amount: app_commands.Range[int, 1, 100000]):
+    if not _coin_admin(interaction):
+        return await interaction.response.send_message("Administrator only.", ephemeral=True)
+    if user.bot:
+        return await interaction.response.send_message("You can't grant coins to bots.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        info = await db.get_coin_balance(str(user.id))
+    except Exception:
+        info = None
+    if not info:
+        return await interaction.followup.send(
+            f"No data for {user.mention}. They need /register.", ephemeral=True)
+    try:
+        new_bal = await db.add_coin_delta(str(user.id), int(amount), "coin_add",
+                                          {"by": str(interaction.user.id)})
+    except Exception as e:
+        return await interaction.followup.send(str(e)[:160], ephemeral=True)
+    print(f"[coins] add {int(amount):,} to {user.id} by {interaction.user.id}")
+    await interaction.followup.send(
+        f"Granted **{int(amount):,}** Nectar Coins to {user.mention} (balance **{new_bal:,}**).",
+        ephemeral=True)
+
+
+async def _coin_all_ids(limit: int = 5000):
+    """All registered discord_ids. Never raises (empty on failure)."""
+    try:
+        if not db.USE_SUPABASE or not db.supabase:
+            return []
+        r = await db._sb_call(lambda: db.supabase.table("bngc_users").select(
+            "discord_id").limit(int(limit)).execute())
+        out = []
+        for x in ((r.data if hasattr(r, "data") else []) or []):
+            try:
+                did = str((x or {}).get("discord_id") or "")
+                if did and did not in out:
+                    out.append(did)
+            except Exception:
+                continue
+        return out
+    except Exception as e:
+        print(f"[coins] all-ids failed: {e}")
+        return []
+
+
+@coin_group.command(name="give-all", description="Grant Nectar Coins to EVERY registered player (admin)")
+@app_commands.describe(amount="Coins each player receives (1-100000)")
+@app_commands.default_permissions(administrator=True)
+async def coin_give_all_cmd(interaction: discord.Interaction,
+                            amount: app_commands.Range[int, 1, 100000]):
+    if not _coin_admin(interaction):
+        return await interaction.response.send_message("Administrator only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    ids = await _coin_all_ids()
+    if not ids:
+        return await interaction.followup.send("No registered players found.", ephemeral=True)
+    by = str(interaction.user.id)
+    paid, failed, total = 0, [], 0
+    try:
+        prog = await interaction.followup.send(
+            f"Granting **{int(amount):,}** Nectar Coins to **{len(ids)}** players…",
+            ephemeral=True)
+    except Exception:
+        prog = None
+    for i, did in enumerate(ids, 1):
+        try:
+            await db.add_coin_delta(did, int(amount), "coin_add",
+                                    {"by": by, "mass": "give-all"})
+            paid += 1
+            total += int(amount)
+        except Exception as e:
+            print(f"[coins] give-all failed for {did[:6]}: {e}")
+            if len(failed) < 5:
+                failed.append(f"<@{did}>")
+        try:
+            if prog is not None and (i % 25 == 0 or i == len(ids)):
+                await prog.edit(content=f"Granting… **{i}/{len(ids)}** done.")
+        except Exception:
+            pass
+    print(f"[coins] give-all {int(amount):,} x {paid} players by {by}")
+    tail = f" Failed: {', '.join(failed)}." if failed else ""
+    await interaction.followup.send(
+        f"Granted **{int(amount):,}** Nectar Coins to **{paid}/{len(ids)}** players "
+        f"(**{total:,}** total).{tail}", ephemeral=True)
+
+
+@coin_group.command(name="reset-all", description="Zero EVERY player's Nectar Coins (admin, irreversible)")
+@app_commands.describe(confirm="Type RESET ALL to confirm")
+@app_commands.default_permissions(administrator=True)
+async def coin_reset_all_cmd(interaction: discord.Interaction, confirm: str):
+    if not _coin_admin(interaction):
+        return await interaction.response.send_message("Administrator only.", ephemeral=True)
+    if str(confirm or "").strip().upper() != "RESET ALL":
+        return await interaction.response.send_message(
+            'Type `RESET ALL` in confirm to zero every balance. This cannot be undone.',
+            ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        rows = await db._sb_call(lambda: db.supabase.table("bngc_users").select(
+            "discord_id,nectar_coins").limit(5000).execute()) \
+            if db.USE_SUPABASE and db.supabase else None
+        rows = (rows.data if hasattr(rows, "data") else []) or []
+    except Exception as e:
+        print(f"[coins] reset-all read failed: {e}")
+        return await interaction.followup.send("Couldn't read balances — try again later.",
+                                               ephemeral=True)
+    by = str(interaction.user.id)
+    zeroed, skipped, wiped = 0, 0, 0
+    try:
+        prog = await interaction.followup.send(
+            f"Zeroing **{len(rows)}** balances…", ephemeral=True)
+    except Exception:
+        prog = None
+    for i, r in enumerate(rows, 1):
+        try:
+            did = str((r or {}).get("discord_id") or "")
+            bal = int((r or {}).get("nectar_coins") or 0)
+            if not did:
+                continue
+            if bal <= 0:
+                skipped += 1
+                continue
+            await db.add_coin_delta(did, -bal, "coin_reset",
+                                    {"by": by, "mass": "reset-all"})
+            zeroed += 1
+            wiped += bal
+        except Exception as e:
+            print(f"[coins] reset-all failed: {e}")
+        try:
+            if prog is not None and (i % 25 == 0 or i == len(rows)):
+                await prog.edit(content=f"Zeroing… **{i}/{len(rows)}** done.")
+        except Exception:
+            pass
+    print(f"[coins] reset-all by {by}: {zeroed} zeroed, {wiped:,} wiped")
+    await interaction.followup.send(
+        f"Reset **{zeroed}** players to **0** (**{wiped:,}** Nectar Coins wiped, "
+        f"{skipped} already empty).", ephemeral=True)
+
+
+bot.tree.add_command(coin_group)
+
+
+@bot.tree.command(name="coins-history", description="Your recent Nectar Coin transactions")
+async def coins_history_cmd(interaction: discord.Interaction):
+    entries = await db.get_coin_ledger(str(interaction.user.id), 10)
+    if not entries:
+        return await interaction.response.send_message(
+            "No transactions yet — claim **/daily** first.", ephemeral=True)
+    lines = []
+    for x in entries:
+        try:
+            d = int(x.get("delta") or 0)
+            lines.append(f"{'+' if d >= 0 else ''}{d:,} — {x.get('reason')} (bal {int(x.get('balance_after') or 0):,})")
+        except Exception:
+            continue
+    e = discord.Embed(title="Recent Nectar Coins Transactions", description="\n".join(lines) or "—",
+                      color=discord.Color.gold())
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+@bot.tree.command(name="slots", description="Spin 3-reel slots (1-10000 coins; trips pay up to 25x)")
+@app_commands.describe(bet="Coins to wager (1-10000)")
+async def slots_cmd(interaction: discord.Interaction,
+                    bet: app_commands.Range[int, 1, 100000]):
+    await interaction.response.defer()
+    me = str(interaction.user.id)
+    row = await db.get_by_discord(me)
+    if not row:
+        return await interaction.followup.send("You need **/register** first.")
+    try:
+        bal = int(row.get("nectar_coins") or 0)
+    except Exception:
+        return await interaction.followup.send(
+            "Database migration pending — ask a host to apply add_nectar_coins_v252.sql.")
+    if bet < 1:
+        return await interaction.followup.send("Minimum bet is **1** coin.")
+    if bet > 10000:
+        return await interaction.followup.send("Maximum bet is **10,000** coins.")
+    if bet > bal:
+        return await interaction.followup.send(f"Insufficient balance ({bal:,} Nectar Coins).")
+    symbols = db.spin_slots()
+    kind = db.slots_kind(symbols)
+    delta = db.slots_delta(bet, symbols)
+    reason = {"trips": "slots_win", "pair": "slots_refund", "loss": "slots_loss"}[kind]
+    try:
+        new_bal = await db.add_coin_delta(me, delta, reason,
+                                          {"bet": int(bet), "symbols": symbols,
+                                           "kind": kind})
+    except Exception as e:
+        return await interaction.followup.send(str(e)[:160])
+    reels = " | ".join(symbols)
+    if kind == "trips":
+        mult = db.SLOT_TRIPS_MULT.get(symbols[0], 0)
+        color = discord.Color.green()
+        desc = f"**{reels}**\n🎰 JACKPOT — trips pay **{mult}x**: won **+{delta:,}** Nectar Coins"
+    elif kind == "pair":
+        color = discord.Color.gold()
+        desc = f"**{reels}**\nPair — bet refunded (Nectar Coins)"
+    else:
+        color = discord.Color.red()
+        desc = f"**{reels}**\nNo match — lost **-{bet:,}** Nectar Coins"
+    e = discord.Embed(title="🎰 Slots", description=f"{desc}\nBalance: **{new_bal:,}**",
+                      color=color)
+    await interaction.followup.send(embed=e)
+
+
+@bot.tree.command(name="dice", description="Roll 1-100 vs 50: Over wins on 51+, Under on 49- (50 pushes)")
+@app_commands.describe(bet="Coins to wager (1-10000)",
+                       choice="Over (51-100) or Under (1-49); 50 refunds")
+@app_commands.choices(choice=[app_commands.Choice(name="Over", value="Over"),
+                              app_commands.Choice(name="Under", value="Under")])
+async def dice_cmd(interaction: discord.Interaction,
+                   bet: app_commands.Range[int, 1, 100000],
+                   choice: str):
+    if choice not in ("Over", "Under"):
+        return await interaction.response.send_message(
+            "Pick **Over** or **Under**.", ephemeral=True)
+    await interaction.response.defer()
+    me = str(interaction.user.id)
+    row = await db.get_by_discord(me)
+    if not row:
+        return await interaction.followup.send("You need **/register** first.")
+    try:
+        bal = int(row.get("nectar_coins") or 0)
+    except Exception:
+        return await interaction.followup.send(
+            "Database migration pending — ask a host to apply add_nectar_coins_v252.sql.")
+    if bet < 1:
+        return await interaction.followup.send("Minimum bet is **1** coin.")
+    if bet > 10000:
+        return await interaction.followup.send("Maximum bet is **10,000** coins.")
+    if bet > bal:
+        return await interaction.followup.send(f"Insufficient balance ({bal:,} Nectar Coins).")
+    roll = db.roll_dice()
+    delta = db.dice_delta(bet, choice, roll)
+    reason = "dice_win" if delta > 0 else "dice_push" if delta == 0 else "dice_loss"
+    try:
+        new_bal = await db.add_coin_delta(me, delta, reason,
+                                          {"bet": int(bet), "choice": choice,
+                                           "roll": roll})
+    except Exception as e:
+        return await interaction.followup.send(str(e)[:160])
+    if delta > 0:
+        color, outcome = discord.Color.green(), f"won **+{delta:,}** Nectar Coins"
+    elif delta == 0:
+        color, outcome = discord.Color.gold(), "pushed on **50** — bet refunded (Nectar Coins)"
+    else:
+        color, outcome = discord.Color.red(), f"lost **-{bet:,}** Nectar Coins"
+    e = discord.Embed(title=f"🎲 Dice — rolled {roll}",
+                      description=f"You called **{choice}** and {outcome}\nBalance: **{new_bal:,}**",
+                      color=color)
+    await interaction.followup.send(embed=e)
+
+
+def _bets_api_down():
+    try:
+        base = str(SERVER_URL or "").strip().rstrip("/")
+    except Exception:
+        base = ""
+    return ("Server unreachable — match betting needs the API"
+            + (f" ({base})" if base else "") + ". "
+              "Start it (`uvicorn server.main:app`) and check SERVER_URL, then try again.")
+
+
+@bot.tree.command(name="matches", description="Open matches you can bet Nectar Coins on")
+async def matches_cmd(interaction: discord.Interaction):
+    data = await _api_get("/api/coins/bets/open?limit=25")
+    if not data:
+        return await interaction.response.send_message(_bets_api_down(), ephemeral=True)
+    if data.get("error"):
+        return await interaction.response.send_message(str(data["error"])[:180], ephemeral=True)
+    matches = data.get("matches") or []
+    if not matches:
+        return await interaction.response.send_message(
+            "No open matches right now — any tracked live match shows up here "
+            "(any mode: pubs, ranked, tourneys). Play one and check back.")
+    lines = []
+    for m in matches[:12]:
+        try:
+            lines.append(f"`{m.get('match_key') or m.get('key')}` — **{m.get('label')}** "
+                         f"({m.get('participant_count', 0)} players, "
+                         f"{m.get('pool', 0):,} Nectar Coins pool)")
+        except Exception:
+            continue
+    e = discord.Embed(title="🎯 Open matches",
+                      description="\n".join(lines) or "—",
+                      color=discord.Color.gold())
+    e.set_footer(text="Bet with /bet match_key pick:@player amount (1-10000) on any live match. Win-pool winners split it.")
+    await interaction.response.send_message(embed=e)
+
+
+@bot.tree.command(name="bet", description="Bet Nectar Coins on a player (win pool, out, or kills line)")
+@app_commands.describe(match_key="Match key from /matches (e.g. comp:3:2)",
+                       player="Who you are betting on (must be playing)",
+                       amount="Coins to stake (1-10000)",
+                       bet_type="Win = pool split. Out = they get eliminated (live rooms). Kills = they reach X kills.",
+                       line="Kills line 2-20 (required for Kills bets)")
+@app_commands.choices(bet_type=[app_commands.Choice(name="Win", value="win"),
+                                app_commands.Choice(name="Out", value="out"),
+                                app_commands.Choice(name="Kills", value="kills")])
+async def bet_cmd(interaction: discord.Interaction, match_key: str,
+                  player: discord.User, amount: app_commands.Range[int, 1, 100000],
+                  bet_type: str = "win",
+                  line: app_commands.Range[int, 1, 30] | None = None):
+    if player.bot:
+        return await interaction.response.send_message("You can't bet on picks that are bots.", ephemeral=True)
+    if bet_type not in ("win", "out", "kills"):
+        return await interaction.response.send_message("Type must be Win, Out or Kills.", ephemeral=True)
+    if bet_type == "kills" and line is None:
+        return await interaction.response.send_message(
+            "Kills bets need a line — e.g. `line:5` means they must reach 5 kills.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    payload = {
+        "discord_id": str(interaction.user.id),
+        "match_key": str(match_key or "").strip(),
+        "pick_discord_id": str(player.id),
+        "amount": int(amount),
+        "bet_type": bet_type,
+    }
+    if line is not None:
+        payload["line"] = int(line)
+    status, body = await _api_post("/api/coins/bets", payload)
+    if status == 0:
+        return await interaction.followup.send(_bets_api_down(), ephemeral=True)
+    if status != 200 or (body or {}).get("error"):
+        return await interaction.followup.send(
+            str((body or {}).get("error") or f"Bet failed (HTTP {status}).")[:180],
+            ephemeral=True)
+    if (body or {}).get("bet_type", "win") == "win":
+        await interaction.followup.send(
+            f"Bet **{body['amount']:,}** Nectar Coins on **{body.get('pick_name', player.display_name)}** to win "
+            f"**{body.get('label', body['match_key'])}**.\n"
+            f"Pool is now **{body.get('pool', 0):,}** Nectar Coins across {body.get('pool_bets', 0)} bets. "
+            f"Winners split the pool (5% rake).", ephemeral=True)
+    else:
+        desc = (f"**{player.display_name}** to reach **{body.get('line')} kills**"
+                if body.get("bet_type") == "kills" else
+                f"**{player.display_name}** to get eliminated")
+        await interaction.followup.send(
+            f"Bet **{body['amount']:,}** Nectar Coins on {desc} in "
+            f"**{body.get('label', body['match_key'])}** @ **{body.get('odds')}x** — "
+            f"pays **{body.get('to_win', 0):,}** Nectar Coins.", ephemeral=True)
+
+
+@bot.tree.command(name="my-bets", description="Your open and recent Nectar Coin match bets")
+async def my_bets_cmd(interaction: discord.Interaction):
+    data = await _api_get(f"/api/coins/bets/mine?discord_id={interaction.user.id}")
+    if not data:
+        return await interaction.response.send_message(_bets_api_down(), ephemeral=True)
+    if data.get("error"):
+        return await interaction.response.send_message(str(data["error"])[:180], ephemeral=True)
+    open_b, settled = data.get("open") or [], data.get("settled") or []
+    if not open_b and not settled:
+        return await interaction.response.send_message(
+            "No bets yet — see **/matches** and place one with **/bet**.", ephemeral=True)
+    e = discord.Embed(title=f"🎟️ {interaction.user.display_name}'s bets",
+                      color=discord.Color.gold())
+
+    def _tag(b):
+        try:
+            t = str(b.get("bet_type") or "win")
+            if t == "kills":
+                return f" [{b.get('line')}K @ {b.get('odds')}x]"
+            if t == "out":
+                return f" [out @ {b.get('odds')}x]"
+        except Exception:
+            pass
+        return ""
+
+    if open_b:
+        e.add_field(name="Open", value="\n".join(
+            f"{b.get('amount', 0):,} Nectar Coins on **{b.get('pick_name')}**{_tag(b)} ({b.get('label')})"
+            for b in open_b[:8]) or "—", inline=False)
+    if settled:
+        e.add_field(name="Recent", value="\n".join(
+            (f"{b.get('amount', 0):,} → **+{b.get('payout', 0):,}** ✅"
+             if b.get("status") == "won" else
+             f"{b.get('amount', 0):,} refunded ↩️"
+             if b.get("status") == "refunded" else
+             f"{b.get('amount', 0):,} lost ❌")
+            + f" — {b.get('pick_name')} ({b.get('label')})"
+            for b in settled[:8]) or "—", inline=False)
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+@bot.tree.command(name="match-pool", description="Show the betting pool for a match")
+@app_commands.describe(match_key="Match key from /matches (e.g. comp:3:2)")
+async def match_pool_cmd(interaction: discord.Interaction, match_key: str):
+    import urllib.parse as _up
+    data = await _api_get("/api/coins/bets/pool?match_key="
+                          + _up.quote(str(match_key or "").strip()))
+    if not data:
+        return await interaction.response.send_message(_bets_api_down(), ephemeral=True)
+    if data.get("error"):
+        return await interaction.response.send_message(str(data["error"])[:180], ephemeral=True)
+    per = data.get("per_pick") or []
+    pool = int(data.get("pool") or 0)
+    lines = [f"**{p.get('name')}** — {p.get('total', 0):,} Nectar Coins ({p.get('bettors', 0)} bets)"
+             for p in per[:15]]
+    try:
+        evd = data.get("evidence") or None
+        if evd and str(data.get("status") or "") == "open":
+            tgt = evd.get("kill_target")
+            form = [f"{'💀' if p.get('status') != 'alive' else '🟢'} "
+                    f"{p.get('name')} — {p.get('kills', 0)}K"
+                    for p in (evd.get("players") or [])[:12]]
+            if form:
+                lines.append(f"\n__Live feed (first to {tgt} wins)__")
+                lines.extend(form)
+    except Exception:
+        pass
+    title = f"🎯 Pool — {data.get('label', match_key)}"
+    if str(data.get("status") or "") != "open":
+        w = f" Winner: **{data.get('winner_name') or data.get('winner')}**." \
+            if data.get("winner") else " No winner — stakes refunded."
+        title += f" [{data.get('status')}]" + (f" — paid {int(data.get('paid') or 0):,} Nectar Coins" if data.get("paid") else "")
+        if w:
+            lines.append(w)
+    else:
+        lines.append(f"\nTotal **{pool:,}** Nectar Coins — winners split it (5% rake).")
+        try:
+            sides = data.get("side_bets") or []
+            if sides:
+                sl = []
+                for s in sides[:10]:
+                    try:
+                        what = (f"{s.get('line')} kills @ {s.get('odds')}x"
+                                if s.get("type") == "kills" else
+                                f"out @ {s.get('odds')}x")
+                        sl.append(f"{s.get('amount', 0):,} on **{s.get('pick_name')}** {what}")
+                    except Exception:
+                        continue
+                if sl:
+                    lines.append("\n__Side bets__")
+                    lines.extend(sl)
+            offered = data.get("offered") or []
+            if offered:
+                ol = []
+                for o in offered[:12]:
+                    try:
+                        ks = ", ".join(f"{k}:{v}x" for k, v in (o.get("kills") or {}).items())
+                        extra = f" | out {o.get('out_odds')}x" if o.get("out_odds") else ""
+                        prov = " (new)" if o.get("provisional") else ""
+                        ol.append(f"**{o.get('name')}** ({o.get('avg_kills')} K/m{prov}) — {ks}{extra}")
+                    except Exception:
+                        continue
+                if ol:
+                    lines.append("\n__Odds (per coin staked)__")
+                    lines.extend(ol)
+        except Exception:
+            pass
+    e = discord.Embed(title=title, description="\n".join(lines) or "No bets yet — be the first.",
+                      color=discord.Color.gold())
+    await interaction.response.send_message(embed=e)
 
 
 @bot.tree.command(name="serverinfo", description="Shows information about the current server")
@@ -970,6 +1710,20 @@ async def status_cmd(interaction: discord.Interaction):
         if best is None:
             best = (cand, st)
     if best is None:
+        # Engine cold (or modeless bf/DF lobby play): combat rows still prove it.
+        try:
+            _act, _agm, _ats = await db.recent_combat_activity(did, 180)
+        except Exception:
+            _act, _agm = False, None
+        if _act:
+            try:
+                _gm = fmt.format_game_mode(_agm) if _agm else "—"
+            except Exception:
+                _gm = str(_agm or "—")
+            e = discord.Embed(title="Status", color=0x10b981)
+            e.add_field(name="Status", value="In Match", inline=True)
+            e.add_field(name="Game mode", value=_gm, inline=True)
+            return await interaction.followup.send(embed=e)
         return await interaction.followup.send("Linked, but offline — start the game.")
     sid, state = best
     rooms = state.get("rooms") or {}
@@ -983,6 +1737,25 @@ async def status_cmd(interaction: discord.Interaction):
         match_rid, match_room = cur_id, rooms[cur_id]
     in_match = bool(match_room and match_room.get("state") == "match")
     gm_raw = (match_room.get("game_mode") if match_room else None) or state.get("game_mode")
+    if not in_match:
+        # Same modeless fallback as /presence.
+        try:
+            _act, _agm, _ats = await db.recent_combat_activity(did, 180)
+        except Exception:
+            _act, _agm = False, None
+        if _act:
+            in_match = True
+            if not gm_raw and _agm:
+                gm_raw = _agm
+    elif not gm_raw:
+        # Public matchmaking rooms start modeless (gm lives in the outbound
+        # request the hook can miss) — heal from combat rows when they flow.
+        try:
+            _act2, _agm2, _ats2 = await db.recent_combat_activity(did, 180)
+        except Exception:
+            _act2, _agm2 = False, None
+        if _act2 and _agm2:
+            gm_raw = _agm2
     gm = fmt.format_game_mode(gm_raw) if gm_raw else "—"
     e = discord.Embed(title="Status", color=0x10b981 if in_match else 0x2b2d31)
     e.add_field(name="Status", value="In Match" if in_match else "In Lobby", inline=True)
@@ -994,16 +1767,245 @@ async def status_cmd(interaction: discord.Interaction):
     await interaction.followup.send(embed=e)
 
 
+PRESENCE_ONLINE_SEC = 300  # live-companion window for /presence + wager gate default
+
+
+async def _presence_context(code):
+    """Tourney / Ranked context for a room code, else '—' (party is resolved
+    from engine state by the caller). Never raises."""
+    try:
+        code = (code or "").strip().upper()
+        if not code or not db.USE_SUPABASE or not db.supabase:
+            return "—"
+        try:
+            t = await db._sb_call(lambda: db.supabase.table("bngc_comp_tourneys").select(
+                "name").eq("code", code).neq("status", "ended").limit(1).execute())
+            rows = (t.data if hasattr(t, "data") else []) or []
+            if rows:
+                return f"Tourney: {((rows[0] or {}).get('name') or code)}"
+        except Exception:
+            pass
+        try:
+            rm = await asyncio.to_thread(ranked_mod.get_open_room_by_code, code)
+            if rm:
+                return "Ranked"
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return "—"
+
+
+@bot.tree.command(name="afk", description="Toggle AFK (shown in /presence)")
+@app_commands.describe(message="Optional AFK note shown to others")
+async def afk_cmd(interaction: discord.Interaction, message: app_commands.Range[str, 1, 140] | None = None):
+    await interaction.response.defer(ephemeral=True)
+    me = str(interaction.user.id)
+    try:
+        row = await db.get_by_discord(me)
+    except Exception:
+        row = None
+    if not row:
+        return await interaction.followup.send("You need **/register** first.", ephemeral=True)
+    currently = bool((row or {}).get("is_afk"))
+    try:
+        on, msg = await db.set_afk(me, not currently, message)
+    except RuntimeError as e:
+        return await interaction.followup.send(str(e)[:180], ephemeral=True)
+    except LookupError:
+        return await interaction.followup.send("You need **/register** first.", ephemeral=True)
+    except Exception as e:
+        print(f"[afk] save failed for {me}: {e}")
+        return await interaction.followup.send("Couldn't save — try again later.", ephemeral=True)
+    if on:
+        print(f"[afk] {me} is now AFK")
+        return await interaction.followup.send(
+            f"You are now AFK.{(' Note: ' + msg) if msg else ''} Run **/afk** again when back.",
+            ephemeral=True)
+    print(f"[afk] {me} back from AFK")
+    return await interaction.followup.send("Welcome back — AFK cleared.", ephemeral=True)
+
+
+@bot.tree.command(name="presence", description="Live presence: match/lobby, mode, ranked/tourney, version, online")
+@app_commands.describe(user="Whose presence to show (default: you)")
+async def presence_cmd(interaction: discord.Interaction, user: discord.User | None = None):
+    await interaction.response.defer(ephemeral=False)
+    target = user or interaction.user
+    tid = str(target.id)
+    try:
+        row = await db.get_by_discord(tid)
+    except Exception:
+        row = None
+    if not row:
+        return await interaction.followup.send(
+            f"No data for {target.mention} — they need /register.")
+    # Live engine state: prefer the session with a match room.
+    state, match_room, match_rid = None, None, None
+    try:
+        sids = await get_active_sessions(tid, limit=5)
+        best = None
+        for cand in sids:
+            st = await get_session_state(cand)
+            if not st:
+                continue
+            rooms = st.get("rooms") or {}
+            if any(rid != "lobby" and rv.get("state") == "match" for rid, rv in rooms.items()):
+                best = st
+                break
+            if best is None:
+                best = st
+        state = best
+    except Exception:
+        state = None
+    in_match = False
+    gm_raw, code, party = None, None, {}
+    try:
+        if state:
+            rooms = state.get("rooms") or {}
+            try:
+                # Prefer the current room when it is a live non-lobby room
+                # (match state, join code, mode, or our own creation): dict
+                # order can otherwise surface a stale earlier match room first
+                # and hide the live room's gm/code (private DF read as Pub/—).
+                # Retired (ghost-healed) rooms never win.
+                _cur_id = state.get("current_room_id")
+                _cur = rooms.get(_cur_id) if _cur_id else None
+                if (_cur and _cur_id != "lobby"
+                        and not (_cur or {}).get("retired")
+                        and ((_cur or {}).get("state") == "match"
+                             or (_cur or {}).get("short_code")
+                             or (_cur or {}).get("game_mode")
+                             or (_cur or {}).get("created_by_me"))):
+                    match_rid, match_room = _cur_id, _cur
+            except Exception:
+                pass
+            if match_room is None:
+                for rid, rv in rooms.items():
+                    if (rid != "lobby" and (rv or {}).get("state") == "match"
+                            and not (rv or {}).get("retired")):
+                        match_rid, match_room = rid, rv
+                        break
+            if match_room is None:
+                cur_id = state.get("current_room_id")
+                if cur_id and cur_id in rooms:
+                    match_rid, match_room = cur_id, rooms[cur_id]
+            in_match = bool(match_room and match_room.get("state") == "match")
+            gm_raw = (match_room.get("game_mode") if match_room else None) or state.get("game_mode")
+            party = (match_room.get("party") if match_room else None) or state.get("party") or {}
+            try:
+                # Private rooms carry a join code (used for context lookup
+                # only — no Room field is shown); pubs have none.
+                code = (state.get("short_code")
+                        or (match_room.get("short_code") if match_room else None)
+                        or (match_room.get("code") if match_room else None))
+            except Exception:
+                code = None
+    except Exception:
+        pass
+    try:
+        gm = fmt.format_game_mode(gm_raw) if gm_raw else "—"
+    except Exception:
+        gm = str(gm_raw or "—")
+    version = str((row or {}).get("companion_version") or "").strip()[:32] or "unknown"
+    online, ts = db.online_status((row or {}).get("last_online"), PRESENCE_ONLINE_SEC)
+    afk = bool((row or {}).get("is_afk"))
+    afk_msg = str((row or {}).get("afk_message") or "").strip()
+    if state:
+        if in_match:
+            status = "In Match"
+            # Public matchmaking rooms start modeless (the gm lives in the
+            # outbound request, which the hook can miss) — heal the display
+            # from flowing combat rows once they exist.
+            if not gm_raw:
+                try:
+                    _act2, _agm2, _ats2 = await db.recent_combat_activity(tid, 180)
+                except Exception:
+                    _act2, _agm2 = False, None
+                if _act2 and _agm2:
+                    gm_raw = _agm2
+                    try:
+                        gm = fmt.format_game_mode(gm_raw)
+                    except Exception:
+                        gm = str(gm_raw)
+        else:
+            status = "In Lobby"
+            # Modes without scene/stG signals (bf/DF lobby play) never flip
+            # room state — flowing combat rows prove a live match anyway.
+            try:
+                _act, _agm, _ats = await db.recent_combat_activity(tid, 180)
+            except Exception:
+                _act, _agm, _ats = False, None, None
+            if _act:
+                status, in_match = "In Match", True
+                if not gm_raw and _agm:
+                    gm_raw = _agm
+                    try:
+                        gm = fmt.format_game_mode(gm_raw)
+                    except Exception:
+                        gm = str(gm_raw)
+    elif online:
+        status = "Online"
+    else:
+        status = "Offline"
+    if afk:
+        status += f" · AFK{(': ' + afk_msg) if afk_msg else ''}"
+    try:
+        ctx = await _presence_context(code)
+    except Exception:
+        ctx = "—"
+    if ctx == "—":
+        try:
+            _mine = bool(match_room and match_room.get("created_by_me"))
+            if isinstance(party, dict) and party.get("is_party"):
+                # Show the 5-char join code, never the internal room uuid that
+                # the engine stores on party.code.
+                _pc = code
+                if not _pc:
+                    try:
+                        _raw = str(party.get("code") or "")
+                        _pc = _raw if (len(_raw) == 5 and _raw.isalnum()) else None
+                    except Exception:
+                        _pc = None
+                ctx = "Party" + (f" `{_pc}`" if _pc else "")
+            elif code:
+                # Private room with a join code (not tourney/ranked) — pubs
+                # have no code, so this is never a public match.
+                ctx = f"Party `{code}`"
+            elif _mine:
+                # Private room born from our own CreateRoom whose request
+                # (gm/pID/Party) never arrived — still not a pub.
+                ctx = "Party"
+            elif in_match:
+                # Match room, no code, no tourney/ranked/party: public match.
+                ctx = "Pub"
+        except Exception:
+            pass
+    color = 0x10b981 if (in_match or (online and state is None)) else (0x2b2d31 if not online else 0xf59e0b)
+    try:
+        dot = "🟢" if in_match else ("🟡" if (state or online) else "⚫")
+    except Exception:
+        dot = "⚫"
+    e = discord.Embed(title=f"{dot} Presence — {target.display_name}", color=color)
+    e.add_field(name="Status", value=status, inline=True)
+    e.add_field(name="Game mode", value=gm, inline=True)
+    e.add_field(name="Context", value=ctx, inline=True)
+    e.add_field(name="Companion", value=version, inline=True)
+    e.add_field(name="Online", value="Yes" if online else "No", inline=True)
+    if ts is not None:
+        try:
+            e.add_field(name="Last online", value=f"<t:{int(ts.timestamp())}:R>", inline=True)
+        except Exception:
+            pass
+    else:
+        e.add_field(name="Last online", value="never", inline=True)
+    await interaction.followup.send(embed=e)
+
+
 @bot.tree.command(name="match", description="Show current match info")
 async def match_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
     await _match_logic(interaction)
 
-
-@bot.tree.command(name="currentmatch", description="Show current match info (alias for /match)")
-async def currentmatch_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=False)
-    await _match_logic(interaction)
 
 @bot.tree.command(name="skin", description="Show your or another user's current skin")
 async def skin_cmd(interaction: discord.Interaction, user: discord.User = None):
@@ -1180,7 +2182,7 @@ async def alerts_cmd(interaction: discord.Interaction, limit: int = 5):
     # fetch recent regardless of notified
     try:
         if db.USE_SUPABASE and db.supabase:
-            r = db.supabase.table("bngc_alerts").select("*").order("created_at", desc=True).limit(max(1, min(20, limit))).execute()
+            r = await db._sb_call(lambda: db.supabase.table("bngc_alerts").select("*").order("created_at", desc=True).limit(max(1, min(20, limit))).execute())
             rows = r.data or []
     except Exception:
         pass
@@ -1271,7 +2273,7 @@ async def set_lobby_music_cmd(interaction: discord.Interaction, file: discord.At
             base = os.getenv("SUPABASE_URL", "").rstrip("/")
             if base:
                 url = f"{base}/storage/v1/object/public/lobby-music/{path}"
-        db.supabase.table("bngc_users").update({"lobby_music_url": url}).eq("discord_id", did).execute()
+        await db._sb_call(lambda: db.supabase.table("bngc_users").update({"lobby_music_url": url}).eq("discord_id", did).execute())
         done = discord.Embed(
             title="✅ Lobby music set!",
             description="Will **loop in lobby** and **stop in game**. Adjust volume with the slider in the drawer.",
@@ -1297,7 +2299,7 @@ async def remove_lobby_music_cmd(interaction: discord.Interaction):
             db.supabase.storage.from_("lobby-music").remove([path])
         except Exception:
             pass
-        db.supabase.table("bngc_users").update({"lobby_music_url": None}).eq("discord_id", did).execute()
+        await db._sb_call(lambda: db.supabase.table("bngc_users").update({"lobby_music_url": None}).eq("discord_id", did).execute())
         await interaction.followup.send("🗑️ Lobby music removed.", ephemeral=True)
     except Exception as exc:
         await interaction.followup.send(f"Failed: {exc}", ephemeral=True)
@@ -1580,8 +2582,8 @@ async def _comp_reg_rows(tourney_id):
         sb = _comp_sb()
         if sb is None:
             return []
-        res = sb.table("bngc_comp_registrations").select(
-            "id,member_ids,status,source_message_id,team_color").eq("tourney_id", int(tourney_id)).limit(1000).execute()
+        res = await db._sb_call(lambda: sb.table("bngc_comp_registrations").select(
+            "id,member_ids,status,source_message_id,team_color").eq("tourney_id", int(tourney_id)).limit(1000).execute())
         return res.data or []
     except Exception:
         return []
@@ -1628,8 +2630,8 @@ async def _comp_members_with_profile(sb, member_ids: list) -> set:
     try:
         if sb is None or not member_ids:
             return set()
-        res = sb.table("bngc_users").select(
-            "discord_id,game_username").in_("discord_id", [str(m) for m in member_ids]).execute()
+        res = await db._sb_call(lambda: sb.table("bngc_users").select(
+            "discord_id,game_username").in_("discord_id", [str(m) for m in member_ids]).execute())
         have = set()
         for u in (res.data or []):
             try:
@@ -1656,16 +2658,16 @@ async def _comp_promote_if_complete(guild, tourney_id: int, source_message_id: s
             return False
         if reg_id is not None:
             try:
-                rres = sb.table("bngc_comp_registrations").select(
+                rres = await db._sb_call(lambda: sb.table("bngc_comp_registrations").select(
                     "id,tourney_id,member_ids,status,team_color,source_message_id").eq(
-                    "id", reg_id).limit(1).execute()
+                    "id", reg_id).limit(1).execute())
             except Exception:
                 return False
         elif source_message_id:
             try:
-                rres = sb.table("bngc_comp_registrations").select(
+                rres = await db._sb_call(lambda: sb.table("bngc_comp_registrations").select(
                     "id,tourney_id,member_ids,status,team_color,source_message_id").eq(
-                    "source_message_id", str(source_message_id)).limit(5).execute()
+                    "source_message_id", str(source_message_id)).limit(5).execute())
             except Exception:
                 return False
         else:
@@ -1682,11 +2684,11 @@ async def _comp_promote_if_complete(guild, tourney_id: int, source_message_id: s
         have = await _comp_members_with_profile(sb, members)
         if any(m not in have for m in members):
             return False
-        sb.table("bngc_comp_registrations").update({"status": "accepted"}).eq("id", row["id"]).execute()
+        await db._sb_call(lambda: sb.table("bngc_comp_registrations").update({"status": "accepted"}).eq("id", row["id"]).execute())
         # role grant: tourney override else env
         try:
-            trow = sb.table("bngc_comp_tourneys").select("player_role_id").eq(
-                "id", int(tourney_id)).limit(1).execute()
+            trow = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select("player_role_id").eq(
+                "id", int(tourney_id)).limit(1).execute())
             rid = (((trow.data or [{}])[0] or {}).get("player_role_id")) or COMP_PLAYER_ROLE_ID
         except Exception:
             rid = COMP_PLAYER_ROLE_ID
@@ -1807,12 +2809,16 @@ def _comp_is_host(member) -> bool:
     return False
 
 
-def _comp_tourney_hosts(sb, tourney_id) -> list:
+async def _comp_tourney_hosts(sb, tourney_id) -> list:
     """Per-tourney host discord IDs (hosts column + created_by fallback).
-    Missing column (pre-v233 DB) reads as no extra hosts. Never raises."""
+    Missing column (pre-v233 DB) reads as no extra hosts. Never raises.
+
+    async: every caller is a coroutine, and supabase-py is blocking — a sync
+    helper would stall the gateway for the length of the query."""
     try:
-        r = sb.table("bngc_comp_tourneys").select("hosts,created_by").eq(
-            "id", int(tourney_id)).limit(1).execute()
+        r = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select(
+            "hosts,created_by").eq(
+            "id", int(tourney_id)).limit(1).execute())
         row = (r.data or [{}])[0] or {}
         hs = [str(x) for x in (row.get("hosts") or []) if str(x or "").strip()]
         cb = str(row.get("created_by") or "").strip()
@@ -1836,7 +2842,7 @@ async def _comp_require_manager(interaction, tourney_id):
         if _comp_is_host(me):
             return sb, me
         try:
-            hosts = _comp_tourney_hosts(sb, tourney_id)
+            hosts = await _comp_tourney_hosts(sb, tourney_id)
         except Exception:
             hosts = []
         if str(interaction.user.id) in [str(h) for h in hosts]:
@@ -1957,6 +2963,10 @@ def _comp_sb():
                        ping_role="Role pinged on open/close",
                        max_players="Auto-close intake at N accepted players (0 = unlimited)",
                        host_playing="Host plays too (their kills count)",
+                       coin_give="Coin cup: pay Nectar Coin prizes to top-3 (default False)",
+                       coins_first="1st place coins (coin cup only)",
+                       coins_second="2nd place coins (coin cup only)",
+                       coins_third="3rd place coins (coin cup only)",
                        start_time="Start time YYYY-MM-DD HH:MM UTC (optional)")
 @app_commands.choices(mode=[app_commands.Choice(name="Solo", value="solo"),
                             app_commands.Choice(name="Duo", value="duo")])
@@ -1980,6 +2990,9 @@ async def tourney_create_cmd(interaction: discord.Interaction, name: str,
                              shoot_timer: str | None = None,
                              ping_role: discord.Role | None = None,
                              max_players: int = 0, host_playing: bool = True,
+                             coin_give: bool = False,
+                             coins_first: int = 0, coins_second: int = 0,
+                             coins_third: int = 0,
                              start_time: str | None = None):
     await interaction.response.defer(ephemeral=True)
     me = await _comp_member(interaction, interaction.user.id)
@@ -2003,6 +3016,16 @@ async def tourney_create_cmd(interaction: discord.Interaction, name: str,
     if mode_c == "duo" and maxp % 2 == 1:
         return await interaction.followup.send(
             "Duo tourneys need an even `max_players` (full teams of 2).", ephemeral=True)
+    try:
+        _p1, _p2, _p3 = max(0, int(coins_first or 0)), max(0, int(coins_second or 0)), max(0, int(coins_third or 0))
+    except Exception:
+        return await interaction.followup.send(
+            "Coin prizes must be whole numbers (0+).", ephemeral=True)
+    _coin_cup = bool(coin_give)
+    if _coin_cup and _p1 <= 0 and _p2 <= 0 and _p3 <= 0:
+        return await interaction.followup.send(
+            "Coin cup needs at least one prize — set `coins_first`, `coins_second` or `coins_third`.",
+            ephemeral=True)
     sched_iso = None
     if (start_time or "").strip():
         try:
@@ -2029,10 +3052,19 @@ async def tourney_create_cmd(interaction: discord.Interaction, name: str,
             "board_channel_id": COMP_BOARD_CHANNEL_ID or None,
             "player_role_id": COMP_PLAYER_ROLE_ID or None,
             "created_by": str(interaction.user.id),
+            "coin_give": _coin_cup,
+            "coins_first": _p1, "coins_second": _p2, "coins_third": _p3,
         }
         if sched_iso:
             _ins["scheduled_at"] = sched_iso
-        res = sb.table("bngc_comp_tourneys").insert(_ins).execute()
+        try:
+            res = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").insert(_ins).execute())
+        except Exception as e:
+            if "coin_give" in str(e) or "coins_" in str(e):
+                return await interaction.followup.send(
+                    "Database migration pending — ask a host to apply add_comp_v240_coin_cups.sql.",
+                    ephemeral=True)
+            raise
         row = (res.data or [{}])[0]
         tail = ""
         try:
@@ -2043,7 +3075,9 @@ async def tourney_create_cmd(interaction: discord.Interaction, name: str,
             pass
         return await interaction.followup.send(
             f"🏆 Tourney **#{row.get('id')} {row.get('name')}** created ({mode_c}, "
-            f"{series or '∞'} matches).{tail} Post it: `/tourney-post {row.get('id')}`. "
+            f"{series or '∞'} matches)."
+            + (f" Coin cup: 1st +{_p1:,} / 2nd +{_p2:,} / 3rd +{_p3:,}." if _coin_cup else "")
+            + f"{tail} Post it: `/tourney-post {row.get('id')}`. "
             f"Registrations: `/listen-registrations`.", ephemeral=True)
     except Exception as e:
         return await interaction.followup.send(f"Couldn't create: {e}", ephemeral=True)
@@ -2060,19 +3094,19 @@ async def tourney_stop_cmd(interaction: discord.Interaction, tourney_id: int,
         return
     try:
         from datetime import datetime, timezone
-        old = sb.table("bngc_comp_tourneys").select(
-            "code,player_role_id").eq("id", int(tourney_id)).limit(1).execute()
+        old = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select(
+            "code,player_role_id").eq("id", int(tourney_id)).limit(1).execute())
         old_row = ((old.data or [{}])[0] or {})
         old_code = old_row.get("code")
-        res = sb.table("bngc_comp_tourneys").update(
+        res = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").update(
             {"status": "ended", "reg_open": False, "ended_at": datetime.now(timezone.utc).isoformat()}
-        ).eq("id", int(tourney_id)).execute()
+        ).eq("id", int(tourney_id)).execute())
         if not res.data:
             return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
         # drop the room tag so presence stops showing the ended tourney
         if old_code:
             try:
-                sb.table("bngc_room_tags").delete().eq("code", str(old_code).upper()).execute()
+                await db._sb_call(lambda: sb.table("bngc_room_tags").delete().eq("code", str(old_code).upper()).execute())
             except Exception as e:
                 print(f"[comp] stop untag failed: {e}")
         # strip the give-role from the accepted roster (best-effort)
@@ -2093,8 +3127,8 @@ async def tourney_stop_cmd(interaction: discord.Interaction, tourney_id: int,
             if rid and interaction.guild is not None:
                 dids: list = []
                 try:
-                    rres = sb.table("bngc_comp_registrations").select("member_ids").eq(
-                        "tourney_id", int(tourney_id)).eq("status", "accepted").limit(1000).execute()
+                    rres = await db._sb_call(lambda: sb.table("bngc_comp_registrations").select("member_ids").eq(
+                        "tourney_id", int(tourney_id)).eq("status", "accepted").limit(1000).execute())
                     dids = sorted({str(x) for r in (rres.data or []) for x in ((r or {}).get("member_ids") or []) if x})
                 except Exception:
                     dids = []
@@ -2128,6 +3162,15 @@ async def tourney_stop_cmd(interaction: discord.Interaction, tourney_id: int,
                 tail += f" · ✏️ {_renamed} nickname{'s' if _renamed != 1 else ''} updated"
         except Exception as e:
             print(f"[comp] stop nicknames failed: {e}")
+        # archive the final standings in the results channel
+        try:
+            _posted, _note = await comp_results.post_results(
+                interaction.client, int(tourney_id), _comp_tourney)
+            tail += (f" · 🏆 results posted ({_note})" if _posted
+                     else f" · 🏆 results not posted ({_note})")
+        except Exception as e:
+            print(f"[comp] stop results post failed: {e}")
+            tail += " · 🏆 results not posted"
         return await interaction.followup.send(f"🏁 Tourney **#{tourney_id}** closed.{tail}", ephemeral=True)
     except Exception as e:
         return await interaction.followup.send(f"Couldn't stop: {e}", ephemeral=True)
@@ -2166,24 +3209,24 @@ async def _tourney_set_code(tourney_id: int, code: str, actor_id: str):
         sb = _comp_sb()
         if sb is None:
             return False, "Supabase not configured."
-        old = sb.table("bngc_comp_tourneys").select("id,code,name,status").eq(
-            "id", int(tourney_id)).limit(1).execute()
+        old = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select("id,code,name,status").eq(
+            "id", int(tourney_id)).limit(1).execute())
         if not old.data:
             return False, "No tourney with that ID."
         t = old.data[0]
         old_code = (t.get("code") or "").upper() or None
-        sb.table("bngc_comp_tourneys").update({"code": code_c}).eq("id", int(tourney_id)).execute()
+        await db._sb_call(lambda: sb.table("bngc_comp_tourneys").update({"code": code_c}).eq("id", int(tourney_id)).execute())
         # move the room tag so presence follows the new code (started only)
         extra = ""
         try:
             if old_code and old_code != code_c:
-                sb.table("bngc_room_tags").delete().eq("code", old_code).execute()
+                await db._sb_call(lambda: sb.table("bngc_room_tags").delete().eq("code", old_code).execute())
             if str(t.get("status") or "") == "started":
-                sb.table("bngc_room_tags").upsert({
+                await db._sb_call(lambda: sb.table("bngc_room_tags").upsert({
                     "code": code_c, "kind": "tourney",
                     "name": str(t.get("name") or "Tourney"),
                     "created_by": str(actor_id),
-                }, on_conflict="code").execute()
+                }, on_conflict="code").execute())
                 extra = " (room tag moved)"
         except Exception as e:
             print(f"[comp] set-code retag failed: {e}")
@@ -2204,30 +3247,30 @@ async def _comp_set_banned(tourney_id: int, user_id: str, banned: bool, guild=No
             # Drop any active roster rows containing this player first so a
             # banned duo member doesn't stay counted via their old team.
             try:
-                _active = sb.table("bngc_comp_registrations").select(
+                _active = await db._sb_call(lambda: sb.table("bngc_comp_registrations").select(
                     "id,member_ids,status").eq("tourney_id", int(tourney_id)).neq(
-                    "status", "banned").limit(1000).execute()
+                    "status", "banned").limit(1000).execute())
                 for _r in ((_active.data or [])):
                     try:
                         if did in [str(x) for x in (((_r or {}).get("member_ids")) or [])]:
-                            sb.table("bngc_comp_registrations").delete().eq(
-                                "id", (_r or {}).get("id")).execute()
+                            await db._sb_call(lambda: sb.table("bngc_comp_registrations").delete().eq(
+                                "id", (_r or {}).get("id")).execute())
                     except Exception:
                         continue
             except Exception:
                 pass
             try:
-                sb.table("bngc_comp_registrations").insert({
+                await db._sb_call(lambda: sb.table("bngc_comp_registrations").insert({
                     "tourney_id": int(tourney_id), "team_label": f"<@{did}>",
                     "member_ids": [did], "captain_id": did,
                     "source_message_id": None, "status": "banned",
-                }).execute()
+                }).execute())
             except Exception as e:
                 return False, f"Couldn't ban: {e}"
             # strip the player role if we can resolve it
             try:
-                tres = sb.table("bngc_comp_tourneys").select("player_role_id").eq(
-                    "id", int(tourney_id)).limit(1).execute()
+                tres = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select("player_role_id").eq(
+                    "id", int(tourney_id)).limit(1).execute())
                 rid = ((tres.data or [{}])[0] or {}).get("player_role_id") or COMP_PLAYER_ROLE_ID
                 if guild is not None and rid:
                     try:
@@ -2248,8 +3291,8 @@ async def _comp_set_banned(tourney_id: int, user_id: str, banned: bool, guild=No
         if not mine:
             return False, "No ban row for that user in this tourney."
         try:
-            _trow = sb.table("bngc_comp_tourneys").select("mode").eq(
-                "id", int(tourney_id)).limit(1).execute()
+            _trow = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select("mode").eq(
+                "id", int(tourney_id)).limit(1).execute())
             _is_duo = str((((_trow.data or [{}])[0] or {}).get("mode")) or "solo").lower() == "duo"
         except Exception:
             _is_duo = False
@@ -2259,10 +3302,10 @@ async def _comp_set_banned(tourney_id: int, user_id: str, banned: bool, guild=No
                     # Duo: never flip a 1-person ban row into a solo
                     # accepted team — delete so the player re-registers
                     # with a teammate and counts stay in pairs.
-                    sb.table("bngc_comp_registrations").delete().eq("id", r["id"]).execute()
+                    await db._sb_call(lambda: sb.table("bngc_comp_registrations").delete().eq("id", r["id"]).execute())
                 else:
-                    sb.table("bngc_comp_registrations").update(
-                        {"status": "accepted"}).eq("id", r["id"]).execute()
+                    await db._sb_call(lambda: sb.table("bngc_comp_registrations").update(
+                        {"status": "accepted"}).eq("id", r["id"]).execute())
             except Exception:
                 pass
         if _is_duo:
@@ -2306,7 +3349,7 @@ async def tourney_host_status_cmd(interaction: discord.Interaction, tourney_id: 
         return
     hp = str(status or "").lower() != "hosting_only"
     try:
-        res = sb.table("bngc_comp_tourneys").update({"host_playing": hp}).eq("id", int(tourney_id)).execute()
+        res = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").update({"host_playing": hp}).eq("id", int(tourney_id)).execute())
         if not res.data:
             return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
         label = "Playing — your kills count" if hp else "Hosting only — your kills don't count"
@@ -2323,14 +3366,14 @@ async def tourney_add_host_cmd(interaction: discord.Interaction, tourney_id: int
     if sb is None:
         return
     try:
-        chk = sb.table("bngc_comp_tourneys").select("id").eq("id", int(tourney_id)).limit(1).execute()
+        chk = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select("id").eq("id", int(tourney_id)).limit(1).execute())
         if not chk.data:
             return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
-        hosts = _comp_tourney_hosts(sb, tourney_id)
+        hosts = await _comp_tourney_hosts(sb, tourney_id)
         did = str(user.id)
         if did not in hosts:
             hosts.append(did)
-            sb.table("bngc_comp_tourneys").update({"hosts": hosts}).eq("id", int(tourney_id)).execute()
+            await db._sb_call(lambda: sb.table("bngc_comp_tourneys").update({"hosts": hosts}).eq("id", int(tourney_id)).execute())
         return await interaction.followup.send(f"{user.mention} is now a host of tourney **#{tourney_id}**.", ephemeral=True)
     except Exception as e:
         return await interaction.followup.send(f"Couldn't add host: {e}", ephemeral=True)
@@ -2344,13 +3387,13 @@ async def tourney_remove_host_cmd(interaction: discord.Interaction, tourney_id: 
     if sb is None:
         return
     try:
-        chk = sb.table("bngc_comp_tourneys").select("id").eq("id", int(tourney_id)).limit(1).execute()
+        chk = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select("id").eq("id", int(tourney_id)).limit(1).execute())
         if not chk.data:
             return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
-        hosts = _comp_tourney_hosts(sb, tourney_id)
+        hosts = await _comp_tourney_hosts(sb, tourney_id)
         did = str(user.id)
         hosts = [h for h in hosts if h != did]
-        sb.table("bngc_comp_tourneys").update({"hosts": hosts}).eq("id", int(tourney_id)).execute()
+        await db._sb_call(lambda: sb.table("bngc_comp_tourneys").update({"hosts": hosts}).eq("id", int(tourney_id)).execute())
         return await interaction.followup.send(f"{user.mention} is no longer a host of tourney **#{tourney_id}**.", ephemeral=True)
     except Exception as e:
         return await interaction.followup.send(f"Couldn't remove host: {e}", ephemeral=True)
@@ -2366,8 +3409,8 @@ async def tourney_add_player_cmd(interaction: discord.Interaction, tourney_id: i
     if sb is None:
         return
     try:
-        trow = sb.table("bngc_comp_tourneys").select(
-            "id,mode,player_role_id").eq("id", int(tourney_id)).limit(1).execute()
+        trow = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select(
+            "id,mode,player_role_id").eq("id", int(tourney_id)).limit(1).execute())
         if not trow.data:
             return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
         t = trow.data[0] or {}
@@ -2406,10 +3449,10 @@ async def tourney_add_player_cmd(interaction: discord.Interaction, tourney_id: i
                 },
             }
             try:
-                sb.table("bngc_comp_registrations").insert(_add_row).execute()
+                await db._sb_call(lambda: sb.table("bngc_comp_registrations").insert(_add_row).execute())
             except Exception:
                 _add_row.pop("member_names", None)  # pre-migration safe
-                sb.table("bngc_comp_registrations").insert(_add_row).execute()
+                await db._sb_call(lambda: sb.table("bngc_comp_registrations").insert(_add_row).execute())
             try:
                 _rid = (t or {}).get("player_role_id") or COMP_PLAYER_ROLE_ID
                 await _comp_grant_role(interaction.guild, did, _rid)
@@ -2438,10 +3481,10 @@ async def tourney_add_player_cmd(interaction: discord.Interaction, tourney_id: i
             }},
         }
         try:
-            sb.table("bngc_comp_registrations").insert(_add_row).execute()
+            await db._sb_call(lambda: sb.table("bngc_comp_registrations").insert(_add_row).execute())
         except Exception:
             _add_row.pop("member_names", None)  # pre-migration safe
-            sb.table("bngc_comp_registrations").insert(_add_row).execute()
+            await db._sb_call(lambda: sb.table("bngc_comp_registrations").insert(_add_row).execute())
         try:
             _rid = (t or {}).get("player_role_id") or COMP_PLAYER_ROLE_ID
             await _comp_grant_role(interaction.guild, did, _rid)
@@ -2464,14 +3507,14 @@ async def tourney_remove_player_cmd(interaction: discord.Interaction, tourney_id
     if sb is None:
         return
     try:
-        trow = sb.table("bngc_comp_tourneys").select(
-            "id,mode,player_role_id").eq("id", int(tourney_id)).limit(1).execute()
+        trow = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select(
+            "id,mode,player_role_id").eq("id", int(tourney_id)).limit(1).execute())
         if not trow.data:
             return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
         is_duo = str(((trow.data[0] or {}).get("mode")) or "solo").lower() == "duo"
         did = str(user.id)
-        rows = sb.table("bngc_comp_registrations").select(
-            "id,member_ids").eq("tourney_id", int(tourney_id)).neq("status", "banned").limit(1000).execute()
+        rows = await db._sb_call(lambda: sb.table("bngc_comp_registrations").select(
+            "id,member_ids").eq("tourney_id", int(tourney_id)).neq("status", "banned").limit(1000).execute())
         hit = [r for r in (rows.data or []) if did in ((r or {}).get("member_ids") or [])]
         removed_ids: list = []
         for r in hit:
@@ -2481,13 +3524,13 @@ async def tourney_remove_player_cmd(interaction: discord.Interaction, tourney_id
                     # Duo: a player never leaves a half-team behind — drop the
                     # whole team so counts/standings stay in pairs.
                     removed_ids.extend(members)
-                    sb.table("bngc_comp_registrations").delete().eq("id", (r or {}).get("id")).execute()
+                    await db._sb_call(lambda: sb.table("bngc_comp_registrations").delete().eq("id", (r or {}).get("id")).execute())
                 else:
                     remaining = [m for m in ((r or {}).get("member_ids") or []) if m != did]
                     if not remaining:
-                        sb.table("bngc_comp_registrations").delete().eq("id", (r or {}).get("id")).execute()
+                        await db._sb_call(lambda: sb.table("bngc_comp_registrations").delete().eq("id", (r or {}).get("id")).execute())
                     else:
-                        sb.table("bngc_comp_registrations").update({"member_ids": remaining}).eq("id", (r or {}).get("id")).execute()
+                        await db._sb_call(lambda: sb.table("bngc_comp_registrations").update({"member_ids": remaining}).eq("id", (r or {}).get("id")).execute())
                     removed_ids.append(did)
             except Exception:
                 continue
@@ -2527,9 +3570,9 @@ async def tourney_add_back_cmd(interaction: discord.Interaction, tourney_id: int
     try:
         did = str(user.id)
         try:
-            mres = sb.table("bngc_comp_matches").select(
+            mres = await db._sb_call(lambda: sb.table("bngc_comp_matches").select(
                 "id,removed_discord_ids").eq("tourney_id", int(tourney_id)).in_(
-                "status", ["open", "manual"]).order("version", desc=True).limit(1).execute()
+                "status", ["open", "manual"]).order("version", desc=True).limit(1).execute())
         except Exception:
             return await interaction.followup.send(
                 "Match roster removal needs DB migration add_comp_v237.sql.", ephemeral=True)
@@ -2541,7 +3584,7 @@ async def tourney_add_back_cmd(interaction: discord.Interaction, tourney_id: int
         if did not in cur:
             return await interaction.followup.send(f"{user.mention} is not on the removed list.", ephemeral=True)
         cur = [x for x in cur if x != did]
-        sb.table("bngc_comp_matches").update({"removed_discord_ids": cur}).eq("id", m["id"]).execute()
+        await db._sb_call(lambda: sb.table("bngc_comp_matches").update({"removed_discord_ids": cur}).eq("id", m["id"]).execute())
         return await interaction.followup.send(f"{user.mention} added back to the match roster.", ephemeral=True)
     except Exception as e:
         return await interaction.followup.send(f"Couldn't add back: {e}", ephemeral=True)
@@ -2647,6 +3690,19 @@ def _comp_announce_text(t: dict):
             f"**SHOOT TIMER**: {timer}",
             f"**HOSTED BY**: {hosted_by}",
         ]
+        try:
+            if bool(t.get("coin_give")):
+                _c1 = int(t.get("coins_first") or 0)
+                _c2 = int(t.get("coins_second") or 0)
+                _c3 = int(t.get("coins_third") or 0)
+                lines += [
+                    f"**PRIZES**:",
+                    f"1st = :nectar_coin: +{_c1:,} Coins",
+                    f"2nd = :nectar_coin: +{_c2:,} Coins",
+                    f"3rd = :nectar_coin: +{_c3:,} Coins",
+                ]
+        except Exception:
+            pass
         if start_line:
             lines.append(start_line)
         pts = _points_table_lines(t)
@@ -2681,9 +3737,9 @@ async def _announce_upsert(sb, guild, target, t, text):
                 pass
         posted = await target.send(content=text)
         try:
-            sb.table("bngc_comp_tourneys").update(
+            await db._sb_call(lambda: sb.table("bngc_comp_tourneys").update(
                 {"announce_channel_id": str(target.id),
-                 "announce_message_id": str(posted.id)}).eq("id", int((t or {}).get("id"))).execute()
+                 "announce_message_id": str(posted.id)}).eq("id", int((t or {}).get("id"))).execute())
         except Exception:
             pass
         return posted, True
@@ -2705,7 +3761,7 @@ async def tourney_post_cmd(interaction: discord.Interaction, tourney_id: int,
     if sb is None:
         return
     try:
-        tres = sb.table("bngc_comp_tourneys").select("*").eq("id", int(tourney_id)).limit(1).execute()
+        tres = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select("*").eq("id", int(tourney_id)).limit(1).execute())
         if not tres.data:
             return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
         t = tres.data[0]
@@ -2717,7 +3773,7 @@ async def tourney_post_cmd(interaction: discord.Interaction, tourney_id: int,
             if signups_channel is not None:
                 _ov["reg_channel_id"] = str(signups_channel.id)
             if _ov:
-                sb.table("bngc_comp_tourneys").update(_ov).eq("id", int(tourney_id)).execute()
+                await db._sb_call(lambda: sb.table("bngc_comp_tourneys").update(_ov).eq("id", int(tourney_id)).execute())
                 t.update(_ov)
         except Exception as e:
             print(f"[comp] post field persist failed: {e}")
@@ -2752,7 +3808,7 @@ async def tourney_refresh_points_cmd(interaction: discord.Interaction, tourney_i
     if sb is None:
         return
     try:
-        tres = sb.table("bngc_comp_tourneys").select("*").eq("id", int(tourney_id)).limit(1).execute()
+        tres = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select("*").eq("id", int(tourney_id)).limit(1).execute())
         if not tres.data:
             return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
         t = tres.data[0]
@@ -2796,9 +3852,9 @@ async def tourney_schedule_cmd(interaction: discord.Interaction, tourney_id: int
         from datetime import datetime, timezone
         if dt <= datetime.now(timezone.utc):
             return await interaction.followup.send("That time is in the past.", ephemeral=True)
-        res = sb.table("bngc_comp_tourneys").update(
+        res = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").update(
             {"scheduled_at": dt.isoformat(), "status": "scheduled"}
-        ).eq("id", int(tourney_id)).execute()
+        ).eq("id", int(tourney_id)).execute())
         if not res.data:
             return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
         return await interaction.followup.send(
@@ -2818,24 +3874,7 @@ async def _comp_tourney(tourney_id) -> dict | None:
 
 def _comp_board_lines(board, limit=0):
     """Render aggregate standings lines (with mentions). Pure. limit=0 → all."""
-    medals = ["🥇", "🥈", "🥉"]
-    lines = []
-    try:
-        rows = (board or []) if not limit else (board or [])[:limit]
-        for i, r in enumerate(rows, 1):
-            name = (r or {}).get("name") or "?"
-            did = (r or {}).get("discord_id")
-            who = f"{_comp_mention(did)} **{name}**" if did else f"**{name}**"
-            pts = (r or {}).get("points", 0)
-            kills = (r or {}).get("kills", 0)
-            wins = (r or {}).get("wins", 0)
-            avg = (r or {}).get("avg_placement")
-            tail = f" ({kills}K, {wins}W" + (f", {avg} avg" if avg is not None else "") + ")"
-            prefix = medals[i - 1] if i <= 3 else f"{i}."
-            lines.append(f"{prefix} {who} — {pts} pts{tail}")
-    except Exception:
-        pass
-    return lines
+    return comp_results.board_lines(board, limit)
 
 
 @bot.tree.command(name="tourney-board", description="Aggregate leaderboard for a comp tourney")
@@ -3003,6 +4042,119 @@ async def tourney_winner_cmd(interaction: discord.Interaction, tourney_id: int):
         f"({(w or {}).get('kills', 0)}K, {(w or {}).get('wins', 0)}W)")
 
 
+async def _tourney_prize_already_paid(discord_id: str, tourney_id: int, reason: str) -> bool:
+    """Ledger idempotency: was this tourney prize already paid to this user?
+    Never raises (False on any doubt — the caller re-checks after paying)."""
+    try:
+        entries = await db.get_coin_ledger(str(discord_id), 50)
+        for x in (entries or []):
+            try:
+                if str((x or {}).get("reason")) != str(reason):
+                    continue
+                meta = (x or {}).get("meta") or {}
+                if str(meta.get("tourney_id")) == str(tourney_id):
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+@coin_group.command(name="pay-tourney", description="Pay coin-cup prizes to standings top-3 (host, once)")
+@app_commands.describe(tourney_id="Numeric session ID (from 0)")
+async def tourney_pay_coins_cmd(interaction: discord.Interaction, tourney_id: int):
+    await interaction.response.defer(ephemeral=False)
+    sb, me = await _comp_require_manager(interaction, tourney_id)
+    if sb is None:
+        return
+    try:
+        tres = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select(
+            "id,name,mode,coin_give,coins_first,coins_second,coins_third,coins_paid"
+        ).eq("id", int(tourney_id)).limit(1).execute())
+    except Exception as e:
+        if "coin_give" in str(e) or "coins_" in str(e):
+            return await interaction.followup.send(
+                "Database migration pending — ask a host to apply add_comp_v240_coin_cups.sql.")
+        return await interaction.followup.send(f"Couldn't load tourney #{tourney_id}: {e}")
+    trows = (tres.data if hasattr(tres, "data") else tres or []) or []
+    if not trows:
+        return await interaction.followup.send(f"No tourney with ID #{tourney_id}.")
+    t = trows[0] or {}
+    if not bool(t.get("coin_give")):
+        return await interaction.followup.send(
+            f"Tourney **#{tourney_id}** is not a coin cup (`coin_give` off).")
+    if bool(t.get("coins_paid")):
+        return await interaction.followup.send(
+            f"Coin prizes for **#{tourney_id}** were already paid — nothing to do.")
+    data = await _comp_tourney(tourney_id)
+    if not data or data.get("error"):
+        return await interaction.followup.send(
+            f"Couldn't load standings for #{tourney_id}: {(data or {}).get('error') or 'server unreachable'}.")
+    board = data.get("standings") or []
+    if not board:
+        return await interaction.followup.send(
+            f"No sealed matches in **{t.get('name')}** yet — pay after results exist.")
+    prizes = [(int(t.get("coins_first") or 0), "tourney_first", "1st"),
+              (int(t.get("coins_second") or 0), "tourney_second", "2nd"),
+              (int(t.get("coins_third") or 0), "tourney_third", "3rd")]
+    results, all_ok = [], True
+    for idx, (amount, reason, label) in enumerate(prizes):
+        if amount <= 0:
+            continue
+        if idx >= len(board):
+            results.append(f"{label}: no team — skipped")
+            continue
+        row = board[idx] or {}
+        try:
+            mids = [str(x) for x in ((row or {}).get("member_ids") or []) if x]
+        except Exception:
+            mids = []
+        if not mids and (row or {}).get("discord_id"):
+            mids = [str((row or {}).get("discord_id"))]
+        if not mids:
+            results.append(f"{label}: no players — skipped")
+            all_ok = False
+            continue
+        paid_here, failed_here = [], []
+        for did in mids:
+            try:
+                if await _tourney_prize_already_paid(did, int(tourney_id), reason):
+                    paid_here.append(f"<@{did}> (already)")
+                    continue
+                await db.add_coin_delta(did, int(amount), reason,
+                                        {"tourney_id": int(tourney_id), "place": label})
+                paid_here.append(f"<@{did}>")
+            except LookupError:
+                failed_here.append(f"<@{did}> (needs /register)")
+                all_ok = False
+            except Exception as e:
+                print(f"[comp] coin prize failed #{tourney_id} {label} {did}: {e}")
+                failed_here.append(f"<@{did}> (error, retry)")
+                all_ok = False
+        who = ((row or {}).get("label") or (row or {}).get("name")
+               or " / ".join(f"<@{m}>" for m in mids))
+        line = f"{label} (+{amount:,} Nectar Coins): {who} → {', '.join(paid_here) if paid_here else '—'}"
+        if failed_here:
+            line += f" | failed: {', '.join(failed_here)}"
+        results.append(line)
+    if all_ok:
+        try:
+            await db._sb_call(lambda: sb.table("bngc_comp_tourneys").update({"coins_paid": True}).eq(
+                "id", int(tourney_id)).execute())
+        except Exception as e:
+            print(f"[comp] coins_paid flag failed #{tourney_id}: {e}")
+    e = discord.Embed(
+        title=f"Coin prizes — {t.get('name')} (#{tourney_id})",
+        description="\n".join(results) or "No prizes configured.",
+        color=discord.Color.gold())
+    if not all_ok:
+        e.set_footer(text="Some prizes failed — fix them (usually /register) and re-run; already-paid members are skipped.")
+    else:
+        e.set_footer(text="All prizes paid. This command will now refuse (already paid).")
+    await interaction.followup.send(embed=e)
+
+
 @bot.tree.command(name="tourney-best", description="Best slayer of a comp tourney (most kills)")
 @app_commands.describe(tourney_id="Numeric session ID (from 0)")
 async def tourney_best_cmd(interaction: discord.Interaction, tourney_id: int):
@@ -3051,8 +4203,8 @@ async def tourney_name_cmd(interaction: discord.Interaction, allow: bool):
         return await interaction.followup.send("Supabase not configured.", ephemeral=True)
     me = str(interaction.user.id)
     try:
-        upd = sb.table("bngc_users").update(
-            {"tourney_name_optin": bool(allow)}).eq("discord_id", me).execute()
+        upd = await db._sb_call(lambda: sb.table("bngc_users").update(
+            {"tourney_name_optin": bool(allow)}).eq("discord_id", me).execute())
         wrote = bool(upd.data)
     except Exception as e:
         if "tourney_name_optin" in str(e):
@@ -3062,12 +4214,12 @@ async def tourney_name_cmd(interaction: discord.Interaction, allow: bool):
         return await interaction.followup.send("Couldn't save — try again later.", ephemeral=True)
     if not wrote:
         try:
-            sb.table("bngc_users").insert({
+            await db._sb_call(lambda: sb.table("bngc_users").insert({
                 "discord_id": me,
                 "discord_username": getattr(interaction.user, "display_name", None) or str(interaction.user),
                 "tourney_name_optin": bool(allow),
                 "token": gen_token(),
-            }).execute()
+            }).execute())
         except Exception as e:
             if "tourney_name_optin" in str(e):
                 return await interaction.followup.send(
@@ -3078,15 +4230,15 @@ async def tourney_name_cmd(interaction: discord.Interaction, allow: bool):
     if allow and interaction.guild is not None:
         # apply right now (not just at the next calc): current PR + name
         try:
-            ures = sb.table("bngc_users").select(
-                "game_username,tourney_pr").eq("discord_id", me).limit(1).execute()
+            ures = await db._sb_call(lambda: sb.table("bngc_users").select(
+                "game_username,tourney_pr").eq("discord_id", me).limit(1).execute())
             urow = ((ures.data or [{}])[0] or {})
             gname = str(urow.get("game_username") or "").strip()
             pr = urow.get("tourney_pr")
             if pr is None:
                 try:
-                    hres = sb.table("bngc_comp_pr_history").select("pr").eq(
-                        "discord_id", me).order("computed_at", desc=True).limit(1).execute()
+                    hres = await db._sb_call(lambda: sb.table("bngc_comp_pr_history").select("pr").eq(
+                        "discord_id", me).order("computed_at", desc=True).limit(1).execute())
                     if hres.data:
                         pr = (hres.data[0] or {}).get("pr")
                 except Exception:
@@ -3119,8 +4271,8 @@ async def _ranked_name_locked(sb, did: str) -> bool:
     try:
         if sb is None or not did:
             return False
-        r = sb.table("bngc_users").select("ranked_link_locked").eq(
-            "discord_id", str(did)).limit(1).execute()
+        r = await db._sb_call(lambda: sb.table("bngc_users").select("ranked_link_locked").eq(
+            "discord_id", str(did)).limit(1).execute())
         rows = r.data or []
         return bool(((rows[0] or {}).get("ranked_link_locked"))) if rows else False
     except Exception:
@@ -3142,21 +4294,21 @@ def _ranked_milestone_nick(game_name: str, milestone) -> str:
         return ""
 
 
-def _comp_nick_for(sb, did: str):
+async def _comp_nick_for(sb, did: str):
     """(nick|None, game_name). Current PR nickname for a user. Never raises
-    (None when no name/PR yet or DB down)."""
+    (None when no name/PR yet or DB down). async — see _comp_tourney_hosts."""
     try:
         if sb is None or not did:
             return None, ""
-        ures = sb.table("bngc_users").select(
-            "game_username,tourney_pr").eq("discord_id", str(did)).limit(1).execute()
+        ures = await db._sb_call(lambda: sb.table("bngc_users").select(
+            "game_username,tourney_pr").eq("discord_id", str(did)).limit(1).execute())
         urow = ((ures.data or [{}])[0] or {})
         gname = str(urow.get("game_username") or "").strip()
         pr = urow.get("tourney_pr")
         if pr is None:
             try:
-                hres = sb.table("bngc_comp_pr_history").select("pr").eq(
-                    "discord_id", str(did)).order("computed_at", desc=True).limit(1).execute()
+                hres = await db._sb_call(lambda: sb.table("bngc_comp_pr_history").select("pr").eq(
+                    "discord_id", str(did)).order("computed_at", desc=True).limit(1).execute())
                 if hres.data:
                     pr = (hres.data[0] or {}).get("pr")
             except Exception:
@@ -3168,14 +4320,15 @@ def _comp_nick_for(sb, did: str):
         return None, ""
 
 
-def _ranked_nick_for(sb, did: str):
+async def _ranked_nick_for(sb, did: str):
     """(nick|None, game_name, milestone). Current milestone nickname.
-    Never raises (None when no name yet or DB down)."""
+    Never raises (None when no name yet or DB down). async — see
+    _comp_tourney_hosts."""
     try:
         if sb is None or not did:
             return None, "", None
-        ures = sb.table("bngc_users").select(
-            "game_username").eq("discord_id", str(did)).limit(1).execute()
+        ures = await db._sb_call(lambda: sb.table("bngc_users").select(
+            "game_username").eq("discord_id", str(did)).limit(1).execute())
         urow = ((ures.data or [{}])[0] or {})
         gname = str(urow.get("game_username") or "").strip()
         if not gname:
@@ -3280,8 +4433,8 @@ async def ranked_name_cmd(interaction: discord.Interaction, allow: bool):
         return await interaction.followup.send("Supabase not configured.", ephemeral=True)
     me = str(interaction.user.id)
     try:
-        upd = sb.table("bngc_users").update(
-            {"ranked_name_optin": bool(allow)}).eq("discord_id", me).execute()
+        upd = await db._sb_call(lambda: sb.table("bngc_users").update(
+            {"ranked_name_optin": bool(allow)}).eq("discord_id", me).execute())
         wrote = bool(upd.data)
     except Exception as e:
         if "ranked_name_optin" in str(e):
@@ -3291,12 +4444,12 @@ async def ranked_name_cmd(interaction: discord.Interaction, allow: bool):
         return await interaction.followup.send("Couldn't save — try again later.", ephemeral=True)
     if not wrote:
         try:
-            sb.table("bngc_users").insert({
+            await db._sb_call(lambda: sb.table("bngc_users").insert({
                 "discord_id": me,
                 "discord_username": getattr(interaction.user, "display_name", None) or str(interaction.user),
                 "ranked_name_optin": bool(allow),
                 "token": gen_token(),
-            }).execute()
+            }).execute())
         except Exception as e:
             if "ranked_name_optin" in str(e):
                 return await interaction.followup.send(
@@ -3306,7 +4459,7 @@ async def ranked_name_cmd(interaction: discord.Interaction, allow: bool):
     extra = ""
     if allow and interaction.guild is not None:
         try:
-            nick, gname, milestone = _ranked_nick_for(sb, me)
+            nick, gname, milestone = await _ranked_nick_for(sb, me)
             if nick:
                 ok = await _edit_nick_if_different(
                     interaction.guild, me, nick, "Ranked milestone nickname opt-in (immediate)")
@@ -3329,8 +4482,8 @@ async def comp_name_cmd(interaction: discord.Interaction, allow: bool):
         return await interaction.followup.send("Supabase not configured.", ephemeral=True)
     me = str(interaction.user.id)
     try:
-        upd = sb.table("bngc_users").update(
-            {"tourney_name_optin": bool(allow)}).eq("discord_id", me).execute()
+        upd = await db._sb_call(lambda: sb.table("bngc_users").update(
+            {"tourney_name_optin": bool(allow)}).eq("discord_id", me).execute())
         wrote = bool(upd.data)
     except Exception as e:
         if "tourney_name_optin" in str(e):
@@ -3340,12 +4493,12 @@ async def comp_name_cmd(interaction: discord.Interaction, allow: bool):
         return await interaction.followup.send("Couldn't save — try again later.", ephemeral=True)
     if not wrote:
         try:
-            sb.table("bngc_users").insert({
+            await db._sb_call(lambda: sb.table("bngc_users").insert({
                 "discord_id": me,
                 "discord_username": getattr(interaction.user, "display_name", None) or str(interaction.user),
                 "tourney_name_optin": bool(allow),
                 "token": gen_token(),
-            }).execute()
+            }).execute())
         except Exception as e:
             if "tourney_name_optin" in str(e):
                 return await interaction.followup.send(
@@ -3355,7 +4508,7 @@ async def comp_name_cmd(interaction: discord.Interaction, allow: bool):
     extra = ""
     if allow and interaction.guild is not None:
         try:
-            nick, gname = _comp_nick_for(sb, me)
+            nick, gname = await _comp_nick_for(sb, me)
             if nick:
                 ok = await _edit_nick_if_different(
                     interaction.guild, me, nick, "Comp PR nickname opt-in (immediate)")
@@ -3400,8 +4553,8 @@ async def _comp_apply_pr_nicknames(guild, pr_board) -> int:
         if not dids:
             return 0
         try:
-            ures = sb.table("bngc_users").select(
-                "discord_id,game_username,tourney_name_optin").in_("discord_id", dids).execute()
+            ures = await db._sb_call(lambda: sb.table("bngc_users").select(
+                "discord_id,game_username,tourney_name_optin").in_("discord_id", dids).execute())
         except Exception as e:
             if "tourney_name_optin" in str(e):
                 print("[comp] nicknames skipped: apply add_comp_v238.sql")
@@ -3565,9 +4718,9 @@ async def comp_account_cmd(interaction: discord.Interaction, user: discord.User 
     target = user or interaction.user
     did = str(target.id)
     try:
-        ures = sb.table("bngc_users").select(
+        ures = await db._sb_call(lambda: sb.table("bngc_users").select(
             "discord_id,game_username,discord_username,tourney_pr").eq(
-            "discord_id", did).limit(1).execute()
+            "discord_id", did).limit(1).execute())
         urow = ((ures.data or [{}])[0] or {})
     except Exception:
         urow = {}
@@ -3577,8 +4730,8 @@ async def comp_account_cmd(interaction: discord.Interaction, user: discord.User 
             f"{getattr(target, 'mention', 'That user')} has no comp profile yet.")
     kills, mids = 0, set()
     try:
-        eres = sb.table("bngc_comp_events").select("match_id,etype").eq(
-            "discord_id", did).eq("etype", "kill").limit(5000).execute()
+        eres = await db._sb_call(lambda: sb.table("bngc_comp_events").select("match_id,etype").eq(
+            "discord_id", did).eq("etype", "kill").limit(5000).execute())
         for e in (eres.data or []):
             kills += 1
             if (e or {}).get("match_id") is not None:
@@ -3587,8 +4740,8 @@ async def comp_account_cmd(interaction: discord.Interaction, user: discord.User 
         pass
     # also count matches where the player appears without kills (alv rows)
     try:
-        ares = sb.table("bngc_comp_events").select("match_id").eq(
-            "discord_id", did).limit(5000).execute()
+        ares = await db._sb_call(lambda: sb.table("bngc_comp_events").select("match_id").eq(
+            "discord_id", did).limit(5000).execute())
         for e in (ares.data or []):
             if (e or {}).get("match_id") is not None:
                 mids.add((e or {}).get("match_id"))
@@ -3597,8 +4750,8 @@ async def comp_account_cmd(interaction: discord.Interaction, user: discord.User 
     wins, places = 0, []
     try:
         for chunk in [sorted(mids)[i:i + 200] for i in range(0, len(mids), 200)] or []:
-            mres = sb.table("bngc_comp_matches").select(
-                "id,winner_discord_id,placements").in_("id", chunk).limit(200).execute()
+            mres = await db._sb_call(lambda: sb.table("bngc_comp_matches").select(
+                "id,winner_discord_id,placements").in_("id", chunk).limit(200).execute())
             for m in (mres.data or []):
                 try:
                     if str((m or {}).get("winner_discord_id") or "") == did:
@@ -3616,8 +4769,8 @@ async def comp_account_cmd(interaction: discord.Interaction, user: discord.User 
     # PR + delta (same rule as GET /api/stats: last two history rows)
     pr, prev, delta = None, None, None
     try:
-        hres = sb.table("bngc_comp_pr_history").select("pr").eq(
-            "discord_id", did).order("computed_at", desc=True).limit(2).execute()
+        hres = await db._sb_call(lambda: sb.table("bngc_comp_pr_history").select("pr").eq(
+            "discord_id", did).order("computed_at", desc=True).limit(2).execute())
         hist = [float((h or {}).get("pr")) for h in (hres.data or []) if (h or {}).get("pr") is not None]
         if hist:
             pr = hist[0]
@@ -3661,9 +4814,9 @@ async def ranked_account_cmd(interaction: discord.Interaction, user: discord.Use
     target = user or interaction.user
     did = str(target.id)
     try:
-        ures = sb.table("bngc_users").select(
+        ures = await db._sb_call(lambda: sb.table("bngc_users").select(
             "discord_id,game_username,discord_username").eq(
-            "discord_id", did).limit(1).execute()
+            "discord_id", did).limit(1).execute())
         urow = ((ures.data or [{}])[0] or {})
     except Exception:
         urow = {}
@@ -3675,9 +4828,9 @@ async def ranked_account_cmd(interaction: discord.Interaction, user: discord.Use
     milestone, _fee = ranked_mod.milestone_for(pts)
     kills, match_keys = 0, set()
     try:
-        eres = sb.table("bngc_ranked_events").select(
+        eres = await db._sb_call(lambda: sb.table("bngc_ranked_events").select(
             "room_id,match_version,etype").eq(
-            "discord_id", did).limit(5000).execute()
+            "discord_id", did).limit(5000).execute())
         for e in (eres.data or []):
             try:
                 if (e or {}).get("etype") == "kill":
@@ -3691,9 +4844,9 @@ async def ranked_account_cmd(interaction: discord.Interaction, user: discord.Use
         pass
     wins, places = 0, []
     try:
-        rres = sb.table("ranked_results").select(
+        rres = await db._sb_call(lambda: sb.table("ranked_results").select(
             "room_id,match_version,winner_discord_id,kills,placements").order(
-            "match_version", desc=True).limit(1000).execute()
+            "match_version", desc=True).limit(1000).execute())
         for m in (rres.data or []):
             try:
                 key = (str((m or {}).get("room_id")),
@@ -4000,8 +5153,8 @@ async def _ranked_board_rows(limit: int = 50):
     try:
         sb = _comp_sb()
         if sb is not None and dids:
-            ures = sb.table("bngc_users").select(
-                "discord_id,game_username,discord_username").in_("discord_id", dids[:200]).execute()
+            ures = await db._sb_call(lambda: sb.table("bngc_users").select(
+                "discord_id,game_username,discord_username").in_("discord_id", dids[:200]).execute())
             for u in (ures.data or []):
                 try:
                     if (u or {}).get("discord_id"):
@@ -4058,8 +5211,8 @@ async def tourney_list_cmd(interaction: discord.Interaction):
     if sb is None:
         return await interaction.followup.send("Supabase not configured.")
     try:
-        res = sb.table("bngc_comp_tourneys").select(
-            "id,code,name,status,mode,series_len").order("id").limit(25).execute()
+        res = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select(
+            "id,code,name,status,mode,series_len").order("id").limit(25).execute())
         rows = res.data or []
         if not rows:
             return await interaction.followup.send("No tourneys yet. Hosts: `/tourney-create`.")
@@ -4085,18 +5238,18 @@ async def listen_reg_cmd(interaction: discord.Interaction, channel: discord.Text
     if sb is None:
         return await interaction.followup.send("Supabase not configured.", ephemeral=True)
     try:
-        tres = sb.table("bngc_comp_tourneys").select(
+        tres = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select(
             "id,name,mode,player_role_id,ping_role_id").eq(
-            "id", int(tourney_id)).in_("status", ["created", "scheduled", "started"]).limit(1).execute()
+            "id", int(tourney_id)).in_("status", ["created", "scheduled", "started"]).limit(1).execute())
         if not tres.data:
             return await interaction.followup.send(
                 "No registrable tourney with that ID (created/scheduled/started).", ephemeral=True)
         t = tres.data[0]
         print(t)
         ping = str(ping_role.id) if ping_role else (t.get("ping_role_id") or t.get("player_role_id") or COMP_PLAYER_ROLE_ID or "")
-        sb.table("bngc_comp_tourneys").update(
+        await db._sb_call(lambda: sb.table("bngc_comp_tourneys").update(
             {"reg_open": True, "reg_channel_id": str(channel.id),
-             "ping_role_id": ping or None}).eq("id", int(tourney_id)).execute()
+             "ping_role_id": ping or None}).eq("id", int(tourney_id)).execute())
         try:
             _comp_reg_cache["at"] = 0.0
         except Exception:
@@ -4131,13 +5284,13 @@ async def stop_reg_cmd(interaction: discord.Interaction, tourney_id: int):
     if sb is None:
         return await interaction.followup.send("Supabase not configured.", ephemeral=True)
     try:
-        res = sb.table("bngc_comp_tourneys").select(
+        res = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select(
             "id,name,mode,reg_channel_id,ping_role_id,player_role_id").eq(
-            "id", int(tourney_id)).limit(1).execute()
+            "id", int(tourney_id)).limit(1).execute())
         if not res.data:
             return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
         t = res.data[0]
-        sb.table("bngc_comp_tourneys").update({"reg_open": False}).eq("id", int(tourney_id)).execute()
+        await db._sb_call(lambda: sb.table("bngc_comp_tourneys").update({"reg_open": False}).eq("id", int(tourney_id)).execute())
         try:
             _comp_reg_cache["at"] = 0.0
         except Exception:
@@ -4172,8 +5325,8 @@ async def _comp_accepted_counts(tourney_id: int):
         sb = _comp_sb()
         if sb is None:
             return 0, 0
-        res = sb.table("bngc_comp_registrations").select("member_ids").eq(
-            "tourney_id", int(tourney_id)).eq("status", "accepted").limit(1000).execute()
+        res = await db._sb_call(lambda: sb.table("bngc_comp_registrations").select("member_ids").eq(
+            "tourney_id", int(tourney_id)).eq("status", "accepted").limit(1000).execute())
         teams = len(res.data or [])
         players = sum(len((r or {}).get("member_ids") or []) for r in (res.data or []))
         return players, teams
@@ -4188,9 +5341,9 @@ async def _comp_autoclose(tourney_id: int, guild=None, channel=None):
         sb = _comp_sb()
         if sb is None:
             return False
-        tres = sb.table("bngc_comp_tourneys").select(
+        tres = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select(
             "id,name,mode,reg_open,reg_channel_id,max_players").eq(
-            "id", int(tourney_id)).limit(1).execute()
+            "id", int(tourney_id)).limit(1).execute())
         if not tres.data:
             return False
         t = tres.data[0]
@@ -4203,7 +5356,7 @@ async def _comp_autoclose(tourney_id: int, guild=None, channel=None):
         players, teams = await _comp_accepted_counts(int(tourney_id))
         if players < maxp:
             return False
-        sb.table("bngc_comp_tourneys").update({"reg_open": False}).eq("id", int(tourney_id)).execute()
+        await db._sb_call(lambda: sb.table("bngc_comp_tourneys").update({"reg_open": False}).eq("id", int(tourney_id)).execute())
         try:
             _comp_reg_cache["at"] = 0.0
         except Exception:
@@ -4242,26 +5395,26 @@ async def tourney_start_cmd(interaction: discord.Interaction, tourney_id: int,
         return
     try:
         from datetime import datetime, timezone
-        tres = sb.table("bngc_comp_tourneys").select(
-            "id,code,name,status,player_role_id").eq("id", int(tourney_id)).limit(1).execute()
+        tres = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select(
+            "id,code,name,status,player_role_id").eq("id", int(tourney_id)).limit(1).execute())
         if not tres.data:
             return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
         t = tres.data[0]
         role_id = (str(role_to_give.id) if role_to_give else None) or t.get("player_role_id") or COMP_PLAYER_ROLE_ID
         if role_to_give is not None:
             try:
-                sb.table("bngc_comp_tourneys").update(
-                    {"player_role_id": str(role_to_give.id)}).eq("id", int(tourney_id)).execute()
+                await db._sb_call(lambda: sb.table("bngc_comp_tourneys").update(
+                    {"player_role_id": str(role_to_give.id)}).eq("id", int(tourney_id)).execute())
             except Exception:
                 pass
-        rres = sb.table("bngc_comp_registrations").select("member_ids").eq(
-            "tourney_id", int(tourney_id)).eq("status", "accepted").limit(1000).execute()
+        rres = await db._sb_call(lambda: sb.table("bngc_comp_registrations").select("member_ids").eq(
+            "tourney_id", int(tourney_id)).eq("status", "accepted").limit(1000).execute())
         dids = sorted({str(x) for r in (rres.data or []) for x in ((r or {}).get("member_ids") or []) if x})
         if not role_id:
             try:
-                sb.table("bngc_comp_tourneys").update(
+                await db._sb_call(lambda: sb.table("bngc_comp_tourneys").update(
                     {"started_at": datetime.now(timezone.utc).isoformat(),
-                     "status": "started"}).eq("id", int(tourney_id)).execute()
+                     "status": "started"}).eq("id", int(tourney_id)).execute())
             except Exception:
                 pass
             return await interaction.followup.send(
@@ -4273,19 +5426,19 @@ async def tourney_start_cmd(interaction: discord.Interaction, tourney_id: int,
             if await _comp_grant_role(interaction.guild, did, role_id):
                 ok += 1
         try:
-            sb.table("bngc_comp_tourneys").update(
+            await db._sb_call(lambda: sb.table("bngc_comp_tourneys").update(
                 {"started_at": datetime.now(timezone.utc).isoformat(),
-                 "status": "started"}).eq("id", int(tourney_id)).execute()
+                 "status": "started"}).eq("id", int(tourney_id)).execute())
         except Exception:
             pass
         # auto-tag the room code so presence + drawer show the tourney state
         if t.get("code"):
             try:
-                sb.table("bngc_room_tags").upsert({
+                await db._sb_call(lambda: sb.table("bngc_room_tags").upsert({
                     "code": str(t["code"]).upper(), "kind": "tourney",
                     "name": str(t.get("name") or "Tourney"),
                     "created_by": str(interaction.user.id),
-                }, on_conflict="code").execute()
+                }, on_conflict="code").execute())
             except Exception as e:
                 print(f"[comp] start tag failed: {e}")
         extra = "" if ok == len(dids) else f" ({len(dids) - ok} failed — check role order/perms)"
@@ -4390,8 +5543,8 @@ class _GameNameModal(discord.ui.Modal):
             taken_by = None
             if dids:
                 try:
-                    gres = sb.table("bngc_users").select(
-                        "discord_id,game_username").in_("discord_id", dids).execute()
+                    gres = await db._sb_call(lambda: sb.table("bngc_users").select(
+                        "discord_id,game_username").in_("discord_id", dids).execute())
                     for u in (gres.data or []):
                         try:
                             if _norm_game((u or {}).get("game_username")) == norm:
@@ -4409,21 +5562,21 @@ class _GameNameModal(discord.ui.Modal):
                 return await interaction.followup.send(
                     f"❌ '{raw}' is already registered — ask a host to link it if it's yours.", ephemeral=True)
             try:
-                upd = sb.table("bngc_users").update(
-                    {"game_username": raw}).eq("discord_id", me).execute()
+                upd = await db._sb_call(lambda: sb.table("bngc_users").update(
+                    {"game_username": raw}).eq("discord_id", me).execute())
                 wrote = bool(upd.data)
             except Exception:
                 wrote = False
             if not wrote:
                 try:
-                    sb.table("bngc_users").insert({
+                    await db._sb_call(lambda: sb.table("bngc_users").insert({
                         "discord_id": me,
                         "discord_username": getattr(interaction.user, "display_name", None) or str(interaction.user),
                         "game_username": raw,
                         # token is NOT NULL: mint an inert one (same as /register;
                         # unknowable, so it can never be presented for login).
                         "token": gen_token(),
-                    }).execute()
+                    }).execute())
                     wrote = True
                 except Exception as e:
                     return await interaction.followup.send(f"Couldn't save: {e}", ephemeral=True)
@@ -4475,9 +5628,9 @@ class _GameNameModal(discord.ui.Modal):
                 print("[comp] mark_signup: no supabase")
                 return
             me = str(interaction.user.id)
-            rres = sb.table("bngc_comp_registrations").select(
+            rres = await db._sb_call(lambda: sb.table("bngc_comp_registrations").select(
                 "id,member_ids,status,source_message_id,team_color").eq(
-                "tourney_id", int(self.tourney_id)).neq("status", "banned").limit(200).execute()
+                "tourney_id", int(self.tourney_id)).neq("status", "banned").limit(200).execute())
             hit = None
             for r in (rres.data or []):
                 try:
@@ -4582,8 +5735,8 @@ async def _comp_players_embed(tourney_id: int, guild=None):
         if sb is None:
             return None, "Supabase not configured."
         try:
-            trow = sb.table("bngc_comp_tourneys").select("id,name").eq(
-                "id", int(tourney_id)).limit(1).execute()
+            trow = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select("id,name").eq(
+                "id", int(tourney_id)).limit(1).execute())
             tname = (((trow.data or [{}])[0] or {}).get("name")) or f"#{tourney_id}"
         except Exception:
             tname = f"#{tourney_id}"
@@ -4596,8 +5749,8 @@ async def _comp_players_embed(tourney_id: int, guild=None):
             dids = sorted({str(x) for r in acc for x in ((r or {}).get("member_ids") or []) if x})[:100]
             umap, gmap = {}, {}
             if sb is not None and dids:
-                ures = sb.table("bngc_users").select(
-                    "discord_id,game_username,discord_username").in_("discord_id", dids).execute()
+                ures = await db._sb_call(lambda: sb.table("bngc_users").select(
+                    "discord_id,game_username,discord_username").in_("discord_id", dids).execute())
                 for u in (ures.data or []):
                     try:
                         dd = str((u or {}).get("discord_id"))
@@ -4656,9 +5809,9 @@ async def _comp_open_regs():
     try:
         sb = _comp_sb()
         if sb is not None:
-            res = sb.table("bngc_comp_tourneys").select(
+            res = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select(
                 "id,mode,reg_channel_id,player_role_id").eq("reg_open", True).neq(
-                "status", "ended").execute()
+                "status", "ended").execute())
             rows = res.data or []
     except Exception:
         rows = []
@@ -4708,16 +5861,23 @@ async def on_message(message):
             except Exception:
                 pass
 
-        # self-registration only: solo = your own mention; duo = your mention
-        # first, then your teammate. Registering strangers is refused.
+        # self-registration only: solo = your own mention; duo = you + one
+        # teammate in ANY order. Discord does not guarantee message.mentions
+        # order, so a members[0] check misfires on correct "@you @teammate"
+        # messages — the set is what matters. Registering strangers is refused.
         try:
             author_id = str(getattr(message.author, "id", ""))
         except Exception:
             author_id = ""
         if err is None and author_id not in (members or []):
-            err = "mention yourself to register (solo: @you, duo: @you @teammate first)"
-        elif err is None and str((t or {}).get("mode") or "solo").lower() == "duo" and members[0] != author_id:
-            err = "duos: your own mention must come first (@you @teammate)"
+            err = "mention yourself to register (solo: @you, duo: @you + @teammate in any order)"
+        elif err is None and str((t or {}).get("mode") or "solo").lower() == "duo":
+            # Normalize author-first internally so captain/team label stay
+            # deterministic no matter which mention Discord listed first.
+            try:
+                members = [author_id] + [m for m in (members or []) if m != author_id]
+            except Exception:
+                pass
 
         if err or sb is None:
             await _refuse(err or "Registration unavailable, try later.")
@@ -4789,8 +5949,8 @@ async def on_message(message):
                               if (r or {}).get("status") != "banned" and x})[:100]
             _gmap = {}
             if sb is not None and _dids_g:
-                _gres = sb.table("bngc_users").select(
-                    "discord_id,game_username").in_("discord_id", _dids_g).execute()
+                _gres = await db._sb_call(lambda: sb.table("bngc_users").select(
+                    "discord_id,game_username").in_("discord_id", _dids_g).execute())
                 for _u in ((_gres.data or [])):
                     try:
                         _gn = _norm_game((_u or {}).get("game_username"))
@@ -4799,8 +5959,8 @@ async def on_message(message):
                     except Exception:
                         continue
             if sb is not None and members:
-                _nres = sb.table("bngc_users").select(
-                    "discord_id,game_username").in_("discord_id", members).execute()
+                _nres = await db._sb_call(lambda: sb.table("bngc_users").select(
+                    "discord_id,game_username").in_("discord_id", members).execute())
                 for _u in ((_nres.data or [])):
                     try:
                         _gn = _norm_game((_u or {}).get("game_username"))
@@ -4848,10 +6008,10 @@ async def on_message(message):
             if member_names:
                 _reg_row["member_names"] = member_names
             try:
-                sb.table("bngc_comp_registrations").insert(_reg_row).execute()
+                await db._sb_call(lambda: sb.table("bngc_comp_registrations").insert(_reg_row).execute())
             except Exception:
                 _reg_row.pop("member_names", None)  # pre-migration safe
-                sb.table("bngc_comp_registrations").insert(_reg_row).execute()
+                await db._sb_call(lambda: sb.table("bngc_comp_registrations").insert(_reg_row).execute())
         except Exception as e:
             # unique violation = same message processed twice (retry)
             print(f"[comp] reg insert failed: {e}")
@@ -4925,9 +6085,9 @@ async def on_raw_reaction_add(payload):
         if not _comp_is_host(reactor):
             return
         try:
-            rres = sb.table("bngc_comp_registrations").select(
+            rres = await db._sb_call(lambda: sb.table("bngc_comp_registrations").select(
                 "id,tourney_id,member_ids,status").eq(
-                "source_message_id", str(payload.message_id)).limit(5).execute()
+                "source_message_id", str(payload.message_id)).limit(5).execute())
         except Exception:
             return
         rows = [r for r in (rres.data or []) if (r or {}).get("status") == "pending"]
@@ -4936,13 +6096,13 @@ async def on_raw_reaction_add(payload):
         row = rows[0]
         if str(payload.emoji.name) == "✅":
             try:
-                sb.table("bngc_comp_registrations").update({"status": "accepted"}).eq("id", row["id"]).execute()
+                await db._sb_call(lambda: sb.table("bngc_comp_registrations").update({"status": "accepted"}).eq("id", row["id"]).execute())
             except Exception:
                 return
             # player role: tourney override, else env
             role_id = ""
             try:
-                tres = sb.table("bngc_comp_tourneys").select("player_role_id").eq("id", row["tourney_id"]).limit(1).execute()
+                tres = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select("player_role_id").eq("id", row["tourney_id"]).limit(1).execute())
                 role_id = ((tres.data or [{}])[0] or {}).get("player_role_id") or ""
             except Exception:
                 pass
@@ -4957,7 +6117,7 @@ async def on_raw_reaction_add(payload):
                 pass
         else:
             try:
-                sb.table("bngc_comp_registrations").update({"status": "banned"}).eq("id", row["id"]).execute()
+                await db._sb_call(lambda: sb.table("bngc_comp_registrations").update({"status": "banned"}).eq("id", row["id"]).execute())
             except Exception:
                 pass
     except Exception as e:
@@ -5034,7 +6194,7 @@ async def _all_registered_discord_ids():
     """Every registered discord_id (DM targets for update broadcasts)."""
     if db.USE_SUPABASE and db.supabase:
         try:
-            r = db.supabase.table("bngc_users").select("discord_id").limit(10000).execute()
+            r = await db._sb_call(lambda: db.supabase.table("bngc_users").select("discord_id").limit(10000).execute())
             return [str(x.get("discord_id")) for x in (r.data or []) if x.get("discord_id")]
         except Exception as e:
             print(f"[announce] supabase ids failed: {e}")
@@ -5588,6 +6748,29 @@ async def _defer(interaction: discord.Interaction) -> bool:
         return False
 
 
+async def _ranked_admin_only(interaction: discord.Interaction) -> bool:
+    """True when the caller is a server admin (refusal sent otherwise).
+
+    Every /ranked subcommand is admin-only. Safe to call before or after
+    defer. Never raises.
+    """
+    try:
+        admin = bool(interaction.user.guild_permissions.administrator)
+    except Exception:
+        admin = False
+    if admin:
+        return True
+    try:
+        msg = "Administrator only — /ranked commands are host tools."
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
+    return False
+
+
 # Restored: shared by ranked loops + /ranked (room commands retired).
 async def _start_ranked_room(room: dict, via: str = "manual"):
     """Shared manual/countdown start. Returns (ok, message). Steps: eligibility
@@ -5690,7 +6873,12 @@ async def _start_ranked_room(room: dict, via: str = "manual"):
             return False, "Couldn't create the session thread — check my thread perms."
     code = room.get("short_code")
     if private:
-        for did in roster:
+        # roster + host: the host often doesn't play (not on roster) but must
+        # still see the private thread (was silently left out).
+        _invite = [d for d in dict.fromkeys(
+            [str(x) for x in (roster or []) if x]
+            + [str(room.get("host_discord_id") or "")]) if d]
+        for did in _invite:
             try:
                 member = parent.guild.get_member(int(did)) if hasattr(parent, "guild") and parent.guild else None
                 if member is None and hasattr(parent, "guild") and parent.guild:
@@ -5739,7 +6927,8 @@ ranked_group = app_commands.Group(
     name="ranked", description="Ranked sessions (series)")
 
 
-@ranked_group.command(name="register", description="Link your in-game name for ranked (mobile-friendly, no stats tracking)")
+@ranked_group.command(name="register", description="Link your in-game name for ranked (admin)")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(game_username="Your in-game name, exactly as it appears in-game")
 async def ranked_register_cmd(interaction: discord.Interaction, game_username: app_commands.Range[str, 1, 32]):
     """Minimal ranked identity: {discord_id, game_username} only.
@@ -5753,6 +6942,8 @@ async def ranked_register_cmd(interaction: discord.Interaction, game_username: a
     """
     if not await _defer(interaction):
         return
+    if not await _ranked_admin_only(interaction):
+        return
     if not RANKED_ENABLED_BOT:
         return await interaction.followup.send("Ranked is sleeping in v2.19.0 — streak rewards are live. Back soon.", ephemeral=True)
     sb = _comp_sb()
@@ -5760,8 +6951,8 @@ async def ranked_register_cmd(interaction: discord.Interaction, game_username: a
         return await interaction.followup.send("Supabase not configured.", ephemeral=True)
     me = str(interaction.user.id)
     try:
-        ures = sb.table("bngc_users").select(
-            "discord_id,game_username").eq("discord_id", me).limit(1).execute()
+        ures = await db._sb_call(lambda: sb.table("bngc_users").select(
+            "discord_id,game_username").eq("discord_id", me).limit(1).execute())
         cur = (((ures.data or [{}])[0] or {}).get("game_username") or "").strip()
         has_row = bool((ures.data or []))
     except Exception:
@@ -5774,8 +6965,8 @@ async def ranked_register_cmd(interaction: discord.Interaction, game_username: a
         return await interaction.followup.send(
             f"Already set — you are known as **{cur}**.", ephemeral=True)
     try:
-        dup = sb.table("bngc_users").select(
-            "discord_id,game_username").ilike("game_username", raw).limit(25).execute()
+        dup = await db._sb_call(lambda: sb.table("bngc_users").select(
+            "discord_id,game_username").ilike("game_username", raw).limit(25).execute())
         for u in ((dup.data if hasattr(dup, "data") else []) or []):
             try:
                 if str((u or {}).get("discord_id")) == me:
@@ -5789,14 +6980,14 @@ async def ranked_register_cmd(interaction: discord.Interaction, game_username: a
         pass
     try:
         if has_row:
-            sb.table("bngc_users").update({"game_username": raw}).eq("discord_id", me).execute()
+            await db._sb_call(lambda: sb.table("bngc_users").update({"game_username": raw}).eq("discord_id", me).execute())
         else:
-            sb.table("bngc_users").insert({
+            await db._sb_call(lambda: sb.table("bngc_users").insert({
                 "discord_id": me,
                 "discord_username": str(interaction.user.name or "")[:32] or me,
                 "game_username": raw,
                 "token": "ranked-" + secrets.token_hex(16),
-            }).execute()
+            }).execute())
     except Exception as e:
         print(f"[ranked-register] save failed: {e}")
         return await interaction.followup.send("Couldn't save — try again later.", ephemeral=True)
@@ -6291,7 +7482,8 @@ async def _rt_players_lines(tid: int) -> list:
         return []
 
 
-@ranked_group.command(name="create", description="Create a ranked session (series)")
+@ranked_group.command(name="create", description="Create a ranked session (admin)")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(series_len="Matches in the series, 0 = open-ended",
                        mode="Solo or duo",
                        game_mode="Game mode (flavor only, shown in lobby)",
@@ -6316,6 +7508,8 @@ async def ranked_session_create_cmd(interaction: discord.Interaction,
                               ping_role: discord.Role | None = None,
                               starts_in: int = 0):
     if not await _defer(interaction):
+        return
+    if not await _ranked_admin_only(interaction):
         return
     did = str(interaction.user.id)
     try:
@@ -6420,10 +7614,13 @@ def _rt_host_or_admin(interaction: discord.Interaction, t: dict) -> bool:
         return False
 
 
-@ranked_group.command(name="start", description="Start your ranked session (creator)")
+@ranked_group.command(name="start", description="Start your ranked session (admin)")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(tourney_id="Numeric session ID (from create)")
 async def ranked_session_start_cmd(interaction: discord.Interaction, tourney_id: int):
     if not await _defer(interaction):
+        return
+    if not await _ranked_admin_only(interaction):
         return
     t = await asyncio.to_thread(rt_mod.get_tourney, tourney_id)
     if not t:
@@ -6476,7 +7673,18 @@ async def ranked_session_start_cmd(interaction: discord.Interaction, tourney_id:
             return await interaction.followup.send(
                 "Couldn't create the session thread — check my thread perms.", ephemeral=True)
     if private:
-        for did in rids:
+        # roster + session hosts (created_by + hosts): hosts rarely play, but
+        # a private thread they can't see is useless to them.
+        _host_ids = []
+        try:
+            if t.get("created_by"):
+                _host_ids.append(str(t.get("created_by")))
+            _host_ids += [str(x) for x in (t.get("hosts") or []) if x]
+        except Exception:
+            pass
+        _invite = [d for d in dict.fromkeys(
+            [str(x) for x in (rids or []) if x] + _host_ids) if d]
+        for did in _invite:
             try:
                 member = parent.guild.get_member(int(did)) if hasattr(parent, "guild") and parent.guild else None
                 if member is None and hasattr(parent, "guild") and parent.guild:
@@ -6527,11 +7735,14 @@ async def ranked_session_start_cmd(interaction: discord.Interaction, tourney_id:
         f"**ranked session #{tourney_id}** live with {len(rids)} players.", ephemeral=True)
 
 
-@ranked_group.command(name="change-code", description="Change the session room code (creator, live only)")
+@ranked_group.command(name="change-code", description="Change the session room code (admin, live only)")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(tourney_id="Numeric session ID (from create)",
                        code="New 5-char room code")
 async def ranked_session_change_code_cmd(interaction: discord.Interaction, tourney_id: int, code: str):
     if not await _defer(interaction):
+        return
+    if not await _ranked_admin_only(interaction):
         return
     # Sync supabase calls run off the loop: a blocked loop is what starves the
     # next interaction past its defer window (the reported change-code error).
@@ -6562,10 +7773,13 @@ async def ranked_session_change_code_cmd(interaction: discord.Interaction, tourn
             ephemeral=True)
 
 
-@ranked_group.command(name="backout", description="Clear the room code (creator)")
+@ranked_group.command(name="backout", description="Clear the room code (admin)")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(tourney_id="Numeric session ID (from 0)")
 async def ranked_session_backout_cmd(interaction: discord.Interaction, tourney_id: int):
     if not await _defer(interaction):
+        return
+    if not await _ranked_admin_only(interaction):
         return
     t = await asyncio.to_thread(rt_mod.get_tourney, tourney_id)
     if not t:
@@ -6587,10 +7801,13 @@ async def ranked_session_backout_cmd(interaction: discord.Interaction, tourney_i
         ephemeral=True)
 
 
-@ranked_group.command(name="players", description="List ranked session players")
+@ranked_group.command(name="players", description="List ranked session players (admin)")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(tourney_id="Numeric session ID (from 0)")
 async def ranked_session_players_cmd(interaction: discord.Interaction, tourney_id: int):
     if not await _defer(interaction):
+        return
+    if not await _ranked_admin_only(interaction):
         return
     t = await asyncio.to_thread(rt_mod.get_tourney, tourney_id)
     if not t:
@@ -6603,10 +7820,13 @@ async def ranked_session_players_cmd(interaction: discord.Interaction, tourney_i
     await interaction.followup.send(embed=e, ephemeral=True)
 
 
-@ranked_group.command(name="stop", description="End your ranked session (creator)")
+@ranked_group.command(name="stop", description="End your ranked session (admin)")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(tourney_id="Numeric session ID (from 0)")
 async def ranked_session_stop_cmd(interaction: discord.Interaction, tourney_id: int):
     if not await _defer(interaction):
+        return
+    if not await _ranked_admin_only(interaction):
         return
     t = await asyncio.to_thread(rt_mod.get_tourney, tourney_id)
     if not t:
@@ -6774,10 +7994,13 @@ async def _rt_api(method: str, path: str, body: dict | None = None):
         return 0, {"error": str(e)[:100]}
 
 
-@ranked_group.command(name="open", description="Open a blank match (creator)")
+@ranked_group.command(name="open", description="Open a blank match (admin)")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(tourney_id="Numeric session ID (from 0)")
 async def ranked_session_open_cmd(interaction: discord.Interaction, tourney_id: int):
     if not await _defer(interaction):
+        return
+    if not await _ranked_admin_only(interaction):
         return
     t = await asyncio.to_thread(rt_mod.get_tourney, tourney_id)
     if not t:
@@ -6795,10 +8018,13 @@ async def ranked_session_open_cmd(interaction: discord.Interaction, tourney_id: 
         ephemeral=True)
 
 
-@ranked_group.command(name="seal", description="Seal the live match (creator)")
+@ranked_group.command(name="seal", description="Seal the live match (admin)")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(tourney_id="Numeric session ID (from 0)")
 async def ranked_session_seal_cmd(interaction: discord.Interaction, tourney_id: int):
     if not await _defer(interaction):
+        return
+    if not await _ranked_admin_only(interaction):
         return
     t = await asyncio.to_thread(rt_mod.get_tourney, tourney_id)
     if not t:
@@ -6822,11 +8048,14 @@ async def ranked_session_seal_cmd(interaction: discord.Interaction, tourney_id: 
         ephemeral=True)
 
 
-@ranked_group.command(name="winner", description="Set the match winner (creator)")
+@ranked_group.command(name="winner", description="Set the match winner (admin)")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(tourney_id="Numeric session ID (from 0)",
                        player="Game name or @mention of the winner (blank to clear)")
 async def ranked_session_winner_cmd(interaction: discord.Interaction, tourney_id: int, player: str = ""):
     if not await _defer(interaction):
+        return
+    if not await _ranked_admin_only(interaction):
         return
     t = await asyncio.to_thread(rt_mod.get_tourney, tourney_id)
     if not t:
@@ -6879,9 +8108,47 @@ async def ranked_session_winner_cmd(interaction: discord.Interaction, tourney_id
 bot.tree.add_command(ranked_group)
 
 
+_bot_lock_fh = None
+
+
+def _claim_bot_lock():
+    """Refuse to start when another bot instance holds the lock.
+
+    Two live instances share one token: every slash command double-fires
+    (second defer -> 40060, followup races -> 10062). Fail loud instead.
+    Returns True when this process owns the lock. Never raises.
+    """
+    global _bot_lock_fh
+    try:
+        from pathlib import Path as _P
+        lock_path = _P(__file__).resolve().parent / ".bot.lock"
+        _bot_lock_fh = open(lock_path, "w")
+        try:
+            import msvcrt as _ms
+            _ms.locking(_bot_lock_fh.fileno(), _ms.LK_NBLCK, 1)
+            return True
+        except ImportError:
+            pass
+        try:
+            import fcntl as _fc
+            _fc.flock(_bot_lock_fh.fileno(), _fc.LOCK_EX | _fc.LOCK_NB)
+            return True
+        except ImportError:
+            pass
+        # No file-locking available on this platform — single instance
+        # cannot be enforced; let it start (documented risk).
+        return True
+    except Exception:
+        return False
+
+
 if __name__ == "__main__":
     if not TOKEN:
         print("Set DISCORD_TOKEN env")
+        raise SystemExit(1)
+    if not _claim_bot_lock():
+        print("Another bot instance is already running (lock held) — "
+              "not starting a duplicate. Stop the other one first.")
         raise SystemExit(1)
     import asyncio as _aio
     _aio.run(db.init_db())

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Nectar Buildnow Companion
 // @namespace    https://github.com/Nectar-Central
-// @version      2.34.0
-// @description  Nectar Buildnow Companion v2.34.0 — leaderboard panel, insights, friends & chat, graphics filters, Discord rich presence, FPS chip, session refresh modal.
+// @version      2.35.0
+// @description  Nectar Buildnow Companion v2.35.0 — leaderboard panel, graphics presets, Discord rich presence, FPS chip, session refresh modal.
 // @author       Nectar Labs
 // @match        https://buildnow-gg.game-files.crazygames.com/*
 // @match        https://*.crazygames.com/*
@@ -31,7 +31,7 @@
 
 (function () {
   'use strict';
-  const BNC_VERSION = '2.34.0';
+  const BNC_VERSION = '2.35.0';
   const HREF = (() => { try { return location.href; } catch { return ''; } })();
   const IS_GAME_FRAME = HREF.includes('buildnow-gg.game-files.crazygames.com');
   // Loading shell lives inside an intermediate iframe (games.crazygames.com),
@@ -2111,6 +2111,7 @@
   let apiOnline=false;
 
   let infoPanel=null, infoUpdateTimer=null, statsCache=null, statsPollTimer=null, drawerBackdrop=null;
+  let coinsCache=null, _lastCoinsAt=0;
   // Drawer always starts closed on page load (first open) — never auto-open from storage.
   let drawerOpen = false;
   try { GMSet('bnc_info_open', false); } catch {}
@@ -2118,7 +2119,7 @@
   try {
     const _sg = GMGet('bnc_session_gm', null);
     if(_sg && String(_sg).toLowerCase().indexOf('ranked') === 0) GMDel('bnc_session_gm');
-    GMSet('bnc_host_mode', false);
+    // bnc_host_mode is host-owned: set true in Violentmonkey storage to unlock F9/F11/F12 (never auto-reset here).
   } catch {}
   let drawerTab = GMGet('bnc_drawer_tab','stats'); // 'stats' | 'players'
   if(drawerTab!=='stats'&&drawerTab!=='players') drawerTab='stats';
@@ -2130,7 +2131,7 @@
   let _authCount=0; // outgoing Authenticate packets seen (first = login, never touches audio)
   let _lastPauseReason=null; // reason string of the last _audioPause() call (for STOPPED tracing)
   function ensureLobbyAudio(){
-    if(lobbyAudio) return lobbyAudio;
+    if(lobbyAudio) return lobbyAudio; try{ if(typeof _inCompRoom==='function'&&_inCompRoom()){ try{ _audioPause('comp-room'); }catch{} return null; } }catch{} // comp rooms: no audio tag at all (decode + autoplay cost frames)
     try{
       logInfo('[AUDIO] ensureLobbyAudio create hidden tag');
       lobbyAudio=document.createElement('audio');
@@ -2193,7 +2194,7 @@
       if(!a.paused) a.pause();
     }catch(e){ logErr(`[AUDIO] pause err ${e.message}`); }
   }
-  function updateLobbyMusic(){
+  function updateLobbyMusic(){ try{ if(typeof _inCompRoom==='function'&&_inCompRoom()){ try{ _audioPause('comp-room'); }catch{} return; } }catch{} // comp rooms: silent rooms, never music
     try{
       const sc=statsCache;
       const sess=sc && sc.session;
@@ -2255,7 +2256,7 @@
       else { _audioPlayPending=false; logInfo('[AUDIO] play() no promise'); }
     }catch{}
   }
-  function prefetchLobbyMusic(){
+  function prefetchLobbyMusic(){ try{ if(typeof _inCompRoom==='function'&&_inCompRoom()) return; }catch{} // comp rooms: no prefetch either
     try{
       const sc=statsCache;
       const rawUrl=sc && sc.lobby_music_url;
@@ -2448,6 +2449,7 @@
     const deaths = sc? sc.deaths : null;
     const kd = sc && sc.kd!=null ? sc.kd : null;
     const wins = sc? sc.wins : null;
+    const coinsBal = (coinsCache && coinsCache.balance!=null) ? coinsCache.balance : null;
     const tpr = sc && sc.tourney_pr!=null ? sc.tourney_pr : null;
     const tprDelta = sc && sc.pr_delta_pct!=null ? sc.pr_delta_pct : null;
     const tprTxt = tpr==null ? null : (`${tpr}` + (tprDelta==null ? '' : (tprDelta>0 ? ` (+${tprDelta}%)` : (tprDelta<0 ? ` (${tprDelta}%)` : ' (=)'))));
@@ -2595,6 +2597,7 @@
           ${row('Play points', sc && sc.play_points!=null ? fmtPts(sc.play_points) : null)}
           ${(_inTourneyRoom && sc && sc.comp && sc.comp.length ? sc.comp.map(c=>row('🏆 '+String(c.tourney_name!=null?c.tourney_name:('Event #'+c.tourney_id)).replace(/</g,'&lt;'), fmtPts(c.points)+` (${c.wins||0}W)`)).join('') : '')}
           ${row('Wins', wins)}
+          ${row('💰 Nectar Coins', coinsBal!=null ? fmtCoinsCompact(coinsBal) : null)}
           ${row('Tourney PR', tprTxt)}
           ${row('Playtime', pGlobal!=null? fmtPlaytimeDrawer(pGlobal):null)}
           ${perGmRow}
@@ -2826,6 +2829,62 @@
       fetch(url, {method:'GET'}).then(r=>r.text().then(t=>{ if(!fresh(mySeq)) return; if(r.ok){ try{ const j=JSON.parse(t); statsCache=j; logInfo(`[AUDIO] stats fetched (fetch) lobby_music=${String(j.lobby_music_url||'').slice(-30)} state=${j.session? j.session.state:'none'}`); try{ feedLog('info', {audio:'stats-fetch', hasMusic:!!j.lobby_music_url, state:j.session? j.session.state:null}); }catch{} try{ _reconcileServerState(j.session); }catch{} apiOnline=true; _apiPing(_t0,true); try{ _hbFails=0; startHeartbeat(); }catch{} if(j.skin) GMSet('bnc_skin', j.skin); if(j.game_username) GMSet('bnc_game_username', j.game_username); if(j.game_id) GMSet('bnc_game_id', j.game_id); if(j.discord_username) { discordUsername=j.discord_username; GMSet('bnc_discord_username', discordUsername); } renderInfoPanel(); try{ const _pi2=getPartyInfo(j.session); const _inMatch2=effInMatch()===true; if((_pi2.isParty&&_pi2.code)||_inMatch2) fetchPlayers(false); }catch{} }catch(e){ logErr(`[AUDIO] stats parse err (fetch) ${e.message}`); apiOnline=false; if(forceRender) renderInfoPanel(); } } else { apiOnline=false; if(forceRender) renderInfoPanel(); } try{ updateApiDot(); }catch{} }).catch(()=>{ if(!fresh(mySeq)) return; apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} })).catch(()=>{ if(!fresh(mySeq)) return; _apiPing(_t0,false); apiOnline=false; if(forceRender) renderInfoPanel(); try{ updateApiDot(); }catch{} });
     };
     doFetch(true);
+    try{ fetchCoins(); }catch{}
+  }
+  // --- NECTAR COINS drawer line: balance from /api/coins/balance, throttled
+  // to 60s (balance moves on wagers/daily, not per kill). Unknown renders '-'
+  // like every other row. Never throws.
+  // GM_xmlhttpRequest first: the game page is a foreign origin, so plain
+  // fetch() is CORS-blocked and the balance silently stayed unknown ("-").
+  function fetchCoins(){
+    try{
+      const now=Date.now();
+      if(now-(_lastCoinsAt||0)<60000) return;
+      let did=null; try{ did=(typeof myDiscordId==='function'?myDiscordId():null)||discordId||null; }catch{}
+      if(!did) return;
+      _lastCoinsAt=now;
+      let base=''; try{ base=resolveApiBase(); }catch{}
+      if(!base) return;
+      const url=base+'/api/coins/balance?discord_id='+encodeURIComponent(did);
+      const apply=(txt,ok)=>{
+        try{
+          if(!ok) return;
+          const j=JSON.parse(txt);
+          if(j && j.balance!=null && !j.error){
+            coinsCache={balance:Number(j.balance)||0, earned:Number(j.total_earned)||0, wagered:Number(j.total_wagered)||0, ts:Date.now()};
+            try{ renderInfoPanel(); }catch{}
+          }
+        }catch{}
+      };
+      const GM = typeof GM_xmlhttpRequest!=='undefined' ? GM_xmlhttpRequest : (typeof unsafeWindow!=='undefined' && unsafeWindow.GM_xmlhttpRequest) || null;
+      if(GM){
+        try{
+          GM({method:'GET', url, headers:{'Content-Type':'application/json'}, timeout:8000,
+              onload:r=>apply(r.responseText, r.status>=200 && r.status<300),
+              onerror:()=>{}, ontimeout:()=>{}});
+          return;
+        }catch{}
+      }
+      fetch(url,{method:'GET'}).then(r=>r.text().then(t=>apply(t, r.ok))).catch(()=>{});
+    }catch{}
+  }
+  // Compact coin formatting: 1.2K / 3.4M / 5.6B / 7.8T. Whole numbers stay
+  // exact below 1000 (a balance of 500 never renders as "500.0").
+  function fmtCoinsCompact(n){
+    try{
+      const v=Number(n);
+      if(!isFinite(v)) return '-';
+      const neg=v<0, a=Math.abs(v);
+      const units=[[1e12,'T'],[1e9,'B'],[1e6,'M'],[1e3,'K']];
+      for(const [d,s] of units){
+        if(a>=d){
+          const t=a/d;
+          const txt=t>=100?Math.round(t).toString():t.toFixed(1).replace(/\.0$/,'');
+          return (neg?'-':'')+txt+s;
+        }
+      }
+      return (neg?'-':'')+Math.round(a).toLocaleString('en-US');
+    }catch{ return '-'; }
   }
   function startStatsPoll(){
     stopStatsPoll();
@@ -3565,7 +3624,7 @@
     // have started a ranked/tourney room we never sniffed (late inject,
     // missed pID) — entering the code re-runs the join path and tracking
     // continues.
-    if(show && !liveRanked()){
+    try{ if(show && GMGet('bnc_host_mode', false)!==true){ showToast('Host mode off — enable bnc_host_mode in Violentmonkey to unlock', true); return; } }catch{} if(show && !liveRanked()){
       showToast('No ranked session tracked - enter the room code', true);
       try{ logInfo('[RANKED] panel blocked - not in ranked session (code modal)'); }catch{}
       try{ showRankedCodeModal(currentSessionCode()); }catch{}
@@ -3841,7 +3900,7 @@
     createHost11Panel();
     const isHidden=host11Panel.style.display==='none'||!host11Panel.style.display;
     const show=typeof force==='boolean'?force:isHidden;
-    if(show && !hostPanelsAllowed()){ showToast('Host roster needs a tourney room', true); return; }
+    try{ if(show && GMGet('bnc_host_mode', false)!==true){ showToast('Host mode off — enable bnc_host_mode in Violentmonkey to unlock', true); return; } }catch{} if(show && !hostPanelsAllowed()){ showToast('Host roster needs a tourney room', true); return; }
     try{ clearTimeout(_hostFadeT); }catch{}
     if(show){ host11Panel.style.display='flex'; requestAnimationFrame(()=>{ requestAnimationFrame(()=>{ try{ host11Panel.style.opacity='1'; }catch{} }); }); fetchHostPanel(); }
     else { try{ host11Panel.style.opacity='0'; }catch{} _hostFadeT=setTimeout(()=>{ try{ host11Panel.style.display='none'; }catch{} }, 180); }
@@ -3947,7 +4006,7 @@
     createHost12Panel();
     const isHidden=host12Panel.style.display==='none'||!host12Panel.style.display;
     const show=typeof force==='boolean'?force:isHidden;
-    if(show && !hostPanelsAllowed()){ showToast('Host controls need a tourney room', true); return; }
+    try{ if(show && GMGet('bnc_host_mode', false)!==true){ showToast('Host mode off — enable bnc_host_mode in Violentmonkey to unlock', true); return; } }catch{} if(show && !hostPanelsAllowed()){ showToast('Host controls need a tourney room', true); return; }
     try{ clearTimeout(_hostFadeT); }catch{}
     if(show){
       host12Panel.style.display='flex';
@@ -4037,7 +4096,7 @@
   // --- LEADERBOARD PANEL: Alt+Shift+L — all players, any time ---
   // Standalone overlay (same card pattern as the ranked panel): sortable
   // columns (points/kills/wins/K-D/playtime), paginated, Esc/backdrop closes.
-  // Insights + Friends tabs plug into lbTab/renderLbPanel in later slices.
+  // (insights/friends/events/ranked tabs removed; fetchers below kept as dead code)
   function getLbKeybind(){
     try{
       const raw=GMGet('bnc_lb_keybind', null);
@@ -4646,7 +4705,7 @@
     }catch{ try{ done(); }catch{} }
   }
   let lbPanel=null, lbSort='points', lbOrder='desc', lbOffset=0, lbRows=[], lbCount=0, lbLoading=false, _lbFadeT=null;
-  let lbTab='board', lbIns=null, lbInsLoading=false; // 'board' | 'insights' | 'friends' | 'events' | 'ranked' | 'graphics' | 'presence'
+  let lbTab='board', lbIns=null, lbInsLoading=false; // 'board' | 'graphics' | 'presence' (insights/friends/events/ranked removed)
   let lbEvents=null, lbEventsLoading=false, lbEventFilter='all', lbEventDetail=null, lbEventLoading=false;
   let lbProfile=null, lbProfileIns=null, lbProfileLoading=false; // open player profile (within panel)
   let lbFriends=null, lbFriendsLoading=false, lbInvites=null, lbSearch=[], lbSearchLoading=false;
@@ -4658,7 +4717,7 @@
     const ov=document.createElement('div');
     ov.id='bnc-lb';
     Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483646', background:'rgba(0,0,0,0.64)', display:'none', opacity:'0', transition:'opacity 180ms ease-out', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif'});
-    ov.innerHTML=`<div id="bnc-lb-card" style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:14px;width:700px;max-width:94vw;height:500px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden"><div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.08)"><div><b style="font-size:16px;color:#fff">Leaderboard</b><div id="bnc-lb-sub" style="font-size:11px;color:#9ca3af;margin-top:2px">All players</div></div><button id="bnc-lb-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px">Close</button></div><div id="bnc-lb-tabs" style="display:flex;flex-wrap:wrap;gap:8px;padding:12px 18px 0 18px"><button id="bnc-lb-tab-board" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Leaderboard</button><button id="bnc-lb-tab-ins" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Insights</button><button id="bnc-lb-tab-fr" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Friends</button><button id="bnc-lb-tab-ev" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Events</button><button id="bnc-lb-tab-ranked" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Ranked</button><button id="bnc-lb-tab-gfx" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Graphics</button><button id="bnc-lb-tab-rpc" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Presence</button></div><div id="bnc-lb-sorts" style="display:flex;gap:8px;padding:12px 18px 0 18px;flex-wrap:wrap"></div><div id="bnc-lb-body" style="flex:1;overflow:auto;padding:16px 18px"></div><div id="bnc-lb-foot" style="display:flex;justify-content:space-between;align-items:center;padding:10px 18px;border-top:1px solid rgba(255,255,255,0.08)"><button id="bnc-lb-prev" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px">‹ Prev</button><span id="bnc-lb-page" style="font-size:11px;color:#9ca3af"></span><button id="bnc-lb-next" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px">Next ›</button></div></div>`;
+    ov.innerHTML=`<div id="bnc-lb-card" style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:14px;width:700px;max-width:94vw;height:500px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden"><div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.08)"><div><b style="font-size:16px;color:#fff">Leaderboard</b><div id="bnc-lb-sub" style="font-size:11px;color:#9ca3af;margin-top:2px">All players</div></div><button id="bnc-lb-close" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px">Close</button></div><div id="bnc-lb-tabs" style="display:flex;flex-wrap:wrap;gap:8px;padding:12px 18px 0 18px"><button id="bnc-lb-tab-board" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Leaderboard</button><button id="bnc-lb-tab-gfx" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Graphics</button><button id="bnc-lb-tab-rpc" style="flex:1;padding:7px 0;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer">Presence</button></div><div id="bnc-lb-sorts" style="display:flex;gap:8px;padding:12px 18px 0 18px;flex-wrap:wrap"></div><div id="bnc-lb-body" style="flex:1;overflow:auto;padding:16px 18px"></div><div id="bnc-lb-foot" style="display:flex;justify-content:space-between;align-items:center;padding:10px 18px;border-top:1px solid rgba(255,255,255,0.08)"><button id="bnc-lb-prev" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px">‹ Prev</button><span id="bnc-lb-page" style="font-size:11px;color:#9ca3af"></span><button id="bnc-lb-next" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px">Next ›</button></div></div>`;
     (document.body||document.documentElement).appendChild(ov);
     // visible focus ring on panel text inputs (proves focus landed)
     try{
@@ -4677,10 +4736,7 @@
     ov.addEventListener('click', (e)=>{ if(e.target===ov) toggleLbPanel(false); });
     ov.querySelector('#bnc-lb-close').onclick=()=> toggleLbPanel(false);
     ov.querySelector('#bnc-lb-tab-board').onclick=()=>{ lbTab='board'; lbProfile=null; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); };
-    ov.querySelector('#bnc-lb-tab-ins').onclick=()=>{ lbTab='insights'; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); fetchLbIns(); };
-    ov.querySelector('#bnc-lb-tab-fr').onclick=()=>{ lbTab='friends'; renderLbPanel(); fetchLbFriends(); };
-    ov.querySelector('#bnc-lb-tab-ev').onclick=()=>{ lbTab='events'; lbEventDetail=null; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); fetchLbEvents(); };
-    ov.querySelector('#bnc-lb-tab-ranked').onclick=()=>{ lbTab='ranked'; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); fetchLbRanked(); };
+    // removed tabs: insights / friends / events / ranked
     ov.querySelector('#bnc-lb-tab-gfx').onclick=()=>{ lbTab='graphics'; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); };
     ov.querySelector('#bnc-lb-tab-rpc').onclick=()=>{ lbTab='presence'; try{ stopLbChat(); }catch{} try{ untrapRelease(); }catch{} renderLbPanel(); try{ if(rpcCfg().enabled) rpcProbe(()=>{ renderLbRpc(); startRpcView(); }); else { renderLbRpc(); startRpcView(); } }catch{} };
     ov.querySelector('#bnc-lb-prev').onclick=()=>{ if(lbOffset>0){ lbOffset=Math.max(0, lbOffset-LB_LIMIT); fetchLb(); } };
@@ -4695,7 +4751,7 @@
     if(show){
       lbPanel.style.display='flex';
       requestAnimationFrame(()=>{ requestAnimationFrame(()=>{ try{ lbPanel.style.opacity='1'; }catch{} }); });
-      if(lbTab==='insights') fetchLbIns(); else if(lbTab==='friends') fetchLbFriends(); else if(lbTab==='events') fetchLbEvents(); else if(lbTab==='ranked') fetchLbRanked(); else if(lbTab==='presence'){ renderLbRpc(); startRpcView(); } else fetchLb();
+      if(lbTab==='presence'){ renderLbRpc(); startRpcView(); } else { lbTab='board'; fetchLb(); }
     } else {
       try{ lbPanel.style.opacity='0'; }catch{}
       try{ stopLbChat(); }catch{}
@@ -4725,10 +4781,7 @@
       el.style.color=active?'#000':'#9ca3af';
     };
     tabBtn('bnc-lb-tab-board', lbTab==='board');
-    tabBtn('bnc-lb-tab-ins', lbTab==='insights');
-    tabBtn('bnc-lb-tab-fr', lbTab==='friends');
-    tabBtn('bnc-lb-tab-ev', lbTab==='events');
-    tabBtn('bnc-lb-tab-ranked', lbTab==='ranked');
+    // removed tabs: insights / friends / events / ranked
     tabBtn('bnc-lb-tab-gfx', lbTab==='graphics');
     tabBtn('bnc-lb-tab-rpc', lbTab==='presence');
     if(lbTab!=='presence'){ try{ stopRpcView(); }catch{} }
@@ -4738,10 +4791,7 @@
     if(sorts) sorts.style.display = lbTab==='board' ? 'flex' : 'none';
     const foot=document.getElementById('bnc-lb-foot');
     if(foot) foot.style.display = lbTab==='board' ? 'flex' : 'none';
-    if(lbTab==='insights'){ renderLbIns(); return; }
-    if(lbTab==='friends'){ renderLbFriends(); return; }
-    if(lbTab==='events'){ renderLbEvents(); return; }
-    if(lbTab==='ranked'){ renderLbRanked(); return; }
+    if(lbTab==='insights'||lbTab==='friends'||lbTab==='events'||lbTab==='ranked'){ lbTab='board'; }
     if(lbTab==='graphics'){ renderLbGfx(); return; }
     if(lbTab==='presence'){ renderLbRpc(); startRpcView(); return; }
     if(sorts){
@@ -5486,60 +5536,23 @@
     const body=document.getElementById('bnc-lb-body');
     if(!body) return;
     const sub=document.getElementById('bnc-lb-sub');
-    if(sub) sub.textContent='Game filters — tint, saturation, brightness, contrast, grayscale';
+    if(sub) sub.textContent='Game filters — pick a preset';
     const cfg=gfxCfg();
-    const unit=(k)=> k==='tint' ? '°' : '%';
-    const slider=(k, label, hint)=>{
-      const r=GFX_RANGES[k];
-      return '<div style="margin-bottom:10px">'
-        + '<div style="display:flex;justify-content:space-between;font-size:11px;color:#9ca3af"><span>'+label+'</span><span id="bnc-gfx-'+k+'-v" style="color:#fff;font-weight:700">'+cfg[k]+unit(k)+'</span></div>'
-        + '<input id="bnc-gfx-'+k+'" type="range" min="'+r[0]+'" max="'+r[1]+'" value="'+cfg[k]+'" style="width:100%;accent-color:#fff">'
-        + '<div style="font-size:10px;color:#6b7280">'+hint+'</div></div>';
-    };
-    const head=(t)=>'<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:0 0 6px">'+t+'</div>';
     const presets=Object.keys(GFX_PRESETS).map(k=>{
       const active=cfg.preset===k;
       return '<button data-gfx-preset="'+k+'" style="flex:1;min-width:120px;padding:7px 10px;border-radius:999px;font-size:11px;font-weight:700;cursor:pointer;border:1px solid '+(active?'#fff':'rgba(255,255,255,0.12)')+';background:'+(active?'#fff':'#171717')+';color:'+(active?'#000':'#9ca3af')+'">'+GFX_PRESETS[k].label+'</button>';
     }).join('');
     const canvases=gfxTargets().length;
     const css=gfxCss(cfg);
-    body.innerHTML=head('PRESETS')
+    body.innerHTML='<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:0 0 6px">PRESETS</div>'
       + '<div style="display:flex;gap:8px;flex-wrap:wrap">'+presets+'</div>'
-      + '<div style="font-size:10px;color:#6b7280;margin:8px 0 2px">A preset just sets the sliders below — tweak them after and the chip turns into Custom.</div>'
-      + '<div style="padding:12px 0 6px">'+head('IMAGE')+'</div>'
-      + slider('tint','Tint','Hue rotation. Negative is warmer (reds up), positive is cooler (blues up).')
-      + slider('saturation','Saturation','0% is full greyscale, 200% is vivid.')
-      + slider('brightness','Brightness','Lifts dark rooms without blowing out the whites.')
-      + slider('contrast','Contrast','Separates enemies from busy backgrounds.')
-      + slider('grayscale','Grayscale','Drains colour after everything above.')
-      + '<div style="display:flex;gap:10px;align-items:center;margin-top:8px"><button id="bnc-gfx-reset" style="background:#1f2937;color:#e5e7eb;border:0;border-radius:8px;padding:7px 14px;font-size:12px;font-weight:700;cursor:pointer">Reset all</button></div>'
       + '<div style="margin-top:12px;font-size:10px;color:#6b7280;line-height:1.7">Applies to the game canvas only — menus and this panel stay untouched.<br>'
       + (canvases? 'Live on '+canvases+' canvas'+(canvases===1?'':'es')+' in this frame: <code style="color:#e5e7eb">'+(css||'no filter')+'</code>'
                  : 'No canvas in this frame — press F4 while the game frame has focus so the filter lands on the game surface.')
       + '</div>';
-    GFX_KEYS.forEach(k=>{
-      const el=document.getElementById('bnc-gfx-'+k);
-      if(!el) return;
-      el.oninput=()=>{
-        const v=Number(el.value);
-        gfxPersist(k, v);
-        const lab=document.getElementById('bnc-gfx-'+k+'-v');
-        if(lab) lab.textContent=v+unit(k);
-      };
-      // Committing the drag re-renders, so the preset chip can go Custom.
-      el.onchange=()=>{ try{ renderLbGfx(); }catch{} };
-    });
     body.querySelectorAll('[data-gfx-preset]').forEach(b=>{
       b.onclick=()=>{ if(b.dataset.gfxPreset==='custom') return; gfxUsePreset(b.dataset.gfxPreset); renderLbGfx(); };
     });
-    const reset=document.getElementById('bnc-gfx-reset');
-    if(reset) reset.onclick=()=>{
-      GFX_KEYS.forEach(k=> gfxWrite(k, GFX_DEF[k]));
-      gfxWrite('preset','none');
-      gfxApply();
-      renderLbGfx();
-      try{ showToast('Graphics reset', false); }catch{}
-    };
   }
 
   // ---- PASSIVE COUNTERS (former NERDS TAB) -----------------------------
@@ -5714,7 +5727,7 @@
     }catch{}
   }
   function _fpsChipFrame(ts){
-    _fpsChip.raf=null;
+    _fpsChip.raf=null; try{ if(typeof _inCompRoom==='function'&&_inCompRoom()){ try{ if(_fpsChip.el) _fpsChip.el.style.display='none'; }catch{} return; } }catch{} // comp rooms: stop the rAF loop cold (no reschedule below)
     try{
       const c=_fpsChip;
       let hidden=false;
@@ -5783,7 +5796,7 @@
   }
   function mountFpsChip(){
     try{
-      if(document.getElementById(FPS_CHIP_ID)) return;
+      if(document.getElementById(FPS_CHIP_ID)) return; try{ if(typeof _inCompRoom==='function'&&_inCompRoom()) return; }catch{} // comp rooms: never mount (no rAF, no 4Hz paint)
       const el=document.createElement('div');
       el.id=FPS_CHIP_ID;
       el.title='BuildNow Companion - frame rate (mouse click-through)';
@@ -6279,7 +6292,7 @@
   // Capture health: stamped on every successful /api/capture. The drawer dot
   // is stats-based (green while stats poll), which hides a dead capture
   // session — these counters let the dot + logs tell them apart. Never raise.
-  let lastCaptureOkAt=0, _capFails=0, _capSeen=0, _lastCapWarn=0;
+  let lastCaptureOkAt=0, _capFails=0, _capSeen=0, _lastCapWarn=0, _capBackoffMs=0;
   function captureAgeMs(){ try{ return lastCaptureOkAt? Date.now()-lastCaptureOkAt : -1; }catch{ return -1; } }
   // Footer dot truth: Offline (no api) / Login (no session) / Online (capture
   // fresh <90s) / Idle (hook alive, no essential packets — normal lobby idle)
@@ -6621,7 +6634,7 @@
       const now=Date.now();
       if(now-_lastRealFlushAt<5000) return; // real traffic already fresh
       if(flushInFlight) return;
-      apiPost('/api/capture', { sessionId: captureSessionId, records: [{hb:1, t:now}], _quiet:true, _noLiveness:true, _noToken:true, _noWipe:true }, (ok)=>{
+      apiPost('/api/capture', { sessionId: captureSessionId, records: [{hb:1, t:now}], client_version:(typeof BNC_VERSION!=='undefined'?BNC_VERSION:null), _quiet:true, _noLiveness:true, _noToken:true, _noWipe:true }, (ok)=>{
         try{
           if(ok){
             _hbFails=0;
@@ -6660,7 +6673,7 @@
     flushTimer=null;
     const batch=queue.splice(0,BATCH_MAX);
     for(const r of batch) ensureHex(r);
-    const payload={ sessionId: captureSessionId, records: batch };
+    const payload={ sessionId: captureSessionId, records: batch, client_version:(typeof BNC_VERSION!=='undefined'?BNC_VERSION:null) };
     try{ _lastRealFlushAt=Date.now(); }catch{}
     flushInFlight=true;
     try{ _flushStartAt=Date.now(); }catch{}
@@ -6668,7 +6681,7 @@
     apiPost('/api/capture', payload, (ok, txt)=>{
       flushInFlight=false;
       if(ok){
-        try{ lastCaptureOkAt=Date.now(); _capFails=0; }catch{}
+        try{ lastCaptureOkAt=Date.now(); _capFails=0; _capBackoffMs=0; }catch{}
         try{
           const j=JSON.parse(txt);
           if(j.new_req_token) { storeSession({new_req_token:j.new_req_token, new_counter:j.new_counter}); logInfo(`capture token rotated ${String(j.new_req_token).slice(0,4)}…`); feedLog('ok', {rotated:j.new_req_token.slice(0,4)}); }
@@ -6769,7 +6782,18 @@
           queue=batch.concat(queue).slice(0,BATCH_MAX*4);
         }
       }
-      if(queue.length) flushTimer=setTimeout(flush, 40);
+      if(queue.length){
+        // A failing endpoint used to be retried every 40ms FOREVER: the same
+        // batch replayed ~25x/second, which buried the server log in old
+        // packets while the player was idle. Back off exponentially (1s ->
+        // 30s) and say so once, then keep the queue intact for when the
+        // server comes back.
+        try{
+          if(_capFails){ _capBackoffMs = _capBackoffMs ? Math.min(30000, _capBackoffMs*2) : 1000; }
+          else { _capBackoffMs = 0; }
+        }catch{ _capBackoffMs=0; }
+        flushTimer=setTimeout(flush, _capBackoffMs || 40);
+      }
     });
   }
 

@@ -102,6 +102,157 @@ def _lobby_avg_for(rid: str, *, fresh: bool = False) -> float:
         return 0.0
 
 
+def _norm_player_name(s: str) -> str:
+    """Killfeed name normalizer (client mirrors it): strip tags, dc: prefix,
+    trim, lowercase. Never raises."""
+    try:
+        import re as _re
+        nm = _re.sub(r"<[^>]*>", "", str(s or "")).strip().lower()
+        return nm[3:].strip() if nm.startswith("dc:") else nm
+    except Exception:
+        return str(s or "").lower()
+
+
+def _price_kill_sync(code: str, did: str, killer_name: str,
+                     victim_name: str) -> dict:
+    """Price one optimistic kill at seal-time economics. Sync. Never raises.
+
+    Resolves both names against the live roster (room roster or session
+    regs + game names), verifies the killer IS the caller, and returns the
+    exact per-kill award the seal would pay for a first kill (no taper
+    state mid-match — later kills reconcile at seal). {ok, award, mode}.
+    Unresolvable/ambiguous → {ok: False}. No writes.
+    """
+    try:
+        code = str(code or "").strip().upper()
+        did = str(did or "").strip()
+        kn, vn = _norm_player_name(killer_name), _norm_player_name(victim_name)
+        if len(code) != 5 or not code.isalnum() or not did or not kn:
+            return {"ok": False}
+        try:
+            if ranked_mod.ranked_sleeping():
+                return {"ok": False}
+        except Exception:
+            pass
+        if supabase is None:
+            return {"ok": False}
+        # Ranked room first (kill 1..8 upset economy).
+        try:
+            rdata = ranked_mod.get_ranked_room(code)
+        except Exception:
+            rdata = None
+        if rdata:
+            try:
+                roster = ranked_mod.room_roster_ids(rdata)
+                if did not in roster:
+                    return {"ok": False}
+                namemap = ranked_mod._game_names_by_discord_sync(roster) or {}
+                lookup = {_norm_player_name(k): v for k, v in namemap.items()}
+                if lookup.get(kn) != did:
+                    return {"ok": False}
+                vdid = lookup.get(vn)
+                want = [did] + ([vdid] if vdid and vdid != did else [])
+                pts = ranked_mod._get_points_many(want, fresh=True)
+                kpts = int(pts.get(did, 0))
+                vpts = int(pts.get(vdid, kpts)) if vdid else kpts
+                try:
+                    avg = float(ranked_mod.lobby_avg_points_sync(roster, fresh=True))
+                except Exception:
+                    avg = 0.0
+                return {"ok": True, "mode": "room",
+                        "award": max(0, int(ranked_mod.kill_delta(kpts, vpts, avg))),
+                        "killer": did, "victim": vdid}
+            except Exception:
+                return {"ok": False}
+        # Ranked session (kill 4..20 tourney economy).
+        try:
+            from . import ranked_tourney as _rt
+        except Exception:
+            return {"ok": False}
+        try:
+            tres = supabase.table("bngc_ranked_tourneys").select(
+                "id").eq("code", code).neq("status", "ended").limit(2).execute()
+            rows = tres.data or []
+            if len(rows) != 1:
+                return {"ok": False}
+            tid = (rows[0] or {}).get("id")
+            rres = supabase.table("bngc_ranked_tourney_registrations").select(
+                "member_ids,member_names").eq("tourney_id", int(tid)).neq(
+                "status", "banned").limit(500).execute()
+            parts: set[str] = set()
+            disp: dict[str, str] = {}
+            for r in (rres.data or []):
+                try:
+                    for m in ((r or {}).get("member_ids") or []):
+                        if str(m or "").strip():
+                            parts.add(str(m))
+                    for _d, _nm in (((r or {}).get("member_names")) or {}).items():
+                        label = str((_nm or {}).get("display_name")
+                                    or (_nm or {}).get("username") or "").strip()
+                        if _d and label:
+                            disp.setdefault(str(_d), label)
+                except Exception:
+                    continue
+            if did not in parts:
+                return {"ok": False}
+            try:
+                ures = supabase.table("bngc_users").select(
+                    "discord_id,game_username").in_(
+                    "discord_id", sorted(parts)[:200]).execute()
+                for u in (ures.data or []):
+                    try:
+                        g = str((u or {}).get("game_username") or "").strip()
+                        _d = str((u or {}).get("discord_id") or "")
+                        if g and _d:
+                            disp.setdefault(_d, g)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            lookup = {_norm_player_name(v): k for k, v in disp.items()}
+            if lookup.get(kn) != did:
+                return {"ok": False}
+            vdid = lookup.get(vn)
+            snap = _rt._tourney_ladder_snapshot(parts | {did} | ({vdid} if vdid else set()))
+            kpts = int(snap.get(did, 0))
+            vpts = int(snap.get(vdid, kpts)) if vdid else kpts
+            n = max(1, len(parts))
+            try:
+                avg = round(sum(int(snap.get(d, 0)) for d in parts) / len(parts), 1)
+            except Exception:
+                avg = 0.0
+            return {"ok": True, "mode": "session",
+                    "award": max(0, int(_rt.tourney_kill_delta(kpts, vpts, avg, n))),
+                    "killer": did, "victim": vdid}
+        except Exception:
+            return {"ok": False}
+    except Exception:
+        return {"ok": False}
+
+
+@router.post("/api/ranked/kill-price")
+async def ranked_kill_price(request: Request):
+    """Price one optimistic kill for the live counter. Body
+    {code, discord_id, killer_name, victim_name} → {ok, award, mode}.
+
+    Display-only helper: the seal stays the single source of truth (the
+    client shows server_total + priced kills and discards the layer at
+    seal). Best-effort — unresolvable names resolve to ok:false, never 500.
+    """
+    try:
+        b = await request.json()
+        b = b if isinstance(b, dict) else {}
+    except Exception:
+        b = {}
+    try:
+        out = await db_io(_price_kill_sync,
+                          b.get("code"), b.get("discord_id"),
+                          b.get("killer_name"), b.get("victim_name"))
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)[:80]}, status_code=500)
+    return JSONResponse(out if isinstance(out, dict) else {"ok": False})
+
+
 @router.get("/api/ranked/room/by-code")
 async def ranked_room_by_code(request: Request):
     """Room carrying this room code (userscript join detection).

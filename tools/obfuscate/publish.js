@@ -1,25 +1,28 @@
-/* Publishes the obfuscated userscript to Supabase Storage (public `cdn` bucket).
+/* Publishes build artifacts to Supabase Storage (public `cdn` bucket).
  *
  * Usage: node tools/obfuscate/publish.js [target]
  *   target = "nectar" (default) | "clippednow" (standalone clipper, obfuscated)
+ *          | "installer" (BuildNow tray setup exe)
  * Reads credentials from server/.env (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
  * — never committed, never logged.
  * Build first: node tools/obfuscate/build.js (nectar) |
- *              node tools/obfuscate/build-clippednow.js (clippednow)
- * Reads credentials from server/.env (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
- * — never committed, never logged.
+ *              node tools/obfuscate/build-clippednow.js (clippednow) |
+ *              companion\tray\build-exe.bat + ISCC companion\tray\BuildNowTray.iss (installer)
  * Uploads (nectar):
  *   cdn/nectar-companion.latest.user.js   (stable reinstall + @updateURL target)
  *   cdn/nectar-companion.v2.22.1.user.js  (immutable per-release copy)
  * Uploads (clippednow):
  *   cdn/clippednow.latest.user.js         (stable reinstall + @updateURL target)
    *   cdn/clippednow.v1.2.6.user.js         (immutable per-release copy)
+ * Uploads (installer):
+ *   cdn/buildnow-tray-setup.latest.exe    (stable download link)
+ *   cdn/buildnow-tray-setup.v<ver>.exe    (immutable per-release copy)
  */
 const fs = require("fs");
 const path = require("path");
 
 const ROOT = path.join(__dirname, "..", "..");
-const VERSION = "2.31.0";
+const VERSION = "2.33.0";
 
 function loadEnv(p) {
   const env = {};
@@ -47,6 +50,43 @@ function loadEnv(p) {
 
   // 2. upload build (latest + versioned)
   const target = (process.argv[2] || "nectar").toLowerCase();
+  const isInstaller = target === "installer" || target === "setup" || target === "exe" || target === "tray";
+  if (isInstaller) {
+    // dist/NectarBuildnowPresence-Setup-<ver>.exe, built by build-exe.bat + ISCC.
+    // Prefer the VERSION-matching file, fall back to the newest setup exe.
+    const dist = path.join(ROOT, "dist");
+    const cands = fs.readdirSync(dist).filter((f) => /Setup-.*\.exe$/i.test(f));
+    if (!cands.length) throw new Error("no dist/*-Setup-*.exe found - build it first");
+    const exact = `NectarBuildnowPresence-Setup-${VERSION}.exe`;
+    const picked = cands.includes(exact) ? exact
+      : cands.sort((a, b) => fs.statSync(path.join(dist, b)).mtimeMs - fs.statSync(path.join(dist, a)).mtimeMs)[0];
+    const iver = (picked.match(/Setup-(.+)\.exe$/i) || [])[1] || VERSION;
+    const file = fs.readFileSync(path.join(dist, picked));
+    for (const name of [`buildnow-tray-setup.latest.exe`, `buildnow-tray-setup.v${iver}.exe`]) {
+      const up = await fetch(`${URL}/storage/v1/object/cdn/${name}`, {
+        method: "POST",
+        headers: {
+          apikey: KEY,
+          Authorization: `Bearer ${KEY}`,
+          "Content-Type": "application/octet-stream",
+          "x-upsert": "true",
+        },
+        body: file,
+      });
+      if (!up.ok) throw new Error(`upload ${name} failed: ${up.status} ${await up.text()}`);
+      console.log(`uploaded cdn/${name} (${file.length} bytes, from ${picked})`);
+    }
+
+    // 3. verify public reachability (HEAD: no 34MB download just to check)
+    const pub = `${URL}/storage/v1/object/public/cdn/buildnow-tray-setup.latest.exe`;
+    const chk = await fetch(pub, { method: "HEAD" });
+    console.log("public HEAD:", chk.status, `(content-length ${chk.headers.get("content-length")})`);
+    if (chk.status !== 200 || Number(chk.headers.get("content-length")) !== file.length) {
+      throw new Error("public file verification failed");
+    }
+    console.log("INSTALL LINK:", pub);
+    return;
+  }
   const isClip = target === "clippednow" || target === "clipped" || target === "standalone";
   const srcFile = isClip ? "clippednow.obfs.user.js" : "buildnow-companion.obfs.user.js";
   // Version comes from the built obfs header (inherits the source header),
