@@ -25,8 +25,8 @@
 // @connect      *.supabase.co
 // @connect      devtunnels.ms
 // @connect      *.devtunnels.ms
-// @updateURL    disabled-for-lite
-// @downloadURL  disabled-for-lite
+// @updateURL    https://mnpwvwjqawmuqmickteu.supabase.co/storage/v1/object/public/cdn/nectar-companion.competitive.latest.user.js
+// @downloadURL  https://mnpwvwjqawmuqmickteu.supabase.co/storage/v1/object/public/cdn/nectar-companion.competitive.latest.user.js
 // ==/UserScript==
 
 (function () {
