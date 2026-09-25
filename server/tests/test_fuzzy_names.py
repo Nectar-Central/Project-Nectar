@@ -76,3 +76,48 @@ def test_candidates_from_users_keeps_twin_owners():
     pool = names_lib.candidates_from_users(rows)
     assert pool == [("Void Eight", "V"), ("void eight", "W")]
     assert names_lib.fuzzy_pick("VOID EIGHT", pool) is None
+
+
+# --- leftover pairing (elimination, roster-scoped) ------------------------
+
+ROSTER = {"A": "cis6led", "B": "klepper"}
+
+
+def test_pair_leftover_maps_unknown_name_to_unclaimed_roster_player():
+    # "dom" matched nobody, and klepper (did B) never showed up under his
+    # registered name - one name and one player left, so they are each other
+    out = names_lib.pair_leftover(ROSTER, ["cis6led", "dom"],
+                                  {"cis6led": "A"})
+    assert out == {"dom": "B"}
+
+
+def test_pair_leftover_ignores_names_already_resolved():
+    # nothing unmapped -> nothing to pair
+    assert names_lib.pair_leftover(ROSTER, ["cis6led"], {"cis6led": "A"}) == {}
+    # every roster player already claimed -> an unknown name is a stranger
+    assert names_lib.pair_leftover(ROSTER, ["cis6led", "stranger"],
+                                   {"cis6led": "A", "klepper": "B"}) == {}
+
+
+def test_pair_leftover_refuses_ambiguous_leftovers():
+    # two unknown names, one player: no pairing (we cannot tell which)
+    assert names_lib.pair_leftover({"A": "cis6led"}, ["dom", "stranger"], {}) == {}
+    # one unknown name, two unclaimed players: no pairing
+    assert names_lib.pair_leftover({"A": "cis6led", "B": "klepper",
+                                    "C": "chris7"},
+                                   ["dom"], {"cis6led": "A"}) == {}
+
+
+def test_pair_leftover_dedupes_case_and_tag_drift():
+    # the same name seen twice (raw + tagged) is still one leftover
+    out = names_lib.pair_leftover(ROSTER, ["dom", "<color=red>DOM</color>"],
+                                  {"cis6led": "A"})
+    assert out == {"dom": "B"}
+
+
+def test_pair_leftover_ignores_blank_roster_names():
+    # a registrant with no registered name cannot be paired
+    assert names_lib.pair_leftover({"A": "cis6led", "B": ""}, ["dom"],
+                                   {"cis6led": "A"}) == {}
+    assert names_lib.pair_leftover({}, ["dom"], {}) == {}
+    assert names_lib.pair_leftover(None, None, None) == {}

@@ -135,10 +135,11 @@ RT_TOURNEY = {"id": 9, "code": "RCON1", "status": "started", "hosts": ["A"],
               "created_by": "A", "host_playing": True, "series_len": 10}
 
 
-def _sb_comp(monkeypatch, users=None, tourney=None):
+def _sb_comp(monkeypatch, users=None, tourney=None, regs=None):
     sb = _SB({"bngc_comp_tourneys": [dict(tourney or TOURNEY)],
               "bngc_comp_matches": [],
               "bngc_comp_events": [],
+              "bngc_comp_registrations": list(regs or []),
               "bngc_users": list(users if users is not None else USERS)})
     monkeypatch.setattr(proc, "supabase", sb)
     proc._comp_namemap.clear()
@@ -266,6 +267,45 @@ def test_contributor_cannot_open_or_seal(monkeypatch):
     assert [m.get("status") for m in sb.t["bngc_comp_matches"]] == ["open"]
     assert [e for e in sb.t["bngc_comp_events"]
             if e.get("etype") == "alv"] == []
+
+
+# --- killfeed banking: unknown name <-> unclaimed registrant ---------------
+
+def test_killfeed_pairs_unknown_name_to_unclaimed_registrant(monkeypatch):
+    # "dom" is klepper's in-game name; klepper's registered name never shows
+    # up in the room, so the kill still credits him instead of dropping out.
+    sb = _sb_comp(monkeypatch,
+                  users=USERS + [{"game_username": "klepper", "discord_id": "M"}],
+                  regs=[{"tourney_id": 7, "status": "accepted",
+                         "member_ids": ["A", "M"]}])
+    mid = _host_open(sb)
+    proc._comp_seen.clear()
+    room = _room({1: _player("cis6led", 1, True), 2: _player("dom", 2, True)},
+                 [_kill("cis6led", "dom"), _kill("dom", "cis6led")],
+                 me_name="cis6led")
+    roster = proc._tourney_roster_sync(7, "bngc_comp_registrations")
+    assert roster == {"A": "cis6led", "M": "klepper"}
+    batch = proc._bank_open_events(table="bngc_comp_events", seen={}, mid=mid,
+                                   room=room, tag="", roster=roster)
+    # both kills land: cis6led (matched) and dom (paired with klepper)
+    assert [(r["actor_name"], r["discord_id"]) for r in batch] == [
+        ("cis6led", "A"), ("dom", "M")]
+
+
+def test_killfeed_no_pairing_without_roster(monkeypatch):
+    # no registrations to reason from: the unknown name stays unmapped
+    sb = _sb_comp(monkeypatch,
+                  users=USERS + [{"game_username": "klepper", "discord_id": "M"}])
+    mid = _host_open(sb)
+    proc._comp_seen.clear()
+    room = _room({1: _player("cis6led", 1, True), 2: _player("dom", 2, True)},
+                 [_kill("cis6led", "dom")], me_name="cis6led")
+    batch = proc._bank_open_events(table="bngc_comp_events", seen={}, mid=mid,
+                                   room=room, tag="",
+                                   roster=proc._tourney_roster_sync(
+                                       7, "bngc_comp_registrations"))
+    assert [(r["actor_name"], r["discord_id"]) for r in batch] == [
+        ("cis6led", "A")]
 
 
 # --- ranked-tourney mirror ---

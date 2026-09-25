@@ -137,3 +137,64 @@ def candidates_from_users(rows) -> list[tuple[str, str]]:
     except Exception:
         return out
     return out[:MAX_CANDIDATES]
+
+
+def pair_leftover(roster, observed_names, resolved, claimed_dids=None) -> dict:
+    """Elimination tier: the one unknown name is the one unclaimed player.
+
+    The case fuzzy matching cannot reach: a player's registered name is stale
+    and no amount of spelling similarity bridges it. "klepper" in the database
+    and "dom" in game share nothing, so the only way to learn they are the
+    same person is to count. Inside a match with a trusted roster
+    (accepted registrations, room roster) the wager creator's own companion
+    feed names itself correctly, so every other name already has an owner -
+    and one name is left over, and one roster player never showed up under
+    their registered name. Those two are each other.
+
+    roster: {discord_id: registered game name} for the players the match
+    expects. observed_names: names seen in the match. resolved: {name:
+    discord_id} already assigned. claimed_dids: extra accounts to treat as
+    claimed (a spectating host, a manual row).
+
+    Returns {} unless exactly one name is unmapped AND exactly one roster
+    player is unclaimed. That single leftover pair is what a match with a
+    closed roster actually looks like when a registered name is stale. Two
+    leftovers are a coin flip, and refusing those is what keeps a stranger
+    from being handed another player's placement and their coins. The
+    residual risk - one stranger plus one absent registrant - is genuinely
+    indistinguishable from the event stream alone; the host can always
+    override on the dashboard. Callers must NOT cache the result: it is true
+    of this roster, not of that name. Never raises.
+    """
+    try:
+        observed: list = []
+        seen_keys: set = set()
+        for n in (observed_names or []):
+            k = norm_key(n)
+            if not k or k in seen_keys:
+                continue
+            seen_keys.add(k)
+            observed.append(n)
+        if not observed:
+            return {}
+        unmapped = [n for n in observed
+                    if not str((resolved or {}).get(n) or "").strip()]
+        if len(unmapped) != 1:
+            return {}
+        claimed = {str(d) for d in (resolved or {}).values()
+                   if str(d or "").strip()}
+        claimed |= {str(d) for d in (claimed_dids or []) if str(d or "").strip()}
+        left: list = []
+        for did, name in (roster or {}).items():
+            d = str(did or "").strip()
+            if not d or d in claimed or not norm_key(name):
+                continue
+            left.append(d)
+            if len(left) > 1:
+                return {}          # two absent players: no way to tell
+        if len(left) != 1:
+            return {}
+        return {unmapped[0]: left[0]}
+    except Exception:
+        return {}
+

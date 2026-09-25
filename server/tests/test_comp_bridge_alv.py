@@ -90,8 +90,10 @@ ROOM = _room(
 )
 
 
-def _use_sb(monkeypatch, events):
-    sb = _SB({"bngc_comp_events": list(events), "bngc_users": list(USERS)})
+def _use_sb(monkeypatch, events, users=None, regs=None):
+    sb = _SB({"bngc_comp_events": list(events),
+              "bngc_users": list(USERS if users is None else users),
+              "bngc_comp_registrations": list(regs or [])})
     monkeypatch.setattr(proc, "supabase", sb)
     proc._comp_namemap.clear()
     return sb
@@ -137,6 +139,67 @@ def test_alv_fuzzy_maps_drifted_name(monkeypatch):
     assert name == "bngc_comp_events"
     assert {r["actor_name"]: r["discord_id"] for r in rows} == {
         "cis61ed": "A", "chris7": "B"}
+
+
+def test_alv_pairs_unknown_name_to_unclaimed_registrant(monkeypatch):
+    # mobile player registered as "klepper" (stale DB name) plays as "dom";
+    # the companion player's name matches exactly, so the single unclaimed
+    # registrant is the single unknown name and the alv row still resolves.
+    sb = _use_sb(monkeypatch, [], regs=[
+        {"tourney_id": 7, "status": "accepted", "member_ids": ["A", "B"]}])
+    room = _room({1: _player("cis6led", 1, True),
+                  2: _player("dom", 2, False)}, [], me_name="cis6led")
+    proc._comp_bank_alv({"id": 7, "host_playing": True}, 9, room)
+    name, rows = sb.inserts[0]
+    assert name == "bngc_comp_events"
+    assert {r["actor_name"]: r["discord_id"] for r in rows} == {
+        "cis6led": "A", "dom": "B"}
+
+
+def test_alv_no_pairing_without_registrations(monkeypatch):
+    # same room, no roster to reason from: the unknown name stays unmapped
+    sb = _use_sb(monkeypatch, [])
+    room = _room({1: _player("cis6led", 1, True),
+                  2: _player("dom", 2, False)}, [], me_name="cis6led")
+    proc._comp_bank_alv({"id": 7, "host_playing": True}, 9, room)
+    rows = sb.inserts[0][1]
+    assert {r["actor_name"]: r["discord_id"] for r in rows} == {
+        "cis6led": "A", "dom": None}
+
+
+def test_alv_two_unknown_names_stay_unmapped(monkeypatch):
+    # two strangers, one unclaimed registrant: pairing would be a coin flip
+    sb = _use_sb(monkeypatch, [], regs=[
+        {"tourney_id": 7, "status": "accepted", "member_ids": ["A", "B"]}])
+    room = _room({1: _player("cis6led", 1, True),
+                  2: _player("dom", 2, True),
+                  3: _player("stranger", 3, True)}, [], me_name="cis6led")
+    proc._comp_bank_alv({"id": 7, "host_playing": True}, 9, room)
+    rows = sb.inserts[0][1]
+    assert {r["actor_name"]: r["discord_id"] for r in rows} == {
+        "cis6led": "A", "dom": None, "stranger": None}
+
+
+def test_paired_alv_places_player_on_the_board(monkeypatch):
+    # end-to-end: the paired alv row is what puts the mobile player on the
+    # board, which is what a kills line and a wager settle against.
+    sb = _use_sb(monkeypatch, [], regs=[
+        {"tourney_id": 7, "status": "accepted", "member_ids": ["A", "B"]}])
+    room = _room({1: _player("cis6led", 1, True),
+                  2: _player("dom", 2, False)},
+                 [_kill("cis6led", "dom")], me_name="cis6led")
+    proc._comp_bank_alv({"id": 7, "host_playing": True}, 9, room)
+    rows = sb.inserts[0][1]
+    table = {"kill": 1, "win": 3, "placement": [10, 7, 5]}
+    scored = compute_match_points(
+        [{"etype": "kill", "discord_id": "A", "actor_name": "cis6led"}] + [
+            {"etype": "alv", "discord_id": r["discord_id"],
+             "actor_name": r["actor_name"], "alive": r["alive"]} for r in rows],
+        table)
+    by = {r["discord_id"]: r for r in scored}
+    assert set(by) == {"A", "B"}        # dom boards as klepper's did
+    assert by["B"]["placement"] == 2     # ...and places, instead of vanishing
+    assert by["B"]["points"] == 7
 
 
 def test_alv_idempotent_on_retry(monkeypatch):
