@@ -98,6 +98,22 @@ def _names_equal(a, b) -> bool:
     return bool(na and nb and na == nb)
 
 
+def _is_own_join_call(packet, gpb) -> bool:
+    """Is this packet OUR OWN create/join request (not someone else's)?
+
+    Outbound + a CreateRoom/JoinRoom opName is this client acting on itself:
+    the playerProps it carries are the sender's own. The same trust model as
+    the outbound killfeed echo. An inbound join is somebody else arriving and
+    must never be allowed to rewrite our identity. Never raises.
+    """
+    try:
+        if str(getattr(packet, "dir", "") or "") != "out":
+            return False
+        return str((gpb or {}).get("opName") or "") in ("CreateRoom", "JoinRoom")
+    except Exception:
+        return False
+
+
 def _clean_username(raw) -> str:
     """Strip color/formatting tags from a player name at ingestion.
 
@@ -672,6 +688,80 @@ class Engine:
                 pass
             log_engine("join", session_id[:13], name=str(name),
                        source="echo-adopt", room=getattr(room, "room_id", "?")[:8])
+            return True
+        except Exception:
+            return False
+
+    def _adopt_own_rename(self, view, room, name: str | None,
+                          actor_nr, session_id: str,
+                          game_id: str | None = None) -> bool:
+        """Our own join announced a name we do not recognise: we renamed.
+
+        `view.me.username` is the anchor every self-attribution compares
+        against (the processor's `_self_match_tier`), and it is written once
+        per session by the first-join block. A stale name there is silent and
+        total: every killfeed names the NEW name, every comparison uses the
+        OLD one, no tier matches, and the processor writes no `kill`, `win`
+        or `death` row for that player again - they drop off standings and
+        out of duel wagers while their opponent's side keeps scoring.
+
+        The name in an outbound CreateRoom/JoinRoom is this client's own
+        playerProps, the same authority the outbound killfeed echo already
+        gets in `_adopt_me_from_echo`. So an unrecognised name on OUR OWN
+        join is a rename, not another player. Also collapses the duplicate
+        roster row the JOIN handler would otherwise add for the same human,
+        because a twin name in the roster makes every twin guard ambiguous.
+
+        Returns True when a rename was applied. Never raises.
+        """
+        try:
+            me = getattr(view, "me", None) if view is not None else None
+            if me is None or room is None:
+                return False
+            new_name = str(name or "").strip()
+            if not new_name:
+                return False
+            old_name = str(getattr(me, "username", "") or "")
+            # case/tag drift is NOT a rename: the existing fold tiers credit it
+            # already, and rewriting the stored name on a casing wobble would
+            # churn bngc_users.game_username for nothing.
+            if _norm_name(new_name).lower() == _norm_name(old_name).lower():
+                return False
+            me.username = new_name
+            try:
+                if actor_nr is not None:
+                    me.actor_nr = int(actor_nr)
+            except Exception:
+                pass
+            try:  # pfid off the same props: the stable id behind tier 4
+                if game_id:
+                    me.game_id = str(game_id)
+            except Exception:
+                pass
+            try:
+                # one row per human: drop any other row carrying the new name
+                for k, p in list(room.players.items()):
+                    if p is me:
+                        continue
+                    if _names_equal(getattr(p, "username", None), new_name):
+                        room.players.pop(k, None)
+                old_key = next((k for k, p in room.players.items() if p is me),
+                               None)
+                key = me.actor_nr if me.actor_nr != -1 else (hash(new_name) % 100000)
+                if old_key is not None and old_key != key:
+                    room.players.pop(old_key, None)
+                room.players[key] = me
+                room.me = me
+            except Exception:
+                pass
+            try:  # the actor->name map still points at the old name
+                for nr, nm in list(room.actor_map.items()):
+                    if _names_equal(nm, old_name):
+                        room.actor_map[nr] = new_name
+            except Exception:
+                pass
+            log_engine("name_change", session_id[:13], old=old_name,
+                       new=new_name, room=room.room_id[:8], note="own join")
             return True
         except Exception:
             return False
@@ -1724,6 +1814,16 @@ class Engine:
         if is_join_packet and join_name:
             # If this is not the self's first join (already handled), treat as other player joining existing room (normalized for dc: prefix)
             is_self_join = _names_equal(join_name, view.me.username if view.me else None) and is_first_join
+            if not is_self_join and _is_own_join_call(packet, gpb) and view.me is not None:
+                # Our OWN outbound create/join carrying a name we do not know
+                # is a rename (see _adopt_own_rename) - never a second human.
+                try:
+                    _own_pfid = ((gpb or {}).get("playerProps") or {}).get("pfid")
+                except Exception:
+                    _own_pfid = None
+                if self._adopt_own_rename(view, room, join_name, actor_nr,
+                                          session_id, _own_pfid):
+                    is_self_join = True
             if not is_self_join:
                 p_actor = actor_nr
                 existing_key = None
