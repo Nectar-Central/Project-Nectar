@@ -626,23 +626,6 @@ async def ping_cmd(interaction: discord.Interaction):
 admin_group = app_commands.Group(name="admin", description="Owner and dev tools (rarely needed)")
 
 
-@admin_group.command(name="view_dev_team", description="Shows the main developers for Nectar")
-async def view_dev_team_cmd(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="Nectar Development Team",
-        description=(
-            "<:people:1543709237987909682> Here are the main developers for Nectar.\n\n"
-            "**<@1295478685876617299>** — Senior Developer\n"
-            "**<@1267528889383784513>** — Founder\n"
-            "**<@1143465561548927037>** — Web Developer\n"
-            "**<@1526807976801865870>** — Bot Developer\n"
-            "**<@1484202460577796178>** — Manager"
-        ),
-        color=discord.Color.gold(),
-    )
-    await interaction.response.send_message(embed=embed)
-
-
 @bot.tree.command(name="coinflip", description="Flip a coin (optional wager in Nectar Coins)")
 @app_commands.describe(bet="Coins to wager (1-10000, win 2x)",
                        choice="Heads or Tails (required when betting)")
@@ -1328,30 +1311,6 @@ async def match_pool_cmd(interaction: discord.Interaction, match_key: str):
     e = discord.Embed(title=title, description="\n".join(lines) or "No bets yet — be the first.",
                       color=discord.Color.gold())
     await interaction.response.send_message(embed=e)
-
-
-@bot.tree.command(name="serverinfo", description="Shows information about the current server")
-async def serverinfo_cmd(interaction: discord.Interaction):
-    if interaction.guild is None:
-        return await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True)
-    guild = interaction.guild
-    embed = discord.Embed(title=f"Server Info: {guild.name}", color=discord.Color.gold())
-    if guild.icon:
-        embed.set_thumbnail(url=guild.icon.url)
-    embed.add_field(name="Server ID", value=str(guild.id), inline=True)
-    embed.add_field(name="Owner", value=f"<@{guild.owner_id}>", inline=True)
-    embed.add_field(name="Members", value=str(guild.member_count or 0), inline=True)
-    embed.add_field(name="Created", value=f"<t:{int(guild.created_at.timestamp())}:F>", inline=False)
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="avatar", description="Show a user's avatar")
-@app_commands.describe(user="The user whose avatar you want to see")
-async def avatar_cmd(interaction: discord.Interaction, user: discord.Member | None = None):
-    member = user or interaction.user
-    embed = discord.Embed(title=f"{member.display_name}'s Avatar", color=discord.Color.gold())
-    embed.set_image(url=member.display_avatar.url)
-    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="warn", description="Warn a member")
@@ -2462,27 +2421,6 @@ async def _fetch_health():
     except Exception as e:
         print(f"[health] fetch failed: {e}")
     return None
-
-@admin_group.command(name="precision", description="Show server-side processing precision (kills/deaths/wins)")
-async def precision_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=False)
-    data = await _fetch_health()
-    if not data or not isinstance(data.get("precision"), dict):
-        return await interaction.followup.send("Precision data unavailable — API unreachable.")
-    p = data["precision"]
-    pct = p.get("precision_pct", 0)
-    verified = p.get("verified", 0)
-    e = discord.Embed(title="Server Precision", color=0x10b981,
-                      description=f"**{pct}%** · {verified} verified")
-    for action in ("kill", "death", "win", "defeat"):
-        pa = (p.get("per_action") or {}).get(action) or {}
-        e.add_field(name=action.capitalize(),
-                    value=f"{pa.get('pct', 0)}% ({pa.get('ok', 0)} ok / {pa.get('fail', 0)} failed)",
-                    inline=True)
-    e.add_field(name="Pending", value=str(p.get("pending", 0)), inline=True)
-    e.add_field(name="Skipped", value=str(p.get("skipped", 0)), inline=True)
-    await interaction.followup.send(embed=e)
-
 
 @bot.tree.command(name="insights", description="Show your gameplay insights")
 async def insights_cmd(interaction: discord.Interaction, user: discord.User = None):
@@ -4478,32 +4416,6 @@ def _ranked_milestone_nick(game_name: str, milestone) -> str:
         return ""
 
 
-async def _comp_nick_for(sb, did: str):
-    """(nick|None, game_name). Current PR nickname for a user. Never raises
-    (None when no name/PR yet or DB down). async — see _comp_tourney_hosts."""
-    try:
-        if sb is None or not did:
-            return None, ""
-        ures = await db._sb_call(lambda: sb.table("bngc_users").select(
-            "game_username,tourney_pr").eq("discord_id", str(did)).limit(1).execute())
-        urow = ((ures.data or [{}])[0] or {})
-        gname = str(urow.get("game_username") or "").strip()
-        pr = urow.get("tourney_pr")
-        if pr is None:
-            try:
-                hres = await db._sb_call(lambda: sb.table("bngc_comp_pr_history").select("pr").eq(
-                    "discord_id", str(did)).order("computed_at", desc=True).limit(1).execute())
-                if hres.data:
-                    pr = (hres.data[0] or {}).get("pr")
-            except Exception:
-                pass
-        if not gname or pr is None:
-            return None, gname
-        return _comp_pr_nick(gname, pr), gname
-    except Exception:
-        return None, ""
-
-
 async def _ranked_nick_for(sb, did: str):
     """(nick|None, game_name, milestone). Current milestone nickname.
     Never raises (None when no name yet or DB down). async — see
@@ -4653,57 +4565,6 @@ async def ranked_name_cmd(interaction: discord.Interaction, allow: bool):
                 extra = " No ranked profile yet — link a name with **/register** first."
         except Exception as e:
             print(f"[ranked-name] immediate apply failed: {e}")
-    return await interaction.followup.send(f"You opted {state}.{extra}", ephemeral=True)
-
-
-@bot.tree.command(name="comp-name", description="Opt in/out of the [PR] server nickname (Display Name [150])")
-@app_commands.describe(allow="True to opt in, False to opt out")
-async def comp_name_cmd(interaction: discord.Interaction, allow: bool):
-    """Same flag as /tourney-name (shared opt-in), plus immediate apply."""
-    await interaction.response.defer(ephemeral=True)
-    sb = _comp_sb()
-    if sb is None:
-        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
-    me = str(interaction.user.id)
-    try:
-        upd = await db._sb_call(lambda: sb.table("bngc_users").update(
-            {"tourney_name_optin": bool(allow)}).eq("discord_id", me).execute())
-        wrote = bool(upd.data)
-    except Exception as e:
-        if "tourney_name_optin" in str(e):
-            return await interaction.followup.send(
-                "Database migration pending — ask a host to apply add_comp_v238.sql.", ephemeral=True)
-        print(f"[comp-name] save failed: {e}")
-        return await interaction.followup.send("Couldn't save — try again later.", ephemeral=True)
-    if not wrote:
-        try:
-            await db._sb_call(lambda: sb.table("bngc_users").insert({
-                "discord_id": me,
-                "discord_username": getattr(interaction.user, "display_name", None) or str(interaction.user),
-                "tourney_name_optin": bool(allow),
-                "token": gen_token(),
-            }).execute())
-        except Exception as e:
-            if "tourney_name_optin" in str(e):
-                return await interaction.followup.send(
-                    "Database migration pending — ask a host to apply add_comp_v238.sql.", ephemeral=True)
-            return await interaction.followup.send("Couldn't save — try again later.", ephemeral=True)
-    state = "in ✅ — your server nickname becomes **Display Name [PR]** after each tourney" if allow else "out — your nickname stays untouched"
-    extra = ""
-    if allow and interaction.guild is not None:
-        try:
-            nick, gname = await _comp_nick_for(sb, me)
-            if nick:
-                ok = await _edit_nick_if_different(
-                    interaction.guild, me, nick, "Comp PR nickname opt-in (immediate)")
-                extra = (f" Nickname set to **{nick}** now." if ok
-                         else " Couldn't set nickname now (bot needs Manage Nicknames + a higher role) — it applies at the next tourney.")
-            elif not gname:
-                extra = " No comp profile yet, so no nickname to set — it applies once you register."
-            else:
-                extra = " No PR yet — nickname applies after your first rated tourney."
-        except Exception as e:
-            print(f"[comp-name] immediate apply failed: {e}")
     return await interaction.followup.send(f"You opted {state}.{extra}", ephemeral=True)
 
 
