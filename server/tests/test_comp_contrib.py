@@ -308,6 +308,83 @@ def test_killfeed_no_pairing_without_roster(monkeypatch):
         ("cis6led", "A")]
 
 
+# --- spectating host must never be scored (regression) ---
+#
+# A host with host_playing False is a registrant who never enters the room.
+# They must be absent from placements, kills and points. Three separate leaks
+# used to let them back in: the alv filter was keyed on the capturing
+# session's own in-game name (a no-op when the host never spawned an avatar),
+# the contributors paired unknown names onto the host's did, and nothing ever
+# told the scoring layer to ignore them.
+
+
+def _sb_spectating(monkeypatch, **over):
+    t = dict(TOURNEY)
+    t["host_playing"] = False
+    t.update(over)
+    return _sb_comp(monkeypatch, tourney=t)
+
+
+def test_spectating_host_is_marked_removed_on_the_match(monkeypatch):
+    sb = _sb_spectating(monkeypatch)
+    _host_open(sb)
+    assert sb.t["bngc_comp_matches"][0].get("removed_discord_ids") == ["A"]
+
+
+def test_playing_host_is_not_marked_removed(monkeypatch):
+    sb = _sb_comp(monkeypatch)  # TOURNEY has host_playing True
+    _host_open(sb)
+    assert not sb.t["bngc_comp_matches"][0].get("removed_discord_ids")
+
+
+def test_every_non_playing_host_is_marked_removed(monkeypatch):
+    # co-hosting: both hosts are spectating, so both are out
+    sb = _sb_spectating(monkeypatch, hosts=["A", "B"])
+    _host_open(sb)
+    assert sorted(sb.t["bngc_comp_matches"][0]["removed_discord_ids"]) == ["A", "B"]
+
+
+def test_spectating_host_gets_no_alv_row_without_a_spawned_avatar(monkeypatch):
+    # hosting-only host: room.me is unset, so the name-keyed filter no-oped
+    # and the host kept an alv row, which is a placement on the board.
+    sb = _sb_spectating(monkeypatch)
+    _host_open(sb)  # stG 1 opens the match
+    room = _room(PLAYERS, [_kill("chris7", "cis6led")], me_name="", last_stg=3)
+    proc.seal_comp_match("ses-host", "A", room, "room-x", "zw_lg")
+    alv = [e["actor_name"] for e in sb.t["bngc_comp_events"]
+           if e.get("etype") == "alv"]
+    assert "cis6led" not in alv
+    assert "chris7" in alv
+
+
+def test_contributor_never_pairs_a_stranger_onto_a_spectating_host(monkeypatch):
+    # The host registered as "cis6led" but sits in the room under a different
+    # in-game name, so the pairing tier saw an unclaimed registrant and handed
+    # that name straight to the host's did - crediting a spectating host with
+    # someone else's kill. With host_playing False there is no candidate.
+    sb = _sb_spectating(
+        monkeypatch,
+        regs=[{"tourney_id": 7, "status": "accepted",
+               "member_ids": ["A", "B"]}])
+    _host_open(sb)
+    proc._comp_seen.clear()
+    room = _room({1: _player("dom", 1, True), 2: _player("chris7", 2, True)},
+                 [_kill("dom", "chris7")], me_name="chris7")
+    proc.seal_comp_match("ses-b", "B", room, "room-x", "zw_lg")
+    dom_rows = [e for e in sb.t["bngc_comp_events"]
+                if e.get("actor_name") == "dom"]
+    assert dom_rows and all(r.get("discord_id") != "A" for r in dom_rows)
+
+
+def test_rt_spectating_host_is_marked_removed(monkeypatch):
+    sb = _sb_rt(monkeypatch)
+    sb.t["bngc_ranked_tourneys"][0]["host_playing"] = False
+    room = _room(PLAYERS, [_kill("cis6led", "victim1")], short_code="RCON1")
+    proc.seal_ranked_tourney_match("ses-host", "A", room, "room-x", "zw_lg")
+    m = sb.t["bngc_ranked_tourney_matches"][0]
+    assert m.get("removed_discord_ids") == ["A"]
+
+
 # --- ranked-tourney mirror ---
 
 def test_rt_roster_contributor_appends_missed_kill(monkeypatch):

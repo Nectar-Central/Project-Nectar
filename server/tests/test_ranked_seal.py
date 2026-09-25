@@ -730,6 +730,40 @@ def test_hosting_only_host_not_counted_but_seals(monkeypatch):
     assert kw["death_killers"] is None    # V won, K skipped entirely
 
 
+def test_hosting_only_host_is_marked_removed_for_the_engine(monkeypatch):
+    # The processor already skips the host when deriving kills/placements, but
+    # the exclusion never reached seal_match: `involved` was re-populated from
+    # the banked events, so the host was paid points and had their win streak
+    # reset as a loser.
+    fake = _FakeDB()
+    monkeypatch.setattr(proc, "supabase", fake)
+    calls = []
+    monkeypatch.setattr(ranked_mod, "get_ranked_room",
+                        lambda code: dict(_ROOM_DATA, host_status="hosting_only"))
+    monkeypatch.setattr(proc, "_resolve_ranked_dids", lambda names: dict(_NAME2DID))
+    monkeypatch.setattr(ranked_mod, "seal_match", lambda **kw: (
+        calls.append(kw),
+        {"ok": True, "points": {}, "match_version": kw["match_version"]})[1])
+    proc.seal_ranked_match("s", "K", _room(), "r1", "zw_lg")
+    assert len(calls) == 1
+    assert calls[0]["removed_discord_ids"] == ["K"]
+
+
+def test_playing_host_is_not_marked_removed(monkeypatch):
+    # the host is a normal player here: nothing to exclude
+    fake = _FakeDB()
+    monkeypatch.setattr(proc, "supabase", fake)
+    calls = []
+    monkeypatch.setattr(ranked_mod, "get_ranked_room", lambda code: dict(_ROOM_DATA))
+    monkeypatch.setattr(proc, "_resolve_ranked_dids", lambda names: dict(_NAME2DID))
+    monkeypatch.setattr(ranked_mod, "seal_match", lambda **kw: (
+        calls.append(kw),
+        {"ok": True, "points": {}, "match_version": kw["match_version"]})[1])
+    proc.seal_ranked_match("s", "K", _room(), "r1", "zw_lg")
+    assert len(calls) == 1
+    assert not calls[0].get("removed_discord_ids")
+
+
 # ---------------------------------------------------------------------------
 # Duo team liveness: _team_alive_for_me edge cases (wins-only, no defeats)
 # ---------------------------------------------------------------------------

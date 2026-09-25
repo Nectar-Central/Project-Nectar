@@ -1709,7 +1709,7 @@ def _bank_open_events(*, table: str, seen: dict, mid, room, tag: str,
     return []
 
 
-def _comp_contribute(tid, code, session_id, discord_id, room, room_id) -> bool:
+def _comp_contribute(tid, code, session_id, discord_id, room, room_id, tourney=None) -> bool:
     """Roster-member event contribution into the open comp match.
 
     All-players fix: the host owns the lifecycle (open / seal / alv snapshot /
@@ -1719,6 +1719,10 @@ def _comp_contribute(tid, code, session_id, discord_id, room, room_id) -> bool:
     (handled — caller returns silently), False for strangers and anonymous
     sessions (caller keeps the existing skip log). Never opens or seals.
     Never raises.
+
+    tourney is the host's tourney row: a contributor has no other way to
+    learn that a registrant is a spectating host, and without it the pairing
+    tier can hand a stranger's name to the host's did.
     """
     try:
         if not discord_id or supabase is None:
@@ -1746,13 +1750,14 @@ def _comp_contribute(tid, code, session_id, discord_id, room, room_id) -> bool:
             return True  # member, but opens are host-owned
         _bank_open_events(table="bngc_comp_events", seen=_comp_seen,
                           mid=mid, room=room, tag="contrib ",
-                          roster=_tourney_roster_sync(tid, _COMP_REG_TABLE))
+                          roster=_match_roster_sync(
+                              tourney or {"id": tid}, _COMP_REG_TABLE))
         return True
     except Exception:
         return False
 
 
-def _rt_contribute(tid, code, session_id, discord_id, room, room_id) -> bool:
+def _rt_contribute(tid, code, session_id, discord_id, room, room_id, tourney=None) -> bool:
     """Ranked-tourney mirror of _comp_contribute (same contract, ranked tables)."""
     try:
         if not discord_id or supabase is None:
@@ -1780,10 +1785,35 @@ def _rt_contribute(tid, code, session_id, discord_id, room, room_id) -> bool:
             return True  # member, but opens are host-owned
         _bank_open_events(table="bngc_ranked_tourney_events", seen=_rt_seen,
                           mid=mid, room=room, tag="rt contrib ",
-                          roster=_tourney_roster_sync(tid, _RT_REG_TABLE))
+                          roster=_match_roster_sync(
+                              tourney or {"id": tid}, _RT_REG_TABLE))
         return True
     except Exception:
         return False
+
+
+def _spectating_host_dids(tourney) -> set:
+    """Discord ids of hosts who are NOT playing (host_playing is False).
+
+    One source of truth for "who must not be scored": the roster filter, the
+    alv snapshot and the match-level exclusion all read this, so a spectating
+    host cannot re-enter through one path while another still hides them.
+    Empty set when the host is playing or the flag is missing - fail open, so
+    a missing column or a pre-migration tourney row still scores normally.
+    Never raises.
+    """
+    out: set = set()
+    try:
+        t = tourney or {}
+        if t.get("host_playing", True) is not False:
+            return out
+        for d in list(t.get("hosts") or []) + [t.get("created_by")]:
+            d = str(d or "").strip()
+            if d and d != "None":
+                out.add(d)
+    except Exception:
+        pass
+    return out
 
 
 def _match_roster_sync(tourney, table) -> dict:
@@ -1795,16 +1825,45 @@ def _match_roster_sync(tourney, table) -> dict:
     try:
         _t = tourney or {}
         roster = _tourney_roster_sync(_t.get("id"), table)
-        try:
-            if _t.get("host_playing", True) is False:
-                drop = list(_t.get("hosts") or []) + [_t.get("created_by")]
-                for d in drop:
-                    roster.pop(str(d or ""), None)
-        except Exception:
-            pass
+        for d in _spectating_host_dids(_t):
+            roster.pop(d, None)
         return roster
     except Exception:
         return {}
+
+
+def _exclude_spectating_host(match_table: str, mid, tourney, tag: str = "") -> list:
+    """Add a non-playing host to the match's removed_discord_ids.
+
+    One write, and every downstream reader starts ignoring the host:
+    placements, kills, points, manual awards, the winner override and the
+    win/loss streak bookkeeping. Running it on every sweep (not only when the
+    match opens) also repairs matches whose rows were banked before this
+    existed, which is why it beats filtering at write time alone.
+
+    Returns the dids added. Never raises.
+    """
+    added: list = []
+    try:
+        dids = sorted(_spectating_host_dids(tourney))
+        if not dids or mid is None or supabase is None:
+            return added
+        try:
+            mres = supabase.table(match_table).select(
+                "removed_discord_ids").eq("id", mid).limit(1).execute()
+            cur = list(((mres.data or [{}])[0] or {}).get("removed_discord_ids") or [])
+        except Exception:
+            cur = None  # pre-migration column: skip silently
+        if cur is None:
+            return added
+        added = [d for d in dids if d not in cur]
+        if added:
+            supabase.table(match_table).update(
+                {"removed_discord_ids": cur + added}).eq("id", mid).execute()
+            log_comp(f"{tag}match={mid} excluded spectating host {','.join(added)}")
+    except Exception:
+        pass
+    return added
 
 
 def _comp_bank_alv(tourney, mid, room) -> None:
@@ -1891,6 +1950,19 @@ def _comp_bank_alv(tourney, mid, room) -> None:
             return
         mapping = _comp_map_names(
             ordered, roster=_match_roster_sync(tourney, _COMP_REG_TABLE))
+        # Drop the spectating host by DID, not by name: a hosting-only host
+        # never spawned an avatar, so room.me is empty and the name-keyed
+        # filter above cannot see them - they kept an alv row, which is a
+        # placement on the board. Relative order of the survivors is kept.
+        host_dids = _spectating_host_dids(tourney)
+        if host_dids:
+            kept = [n for n in ordered if str(mapping.get(n) or "") not in host_dids]
+            if len(kept) != len(ordered):
+                log_comp(f"alv match={mid} dropped "
+                         f"{len(ordered) - len(kept)} spectating host row(s)")
+            ordered = kept
+        if not ordered:
+            return
         rows = [{
             "match_id": mid,
             "etype": "alv",
@@ -1913,8 +1985,48 @@ def _comp_bank_alv(tourney, mid, room) -> None:
 _comp_host_warned: set = set()  # (session, code) already told they're not host
 
 
-def _comp_series_complete(tid, series_len) -> bool:
-    """True when sealed+manual count reached series_len (0 = open-ended).
+def _burned_versions(deleted_versions) -> set:
+    """Version numbers this tourney has burned (deleted matches). Never raises.
+
+    Read defensively: a tourney row without the column (pre-migration) reads
+    as no tombstones, which is exactly the old behaviour.
+    """
+    out: set = set()
+    try:
+        for v in (deleted_versions or []):
+            try:
+                out.add(int(v))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def _next_match_version(match_table: str, tid, deleted_versions=None) -> int:
+    """Next version for a new match: max(surviving + burned) + 1.
+
+    A deleted match's number is retired, so the bridge never re-issues it and
+    a deleted match cannot be re-created under the same identity. Comp and
+    ranked tourneys share the counter per tourney, so engine versions cannot
+    be reused across rooms either. Never raises (0 on any failure).
+    """
+    try:
+        vres = supabase.table(match_table).select("version").eq(
+            "tourney_id", int(tid)).order("version", desc=True).limit(1).execute()
+        vrows = vres.data or []
+        seen = [int(r.get("version", -1)) for r in vrows if r.get("version") is not None]
+        return max(seen + list(_burned_versions(deleted_versions)) + [-1]) + 1
+    except Exception:
+        return 0
+
+
+def _comp_series_complete(tid, series_len, deleted_versions=None) -> bool:
+    """True when sealed+manual count plus burned slots reached series_len.
+
+    A deleted match still consumed its slot, so its version counts towards the
+    series: deleting a match can never un-finish a tourney and invite the
+    bridge to re-create it. (0 = open-ended.)
     Auto-opens stop here; dashboard manual blanks still allowed. Never raises."""
     try:
         sl = int(series_len or 0)
@@ -1925,7 +2037,7 @@ def _comp_series_complete(tid, series_len) -> bool:
     try:
         res = supabase.table("bngc_comp_matches").select("id").eq(
             "tourney_id", int(tid)).in_("status", ["sealed", "manual"]).limit(500).execute()
-        n = len(res.data or [])
+        n = len(res.data or []) + len(_burned_versions(deleted_versions))
         return n >= sl
     except Exception:
         return False
@@ -1972,7 +2084,8 @@ def seal_comp_match(session_id, discord_id, room, room_id, gm) -> None:
             last_stg = None
         try:
             tres = supabase.table("bngc_comp_tourneys").select(
-                "id,code,status,hosts,created_by,host_playing,series_len").eq("code", code).neq(
+                "id,code,status,hosts,created_by,host_playing,series_len,"
+                "deleted_versions").eq("code", code).neq(
                 "status", "ended").limit(2).execute()
             rows = tres.data or []
         except Exception as exc:
@@ -2000,7 +2113,8 @@ def seal_comp_match(session_id, discord_id, room, room_id, gm) -> None:
             hosts = set()
         if not discord_id or str(discord_id) not in hosts:
             try:
-                if _comp_contribute(tid, code, session_id, discord_id, room, room_id):
+                if _comp_contribute(tid, code, session_id, discord_id, room, room_id,
+                                tourney=t):
                     return
             except Exception:
                 pass
@@ -2063,22 +2177,19 @@ def seal_comp_match(session_id, discord_id, room, room_id, gm) -> None:
             # Series complete: no new auto-opens (manual dashboard blanks
             # still allowed — they bypass the bridge entirely).
             try:
-                if _comp_series_complete(tid, (t or {}).get("series_len")):
+                if _comp_series_complete(tid, (t or {}).get("series_len"),
+                                        (t or {}).get("deleted_versions")):
                     log_comp(f"tid={tid} code={code} series complete — auto-open ignored")
                     return
             except Exception:
                 pass
             # stG == 1: open a blank match, enable writes. Version is the
-            # per-tourney max+1 (rooms share the counter, so engine versions
-            # can't be reused across rooms). A lost insert race re-reads the
-            # winner's row instead of duplicating.
-            try:
-                vres = supabase.table("bngc_comp_matches").select("version").eq(
-                    "tourney_id", int(tid)).order("version", desc=True).limit(1).execute()
-                vrows = vres.data or []
-                ver = int(vrows[0].get("version", -1)) + 1 if vrows else 0
-            except Exception:
-                ver = 0
+            # per-tourney max+1 over surviving AND deleted versions (rooms
+            # share the counter, so engine versions can't be reused across
+            # rooms, and a deleted match's number stays retired). A lost
+            # insert race re-reads the winner's row instead of duplicating.
+            ver = _next_match_version("bngc_comp_matches", tid,
+                                      (t or {}).get("deleted_versions"))
             try:
                 ires = supabase.table("bngc_comp_matches").insert({
                     "tourney_id": tid, "version": ver,
@@ -2137,6 +2248,10 @@ def seal_comp_match(session_id, discord_id, room, room_id, gm) -> None:
                     pass
         except Exception:
             pass
+        # A host who is not playing is not a participant: mark them removed so
+        # placements, kills, points and streaks all ignore them. Runs every
+        # sweep, so a mid-tourney host_playing toggle is honoured too.
+        _exclude_spectating_host("bngc_comp_matches", mid, t)
         # No phase-end handling here: sealing is decided above from last_stg
         # (the ranked sweep consumes stg_is_phase_end first, so it can never
         # be trusted this late in the batch).
@@ -2157,9 +2272,8 @@ def _rt_calc(tid, who="bridge"):
         return []
 
 
-def _rt_series_complete(tid, series_len) -> bool:
-    """True when sealed+manual count reached series_len (0 = open-ended).
-    Auto-opens stop here; dashboard manual blanks still allowed. Never raises."""
+def _rt_series_complete(tid, series_len, deleted_versions=None) -> bool:
+    """Ranked-tourney mirror of _comp_series_complete (same contract)."""
     try:
         sl = int(series_len or 0)
     except Exception:
@@ -2169,7 +2283,7 @@ def _rt_series_complete(tid, series_len) -> bool:
     try:
         res = supabase.table("bngc_ranked_tourney_matches").select("id").eq(
             "tourney_id", int(tid)).in_("status", ["sealed", "manual"]).limit(500).execute()
-        n = len(res.data or [])
+        n = len(res.data or []) + len(_burned_versions(deleted_versions))
         return n >= sl
     except Exception:
         return False
@@ -2255,6 +2369,16 @@ def _rt_bank_alv(tourney, mid, room) -> None:
             return
         mapping = _comp_map_names(
             ordered, roster=_match_roster_sync(tourney, _RT_REG_TABLE))
+        # same did-based spectating-host drop as the comp snapshot
+        host_dids = _spectating_host_dids(tourney)
+        if host_dids:
+            kept = [n for n in ordered if str(mapping.get(n) or "") not in host_dids]
+            if len(kept) != len(ordered):
+                log_comp(f"rt alv match={mid} dropped "
+                         f"{len(ordered) - len(kept)} spectating host row(s)")
+            ordered = kept
+        if not ordered:
+            return
         rows = [{
             "match_id": mid,
             "etype": "alv",
@@ -2513,7 +2637,8 @@ def seal_ranked_tourney_match(session_id, discord_id, room, room_id, gm,
             last_stg = None
         try:
             tres = supabase.table("bngc_ranked_tourneys").select(
-                "id,code,status,hosts,created_by,host_playing,series_len").eq("code", code).neq(
+                "id,code,status,hosts,created_by,host_playing,series_len,"
+                "deleted_versions").eq("code", code).neq(
                 "status", "ended").limit(2).execute()
             rows = tres.data or []
         except Exception as exc:
@@ -2551,7 +2676,8 @@ def seal_ranked_tourney_match(session_id, discord_id, room, room_id, gm,
             hosts = set()
         if not discord_id or str(discord_id) not in hosts:
             try:
-                if _rt_contribute(tid, code, session_id, discord_id, room, room_id):
+                if _rt_contribute(tid, code, session_id, discord_id, room, room_id,
+                              tourney=t):
                     return
             except Exception:
                 pass
@@ -2620,22 +2746,19 @@ def seal_ranked_tourney_match(session_id, discord_id, room, room_id, gm,
             # Series complete: no new auto-opens (manual dashboard blanks
             # still allowed — they bypass the bridge entirely).
             try:
-                if _rt_series_complete(tid, (t or {}).get("series_len")):
+                if _rt_series_complete(tid, (t or {}).get("series_len"),
+                                       (t or {}).get("deleted_versions")):
                     log_comp(f"rt tid={tid} code={code} series complete — auto-open ignored")
                     return
             except Exception:
                 pass
             # stG == 1: open a blank match, enable writes. Version is the
-            # per-tourney max+1 (rooms share the counter, so engine versions
-            # can't be reused across rooms). A lost insert race re-reads the
-            # winner's row instead of duplicating.
-            try:
-                vres = supabase.table("bngc_ranked_tourney_matches").select("version").eq(
-                    "tourney_id", int(tid)).order("version", desc=True).limit(1).execute()
-                vrows = vres.data or []
-                ver = int(vrows[0].get("version", -1)) + 1 if vrows else 0
-            except Exception:
-                ver = 0
+            # per-tourney max+1 over surviving AND deleted versions (rooms
+            # share the counter, so engine versions can't be reused across
+            # rooms, and a deleted match's number stays retired). A lost
+            # insert race re-reads the winner's row instead of duplicating.
+            ver = _next_match_version("bngc_ranked_tourney_matches", tid,
+                                      (t or {}).get("deleted_versions"))
             try:
                 ires = supabase.table("bngc_ranked_tourney_matches").insert({
                     "tourney_id": tid, "version": ver,
@@ -2669,6 +2792,7 @@ def seal_ranked_tourney_match(session_id, discord_id, room, room_id, gm,
         _bank_open_events(table="bngc_ranked_tourney_events", seen=_rt_seen,
                           mid=mid, room=room, tag="rt ",
                           roster=_match_roster_sync(t, _RT_REG_TABLE))
+        _exclude_spectating_host("bngc_ranked_tourney_matches", mid, t, "rt ")
         # No phase-end handling here: sealing is decided above from last_stg.
     except Exception as exc:
         try:
@@ -2939,6 +3063,7 @@ def seal_ranked_match(session_id, discord_id, room, room_id, gm) -> None:
                                     placements=placements or None,
                                     kill_events=kill_events or None,
                                     death_killers=deaths or None,
+                                    removed_discord_ids=sorted(skip) or None,
                                     tied_winners=tied_winners or None)
         if not res.get("ok"):
             log_ranked(f"[ranked] seal failed {rid} v{mver}: {res.get('error')}")

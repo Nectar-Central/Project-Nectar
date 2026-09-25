@@ -3228,6 +3228,25 @@ async def comp_match_delete(request: Request):
         except Exception:
             pass
         supabase.table("bngc_ranked_tourney_matches").delete().eq("id", mid).execute()
+# Retire the version so the bridge treats the slot as consumed and never
+        # re-issues the number (which re-created the match on the next sweep).
+        # Best effort: pre-migration column, the delete still stands.
+        try:
+            ver = int(m.get("version"))
+        except Exception:
+            ver = None
+        if ver is not None and m.get("tourney_id") is not None:
+            try:
+                tres = supabase.table("bngc_ranked_tourneys").select(
+                    "deleted_versions").eq("id", m.get("tourney_id")).limit(1).execute()
+                trow = ((tres.data or [{}])[0] or {})
+                cur = [int(x) for x in (trow.get("deleted_versions") or []) if x is not None]
+                if ver not in cur:
+                    supabase.table("bngc_ranked_tourneys").update(
+                        {"deleted_versions": sorted(cur + [ver])}).eq(
+                        "id", m.get("tourney_id")).execute()
+            except Exception:
+                pass
         return JSONResponse({"ok": True, "match_id": mid, "tourney_id": m.get("tourney_id"),
                              "version": m.get("version")})
     except Exception as e:

@@ -20,6 +20,7 @@ import views
 import alerts as alert_mod
 import ranked as ranked_mod
 import ranked_tourney as rt_mod
+import transfer as xfer_mod
 import duels as duels_mod
 import earn as earn_mod
 import comp_results
@@ -619,21 +620,10 @@ async def ping_cmd(interaction: discord.Interaction):
     await interaction.response.send_message("🏓 Pong!")
 
 
-@bot.tree.command(name="view_dev_team", description="Shows the main developers for Nectar")
-async def view_dev_team_cmd(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="Nectar Development Team",
-        description=(
-            "<:people:1543709237987909682> Here are the main developers for Nectar.\n\n"
-            "**<@1295478685876617299>** — Senior Developer\n"
-            "**<@1267528889383784513>** — Founder\n"
-            "**<@1143465561548927037>** — Web Developer\n"
-            "**<@1526807976801865870>** — Bot Developer\n"
-            "**<@1484202460577796178>** — Manager"
-        ),
-        color=discord.Color.gold(),
-    )
-    await interaction.response.send_message(embed=embed)
+# /admin group (owner/dev tools) -same reason as /coin: the tree sits at the
+# 100-command Discord cap, so rarely-needed tools ship as subcommands. The
+# everyday commands (lock, unlock, warn, register, ...) stay flat on purpose.
+admin_group = app_commands.Group(name="admin", description="Owner and dev tools (rarely needed)")
 
 
 @bot.tree.command(name="coinflip", description="Flip a coin (optional wager in Nectar Coins)")
@@ -1323,30 +1313,6 @@ async def match_pool_cmd(interaction: discord.Interaction, match_key: str):
     await interaction.response.send_message(embed=e)
 
 
-@bot.tree.command(name="serverinfo", description="Shows information about the current server")
-async def serverinfo_cmd(interaction: discord.Interaction):
-    if interaction.guild is None:
-        return await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True)
-    guild = interaction.guild
-    embed = discord.Embed(title=f"Server Info: {guild.name}", color=discord.Color.gold())
-    if guild.icon:
-        embed.set_thumbnail(url=guild.icon.url)
-    embed.add_field(name="Server ID", value=str(guild.id), inline=True)
-    embed.add_field(name="Owner", value=f"<@{guild.owner_id}>", inline=True)
-    embed.add_field(name="Members", value=str(guild.member_count or 0), inline=True)
-    embed.add_field(name="Created", value=f"<t:{int(guild.created_at.timestamp())}:F>", inline=False)
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="avatar", description="Show a user's avatar")
-@app_commands.describe(user="The user whose avatar you want to see")
-async def avatar_cmd(interaction: discord.Interaction, user: discord.Member | None = None):
-    member = user or interaction.user
-    embed = discord.Embed(title=f"{member.display_name}'s Avatar", color=discord.Color.gold())
-    embed.set_image(url=member.display_avatar.url)
-    await interaction.response.send_message(embed=embed)
-
-
 @bot.tree.command(name="warn", description="Warn a member")
 @app_commands.describe(user="The member you want to warn", reason="Why you are warning them")
 @app_commands.default_permissions(administrator=True)
@@ -1414,7 +1380,7 @@ async def token_cmd(interaction: discord.Interaction):
     if not row: return await interaction.response.send_message("Not registered. Use /register first.", ephemeral=True)
     await interaction.response.send_message(f"Your token: {fmt.censor_token(row.get('token'))}", ephemeral=True)
 
-@bot.tree.command(name="refresh-token", description="Generate a new login token (old one stays valid for 5 min)")
+@admin_group.command(name="refresh-token", description="Generate a new login token (old one stays valid for 5 min)")
 async def refresh_token_cmd(interaction: discord.Interaction):
     did = str(interaction.user.id)
     row = await db.get_by_discord(did)
@@ -1447,7 +1413,7 @@ async def lock_cmd(interaction: discord.Interaction, user: discord.User, reason:
     except: pass
     await interaction.followup.send(f"🔒 Locked {user.mention} (default — they can /unlock). Reason: {reason}", ephemeral=True)
 
-@bot.tree.command(name="adminlock", description="Admin-lock a user (only admins can unlock)")
+@admin_group.command(name="adminlock", description="Admin-lock a user (only admins can unlock)")
 @app_commands.describe(user="User to admin-lock", reason="Reason for admin lock")
 @app_commands.default_permissions(administrator=True)
 async def adminlock_cmd(interaction: discord.Interaction, user: discord.User, reason: str = "No reason"):
@@ -1460,7 +1426,7 @@ async def adminlock_cmd(interaction: discord.Interaction, user: discord.User, re
     except: pass
     await interaction.followup.send(f"⛔ Admin-locked {user.mention}. Only admins can unlock. Reason: {reason}", ephemeral=True)
 
-@bot.tree.command(name="adminunlock", description="Unlock any user (admin only, bypasses admin-lock)")
+@admin_group.command(name="adminunlock", description="Unlock any user (admin only, bypasses admin-lock)")
 @app_commands.describe(user="User to unlock")
 @app_commands.default_permissions(administrator=True)
 async def adminunlock_cmd(interaction: discord.Interaction, user: discord.User):
@@ -1472,6 +1438,141 @@ async def adminunlock_cmd(interaction: discord.Interaction, user: discord.User):
         await user.send("🔓 An admin unlocked your BuildNow account. You can continue.")
     except: pass
     await interaction.followup.send(f"🔓 Admin-unlocked {user.mention}.", ephemeral=True)
+
+_XFER_COLS = ",".join(
+    ["discord_id", "token", "transferred_to", "transferred_at",
+     xfer_mod.PLAYTIME_MAP_FIELD] +
+    list(xfer_mod.SUM_FIELDS) + list(xfer_mod.MAX_FIELDS) +
+    list(xfer_mod.EARLIEST_FIELDS) + list(xfer_mod.PROFILE_FIELDS))
+
+
+async def _xfer_read(sb, did: str):
+    """One bngc_users row for a transfer, or None. Never raises."""
+    try:
+        r = await db._sb_call(lambda: sb.table("bngc_users").select(_XFER_COLS)
+                              .eq("discord_id", str(did)).limit(1).execute())
+        rows = (getattr(r, "data", None) or [])
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+async def _xfer_ranked_points(sb, did: str) -> int:
+    """Ranked ladder points for an account; 0 on miss or pre-v240 DB."""
+    try:
+        r = await db._sb_call(lambda: sb.table("ranked_points").select("points")
+                              .eq("discord_id", str(did)).limit(1).execute())
+        rows = (getattr(r, "data", None) or [])
+        return int((rows[0] or {}).get("points") or 0) if rows else 0
+    except Exception:
+        return 0
+
+
+@admin_group.command(name="transfer", description="Move a player's profile + lifetime stats to another account")
+@app_commands.describe(source="Account to move data FROM",
+                       target="Account to move data TO",
+                       confirm="true = actually write it (default: preview only)")
+@app_commands.default_permissions(administrator=True)
+async def transfer_cmd(interaction: discord.Interaction, source: discord.User,
+                       target: discord.User, confirm: bool = False):
+    """Move one account's live profile and lifetime totals onto another.
+
+    Moves: in-game name/id, skin, pickaxe, kills, deaths, wins, defeats,
+    playtime, streaks, records, play points, nectar coins, tourney PR and
+    ranked ladder points. Historic rows (game events, comp/ranked matches,
+    registrations, per-tourney PR history, bets) stay on the old account, so
+    past boards keep showing what actually happened.
+
+    The source is then emptied and stamped, so it cannot be transferred twice
+    or farmed by re-registering. Dry run by default: re-run with
+    confirm=true to apply.
+    """
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("Administrator only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    sb = _comp_sb()
+    if sb is None:
+        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+    sid, tid = str(source.id), str(target.id)
+    if sid == tid:
+        return await interaction.followup.send("Source and target are the same account.", ephemeral=True)
+    src = await _xfer_read(sb, sid)
+    if not src:
+        return await interaction.followup.send(
+            f"No account found for {source.mention} - they have never registered.", ephemeral=True)
+    dst = await _xfer_read(sb, tid)
+    if not dst:
+        return await interaction.followup.send(
+            f"No account found for {target.mention} - they have never registered.", ephemeral=True)
+    src_pts = await _xfer_ranked_points(sb, sid)
+    dst_pts = await _xfer_ranked_points(sb, tid)
+    try:
+        plan = xfer_mod.plan_transfer(
+            src, dst, now_iso=datetime.now(timezone.utc).isoformat(),
+            ranked_points=src_pts)
+    except xfer_mod.TransferRefused as e:
+        return await interaction.followup.send(f"Refused: {e}", ephemeral=True)
+
+    name = src.get("game_username") or "(no game name)"
+    head = (f"**{name}** `{sid}`\n→ **{dst.get('game_username') or '(no game name)'}** "
+            f"`{tid}`\n")
+    if src_pts:
+        head += f"Ranked points: **{src_pts}** + {dst_pts} = **{src_pts + dst_pts}**\n"
+    lines = []
+    for f, a, b in plan["moves"]:
+        lines.append(f"`{f}`: {a} → {b}")
+    body = "\n".join(lines) or "Nothing to move."
+    warn = ("\n\n:warning: Historical matches stay on the old account, and per-tourney "
+            "PR/Elo history starts fresh on the new one. Re-apply the migration "
+            "`add_transfer_v261.sql` if `transferred_to` is missing.")
+
+    if not confirm:
+        preview = head + f"\n{body}\n\n**Dry run - nothing was written.**{warn}\nRun again with `confirm: true` to apply."
+        if len(preview) > 1900:
+            preview = preview[:1880] + "\n... (truncated)"
+        return await interaction.followup.send(preview, ephemeral=True)
+
+    t_patch, s_patch = dict(plan["target"]), dict(plan["source"])
+    for f in xfer_mod.SUM_FIELDS:
+        t_patch[f] = int(t_patch.get(f, 0) or 0)
+    for f in xfer_mod.MAX_FIELDS:
+        if f in ("tourney_pr", "daily_streak"):
+            continue
+        t_patch[f] = int(t_patch.get(f, 0) or 0)
+    try:
+        w1 = await db._sb_call(lambda: sb.table("bngc_users").update(t_patch)
+                               .eq("discord_id", tid).execute())
+        w2 = await db._sb_call(lambda: sb.table("bngc_users").update(s_patch)
+                               .eq("discord_id", sid).execute())
+    except Exception as e:
+        print(f"[transfer] write failed: {e}")
+        return await interaction.followup.send(
+            f"**Write failed - nothing else was changed:** {e}", ephemeral=True)
+    if not (getattr(w1, "data", None) and getattr(w2, "data", None)):
+        return await interaction.followup.send(
+            "**DB reported no rows written** - check the account ids and whether "
+            f"`add_transfer_v261.sql` is applied.\n{head}", ephemeral=True)
+
+    skipped = ""
+    if src_pts:
+        try:
+            await db._sb_call(lambda: sb.table("ranked_points").upsert(
+                [{"discord_id": tid, "points": src_pts + dst_pts,
+                  "updated_at": datetime.now(timezone.utc).isoformat()}],
+                on_conflict="discord_id").execute())
+            await db._sb_call(lambda: sb.table("ranked_points").delete()
+                              .eq("discord_id", sid).execute())
+        except Exception as e:
+            skipped = f"\n:warning: Ranked points **not** moved ({e}) - move them by hand."
+    done = head + f"\n**Applied.** {len(plan['moves'])} field(s) moved.\n{body}"
+    if skipped:
+        done += skipped
+    elif src_pts:
+        done += f"\nRanked points **{src_pts + dst_pts}**."
+    if len(done) > 1900:
+        done = done[:1880] + "\n... (truncated)"
+    return await interaction.followup.send(done + warn, ephemeral=True)
+
 
 @bot.tree.command(name="unlock", description="Unlock your account if it was default-locked")
 async def unlock_cmd(interaction: discord.Interaction):
@@ -2321,27 +2422,6 @@ async def _fetch_health():
         print(f"[health] fetch failed: {e}")
     return None
 
-@bot.tree.command(name="precision", description="Show server-side processing precision (kills/deaths/wins)")
-async def precision_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=False)
-    data = await _fetch_health()
-    if not data or not isinstance(data.get("precision"), dict):
-        return await interaction.followup.send("Precision data unavailable — API unreachable.")
-    p = data["precision"]
-    pct = p.get("precision_pct", 0)
-    verified = p.get("verified", 0)
-    e = discord.Embed(title="Server Precision", color=0x10b981,
-                      description=f"**{pct}%** · {verified} verified")
-    for action in ("kill", "death", "win", "defeat"):
-        pa = (p.get("per_action") or {}).get(action) or {}
-        e.add_field(name=action.capitalize(),
-                    value=f"{pa.get('pct', 0)}% ({pa.get('ok', 0)} ok / {pa.get('fail', 0)} failed)",
-                    inline=True)
-    e.add_field(name="Pending", value=str(p.get("pending", 0)), inline=True)
-    e.add_field(name="Skipped", value=str(p.get("skipped", 0)), inline=True)
-    await interaction.followup.send(embed=e)
-
-
 @bot.tree.command(name="insights", description="Show your gameplay insights")
 async def insights_cmd(interaction: discord.Interaction, user: discord.User = None):
     target = user or interaction.user
@@ -2771,7 +2851,7 @@ class _CompProfileView(discord.ui.View):
                 pass
 
 
-@bot.tree.command(name="untag", description="Remove the scrim/tourney tag from a room code")
+@admin_group.command(name="untag", description="Remove the scrim/tourney tag from a room code")
 @app_commands.describe(code="5-letter private party code")
 async def untag_cmd(interaction: discord.Interaction, code: str):
     await interaction.response.defer(ephemeral=False)
@@ -3497,6 +3577,48 @@ async def tourney_add_player_cmd(interaction: discord.Interaction, tourney_id: i
         return await interaction.followup.send(f"{user.mention} added to tourney **#{tourney_id}** roster.", ephemeral=True)
     except Exception as e:
         return await interaction.followup.send(f"Couldn't add player: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="tourney-refresh-teams",
+                     description="Re-derive duo team colors and re-grant each team's roles (host)")
+@app_commands.describe(tourney_id="Numeric session ID (from 0)")
+async def tourney_refresh_teams_cmd(interaction: discord.Interaction, tourney_id: int):
+    """Repair team colors + roles after teams were added, dropped or moved.
+
+    Colors are frozen on the registration row at intake, so they drift as soon
+    as a team is removed and later teams shift; roles are granted at signup and
+    never re-checked. This re-derives both from the live roster, stripping any
+    team role a member should no longer hold.
+    """
+    await interaction.response.defer(ephemeral=True)
+    sb, me = await _comp_require_manager(interaction, tourney_id)
+    if sb is None:
+        return
+    try:
+        trow = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select(
+            "id,name,mode").eq("id", int(tourney_id)).limit(1).execute())
+        if not trow.data:
+            return await interaction.followup.send("No tourney with that ID.",
+                                                  ephemeral=True)
+        t = trow.data[0] or {}
+        out = await _comp_sync_team_roles(interaction.guild, sb, t)
+        if out.get("solo"):
+            return await interaction.followup.send(
+                f"Tourney **#{tourney_id}** is solo -no teams to refresh.",
+                ephemeral=True)
+        lines = [f"**Tourney #{tourney_id}** teams refreshed:",
+                 f"Teams: **{out['teams']}** · members: **{out['members']}**",
+                 f"Colors corrected: **{out['recolored']}**",
+                 f"Roles granted: **{out['granted']}** · stale roles stripped: **{out['stripped']}**"]
+        if out.get("no_role_config"):
+            lines.append("_No team roles configured - set `COMP_TEAM_ROLE_1..6` "
+                         "to their role ids and re-run._")
+        lines.append("Team order = signup order, so colours and roles both cycle "
+                     "every six teams.")
+        return await interaction.followup.send("\n".join(lines), ephemeral=True)
+    except Exception as e:
+        return await interaction.followup.send(f"Couldn't refresh teams: {e}",
+                                              ephemeral=True)
 
 
 @bot.tree.command(name="tourney-remove-player", description="Remove a player from a tourney roster (host)")
@@ -4294,32 +4416,6 @@ def _ranked_milestone_nick(game_name: str, milestone) -> str:
         return ""
 
 
-async def _comp_nick_for(sb, did: str):
-    """(nick|None, game_name). Current PR nickname for a user. Never raises
-    (None when no name/PR yet or DB down). async — see _comp_tourney_hosts."""
-    try:
-        if sb is None or not did:
-            return None, ""
-        ures = await db._sb_call(lambda: sb.table("bngc_users").select(
-            "game_username,tourney_pr").eq("discord_id", str(did)).limit(1).execute())
-        urow = ((ures.data or [{}])[0] or {})
-        gname = str(urow.get("game_username") or "").strip()
-        pr = urow.get("tourney_pr")
-        if pr is None:
-            try:
-                hres = await db._sb_call(lambda: sb.table("bngc_comp_pr_history").select("pr").eq(
-                    "discord_id", str(did)).order("computed_at", desc=True).limit(1).execute())
-                if hres.data:
-                    pr = (hres.data[0] or {}).get("pr")
-            except Exception:
-                pass
-        if not gname or pr is None:
-            return None, gname
-        return _comp_pr_nick(gname, pr), gname
-    except Exception:
-        return None, ""
-
-
 async def _ranked_nick_for(sb, did: str):
     """(nick|None, game_name, milestone). Current milestone nickname.
     Never raises (None when no name yet or DB down). async — see
@@ -4469,57 +4565,6 @@ async def ranked_name_cmd(interaction: discord.Interaction, allow: bool):
                 extra = " No ranked profile yet — link a name with **/register** first."
         except Exception as e:
             print(f"[ranked-name] immediate apply failed: {e}")
-    return await interaction.followup.send(f"You opted {state}.{extra}", ephemeral=True)
-
-
-@bot.tree.command(name="comp-name", description="Opt in/out of the [PR] server nickname (Display Name [150])")
-@app_commands.describe(allow="True to opt in, False to opt out")
-async def comp_name_cmd(interaction: discord.Interaction, allow: bool):
-    """Same flag as /tourney-name (shared opt-in), plus immediate apply."""
-    await interaction.response.defer(ephemeral=True)
-    sb = _comp_sb()
-    if sb is None:
-        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
-    me = str(interaction.user.id)
-    try:
-        upd = await db._sb_call(lambda: sb.table("bngc_users").update(
-            {"tourney_name_optin": bool(allow)}).eq("discord_id", me).execute())
-        wrote = bool(upd.data)
-    except Exception as e:
-        if "tourney_name_optin" in str(e):
-            return await interaction.followup.send(
-                "Database migration pending — ask a host to apply add_comp_v238.sql.", ephemeral=True)
-        print(f"[comp-name] save failed: {e}")
-        return await interaction.followup.send("Couldn't save — try again later.", ephemeral=True)
-    if not wrote:
-        try:
-            await db._sb_call(lambda: sb.table("bngc_users").insert({
-                "discord_id": me,
-                "discord_username": getattr(interaction.user, "display_name", None) or str(interaction.user),
-                "tourney_name_optin": bool(allow),
-                "token": gen_token(),
-            }).execute())
-        except Exception as e:
-            if "tourney_name_optin" in str(e):
-                return await interaction.followup.send(
-                    "Database migration pending — ask a host to apply add_comp_v238.sql.", ephemeral=True)
-            return await interaction.followup.send("Couldn't save — try again later.", ephemeral=True)
-    state = "in ✅ — your server nickname becomes **Display Name [PR]** after each tourney" if allow else "out — your nickname stays untouched"
-    extra = ""
-    if allow and interaction.guild is not None:
-        try:
-            nick, gname = await _comp_nick_for(sb, me)
-            if nick:
-                ok = await _edit_nick_if_different(
-                    interaction.guild, me, nick, "Comp PR nickname opt-in (immediate)")
-                extra = (f" Nickname set to **{nick}** now." if ok
-                         else " Couldn't set nickname now (bot needs Manage Nicknames + a higher role) — it applies at the next tourney.")
-            elif not gname:
-                extra = " No comp profile yet, so no nickname to set — it applies once you register."
-            else:
-                extra = " No PR yet — nickname applies after your first rated tourney."
-        except Exception as e:
-            print(f"[comp-name] immediate apply failed: {e}")
     return await interaction.followup.send(f"You opted {state}.{extra}", ephemeral=True)
 
 
@@ -5225,7 +5270,7 @@ async def tourney_list_cmd(interaction: discord.Interaction):
         return await interaction.followup.send(f"Couldn't list: {e}")
 
 
-@bot.tree.command(name="listen-registrations", description="Open signups in a channel (host)")
+@admin_group.command(name="listen-registrations", description="Open signups in a channel (host)")
 @app_commands.describe(channel="Signups channel", tourney_id="Numeric session ID",
                        ping_role="Role to ping (default: tourney player role)")
 async def listen_reg_cmd(interaction: discord.Interaction, channel: discord.TextChannel,
@@ -5273,7 +5318,7 @@ async def listen_reg_cmd(interaction: discord.Interaction, channel: discord.Text
         return await interaction.followup.send(f"Couldn't listen: {e}", ephemeral=True)
 
 
-@bot.tree.command(name="stop-registration", description="Close signups: lock typing + post counts (host)")
+@admin_group.command(name="stop-registration", description="Close signups: lock typing + post counts (host)")
 @app_commands.describe(tourney_id="Numeric session ID")
 async def stop_reg_cmd(interaction: discord.Interaction, tourney_id: int):
     await interaction.response.defer(ephemeral=True)
@@ -5451,13 +5496,77 @@ async def tourney_start_cmd(interaction: discord.Interaction, tourney_id: int,
 
 TEAM_COLORS = ["🔵", "🔴", "🟠", "🟡", "🟢", "🟣"]
 
+# One Discord role per team slot, same order as TEAM_COLORS. The mapping and
+# the role-id config live in teams.py so they can be unit-tested without the
+# bot's command tree; these names keep the existing call sites readable.
+from teams import (configured_team_role_ids as _comp_team_role_ids_set,  # noqa: E402
+                   team_color as _comp_team_color,
+                   team_role_id as _comp_team_role_id)
 
-def _comp_team_color(index: int) -> str:
-    """Team color by intake order (cycles 6). Pure."""
+
+async def _comp_sync_team_roles(guild, sb, tourney) -> dict:
+    """Re-derive duo team colors and re-grant each team's Discord roles.
+
+    Colors are keyed by team order (the same intake order that produced them)
+    and are FROZEN on the registration row, so after a team is added or
+    dropped the stored values drift. Roles are keyed by the same index and
+    are stripped-then-granted, mirroring _ranked_sync_member_roles, so a
+    player who moved teams never keeps the old colour role.
+
+    Returns {"teams", "members", "granted", "stripped", "recolored",
+    "no_role_config", "solo"}. Never raises.
+    """
+    out = {"teams": 0, "members": 0, "granted": 0, "stripped": 0,
+           "recolored": 0, "no_role_config": not _comp_team_role_ids_set(),
+           "solo": False}
     try:
-        return TEAM_COLORS[int(index or 0) % len(TEAM_COLORS)]
-    except Exception:
-        return TEAM_COLORS[0]
+        t = tourney or {}
+        tid = int(t.get("id") or 0)
+        if not tid:
+            return out
+        if str(t.get("mode") or "solo").lower() != "duo":
+            out["solo"] = True
+            return out
+        rows = await _comp_reg_rows(tid)
+        live = [r for r in (rows or []) if str((r or {}).get("status") or "") != "banned"]
+        out["teams"] = len(live)
+        if not live:
+            return out
+        # first pass: colours (a write, so do it before the rate-limited grants)
+        for idx, r in enumerate(live):
+            try:
+                want = _comp_team_color(idx)
+                if str((r or {}).get("team_color") or "") != want:
+                    await db._sb_call(lambda: sb.table("bngc_comp_registrations")
+                                      .update({"team_color": want})
+                                      .eq("id", (r or {}).get("id")).execute())
+                    out["recolored"] += 1
+            except Exception:
+                continue
+        if guild is None:
+            return out
+        every = _comp_team_role_ids_set()
+        for idx, r in enumerate(live):
+            want_role = _comp_team_role_id(idx)
+            for did in ((r or {}).get("member_ids") or []):
+                did = str(did or "").strip()
+                if not did:
+                    continue
+                out["members"] += 1
+                for other in every:
+                    if other == want_role:
+                        continue
+                    if await _comp_remove_role(guild, did, other,
+                                               reason=f"comp team #{tid} refresh"):
+                        out["stripped"] += 1
+                if want_role and await _comp_grant_role(guild, did, want_role):
+                    out["granted"] += 1
+                if out["members"] % 20 == 0:
+                    await asyncio.sleep(1)  # stay under the role rate limit
+        return out
+    except Exception as e:
+        print(f"[comp] team role sync failed: {e}")
+        return out
 
 
 def _comp_open_text(mode: str, ping_role_id: str | None = None, name: str = "Tourney") -> str:
@@ -6044,6 +6153,14 @@ async def on_message(message):
                 await _comp_grant_role(message.guild, _did, _rid)
         except Exception as e:
             print(f"[comp] intake role grant failed: {e}")
+        # duo: also grant THIS team's role (and strip any other team role, so a
+        # player who re-signed with a new partner never keeps the old one).
+        if color:
+            try:
+                await _comp_sync_team_roles(message.guild, sb, {
+                    "id": int(t["id"]), "mode": (t or {}).get("mode") or "duo"})
+            except Exception as e:
+                print(f"[comp] intake team role grant failed: {e}")
         # intake verdict right on the message: team color (duo) / ✅ solo,
         # ❌ only on failure paths above. Host ✅/❌ moderation still works:
         # hosts are different users, so their reactions are distinct.
@@ -8106,6 +8223,7 @@ async def ranked_session_winner_cmd(interaction: discord.Interaction, tourney_id
 
 
 bot.tree.add_command(ranked_group)
+bot.tree.add_command(admin_group)
 
 
 _bot_lock_fh = None

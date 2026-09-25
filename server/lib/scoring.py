@@ -192,6 +192,25 @@ def dynamic_rows(events: list, table: dict, winner: str | None,
     return rows
 
 
+def _team_display_label(label) -> str | None:
+    """A `team_label` worth showing to a human, or None.
+
+    The bot stores a duo's label as raw mention syntax (`<@a> / <@b>`, or
+    `<@a> <@b>` from /tourney-add-player) because that is what renders in a
+    Discord thread. Anywhere else it is just a column of discord ids: the
+    dashboard's Player column showed them instead of names. A mention-shaped
+    label is therefore not a label, and the member display names are used
+    instead. A real human label ("Champs") is still honoured. Never raises.
+    """
+    try:
+        s = str(label or "").strip()
+        if not s or "<@" in s:
+            return None
+        return s
+    except Exception:
+        return None
+
+
 def group_standings_by_team(board: list[dict], regs: list[dict] | None,
                             names: dict | None = None) -> list[dict]:
     """Fold a per-player series board into team rows. Pure, unit-tested.
@@ -214,7 +233,7 @@ def group_standings_by_team(board: list[dict], regs: list[dict] | None,
                 members = []
             if not members:
                 continue
-            label = str((r or {}).get("team_label") or "").strip() or None
+            label = _team_display_label((r or {}).get("team_label"))
             teams.append({"label": label, "member_ids": members,
                           "kills": 0, "wins": 0, "points": 0, "matches": 0,
                           "avg_w": 0.0, "avg_n": 0})

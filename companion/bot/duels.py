@@ -867,6 +867,37 @@ def _room_mode_ok(mode: str, room) -> bool:
         return True
 
 
+def set_code_patch(rooms, code, bound_room: str = "") -> dict:
+    """Fields that pin a wager to the room running under `code`.
+
+    `/wager set-code` exists because setting the code alone is not enough: if
+    the wager is still bound to an abandoned room, every row of the real room
+    is filtered as `room != bound` and the duel tracks nothing while looking
+    perfectly alive. So the code takes the BINDING with it - the freshest
+    room carrying that code wins - and an as-yet-unseen code releases the
+    binding instead, letting the resolver bind when that room appears.
+
+    rooms: `room_evidence` rows. Returns {"room_code", "room_id"}; room_id
+    None means "re-bind on the next tick". Never raises.
+    """
+    try:
+        want = str(code or "").strip().upper()
+        if not want:
+            return {"room_code": None, "room_id": None}
+        try:
+            fresh = sorted([r for r in (rooms or []) if isinstance(r, dict)],
+                           key=lambda r: str(r.get("last_ts") or ""), reverse=True)
+        except Exception:
+            fresh = []
+        for r in fresh:
+            if str(r.get("code") or "").strip().upper() == want:
+                rid = str(r.get("room_id") or "").strip()
+                return {"room_code": want, "room_id": rid or None}
+        return {"room_code": want, "room_id": None}
+    except Exception:
+        return {"room_code": None, "room_id": None}
+
+
 def choose_bound_room(bound_room: str, rooms, now_iso: str,
                       bound_code: str = "", mode: str = "") -> tuple:
     """Which room is this duel in now? (room_id, code, action).
@@ -902,12 +933,18 @@ def choose_bound_room(bound_room: str, rooms, now_iso: str,
         by_id = {str(r["room_id"]): r for r in rooms}
         cur = by_id.get(str(bound_room))
         if cur is not None:
+            # The bound room's OWN rows outrank the stored code: the stored one
+            # is whatever a duelist typed earlier, possibly for a room they
+            # abandoned, and grouping drops every row that disagrees with it -
+            # a silently dead wager. The room pins the wager, so its code is
+            # the truth; the stored one is only a fallback.
+            _code = str(cur.get("code") or "") or str(bound_code or "")
             try:
                 last = _parse_ts(cur.get("last_ts"))
                 if last is not None and (now - last).total_seconds() <= idle:
-                    return str(bound_room), str(bound_code or cur.get("code") or ""), "keep"
+                    return str(bound_room), _code, "keep"
             except Exception:
-                return str(bound_room), str(bound_code or cur.get("code") or ""), "keep"
+                return str(bound_room), _code, "keep"
         # Bound room is quiet (or no longer has evidence): follow the live one.
         best = rooms[0]
         if str(best["room_id"]) == str(bound_room):
@@ -3077,6 +3114,29 @@ async def _stall_refund(bot, w: dict):
         print(f"[duels] _stall_refund failed: {e}")
 
 
+async def recent_event_iso(discord_id: str) -> str | None:
+    """Newest bngc_game_events timestamp for one player, or None. Never raises.
+
+    Presence evidence the AFK guard can trust: a row only exists because this
+    player's own companion reported it, so it beats a heartbeat that is
+    written best-effort under a 6s deadline (and is NULL for anyone who has
+    never been captured).
+    """
+    try:
+        sb = _sb()
+        if sb is None or not discord_id:
+            return None
+        r = await db._sb_call(lambda: sb.table("bngc_game_events").select(
+            "created_at").eq("discord_id", str(discord_id)).order(
+            "created_at", desc=True).limit(1).execute())
+        rows = (r.data if hasattr(r, "data") else []) or []
+        if not rows:
+            return None
+        return str((rows[0] or {}).get("created_at") or "") or None
+    except Exception:
+        return None
+
+
 async def _afk_guard(bot, w: dict) -> bool:
     """Cancel + refund when a duelist has been offline too long.
 
@@ -3085,7 +3145,16 @@ async def _afk_guard(bot, w: dict) -> bool:
     for the full stall window. Anyone offline longer than
     WAGER_AFK_CANCEL_SEC after the duel went live ends it for both, with a
     refund and a thread teardown. Returns True when the wager was cancelled.
-    Never raises.
+
+    Fails OPEN, because this is the only thing in the resolver that moves
+    real coins. `last_online` is stamped best-effort on every capture batch
+    under a 6s deadline and is NULL for anyone never captured, so an unknown
+    stamp (NULL, unparsable, failed read) is not evidence of absence. A
+    duelist with their own duel rows inside the window is demonstrably
+    playing and is never counted as offline, whatever the heartbeat says.
+    The trade: a duelist whose stamp was NEVER written cannot trip this
+    guard at all - `/wager expires` and the 24h stall refund still cover
+    abandonment. Never raises.
     """
     try:
         grace = int(os.getenv("WAGER_AFK_GRACE_SEC", "900") or 900)   # ignore the first 15 min
@@ -3096,6 +3165,7 @@ async def _afk_guard(bot, w: dict) -> bool:
         age = (datetime.now(timezone.utc) - since).total_seconds()
         if age < grace:
             return False  # still inside the grace window
+        now = datetime.now(timezone.utc)
         rows = {}
         for uid in (str(w.get("creator_id") or ""), str(w.get("opponent_id") or "")):
             if not uid:
@@ -3103,16 +3173,27 @@ async def _afk_guard(bot, w: dict) -> bool:
             try:
                 rows[uid] = await db.get_by_discord(uid) or {}
             except Exception:
-                rows[uid] = {}
+                rows[uid] = None      # read failed: unknown, never offline
         offline = []
         for uid, row in rows.items():
             try:
+                if row is None:
+                    continue             # unknown heartbeat: fail open
                 online, ts = db.online_status(row.get("last_online"), limit)
             except Exception:
-                online, ts = False, None
+                continue
             if not online:
+                if ts is None:
+                    continue             # NULL/unparsable stamp: unknown
+                # their own duel rows are the stronger presence signal
                 try:
-                    idle = int((datetime.now(timezone.utc).timestamp()
+                    seen = _parse_ts(await recent_event_iso(uid))
+                except Exception:
+                    seen = None
+                if seen is not None and (now - seen).total_seconds() <= limit:
+                    continue
+                try:
+                    idle = int((now.timestamp()
                                 - float(ts.timestamp())) if ts else 10 ** 9)
                 except Exception:
                     idle = 10 ** 9
@@ -3950,6 +4031,69 @@ def register(tree: app_commands.CommandTree, bot=None):
             except Exception:
                 pass
 
+    @wager_group.command(name="set-code",
+                         description="Force the resolver onto a room code (duelist escape hatch)")
+    @app_commands.describe(wager_id="Wager id (first 8 chars are enough)",
+                           code="5-character room code (blank clears it)")
+    async def wager_set_code_cmd(interaction: discord.Interaction, wager_id: str,
+                                 code: str):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            w = await get_wager(wager_id)
+            if not w:
+                return await interaction.followup.send("Wager not found.", ephemeral=True)
+            me = str(interaction.user.id)
+            if me not in (str(w.get("creator_id")), str(w.get("opponent_id") or "")):
+                return await interaction.followup.send(
+                    "Only the duelists can set the room code.", ephemeral=True)
+            if str(w.get("status")) not in ("open", "pending", "active"):
+                return await interaction.followup.send(
+                    "That wager is closed.", ephemeral=True)
+            if (w.get("sealed") or []):
+                return await interaction.followup.send(
+                    "Room code is locked - matches already sealed.", ephemeral=True)
+            ok, err = validate_room_code(code)
+            if not ok:
+                return await interaction.followup.send(
+                    str(err or "Bad code."), ephemeral=True)
+            want = str(code or "").strip().upper()
+            # pull the binding across too, or a stale room keeps filtering
+            rooms = []
+            try:
+                rows = await duel_events(str(w.get("creator_id")),
+                                         str(w.get("opponent_id") or ""),
+                                         str(w.get("active_since")
+                                             or w.get("created_at") or ""))
+                rooms = room_evidence(rows, str(w.get("active_since")
+                                                or w.get("created_at") or ""))
+            except Exception:
+                rooms = []
+            patch = set_code_patch(rooms, want, str(w.get("room_id") or ""))
+            if not await update_wager(str(w.get("id")), patch):
+                return await interaction.followup.send(
+                    "Couldn't save that -try again.", ephemeral=True)
+            short = short_wager_id(w.get("id"))
+            print(f"[duels] {short} code set to {want or '-'} by {me[:6]} "
+                  f"(room={str(patch.get('room_id') or '-')[:8]})")
+            if not want:
+                return await interaction.followup.send(
+                    f"Cleared the room code on `{short}`.", ephemeral=True)
+            if patch.get("room_id"):
+                return await interaction.followup.send(
+                    f"Room code set to `{want}` on `{short}` - now tracking "
+                    f"room `{str(patch['room_id'])[:8]}`.", ephemeral=True)
+            return await interaction.followup.send(
+                f"Room code set to `{want}` on `{short}`. No room is running "
+                f"that code yet - tracking starts as soon as it does.",
+                ephemeral=True)
+        except Exception as e:
+            print(f"[duels] wager-set-code failed: {e}")
+            try:
+                await interaction.followup.send("Something went wrong -try again.",
+                                                ephemeral=True)
+            except Exception:
+                pass
+
     @wager_group.command(name="forfeit",
                          description="Forfeit your live duel (opponent takes the pot)")
     @app_commands.describe(wager_id="Wager id (first 8 chars are enough)")
@@ -4079,7 +4223,7 @@ def register(tree: app_commands.CommandTree, bot=None):
             f"✅ {user.mention} can wager again.", ephemeral=True)
 
     tree.add_command(wager_group)
-    print(f"[duels] registered /wager group (8 subcommands, "
+    print(f"[duels] registered /wager group (9 subcommands, "
           f"{len(tree.get_commands())} top-level on tree)", flush=True)
     print(f"[duels] WAGER_CHANNEL_ID={_wager_channel_id() or '(unset — using command channel)'}",
           flush=True)

@@ -142,6 +142,41 @@ def test_group_duo_label_and_unregistered():
     assert group_standings_by_team([], []) == []
 
 
+def test_group_duo_mention_label_is_not_shown_as_a_name():
+    # The bot stores the duo label as raw mention syntax ("<@a> / <@b>")
+    # because that is what renders in a Discord thread. On the dashboard it
+    # put those ids in the Player column instead of names.
+    board = [{"discord_id": "1331576167966445703", "name": "Alice", "kills": 1,
+              "wins": 0, "points": 3, "matches": 1},
+             {"discord_id": "1530006126954024980", "name": "Bob", "kills": 0,
+              "wins": 0, "points": 0, "matches": 1}]
+    regs = [{"team_label": "<@1331576167966445703> / <@1530006126954024980>",
+             "member_ids": ["1331576167966445703", "1530006126954024980"]}]
+    names = {"1331576167966445703": "Alice", "1530006126954024980": "Bob"}
+    team = group_standings_by_team(board, regs, names)[0]
+    assert team["name"] == "@Alice & @Bob"
+    assert "<@" not in team["name"]
+    assert team["team_label"] is None
+
+
+def test_group_duo_space_separated_mention_label_is_also_ignored():
+    # /tourney-add-player writes "<@a> <@b>" (space, not " / ")
+    board = [{"discord_id": "a", "name": "A", "kills": 1, "wins": 0,
+              "points": 3, "matches": 1}]
+    regs = [{"team_label": "<@a> <@b>", "member_ids": ["a", "b"]}]
+    team = group_standings_by_team(board, regs, {"a": "A", "b": "B"})[0]
+    assert team["name"] == "@A & @B"
+
+
+def test_a_human_team_label_still_wins():
+    board = [{"discord_id": "a", "name": "A", "kills": 1, "wins": 0,
+              "points": 3, "matches": 1}]
+    regs = [{"team_label": "Champs", "member_ids": ["a", "b"]}]
+    team = group_standings_by_team(board, regs, {"a": "A", "b": "B"})[0]
+    assert team["name"] == "Champs"
+    assert team["team_label"] == "Champs"
+
+
 def test_tied_p1_shares_win_bonus():
     evs = [
         {"etype": "kill", "discord_id": "a", "actor_name": "A"},

@@ -204,6 +204,25 @@ def test_the_same_rows_produce_nothing_when_the_old_room_was_bound():
         opp_name="nemo", creator_name="aqua") == []
 
 
+def test_a_stale_stored_code_never_pins_a_live_bound_room():
+    # The host typed a code, then abandoned that room; the bound room is
+    # running under a different code. Preferring the STORED one filters
+    # every real row as "code != bound" and the wager goes silently dead.
+    duels = _load_duels()
+    rooms = [{"room_id": OLD_ROOM, "code": "REAL1", "gm": "zw_lg",
+              "last_ts": _iso(seconds=5)}]
+    room, code, action = duels.choose_bound_room(OLD_ROOM, rooms, _now_iso(),
+                                                "OLDCD", "zw_lg")
+    assert (room, code, action) == (OLD_ROOM, "REAL1", "keep")
+
+
+def test_the_stored_code_still_stands_when_the_room_has_none():
+    duels = _load_duels()
+    rooms = [{"room_id": OLD_ROOM, "code": "", "last_ts": _iso(seconds=5)}]
+    assert duels.choose_bound_room(OLD_ROOM, rooms, _now_iso(), "OLDCD",
+                                   "zw_lg")[1] == "OLDCD"
+
+
 def test_first_evidence_binds_the_newest_room_not_the_oldest():
     duels = _load_duels()
     rooms = [{"room_id": OLD_ROOM, "code": "TEPUU", "last_ts": _iso(minutes=30)},
