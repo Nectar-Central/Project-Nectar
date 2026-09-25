@@ -313,12 +313,16 @@ async def _sb_first(table: str, select: str, filters: list[tuple[str, str, objec
         return None
 
 
-async def get_wager(wager_id: str):
+async def get_wager(wager_id: str, include_ended: bool = False):
     """Fetch one wager by full id or id prefix. Never raises (None on miss).
 
     NOTE: ``id`` is uuid — Postgres has no LIKE/~~ operator for uuid, so
     prefix matching is done in Python over recent non-terminal rows (small
     table, single round trip) instead of a server-side like().
+
+    include_ended also searches cancelled/expired rows, which the default
+    deliberately skips: /wager reset is the one command whose whole job is a
+    closed wager, and an 8-char id would otherwise never resolve.
     """
     sb = _sb()
     if sb is None or not wager_id:
@@ -328,8 +332,11 @@ async def get_wager(wager_id: str):
         if len(wid) >= 36:
             return await _sb_first("bngc_duel_wagers", "*",
                                    [("id", "eq", wid)])
+        statuses = list(ACTIVE_STATUSES) + ["resolved"]
+        if include_ended:
+            statuses = list(ENDED_STATUSES) + statuses
         r = await db._sb_call(lambda: sb.table("bngc_duel_wagers").select("*")
-                              .in_("status", list(ACTIVE_STATUSES) + ["resolved"])
+                              .in_("status", statuses)
                               .order("created_at", desc=True).limit(100).execute())
         rows = (r.data if hasattr(r, "data") else []) or []
         hits = [x for x in rows if str((x or {}).get("id") or "").lower().startswith(wid)]
@@ -896,6 +903,95 @@ def set_code_patch(rooms, code, bound_room: str = "") -> dict:
         return {"room_code": want, "room_id": None}
     except Exception:
         return {"room_code": None, "room_id": None}
+
+
+def reset_needs_escrow(wager) -> bool:
+    """True when reviving this wager has to re-take the stakes.
+
+    A cancel refunds BOTH escrows, so a revived wager's pot is unfunded and
+    settling it would pay a winner out of nothing. Re-escrowing first makes
+    the ledger net back to the pre-cancel state. A live wager still holds its
+    stakes, and a 0-stake (for-fun) duel never escrowed anything. Never raises.
+    """
+    try:
+        if int(wager.get("stake", 0) or 0) <= 0:
+            return False
+        return str(wager.get("status") or "") not in ACTIVE_STATUSES
+    except Exception:
+        return True  # unknown state: assume money moved, be safe
+
+
+def reset_refusal(wager, *, is_duelist: bool, is_admin: bool) -> str:
+    """Why a reset must not run; "" means it may. Never raises.
+
+    Two contracts in one command. A LIVE wager being pointed at the wrong
+    room is the duelist's own problem, so a duelist may fix it and no money
+    moves. Reviving a CANCELLED/EXPIRED one is a re-buy - their stakes were
+    already refunded - so it is admin-only.
+    """
+    try:
+        w = wager or {}
+        status = str(w.get("status") or "")
+        if status == "resolved" or str(w.get("winner_id") or ""):
+            return "That wager is already settled - the pot is final."
+        if status in ("open", "pending"):
+            return ("That wager has not started yet, so there is nothing to "
+                    "reset - use /wager create or wait for a joiner.")
+        if not str(w.get("opponent_id") or ""):
+            return "That wager has no opponent, so it is not tracking anything."
+        if status in ("cancelled", "expired"):
+            if not is_admin:
+                return ("That wager was closed and both stakes were refunded, "
+                        "so reviving it re-buys the duel - an admin has to do "
+                        "it with /wager reset.")
+            return ""
+        if status == "active":
+            if not (is_duelist or is_admin):
+                return "Only the duelists can reset their own wager."
+            return ""
+        return f"That wager is {status or 'in an unknown state'} - nothing to reset."
+    except Exception:
+        return "Couldn't read that wager - try again."
+
+
+def reset_patch(wager, *, now_iso: str = "", code: str = "", rooms=None) -> dict:
+    """Fields that put a backed-out wager back onto a live room. Never raises.
+
+    `active_since` is the quiet one: every filter is a `>=` on it, so an old
+    stamp does not hide new rows - it instead leaves the AFK grace and the
+    24h stall clock already spent, so the first tick after a reset can cancel
+    or expire the wager. Moving it restarts both and shrinks the event window
+    to the new room.
+
+    Deliberately NOT touched: `sealed` (it IS the score), `score_*` /
+    `kills_*` (the victory check - clearing them erases a loss), `voided`
+    (the anti-farm list) and every term of the duel (`stake`, `pot`,
+    `first_to`, `mode`, `race`).
+
+    `code` is optional: given, it is applied through set_code_patch so the
+    binding moves with it; omitted, the binding is dropped and the resolver
+    rebinds to the freshest room itself.
+    """
+    try:
+        want = str(code or "").strip().upper()
+        if want:
+            sub = set_code_patch(rooms, want, "")
+        else:
+            # no code given: take the freshest room ourselves, or drop the
+            # binding entirely and let the resolver rebind on its next tick
+            fresh = sorted([r for r in (rooms or []) if isinstance(r, dict)
+                            and str(r.get("room_id") or "")],
+                           key=lambda r: str(r.get("last_ts") or ""), reverse=True)
+            sub = ({"room_code": str(fresh[0].get("code") or "").strip().upper() or None,
+                    "room_id": str(fresh[0].get("room_id") or "")}
+                   if fresh else {"room_code": None, "room_id": None})
+        return {"active_since": str(now_iso or "") or None,
+                "room_id": sub.get("room_id"),
+                "room_code": sub.get("room_code"),
+                "resolved_at": None}
+    except Exception:
+        return {"active_since": str(now_iso or "") or None, "room_id": None,
+                "room_code": None, "resolved_at": None}
 
 
 def choose_bound_room(bound_room: str, rooms, now_iso: str,
@@ -4090,6 +4186,143 @@ def register(tree: app_commands.CommandTree, bot=None):
             print(f"[duels] wager-set-code failed: {e}")
             try:
                 await interaction.followup.send("Something went wrong -try again.",
+                                                ephemeral=True)
+            except Exception:
+                pass
+
+    @wager_group.command(name="reset",
+                         description="Re-point a backed-out duel at your new room")
+    @app_commands.describe(wager_id="Wager id (first 8 chars are enough)",
+                           code="New room code (optional - skips the /wager set-code step)")
+    async def wager_reset_cmd(interaction: discord.Interaction, wager_id: str,
+                              code: str = ""):
+        """Recover a duel after backing out to the lobby and rejoining.
+
+        Backing out leaves the wager bound to a room nobody is in, and the
+        `active_since` it was stamped with keeps two clocks already spent - the
+        AFK grace and the 24h stall - so the first tick can cancel a duelist
+        for being "offline" and the wager dies before it tracks anything. This
+        moves the binding and the clock in one step, and takes the new code
+        with it so it replaces /wager set-code.
+
+        It never touches the score: `sealed`, `score_*`, `kills_*` and
+        `voided` survive, so a duelist cannot reset their way out of a loss.
+
+        A live wager is the duelists' own to fix. A CANCELLED or EXPIRED one
+        is admin-only, because cancel already refunded both stakes and
+        reviving it re-takes them.
+        """
+        await interaction.response.defer(ephemeral=True)
+        try:
+            w = await get_wager(wager_id, include_ended=True)
+            if not w:
+                return await interaction.followup.send("Wager not found.", ephemeral=True)
+            me = str(interaction.user.id)
+            is_duelist = me in (str(w.get("creator_id")),
+                                str(w.get("opponent_id") or ""))
+            try:
+                is_admin = bool(interaction.user.guild_permissions.administrator)
+            except Exception:
+                is_admin = False
+            why = reset_refusal(w, is_duelist=is_duelist, is_admin=is_admin)
+            if why:
+                return await interaction.followup.send(why, ephemeral=True)
+            wid = str(w.get("id"))
+            short = short_wager_id(wid)
+            creator = str(w.get("creator_id") or "")
+            opponent = str(w.get("opponent_id") or "")
+            stake = int(w.get("stake", 0) or 0)
+
+            ok, err = validate_room_code(code) if str(code or "").strip() else (True, None)
+            if not ok:
+                return await interaction.followup.send(str(err or "Bad code."),
+                                                       ephemeral=True)
+
+            # Room evidence, for both the code hand-off and the freshest-room
+            # fallback. Best effort: with no evidence the patch just releases
+            # the binding and the resolver rebinds when a room shows up.
+            rooms = []
+            try:
+                rows = await duel_events(creator, opponent,
+                                         str(w.get("active_since")
+                                             or w.get("created_at") or ""))
+                rooms = room_evidence(rows, str(w.get("active_since")
+                                                or w.get("created_at") or ""))
+            except Exception:
+                rooms = []
+
+            patch = reset_patch(w, now_iso=_now_iso(), code=code, rooms=rooms)
+
+            # Reviving a closed wager: re-take BOTH stakes before the status
+            # flips, or the pot is unfunded and settling it mints coins.
+            re_escrowed = []
+            if reset_needs_escrow(w):
+                for uid in (creator, opponent):
+                    busy = await get_user_active(uid, ignore_id=wid)
+                    if busy:
+                        return await interaction.followup.send(
+                            f"<@{uid}> is already in another live wager "
+                            f"(`{short_wager_id(busy.get('id'))}`) - they would be "
+                            "in two duels at once.", ephemeral=True)
+                    try:
+                        row = await db.get_by_discord(uid)
+                    except Exception:
+                        row = None
+                    if not row:
+                        return await interaction.followup.send(
+                            f"<@{uid}> has no account - cannot re-take the stake.",
+                            ephemeral=True)
+                    if int(row.get("nectar_coins", 0) or 0) < stake:
+                        return await interaction.followup.send(
+                            f"<@{uid}> has {row.get('nectar_coins', 0)} coins but the "
+                            f"stake is {stake} - reviving this wager re-takes it, so "
+                            "they need the balance first.", ephemeral=True)
+                try:
+                    for uid in (creator, opponent):
+                        await _escrow(uid, stake, short)
+                        re_escrowed.append(uid)
+                except Exception as e:
+                    for uid in re_escrowed:
+                        await _refund(uid, stake, short, "reset_escrow_failed")
+                    return await interaction.followup.send(
+                        f"Couldn't re-take the stakes - nothing changed: "
+                        f"{str(e)[:160]}", ephemeral=True)
+                patch["status"] = "active"
+
+            if not await update_wager(wid, patch):
+                for uid in re_escrowed:
+                    await _refund(uid, stake, short, "reset_update_failed")
+                return await interaction.followup.send(
+                    "Couldn't save that - try again.", ephemeral=True)
+
+            try:
+                await refresh_board_embed(interaction.client, w)
+            except Exception:
+                pass
+            revived = "Revived" if re_escrowed else "Reset"
+            where = (f"room `{str(patch.get('room_id') or '')[:8]}`"
+                     if patch.get("room_id") else "the next room that shows up")
+            line = (f"{revived} `{short}`: now tracking {where}"
+                    + (f" under code `{patch['room_code']}`"
+                       if patch.get("room_code") else "")
+                    + ". Score and sealed matches were kept.")
+            print(f"[duels] {short} reset by {me[:6]} "
+                  f"room={str(patch.get('room_id') or '-')[:8]} "
+                  f"code={patch.get('room_code') or '-'} "
+                  f"revived={bool(re_escrowed)}")
+            try:
+                for uid in (creator, opponent):
+                    if uid and uid != me:
+                        await _dm(interaction.client, uid,
+                                  f"Your duel `{short}` was reset by <@{me}> and is "
+                                  f"live again - rejoin the room it names.")
+            except Exception:
+                pass
+            return await interaction.followup.send(line, ephemeral=True)
+        except Exception as e:
+            print(f"[duels] wager-reset failed: {e}")
+            try:
+                await interaction.followup.send("Something went wrong - try again.",
                                                 ephemeral=True)
             except Exception:
                 pass
