@@ -54,6 +54,20 @@ def test_announce_start_time():
     assert "**START TIME**:" not in text2
 
 
+def test_announce_coin_prizes():
+    t = {"id": 4, "name": "Cup", "coin_give": True,
+         "coins_first": 1000, "coins_second": 500, "coins_third": 250}
+    text = bot_mod._comp_announce_text(t)
+    assert "**PRIZES**:" in text
+    assert "1st = 1,000 Nectar Coins" in text
+    assert "2nd = 500 Nectar Coins" in text
+    assert "3rd = 250 Nectar Coins" in text
+    assert ":nectar_coin:" not in text
+    # no coin cup -> no prize lines
+    assert "Nectar Coins" not in bot_mod._comp_announce_text(
+        {"id": 4, "name": "Cup"})
+
+
 def test_announce_hosted_by():
     t = {"id": 4, "name": "Cup", "hosts": ["111", "222"], "created_by": "111"}
     text = bot_mod._comp_announce_text(t)

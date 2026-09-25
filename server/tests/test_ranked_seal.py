@@ -799,6 +799,36 @@ _BANK_USERS = [{"game_username": "Killer", "discord_id": "K"},
                {"game_username": "Victim", "discord_id": "V"}]
 
 
+def test_roster_name2did_pairs_unknown_name_to_unclaimed_roster(monkeypatch):
+    # mobile player joined the room as "dom" but the roster row still says
+    # "klepper"; the companion player's name resolves exactly, so the one
+    # unclaimed roster entry is the one unknown name.
+    room = RoomView(room_id="r1")
+    room.players[1] = Player(actor_nr=1, username="Killer")
+    room.players[2] = Player(actor_nr=2, username="dom")
+    room_data = {"roster": [{"discord_id": "K", "game_username": "Killer"},
+                            {"discord_id": "M", "game_username": "klepper"}]}
+    monkeypatch.setattr(proc, "_resolve_ranked_dids",
+                        lambda names: {"Killer": "K"})
+    out = proc._roster_name2did(room_data, room)
+    assert out["Killer"] == "K"
+    assert out["dom"] == "M"
+
+
+def test_roster_name2did_two_unknown_names_stay_unmapped(monkeypatch):
+    # two strangers, one unclaimed roster entry: pairing would be a coin flip
+    room = RoomView(room_id="r1")
+    room.players[1] = Player(actor_nr=1, username="Killer")
+    room.players[2] = Player(actor_nr=2, username="dom")
+    room.players[3] = Player(actor_nr=3, username="stranger")
+    room_data = {"roster": [{"discord_id": "K", "game_username": "Killer"},
+                            {"discord_id": "M", "game_username": "klepper"}]}
+    monkeypatch.setattr(proc, "_resolve_ranked_dids",
+                        lambda names: {"Killer": "K"})
+    out = proc._roster_name2did(room_data, room)
+    assert "dom" not in out and "stranger" not in out
+
+
 def _bank_seal(monkeypatch, fake, room_data=None):
     """Run a happy-path ranked seal with the real bank + mocked seal_match."""
     proc._comp_namemap.clear()

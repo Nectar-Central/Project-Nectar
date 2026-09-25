@@ -27,6 +27,9 @@ from server.lib.logger import log_sys, log_err, log_engine, log_ranked, log_dbg,
 # Strip color tags from player names (e.g. "<color=red>Player</color>" → "Player")
 from server.lib.gpbinary import _strip_color_tags
 
+# Shared conservative name resolver (killfeed/ALV game name -> discord_id)
+from server.lib import names as _names_lib
+
 # Retransmit window shared with the engine (killfeed can arrive twice with
 # different Photon framing: client RaiseEvent echo + server broadcast).
 from server.lib.photon_engine.engine import _KILL_DUP_WINDOW_MS
@@ -1364,8 +1367,11 @@ def _roster_name2did(room_data, room) -> dict:
     Roster entries written by the bot carry game_username; anything missing
     is resolved via one bngc_users query for the names the host actually saw
     (room.players + killfeed). Unmapped names stay absent (no fake points).
+    The roster is a closed set, so one name that matches nothing is paired
+    with the one player who never showed up under their registered name.
     """
     out: dict = {}
+    roster: dict = {}
     try:
         for entry in (room_data.get("roster") or []):
             try:
@@ -1373,28 +1379,41 @@ def _roster_name2did(room_data, room) -> dict:
                 did = entry.get("discord_id")
                 if uname and did:
                     out[str(uname)] = str(did)
+                    roster[str(did)] = str(uname)
             except Exception:
                 continue
     except Exception:
         pass
+    observed: list = []
     try:
-        missing = []
-        try:
-            for p in (getattr(room, "players", None) or {}).values():
-                uname = getattr(p, "username", None)
-                if uname and str(uname) not in out and str(uname) not in missing:
-                    missing.append(str(uname))
-        except Exception:
-            pass
-        try:
-            for k in (getattr(room, "recent_kills", None) or []):
-                for uname in (getattr(k, "instigator", None), getattr(k, "instigated", None)):
-                    if uname and str(uname) not in out and str(uname) not in missing:
-                        missing.append(str(uname))
-        except Exception:
-            pass
+        for p in (getattr(room, "players", None) or {}).values():
+            uname = getattr(p, "username", None)
+            if uname and str(uname) not in observed:
+                observed.append(str(uname))
+    except Exception:
+        pass
+    try:
+        for k in (getattr(room, "recent_kills", None) or []):
+            for uname in (getattr(k, "instigator", None), getattr(k, "instigated", None)):
+                if uname and str(uname) not in observed:
+                    observed.append(str(uname))
+    except Exception:
+        pass
+    resolved: dict = {}
+    try:
+        missing = [n for n in observed if n not in out]
         if missing:
-            out.update(_resolve_ranked_dids(missing))
+            resolved = {n: d for n, d in
+                        (_resolve_ranked_dids(missing) or {}).items() if d}
+            out.update(resolved)
+    except Exception:
+        resolved = {}
+    try:
+        claim = dict(resolved)
+        for n in observed:
+            if n in out:
+                claim[n] = out[n]
+        out.update(_names_lib.pair_leftover(roster, observed, claim))
     except Exception:
         pass
     return out
@@ -1417,13 +1436,66 @@ def _comp_norm_key(name) -> str:
         return ""
 
 
-def _comp_map_names(names: list) -> dict:
-    """Batch game_username → discord_id. Exact-first, fold-fallback, twins None.
+# Registrations are the one closed set a leftover pairing may reason about:
+# these are the players the tourney says are in the match.
+_COMP_REG_TABLE = "bngc_comp_registrations"
+_RT_REG_TABLE = "bngc_ranked_tourney_registrations"
+
+
+def _tourney_roster_sync(tid, table, drop_dids=None) -> dict:
+    """{discord_id: registered game name} for every accepted registrant.
+
+    The elimination tier's candidate set. drop_dids removes accounts that are
+    on paper but not in this match (a spectating host is a registrant who
+    never enters the room, and must not be handed a stranger's name). Never
+    raises.
+    """
+    try:
+        if supabase is None or tid is None or not table:
+            return {}
+        dids: list = []
+        res = supabase.table(table).select("member_ids").eq(
+            "tourney_id", int(tid)).eq("status", "accepted").limit(500).execute()
+        for r in (res.data or []):
+            try:
+                for m in ((r or {}).get("member_ids") or []):
+                    m = str(m or "").strip()
+                    if m and m not in dids:
+                        dids.append(m)
+            except Exception:
+                continue
+        if not dids:
+            return {}
+        drop = {str(d) for d in (drop_dids or []) if str(d or "").strip()}
+        ures = supabase.table("bngc_users").select(
+            "discord_id,game_username").in_("discord_id", dids[:200]).execute()
+        out: dict = {}
+        for u in (ures.data or []):
+            try:
+                did = str(u.get("discord_id") or "").strip()
+                name = str(u.get("game_username") or "").strip()
+                if did and name and did not in drop and did not in out:
+                    out[did] = name
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return {}
+
+
+def _comp_map_names(names: list, roster: dict | None = None,
+                    claimed=None) -> dict:
+    """Batch game_username → discord_id. Exact-first, fold-fallback, fuzzy last.
 
     Killfeed names drift (case, color tags, dc: prefix) while bngc_users stores
     clean names — same tier rule as lifetime _is_self: a byte-exact single
     owner wins; otherwise a normalized (tags/dc stripped, case-folded) single
-    owner wins; genuine conflicts stay None for the dashboard /link flow.
+    owner wins; a drifted spelling then gets one last, deliberately
+    conservative fuzzy attempt (server.lib.names); genuine conflicts stay None
+    for the dashboard /link flow.
+    roster (optional) enables the elimination tier for names no amount of
+    spelling similarity can reach - see _tourney_roster_sync. Without a
+    roster the function is name-only and never guesses across accounts.
     Only positive hits are cached, so a mid-tourney /link heals on the next
     batch instead of sticking until process restart. Never raises.
     """
@@ -1494,6 +1566,44 @@ def _comp_map_names(names: list) -> dict:
                 continue
     except Exception:
         pass
+    # Fuzzy tier (unique + confident only): the last resort for a name that
+    # drifted further than a fold - the player who re-set their in-game
+    # username to a near-miss, typically on mobile with no companion row to
+    # heal from. One bounded candidate read per batch, and only when a name is
+    # still unmapped, so the hot path never pays for it. Near-ties, weak
+    # matches and twins stay None (dashboard /link resolves them). Uncached
+    # misses, so a later /link still heals on the next batch.
+    try:
+        _fuzzy = [n for n in (still or []) if out.get(n) is None
+                  and _comp_norm_key(n)][:10]
+    except Exception:
+        _fuzzy = []
+    if _fuzzy and supabase is not None:
+        try:
+            fres = supabase.table("bngc_users").select(
+                "discord_id,game_username").limit(
+                    _names_lib.MAX_CANDIDATES).execute()
+            pool = _names_lib.candidates_from_users(fres.data or [])
+            for n in _fuzzy:
+                try:
+                    did = _names_lib.fuzzy_pick(n, pool)
+                    if did:
+                        _comp_namemap[n] = did
+                        out[n] = did
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    # Elimination tier (roster-scoped, never cached): a stale registered name
+    # shares nothing with the in-game one, so spelling can't bridge it - the
+    # roster can. The wager creator's companion feed names itself correctly,
+    # so if exactly one name is still unknown and exactly one roster player
+    # never showed up, they are each other. Anything less stays None.
+    try:
+        if roster:
+            out.update(_names_lib.pair_leftover(roster, want, out, claimed))
+    except Exception:
+        pass
     return {n: out.get(n) for n in want}
 
 
@@ -1537,14 +1647,17 @@ def _comp_banked_keys(table: str, mid) -> set:
     return keys
 
 
-def _bank_open_events(*, table: str, seen: dict, mid, room, tag: str) -> int:
+def _bank_open_events(*, table: str, seen: dict, mid, room, tag: str,
+                      roster: dict | None = None) -> int:
     """Append fresh kill/leave rows into an already-open tourney match.
 
     Shared by the host writer and roster contributors: collects this view's
     recent killfeed, drops rows already banked (in-memory seen + DB check,
     both normalized so "cis6led" and "CIS6LED" are the same kill), maps names
     in one query, inserts the remainder. Unknown/twins stay null for /link.
-    Returns rows inserted. Never raises.
+    roster (optional) is the match's expected roster, which lets a name that
+    matches nothing be paired with the one player who never showed up under
+    their registered name. Returns rows inserted. Never raises.
     """
     try:
         kills = [k for k in (getattr(room, "recent_kills", None) or [])
@@ -1572,7 +1685,8 @@ def _bank_open_events(*, table: str, seen: dict, mid, room, tag: str) -> int:
         if not fresh_kills:
             return 0
         mapping = _comp_map_names([n for (_et, killer, victim) in fresh_kills
-                                   for n in (killer, victim)])
+                                   for n in (killer, victim)],
+                                  roster=roster)
         batch = [{
             "match_id": mid,
             "etype": "leave" if et == "left" else "kill",
@@ -1631,7 +1745,8 @@ def _comp_contribute(tid, code, session_id, discord_id, room, room_id) -> bool:
         if mid is None:
             return True  # member, but opens are host-owned
         _bank_open_events(table="bngc_comp_events", seen=_comp_seen,
-                          mid=mid, room=room, tag="contrib ")
+                          mid=mid, room=room, tag="contrib ",
+                          roster=_tourney_roster_sync(tid, _COMP_REG_TABLE))
         return True
     except Exception:
         return False
@@ -1664,10 +1779,32 @@ def _rt_contribute(tid, code, session_id, discord_id, room, room_id) -> bool:
         if mid is None:
             return True  # member, but opens are host-owned
         _bank_open_events(table="bngc_ranked_tourney_events", seen=_rt_seen,
-                          mid=mid, room=room, tag="rt contrib ")
+                          mid=mid, room=room, tag="rt contrib ",
+                          roster=_tourney_roster_sync(tid, _RT_REG_TABLE))
         return True
     except Exception:
         return False
+
+
+def _match_roster_sync(tourney, table) -> dict:
+    """Roster for the elimination tier, minus a spectating host.
+
+    A host who is not playing is a registrant who never enters the room, so
+    they must not be eligible to absorb an unknown name. Never raises.
+    """
+    try:
+        _t = tourney or {}
+        roster = _tourney_roster_sync(_t.get("id"), table)
+        try:
+            if _t.get("host_playing", True) is False:
+                drop = list(_t.get("hosts") or []) + [_t.get("created_by")]
+                for d in drop:
+                    roster.pop(str(d or ""), None)
+        except Exception:
+            pass
+        return roster
+    except Exception:
+        return {}
 
 
 def _comp_bank_alv(tourney, mid, room) -> None:
@@ -1752,7 +1889,8 @@ def _comp_bank_alv(tourney, mid, room) -> None:
         ordered += [n for n, d in info.items() if n not in ordered and d["alive"]]
         if not ordered:
             return
-        mapping = _comp_map_names(ordered)
+        mapping = _comp_map_names(
+            ordered, roster=_match_roster_sync(tourney, _COMP_REG_TABLE))
         rows = [{
             "match_id": mid,
             "etype": "alv",
@@ -1974,7 +2112,8 @@ def seal_comp_match(session_id, discord_id, room, room_id, gm) -> None:
             # unknown/twins stay null for the dashboard /link flow.
         try:
             batch = _bank_open_events(table="bngc_comp_events", seen=_comp_seen,
-                                      mid=mid, room=room, tag="")
+                                      mid=mid, room=room, tag="",
+                                      roster=_match_roster_sync(t, _COMP_REG_TABLE))
             if batch:
                 # auto-remove mapped leavers from the match roster (mirrors
                 # comp-intake leaves[]; host adds back via dashboard/bot)
@@ -2114,7 +2253,8 @@ def _rt_bank_alv(tourney, mid, room) -> None:
         ordered += [n for n, d in info.items() if n not in ordered and d["alive"]]
         if not ordered:
             return
-        mapping = _comp_map_names(ordered)
+        mapping = _comp_map_names(
+            ordered, roster=_match_roster_sync(tourney, _RT_REG_TABLE))
         rows = [{
             "match_id": mid,
             "etype": "alv",
@@ -2527,7 +2667,8 @@ def seal_ranked_tourney_match(session_id, discord_id, room, room_id, gm,
             # normalized), so host + roster contributors never double-bank;
             # unknown/twins stay null for the dashboard /link flow.
         _bank_open_events(table="bngc_ranked_tourney_events", seen=_rt_seen,
-                          mid=mid, room=room, tag="rt ")
+                          mid=mid, room=room, tag="rt ",
+                          roster=_match_roster_sync(t, _RT_REG_TABLE))
         # No phase-end handling here: sealing is decided above from last_stg.
     except Exception as exc:
         try:

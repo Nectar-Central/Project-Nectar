@@ -3697,9 +3697,9 @@ def _comp_announce_text(t: dict):
                 _c3 = int(t.get("coins_third") or 0)
                 lines += [
                     f"**PRIZES**:",
-                    f"1st = :nectar_coin: +{_c1:,} Coins",
-                    f"2nd = :nectar_coin: +{_c2:,} Coins",
-                    f"3rd = :nectar_coin: +{_c3:,} Coins",
+                    f"1st = {_c1:,} Nectar Coins",
+                    f"2nd = {_c2:,} Nectar Coins",
+                    f"3rd = {_c3:,} Nectar Coins",
                 ]
         except Exception:
             pass
