@@ -20,6 +20,7 @@ import views
 import alerts as alert_mod
 import ranked as ranked_mod
 import ranked_tourney as rt_mod
+import transfer as xfer_mod
 import duels as duels_mod
 import earn as earn_mod
 import comp_results
@@ -1478,6 +1479,141 @@ async def adminunlock_cmd(interaction: discord.Interaction, user: discord.User):
         await user.send("🔓 An admin unlocked your BuildNow account. You can continue.")
     except: pass
     await interaction.followup.send(f"🔓 Admin-unlocked {user.mention}.", ephemeral=True)
+
+_XFER_COLS = ",".join(
+    ["discord_id", "token", "transferred_to", "transferred_at",
+     xfer_mod.PLAYTIME_MAP_FIELD] +
+    list(xfer_mod.SUM_FIELDS) + list(xfer_mod.MAX_FIELDS) +
+    list(xfer_mod.EARLIEST_FIELDS) + list(xfer_mod.PROFILE_FIELDS))
+
+
+async def _xfer_read(sb, did: str):
+    """One bngc_users row for a transfer, or None. Never raises."""
+    try:
+        r = await db._sb_call(lambda: sb.table("bngc_users").select(_XFER_COLS)
+                              .eq("discord_id", str(did)).limit(1).execute())
+        rows = (getattr(r, "data", None) or [])
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+async def _xfer_ranked_points(sb, did: str) -> int:
+    """Ranked ladder points for an account; 0 on miss or pre-v240 DB."""
+    try:
+        r = await db._sb_call(lambda: sb.table("ranked_points").select("points")
+                              .eq("discord_id", str(did)).limit(1).execute())
+        rows = (getattr(r, "data", None) or [])
+        return int((rows[0] or {}).get("points") or 0) if rows else 0
+    except Exception:
+        return 0
+
+
+@admin_group.command(name="transfer", description="Move a player's profile + lifetime stats to another account")
+@app_commands.describe(source="Account to move data FROM",
+                       target="Account to move data TO",
+                       confirm="true = actually write it (default: preview only)")
+@app_commands.default_permissions(administrator=True)
+async def transfer_cmd(interaction: discord.Interaction, source: discord.User,
+                       target: discord.User, confirm: bool = False):
+    """Move one account's live profile and lifetime totals onto another.
+
+    Moves: in-game name/id, skin, pickaxe, kills, deaths, wins, defeats,
+    playtime, streaks, records, play points, nectar coins, tourney PR and
+    ranked ladder points. Historic rows (game events, comp/ranked matches,
+    registrations, per-tourney PR history, bets) stay on the old account, so
+    past boards keep showing what actually happened.
+
+    The source is then emptied and stamped, so it cannot be transferred twice
+    or farmed by re-registering. Dry run by default: re-run with
+    confirm=true to apply.
+    """
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("Administrator only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    sb = _comp_sb()
+    if sb is None:
+        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+    sid, tid = str(source.id), str(target.id)
+    if sid == tid:
+        return await interaction.followup.send("Source and target are the same account.", ephemeral=True)
+    src = await _xfer_read(sb, sid)
+    if not src:
+        return await interaction.followup.send(
+            f"No account found for {source.mention} - they have never registered.", ephemeral=True)
+    dst = await _xfer_read(sb, tid)
+    if not dst:
+        return await interaction.followup.send(
+            f"No account found for {target.mention} - they have never registered.", ephemeral=True)
+    src_pts = await _xfer_ranked_points(sb, sid)
+    dst_pts = await _xfer_ranked_points(sb, tid)
+    try:
+        plan = xfer_mod.plan_transfer(
+            src, dst, now_iso=datetime.now(timezone.utc).isoformat(),
+            ranked_points=src_pts)
+    except xfer_mod.TransferRefused as e:
+        return await interaction.followup.send(f"Refused: {e}", ephemeral=True)
+
+    name = src.get("game_username") or "(no game name)"
+    head = (f"**{name}** `{sid}`\n→ **{dst.get('game_username') or '(no game name)'}** "
+            f"`{tid}`\n")
+    if src_pts:
+        head += f"Ranked points: **{src_pts}** + {dst_pts} = **{src_pts + dst_pts}**\n"
+    lines = []
+    for f, a, b in plan["moves"]:
+        lines.append(f"`{f}`: {a} → {b}")
+    body = "\n".join(lines) or "Nothing to move."
+    warn = ("\n\n:warning: Historical matches stay on the old account, and per-tourney "
+            "PR/Elo history starts fresh on the new one. Re-apply the migration "
+            "`add_transfer_v261.sql` if `transferred_to` is missing.")
+
+    if not confirm:
+        preview = head + f"\n{body}\n\n**Dry run - nothing was written.**{warn}\nRun again with `confirm: true` to apply."
+        if len(preview) > 1900:
+            preview = preview[:1880] + "\n... (truncated)"
+        return await interaction.followup.send(preview, ephemeral=True)
+
+    t_patch, s_patch = dict(plan["target"]), dict(plan["source"])
+    for f in xfer_mod.SUM_FIELDS:
+        t_patch[f] = int(t_patch.get(f, 0) or 0)
+    for f in xfer_mod.MAX_FIELDS:
+        if f in ("tourney_pr", "daily_streak"):
+            continue
+        t_patch[f] = int(t_patch.get(f, 0) or 0)
+    try:
+        w1 = await db._sb_call(lambda: sb.table("bngc_users").update(t_patch)
+                               .eq("discord_id", tid).execute())
+        w2 = await db._sb_call(lambda: sb.table("bngc_users").update(s_patch)
+                               .eq("discord_id", sid).execute())
+    except Exception as e:
+        print(f"[transfer] write failed: {e}")
+        return await interaction.followup.send(
+            f"**Write failed - nothing else was changed:** {e}", ephemeral=True)
+    if not (getattr(w1, "data", None) and getattr(w2, "data", None)):
+        return await interaction.followup.send(
+            "**DB reported no rows written** - check the account ids and whether "
+            f"`add_transfer_v261.sql` is applied.\n{head}", ephemeral=True)
+
+    skipped = ""
+    if src_pts:
+        try:
+            await db._sb_call(lambda: sb.table("ranked_points").upsert(
+                [{"discord_id": tid, "points": src_pts + dst_pts,
+                  "updated_at": datetime.now(timezone.utc).isoformat()}],
+                on_conflict="discord_id").execute())
+            await db._sb_call(lambda: sb.table("ranked_points").delete()
+                              .eq("discord_id", sid).execute())
+        except Exception as e:
+            skipped = f"\n:warning: Ranked points **not** moved ({e}) - move them by hand."
+    done = head + f"\n**Applied.** {len(plan['moves'])} field(s) moved.\n{body}"
+    if skipped:
+        done += skipped
+    elif src_pts:
+        done += f"\nRanked points **{src_pts + dst_pts}**."
+    if len(done) > 1900:
+        done = done[:1880] + "\n... (truncated)"
+    return await interaction.followup.send(done + warn, ephemeral=True)
+
 
 @bot.tree.command(name="unlock", description="Unlock your account if it was default-locked")
 async def unlock_cmd(interaction: discord.Interaction):
