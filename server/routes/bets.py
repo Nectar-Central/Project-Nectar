@@ -30,6 +30,7 @@ from ..lib.supabase_client import supabase, db_io
 from ..lib.logger import log_sys
 from ..lib import bets as bets_lib
 from ..lib import coins as coins_lib
+from ..lib import names as names_lib
 from .coins import _apply_delta_sync, _missing_table, _MISSING_HINT
 
 router = APIRouter()
@@ -159,8 +160,17 @@ _SESS_FEED_KEYS = ("instigator", "instigated", "victim", "killer",
 
 
 def _resolve_names_sync(names: list[str]) -> dict[str, str]:
-    """game_username -> discord_id for registered users (exact match only —
-    money paths never guess on fold twins). Never raises."""
+    """game_username -> discord_id for registered users. Never raises.
+
+    Exact match first, then the shared conservative resolver
+    (server.lib.names): normalized match covers case/tag/`dc:` drift, and one
+    unique confident fuzzy hit covers a player who re-set their username to a
+    near-miss - usually the one mobile player in a room, whose only evidence
+    is the host's killfeed. Near-ties, weak matches and twins stay unmapped,
+    so a wager never pays against a guessed player; those bets refund as they
+    did before. Unmapped names are absent from the result. A candidate read
+    only happens when a name is still unresolved.
+    """
     try:
         clean = sorted({str(n or "").strip() for n in (names or [])
                         if str(n or "").strip()})[:200]
@@ -168,14 +178,33 @@ def _resolve_names_sync(names: list[str]) -> dict[str, str]:
             return {}
         res = supabase.table("bngc_users").select(
             "discord_id,game_username").in_("game_username", clean).execute()
-        out = {}
+        out: dict[str, str] = {}
+        owners: dict[str, set[str]] = {}
         for r in ((res.data if hasattr(res, "data") else []) or []):
             try:
                 g, d = r.get("game_username"), r.get("discord_id")
                 if g and d and str(g) in clean:
-                    out[str(g)] = str(d)
+                    owners.setdefault(str(g), set()).add(str(d))
             except Exception:
                 continue
+        # a name owned by two accounts is not guessable - leave it to the
+        # fuzzy tier, which is twin-guarded the same way
+        pending = list(clean)
+        for n, dids in owners.items():
+            if len(dids) == 1:
+                out[n] = next(iter(dids))
+                pending.remove(n)
+        if not pending:
+            return out
+        fres = supabase.table("bngc_users").select(
+            "discord_id,game_username").limit(
+                names_lib.MAX_CANDIDATES).execute()
+        pool = names_lib.candidates_from_users(
+            fres.data if hasattr(fres, "data") else [])
+        for n in pending:
+            did = names_lib.fuzzy_pick(n, pool)
+            if did:
+                out[n] = did
         return out
     except Exception:
         return {}

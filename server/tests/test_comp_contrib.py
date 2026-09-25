@@ -190,6 +190,26 @@ def test_map_twin_conflict_stays_null(monkeypatch):
     assert proc._comp_map_names(["cis6led"]) == {"cis6led": "A"}
 
 
+def test_map_fuzzy_typo_credits_single_owner(monkeypatch):
+    # mobile player drifted one character in-game; unique close owner maps
+    _sb_comp(monkeypatch)
+    assert proc._comp_map_names(["cis61ed"]) == {"cis61ed": "A"}
+
+
+def test_map_fuzzy_near_tie_stays_null(monkeypatch):
+    # two registered owners sit within the margin: nobody is guessable
+    _sb_comp(monkeypatch, users=[
+        {"game_username": "Void Eight", "discord_id": "A"},
+        {"game_username": "Void Eights", "discord_id": "Z"}])
+    assert proc._comp_map_names(["Void Eigh"]) == {"Void Eigh": None}
+
+
+def test_map_fuzzy_weak_stays_null(monkeypatch):
+    _sb_comp(monkeypatch)
+    assert proc._comp_map_names(["Totally Unrelated"]) == {
+        "Totally Unrelated": None}
+
+
 def test_map_heals_after_link_without_restart(monkeypatch):
     sb = _sb_comp(monkeypatch, users=list(USERS))
     assert proc._comp_map_names(["ghost"]) == {"ghost": None}

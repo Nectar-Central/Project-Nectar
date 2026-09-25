@@ -126,6 +126,19 @@ def test_alv_snapshot_order_and_winner(monkeypatch):
     assert by["C"]["placement"] == 2 and by["B"]["placement"] == 3
 
 
+def test_alv_fuzzy_maps_drifted_name(monkeypatch):
+    # roster name drifted a character (mobile player) - the snapshot still
+    # resolves the did so the player boards instead of dropping out
+    sb = _use_sb(monkeypatch, [])
+    room = _room({1: _player("cis61ed", 1, False),
+                  2: _player("chris7", 2, False)}, [], me_name="cis61ed")
+    proc._comp_bank_alv({"host_playing": True}, 9, room)
+    name, rows = sb.inserts[0]
+    assert name == "bngc_comp_events"
+    assert {r["actor_name"]: r["discord_id"] for r in rows} == {
+        "cis61ed": "A", "chris7": "B"}
+
+
 def test_alv_idempotent_on_retry(monkeypatch):
     sb = _use_sb(monkeypatch, [{"id": 1, "match_id": 9, "etype": "alv"}])
     proc._comp_bank_alv({"host_playing": True}, 9, ROOM)

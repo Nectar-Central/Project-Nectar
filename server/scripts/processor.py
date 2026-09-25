@@ -27,6 +27,9 @@ from server.lib.logger import log_sys, log_err, log_engine, log_ranked, log_dbg,
 # Strip color tags from player names (e.g. "<color=red>Player</color>" → "Player")
 from server.lib.gpbinary import _strip_color_tags
 
+# Shared conservative name resolver (killfeed/ALV game name -> discord_id)
+from server.lib import names as _names_lib
+
 # Retransmit window shared with the engine (killfeed can arrive twice with
 # different Photon framing: client RaiseEvent echo + server broadcast).
 from server.lib.photon_engine.engine import _KILL_DUP_WINDOW_MS
@@ -1418,12 +1421,14 @@ def _comp_norm_key(name) -> str:
 
 
 def _comp_map_names(names: list) -> dict:
-    """Batch game_username → discord_id. Exact-first, fold-fallback, twins None.
+    """Batch game_username → discord_id. Exact-first, fold-fallback, fuzzy last.
 
     Killfeed names drift (case, color tags, dc: prefix) while bngc_users stores
     clean names — same tier rule as lifetime _is_self: a byte-exact single
     owner wins; otherwise a normalized (tags/dc stripped, case-folded) single
-    owner wins; genuine conflicts stay None for the dashboard /link flow.
+    owner wins; a drifted spelling then gets one last, deliberately
+    conservative fuzzy attempt (server.lib.names); genuine conflicts stay None
+    for the dashboard /link flow.
     Only positive hits are cached, so a mid-tourney /link heals on the next
     batch instead of sticking until process restart. Never raises.
     """
@@ -1494,6 +1499,34 @@ def _comp_map_names(names: list) -> dict:
                 continue
     except Exception:
         pass
+    # Fuzzy tier (unique + confident only): the last resort for a name that
+    # drifted further than a fold - the player who re-set their in-game
+    # username to a near-miss, typically on mobile with no companion row to
+    # heal from. One bounded candidate read per batch, and only when a name is
+    # still unmapped, so the hot path never pays for it. Near-ties, weak
+    # matches and twins stay None (dashboard /link resolves them). Uncached
+    # misses, so a later /link still heals on the next batch.
+    try:
+        _fuzzy = [n for n in (still or []) if out.get(n) is None
+                  and _comp_norm_key(n)][:10]
+    except Exception:
+        _fuzzy = []
+    if _fuzzy and supabase is not None:
+        try:
+            fres = supabase.table("bngc_users").select(
+                "discord_id,game_username").limit(
+                    _names_lib.MAX_CANDIDATES).execute()
+            pool = _names_lib.candidates_from_users(fres.data or [])
+            for n in _fuzzy:
+                try:
+                    did = _names_lib.fuzzy_pick(n, pool)
+                    if did:
+                        _comp_namemap[n] = did
+                        out[n] = did
+                except Exception:
+                    continue
+        except Exception:
+            pass
     return {n: out.get(n) for n in want}
 
 
