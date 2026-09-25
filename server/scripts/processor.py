@@ -1985,8 +1985,48 @@ def _comp_bank_alv(tourney, mid, room) -> None:
 _comp_host_warned: set = set()  # (session, code) already told they're not host
 
 
-def _comp_series_complete(tid, series_len) -> bool:
-    """True when sealed+manual count reached series_len (0 = open-ended).
+def _burned_versions(deleted_versions) -> set:
+    """Version numbers this tourney has burned (deleted matches). Never raises.
+
+    Read defensively: a tourney row without the column (pre-migration) reads
+    as no tombstones, which is exactly the old behaviour.
+    """
+    out: set = set()
+    try:
+        for v in (deleted_versions or []):
+            try:
+                out.add(int(v))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def _next_match_version(match_table: str, tid, deleted_versions=None) -> int:
+    """Next version for a new match: max(surviving + burned) + 1.
+
+    A deleted match's number is retired, so the bridge never re-issues it and
+    a deleted match cannot be re-created under the same identity. Comp and
+    ranked tourneys share the counter per tourney, so engine versions cannot
+    be reused across rooms either. Never raises (0 on any failure).
+    """
+    try:
+        vres = supabase.table(match_table).select("version").eq(
+            "tourney_id", int(tid)).order("version", desc=True).limit(1).execute()
+        vrows = vres.data or []
+        seen = [int(r.get("version", -1)) for r in vrows if r.get("version") is not None]
+        return max(seen + list(_burned_versions(deleted_versions)) + [-1]) + 1
+    except Exception:
+        return 0
+
+
+def _comp_series_complete(tid, series_len, deleted_versions=None) -> bool:
+    """True when sealed+manual count plus burned slots reached series_len.
+
+    A deleted match still consumed its slot, so its version counts towards the
+    series: deleting a match can never un-finish a tourney and invite the
+    bridge to re-create it. (0 = open-ended.)
     Auto-opens stop here; dashboard manual blanks still allowed. Never raises."""
     try:
         sl = int(series_len or 0)
@@ -1997,7 +2037,7 @@ def _comp_series_complete(tid, series_len) -> bool:
     try:
         res = supabase.table("bngc_comp_matches").select("id").eq(
             "tourney_id", int(tid)).in_("status", ["sealed", "manual"]).limit(500).execute()
-        n = len(res.data or [])
+        n = len(res.data or []) + len(_burned_versions(deleted_versions))
         return n >= sl
     except Exception:
         return False
@@ -2044,7 +2084,8 @@ def seal_comp_match(session_id, discord_id, room, room_id, gm) -> None:
             last_stg = None
         try:
             tres = supabase.table("bngc_comp_tourneys").select(
-                "id,code,status,hosts,created_by,host_playing,series_len").eq("code", code).neq(
+                "id,code,status,hosts,created_by,host_playing,series_len,"
+                "deleted_versions").eq("code", code).neq(
                 "status", "ended").limit(2).execute()
             rows = tres.data or []
         except Exception as exc:
@@ -2136,22 +2177,19 @@ def seal_comp_match(session_id, discord_id, room, room_id, gm) -> None:
             # Series complete: no new auto-opens (manual dashboard blanks
             # still allowed — they bypass the bridge entirely).
             try:
-                if _comp_series_complete(tid, (t or {}).get("series_len")):
+                if _comp_series_complete(tid, (t or {}).get("series_len"),
+                                        (t or {}).get("deleted_versions")):
                     log_comp(f"tid={tid} code={code} series complete — auto-open ignored")
                     return
             except Exception:
                 pass
             # stG == 1: open a blank match, enable writes. Version is the
-            # per-tourney max+1 (rooms share the counter, so engine versions
-            # can't be reused across rooms). A lost insert race re-reads the
-            # winner's row instead of duplicating.
-            try:
-                vres = supabase.table("bngc_comp_matches").select("version").eq(
-                    "tourney_id", int(tid)).order("version", desc=True).limit(1).execute()
-                vrows = vres.data or []
-                ver = int(vrows[0].get("version", -1)) + 1 if vrows else 0
-            except Exception:
-                ver = 0
+            # per-tourney max+1 over surviving AND deleted versions (rooms
+            # share the counter, so engine versions can't be reused across
+            # rooms, and a deleted match's number stays retired). A lost
+            # insert race re-reads the winner's row instead of duplicating.
+            ver = _next_match_version("bngc_comp_matches", tid,
+                                      (t or {}).get("deleted_versions"))
             try:
                 ires = supabase.table("bngc_comp_matches").insert({
                     "tourney_id": tid, "version": ver,
@@ -2234,9 +2272,8 @@ def _rt_calc(tid, who="bridge"):
         return []
 
 
-def _rt_series_complete(tid, series_len) -> bool:
-    """True when sealed+manual count reached series_len (0 = open-ended).
-    Auto-opens stop here; dashboard manual blanks still allowed. Never raises."""
+def _rt_series_complete(tid, series_len, deleted_versions=None) -> bool:
+    """Ranked-tourney mirror of _comp_series_complete (same contract)."""
     try:
         sl = int(series_len or 0)
     except Exception:
@@ -2246,7 +2283,7 @@ def _rt_series_complete(tid, series_len) -> bool:
     try:
         res = supabase.table("bngc_ranked_tourney_matches").select("id").eq(
             "tourney_id", int(tid)).in_("status", ["sealed", "manual"]).limit(500).execute()
-        n = len(res.data or [])
+        n = len(res.data or []) + len(_burned_versions(deleted_versions))
         return n >= sl
     except Exception:
         return False
@@ -2600,7 +2637,8 @@ def seal_ranked_tourney_match(session_id, discord_id, room, room_id, gm,
             last_stg = None
         try:
             tres = supabase.table("bngc_ranked_tourneys").select(
-                "id,code,status,hosts,created_by,host_playing,series_len").eq("code", code).neq(
+                "id,code,status,hosts,created_by,host_playing,series_len,"
+                "deleted_versions").eq("code", code).neq(
                 "status", "ended").limit(2).execute()
             rows = tres.data or []
         except Exception as exc:
@@ -2708,22 +2746,19 @@ def seal_ranked_tourney_match(session_id, discord_id, room, room_id, gm,
             # Series complete: no new auto-opens (manual dashboard blanks
             # still allowed — they bypass the bridge entirely).
             try:
-                if _rt_series_complete(tid, (t or {}).get("series_len")):
+                if _rt_series_complete(tid, (t or {}).get("series_len"),
+                                       (t or {}).get("deleted_versions")):
                     log_comp(f"rt tid={tid} code={code} series complete — auto-open ignored")
                     return
             except Exception:
                 pass
             # stG == 1: open a blank match, enable writes. Version is the
-            # per-tourney max+1 (rooms share the counter, so engine versions
-            # can't be reused across rooms). A lost insert race re-reads the
-            # winner's row instead of duplicating.
-            try:
-                vres = supabase.table("bngc_ranked_tourney_matches").select("version").eq(
-                    "tourney_id", int(tid)).order("version", desc=True).limit(1).execute()
-                vrows = vres.data or []
-                ver = int(vrows[0].get("version", -1)) + 1 if vrows else 0
-            except Exception:
-                ver = 0
+            # per-tourney max+1 over surviving AND deleted versions (rooms
+            # share the counter, so engine versions can't be reused across
+            # rooms, and a deleted match's number stays retired). A lost
+            # insert race re-reads the winner's row instead of duplicating.
+            ver = _next_match_version("bngc_ranked_tourney_matches", tid,
+                                      (t or {}).get("deleted_versions"))
             try:
                 ires = supabase.table("bngc_ranked_tourney_matches").insert({
                     "tourney_id": tid, "version": ver,
