@@ -3259,6 +3259,13 @@ async def tourney_stop_cmd(interaction: discord.Interaction, tourney_id: int,
         except Exception as e:
             print(f"[comp] stop role strip failed: {e}")
         tail = f" ({stripped} role{'s' if stripped != 1 else ''} stripped)" if stripped else ""
+        # team colour roles: handed out at /tourney-start, taken back here so a
+        # finished tourney does not leave its colours on people's profiles
+        team_stripped = await _comp_strip_team_roles(interaction.guild,
+                                                     int(tourney_id))
+        if team_stripped:
+            tail += (f" · 🎨 {team_stripped} team role"
+                     f"{'s' if team_stripped != 1 else ''} removed")
         # auto-compute Tourney PR on close (idempotent; unattributed kills
         # simply don't count — every accepted signup now holds a profile).
         pr_board: list = []
@@ -5563,7 +5570,32 @@ TEAM_COLORS = ["🔵", "🔴", "🟠", "🟡", "🟢", "🟣"]
 from teams import (configured_team_role_ids as _comp_team_role_ids_set,  # noqa: E402
                    team_color as _comp_team_color,
                    team_role_id as _comp_team_role_id,
+                   team_role_strip_targets as _comp_team_strip_targets,
                    team_slots as _comp_team_slots)
+
+
+async def _comp_strip_team_roles(guild, tourney_id) -> int:
+    """Take every configured team role back off a tourney's players. Never raises.
+
+    Ends the colours with the tourney: /tourney-start hands them out and
+    /tourney-stop takes them back, so nobody walks away still wearing a team
+    role from a finished cup. Targets every registered member, not just the
+    live teams, because a banned or re-signed duo may still hold theirs.
+    """
+    out = 0
+    try:
+        if guild is None:
+            return 0
+        roles = _comp_team_role_ids_set()
+        if not roles:
+            return 0
+        for did, rid in _comp_team_strip_targets(await _comp_reg_rows(tourney_id), roles):
+            if await _comp_remove_role(guild, did, rid,
+                                      reason=f"Comp tourney #{tourney_id} ended"):
+                out += 1
+    except Exception as e:
+        print(f"[comp] stop team role strip failed: {e}")
+    return out
 
 
 async def _comp_sync_team_roles(guild, sb, tourney) -> dict:

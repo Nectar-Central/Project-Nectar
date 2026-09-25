@@ -119,6 +119,55 @@ def test_a_banned_team_does_not_shift_the_next_teams_colour():
     assert t.team_color(live[1][1]) == t.team_color(1)   # id 3 -> slot 1
 
 
+# --- ending a tourney takes the team roles back off -----------------------
+
+def test_every_team_role_is_stripped_from_every_member():
+    t = _teams()
+    rows = [{"member_ids": ["A", "B"], "status": "accepted"},
+            {"member_ids": ["C", "D"], "status": "accepted"}]
+    got = t.team_role_strip_targets(rows, t.configured_team_role_ids())
+    assert len(got) == 4 * len(t.configured_team_role_ids())   # every pair
+    assert {d for d, _r in got} == {"A", "B", "C", "D"}
+
+
+def test_a_banned_or_removed_team_is_stripped_too():
+    # it may still be wearing the role it was granted
+    t = _teams()
+    rows = [{"member_ids": ["A"], "status": "banned"},
+            {"member_ids": ["B"], "status": "rejected"},
+            {"member_ids": ["C"], "status": "accepted"}]
+    got = t.team_role_strip_targets(rows, t.configured_team_role_ids())
+    assert {d for d, _r in got} == {"A", "B", "C"}
+
+
+def test_strip_targets_cover_only_configured_roles():
+    t = _teams()
+    got = t.team_role_strip_targets([{"member_ids": ["A"]}], ["111", "", "222"])
+    assert got == [("A", "111"), ("A", "222")]
+
+
+def test_nothing_to_strip_without_configured_roles():
+    t = _teams()
+    assert t.team_role_strip_targets([{"member_ids": ["A"]}], []) == []
+    assert t.team_role_strip_targets([{"member_ids": ["A"]}], None) == []
+
+
+def test_strip_targets_survive_junk():
+    t = _teams()
+    got = t.team_role_strip_targets([None, {}, {"member_ids": [None, "", "A"]}],
+                                    t.configured_team_role_ids())
+    assert {d for d, _r in got} == {"A"}
+
+
+def test_strip_targets_are_deterministic():
+    # a set of role ids would otherwise iterate in arbitrary order
+    t = _teams()
+    rows = [{"member_ids": ["A"]}]
+    roles = t.configured_team_role_ids()
+    assert (t.team_role_strip_targets(rows, roles)
+            == t.team_role_strip_targets(rows, roles))
+
+
 # --- the read order has to be stable ---------------------------------------
 
 class _Q:
