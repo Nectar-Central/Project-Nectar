@@ -2,21 +2,50 @@
 
 A team is identified by its ORDER in the tourney roster - the same order the
 intake assigns it - and there are six slots, so colour and role cycle
-together past six teams. Roles are configuration (COMP_TEAM_ROLE_1..6) so
-the ids live in the environment and never in code; an unset slot grants
-nothing and is never stripped.
+together past six teams.
+
+TEAM_COLORS and DEFAULT_TEAM_ROLE_IDS are in lockstep by index and MUST stay
+that way: slot N's colour is the colour of the role it grants, so reordering
+one without the other hands a team a role that disagrees with the board.
+
+Role ids default to the six roles that exist on the Nectar server, so a fresh
+deployment grants the right roles with no extra setup. COMP_TEAM_ROLE_1..6
+override them per slot, and a variable that is set but EMPTY disables that
+slot (distinct from not being set, which means "use the default"). An unset
+slot grants nothing and is never stripped.
 
 Kept in its own module so it can be imported (and unit-tested) without
 dragging in the bot's command tree.
 """
 import os
 
-TEAM_COLORS = ["🔵", "🔴", "🟠", "🟡", "🟢", "🟣"]
+# blue, red, green, yellow, orange, purple
+TEAM_COLORS = ["🔵", "🔴", "🟢", "🟡", "🟠", "🟣"]
 
 TEAM_SLOTS = len(TEAM_COLORS)
 
-TEAM_ROLE_IDS = [os.getenv(f"COMP_TEAM_ROLE_{i}", "").strip()
-                 for i in range(1, TEAM_SLOTS + 1)]
+DEFAULT_TEAM_ROLE_IDS = [
+    "1553079575452450977",  # 1 blue
+    "1553079824124223690",  # 2 red
+    "1553079938599358605",  # 3 green
+    "1553080070019481750",  # 4 yellow
+    "1553080214240624750",  # 5 orange
+    "1553080641502056458",  # 6 purple
+]
+
+
+def _configured_role_id(slot: int) -> str:
+    """Env override for a slot, else the shipped default, else "".
+
+    Absent means "use the default"; present-but-empty means "no role here".
+    """
+    raw = os.getenv(f"COMP_TEAM_ROLE_{slot}")
+    if raw is None:
+        return DEFAULT_TEAM_ROLE_IDS[slot - 1]
+    return str(raw or "").strip()
+
+
+TEAM_ROLE_IDS = [_configured_role_id(i) for i in range(1, TEAM_SLOTS + 1)]
 
 
 def team_color(index) -> str:
