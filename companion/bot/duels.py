@@ -3077,6 +3077,29 @@ async def _stall_refund(bot, w: dict):
         print(f"[duels] _stall_refund failed: {e}")
 
 
+async def recent_event_iso(discord_id: str) -> str | None:
+    """Newest bngc_game_events timestamp for one player, or None. Never raises.
+
+    Presence evidence the AFK guard can trust: a row only exists because this
+    player's own companion reported it, so it beats a heartbeat that is
+    written best-effort under a 6s deadline (and is NULL for anyone who has
+    never been captured).
+    """
+    try:
+        sb = _sb()
+        if sb is None or not discord_id:
+            return None
+        r = await db._sb_call(lambda: sb.table("bngc_game_events").select(
+            "created_at").eq("discord_id", str(discord_id)).order(
+            "created_at", desc=True).limit(1).execute())
+        rows = (r.data if hasattr(r, "data") else []) or []
+        if not rows:
+            return None
+        return str((rows[0] or {}).get("created_at") or "") or None
+    except Exception:
+        return None
+
+
 async def _afk_guard(bot, w: dict) -> bool:
     """Cancel + refund when a duelist has been offline too long.
 
@@ -3085,7 +3108,16 @@ async def _afk_guard(bot, w: dict) -> bool:
     for the full stall window. Anyone offline longer than
     WAGER_AFK_CANCEL_SEC after the duel went live ends it for both, with a
     refund and a thread teardown. Returns True when the wager was cancelled.
-    Never raises.
+
+    Fails OPEN, because this is the only thing in the resolver that moves
+    real coins. `last_online` is stamped best-effort on every capture batch
+    under a 6s deadline and is NULL for anyone never captured, so an unknown
+    stamp (NULL, unparsable, failed read) is not evidence of absence. A
+    duelist with their own duel rows inside the window is demonstrably
+    playing and is never counted as offline, whatever the heartbeat says.
+    The trade: a duelist whose stamp was NEVER written cannot trip this
+    guard at all - `/wager expires` and the 24h stall refund still cover
+    abandonment. Never raises.
     """
     try:
         grace = int(os.getenv("WAGER_AFK_GRACE_SEC", "900") or 900)   # ignore the first 15 min
@@ -3096,6 +3128,7 @@ async def _afk_guard(bot, w: dict) -> bool:
         age = (datetime.now(timezone.utc) - since).total_seconds()
         if age < grace:
             return False  # still inside the grace window
+        now = datetime.now(timezone.utc)
         rows = {}
         for uid in (str(w.get("creator_id") or ""), str(w.get("opponent_id") or "")):
             if not uid:
@@ -3103,16 +3136,27 @@ async def _afk_guard(bot, w: dict) -> bool:
             try:
                 rows[uid] = await db.get_by_discord(uid) or {}
             except Exception:
-                rows[uid] = {}
+                rows[uid] = None      # read failed: unknown, never offline
         offline = []
         for uid, row in rows.items():
             try:
+                if row is None:
+                    continue             # unknown heartbeat: fail open
                 online, ts = db.online_status(row.get("last_online"), limit)
             except Exception:
-                online, ts = False, None
+                continue
             if not online:
+                if ts is None:
+                    continue             # NULL/unparsable stamp: unknown
+                # their own duel rows are the stronger presence signal
                 try:
-                    idle = int((datetime.now(timezone.utc).timestamp()
+                    seen = _parse_ts(await recent_event_iso(uid))
+                except Exception:
+                    seen = None
+                if seen is not None and (now - seen).total_seconds() <= limit:
+                    continue
+                try:
+                    idle = int((now.timestamp()
                                 - float(ts.timestamp())) if ts else 10 ** 9)
                 except Exception:
                     idle = 10 ** 9
