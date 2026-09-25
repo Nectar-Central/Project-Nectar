@@ -67,6 +67,29 @@ def team_role_id(index) -> str:
         return ""
 
 
+def team_slots(rows) -> list:
+    """(row, slot) for every non-banned row, in the order given.
+
+    The slot is the row's POSITION among live teams, so a team's colour, its
+    role and its number all come from one index and cannot disagree.
+
+    Callers MUST pass rows in a stable order - registration id, which is a
+    monotonic identity. An unstable order is precisely what let a team end up
+    displaying one team's colour while holding another team's role: Postgres
+    guarantees no row order without ORDER BY, so the same team could land in a
+    different slot on every sync. Never raises.
+    """
+    out: list = []
+    try:
+        for r in (rows or []):
+            if str((r or {}).get("status") or "") == "banned":
+                continue
+            out.append((r, len(out)))
+    except Exception:
+        pass
+    return out
+
+
 def configured_team_role_ids() -> set:
     """Every configured team role id - the ones to strip from a member who
     is no longer on that team. Never raises."""

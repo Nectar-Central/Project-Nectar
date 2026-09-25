@@ -2685,13 +2685,22 @@ async def tourney_cmd(interaction: discord.Interaction, code: str, name: str):
 
 
 async def _comp_reg_rows(tourney_id):
-    """All registration rows for a tourney (id, members, status, source msg). Never raises."""
+    """All registration rows for a tourney, in REGISTRATION order. Never raises.
+
+    ORDER BY id is load-bearing, not cosmetic: `id` is a monotonic identity, so
+    this is the one order that means "the order the teams signed up". The team
+    slot is the row's position in this list, and the slot decides both the
+    colour and the Discord role - so an unordered read (Postgres promises
+    nothing without ORDER BY) is what let a team show one team's colour while
+    holding another team's role.
+    """
     try:
         sb = _comp_sb()
         if sb is None:
             return []
         res = await db._sb_call(lambda: sb.table("bngc_comp_registrations").select(
-            "id,member_ids,status,source_message_id,team_color").eq("tourney_id", int(tourney_id)).limit(1000).execute())
+            "id,member_ids,status,source_message_id,team_color").eq("tourney_id", int(tourney_id)).order(
+            "id").limit(1000).execute())
         return res.data or []
     except Exception:
         return []
@@ -5469,11 +5478,33 @@ async def tourney_start_cmd(interaction: discord.Interaction, tourney_id: int,
     try:
         from datetime import datetime, timezone
         tres = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select(
-            "id,code,name,status,player_role_id").eq("id", int(tourney_id)).limit(1).execute())
+            "id,code,name,status,mode,player_role_id").eq("id", int(tourney_id)).limit(1).execute())
         if not tres.data:
             return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
         t = tres.data[0]
         role_id = (str(role_to_give.id) if role_to_give else None) or t.get("player_role_id") or COMP_PLAYER_ROLE_ID
+        # Team colour roles land HERE, not at signup: this is the first moment
+        # the roster is final, so each member's role is the one matching the
+        # colour already frozen on their signup message. Runs before the
+        # player-role branch so it happens even with no player role set.
+        teams_out = {}
+        try:
+            teams_out = await _comp_sync_team_roles(
+                interaction.guild, sb, {"id": int(tourney_id),
+                                        "mode": t.get("mode") or "solo"})
+        except Exception as e:
+            print(f"[comp] start team role sync failed: {e}")
+        team_line = ""
+        if teams_out and not teams_out.get("solo"):
+            if teams_out.get("no_role_config"):
+                team_line = ("\n:warning: No team roles configured - colours "
+                             "refreshed only.")
+            else:
+                team_line = (f"\nTeam roles: **{teams_out.get('granted', 0)}** granted"
+                             f" · **{teams_out.get('stripped', 0)}** stale removed"
+                             f" across **{teams_out.get('teams', 0)}** teams"
+                             + (f" · **{teams_out['recolored']}** colour(s) corrected"
+                                if teams_out.get("recolored") else ""))
         if role_to_give is not None:
             try:
                 await db._sb_call(lambda: sb.table("bngc_comp_tourneys").update(
@@ -5492,7 +5523,8 @@ async def tourney_start_cmd(interaction: discord.Interaction, tourney_id: int,
                 pass
             return await interaction.followup.send(
                 f"🚀 Tourney **#{tourney_id}** started ({len(dids)} players) — "
-                f"no player role configured, nobody to give it to. Pass `role_to_give`.",
+                f"no player role configured, nobody to give it to. Pass `role_to_give`."
+                + team_line,
                 ephemeral=True)
         ok = 0
         for did in dids:
@@ -5516,7 +5548,8 @@ async def tourney_start_cmd(interaction: discord.Interaction, tourney_id: int,
                 print(f"[comp] start tag failed: {e}")
         extra = "" if ok == len(dids) else f" ({len(dids) - ok} failed — check role order/perms)"
         return await interaction.followup.send(
-            f"🚀 Tourney **#{tourney_id}** started — role to {ok}/{len(dids)} players.{extra}",
+            f"🚀 Tourney **#{tourney_id}** started — role to {ok}/{len(dids)} players.{extra}"
+            + team_line,
             ephemeral=True)
     except Exception as e:
         return await interaction.followup.send(f"Couldn't start: {e}", ephemeral=True)
@@ -5529,17 +5562,28 @@ TEAM_COLORS = ["🔵", "🔴", "🟠", "🟡", "🟢", "🟣"]
 # bot's command tree; these names keep the existing call sites readable.
 from teams import (configured_team_role_ids as _comp_team_role_ids_set,  # noqa: E402
                    team_color as _comp_team_color,
-                   team_role_id as _comp_team_role_id)
+                   team_role_id as _comp_team_role_id,
+                   team_slots as _comp_team_slots)
 
 
 async def _comp_sync_team_roles(guild, sb, tourney) -> dict:
     """Re-derive duo team colors and re-grant each team's Discord roles.
 
-    Colors are keyed by team order (the same intake order that produced them)
-    and are FROZEN on the registration row, so after a team is added or
-    dropped the stored values drift. Roles are keyed by the same index and
-    are stripped-then-granted, mirroring _ranked_sync_member_roles, so a
-    player who moved teams never keeps the old colour role.
+    Colour and role both come from ONE slot per team - the row's position
+    among live teams, in registration order (see _comp_reg_rows). Deriving
+    them separately is what swapped them: the colour used to be frozen from a
+    count taken at intake while the role came from the row's position, and
+    those two disagree whenever the read order does.
+
+    Colors are FROZEN on the registration row because they are the reaction the
+    players see on their signup message, so a drift is corrected here. Roles
+    are stripped-then-granted from the same slot, mirroring
+    _ranked_sync_member_roles, so a player who moved teams never keeps the old
+    colour role.
+
+    Called from /tourney-start (roster final) and /tourney-refresh-teams -
+    NOT at signup, so nobody wears a team role for a tourney that never
+    started.
 
     Returns {"teams", "members", "granted", "stripped", "recolored",
     "no_role_config", "solo"}. Never raises.
@@ -5555,13 +5599,12 @@ async def _comp_sync_team_roles(guild, sb, tourney) -> dict:
         if str(t.get("mode") or "solo").lower() != "duo":
             out["solo"] = True
             return out
-        rows = await _comp_reg_rows(tid)
-        live = [r for r in (rows or []) if str((r or {}).get("status") or "") != "banned"]
-        out["teams"] = len(live)
-        if not live:
+        slots = _comp_team_slots(await _comp_reg_rows(tid))
+        out["teams"] = len(slots)
+        if not slots:
             return out
         # first pass: colours (a write, so do it before the rate-limited grants)
-        for idx, r in enumerate(live):
+        for r, idx in slots:
             try:
                 want = _comp_team_color(idx)
                 if str((r or {}).get("team_color") or "") != want:
@@ -5574,7 +5617,7 @@ async def _comp_sync_team_roles(guild, sb, tourney) -> dict:
         if guild is None:
             return out
         every = _comp_team_role_ids_set()
-        for idx, r in enumerate(live):
+        for r, idx in slots:
             want_role = _comp_team_role_id(idx)
             for did in ((r or {}).get("member_ids") or []):
                 did = str(did or "").strip()
@@ -6181,17 +6224,12 @@ async def on_message(message):
                 await _comp_grant_role(message.guild, _did, _rid)
         except Exception as e:
             print(f"[comp] intake role grant failed: {e}")
-        # duo: also grant THIS team's role (and strip any other team role, so a
-        # player who re-signed with a new partner never keeps the old one).
-        if color:
-            try:
-                await _comp_sync_team_roles(message.guild, sb, {
-                    "id": int(t["id"]), "mode": (t or {}).get("mode") or "duo"})
-            except Exception as e:
-                print(f"[comp] intake team role grant failed: {e}")
         # intake verdict right on the message: team color (duo) / ✅ solo,
         # ❌ only on failure paths above. Host ✅/❌ moderation still works:
         # hosts are different users, so their reactions are distinct.
+        # NOTE: no team Discord role is granted here. The roster is still
+        # changing at signup, so a slot (and therefore a colour and a role)
+        # can still move; roles land at /tourney-start, when it is final.
         try:
             await message.add_reaction(color or "✅")
         except Exception as e:
