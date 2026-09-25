@@ -11,8 +11,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from transfer import (  # noqa: E402
-    EARLIEST_FIELDS, MAX_FIELDS, PROFILE_FIELDS, SUM_FIELDS,
-    TransferRefused, plan_transfer,
+    EARLIEST_FIELDS, MAX_FIELDS, PROFILE_FIELDS, SOURCE_RESET_DEFAULTS,
+    SUM_FIELDS, TransferRefused, plan_transfer,
 )
 
 NOW = "2026-01-02T03:04:05+00:00"
@@ -117,8 +117,12 @@ class TestSourceEmptied:
 
     def test_profile_cleared(self):
         s = plan_transfer(_src(), _dst(), now_iso=NOW)["source"]
+        # identity is cleared; NOT NULL columns reset to their default instead
         for f in PROFILE_FIELDS:
-            assert s[f] is None
+            if f in SOURCE_RESET_DEFAULTS:
+                assert s[f] == SOURCE_RESET_DEFAULTS[f]
+            else:
+                assert s[f] is None
         assert s["playtime_per_gm"] == {}
 
     def test_stamped_with_the_target(self):
@@ -130,6 +134,45 @@ class TestSourceEmptied:
         s = plan_transfer(_src(), _dst(), now_iso=NOW)["source"]
         for keep in ("token", "discord_id", "discord_username", "is_locked"):
             assert keep not in s
+
+
+class TestNotNullColumns:
+    """The source is emptied, so a NOT NULL column must reset to its default.
+
+    Regression: lobby_music_volume is `not null default 0.5`, and nulling it
+    aborted the whole transfer with a 23502.
+    """
+
+    def test_source_never_writes_null_into_a_not_null_profile_column(self):
+        s = plan_transfer(_src(), _dst(), now_iso=NOW)["source"]
+        for f, default in SOURCE_RESET_DEFAULTS.items():
+            assert f in PROFILE_FIELDS
+            assert s[f] == default, f"{f} would violate its NOT NULL constraint"
+
+    def test_lobby_music_volume_resets_to_the_column_default(self):
+        s = plan_transfer(_src(lobby_music_volume=0.9), _dst(), now_iso=NOW)["source"]
+        assert s["lobby_music_volume"] == 0.5
+
+    def test_nullable_profile_fields_are_still_cleared(self):
+        s = plan_transfer(_src(), _dst(), now_iso=NOW)["source"]
+        for f in ("game_username", "game_id", "skin", "pickaxe", "lobby_music_url"):
+            assert f not in SOURCE_RESET_DEFAULTS
+            assert s[f] is None
+
+    def test_the_targets_volume_is_taken_from_the_source(self):
+        t = plan_transfer(_src(lobby_music_volume=0.9), _dst(lobby_music_volume=0.2),
+                          now_iso=NOW)["target"]
+        assert t["lobby_music_volume"] == 0.9
+
+    def test_no_source_patch_value_is_none_for_a_sum_or_max_field(self):
+        s = plan_transfer(_src(), _dst(), now_iso=NOW)["source"]
+        for f in SUM_FIELDS + MAX_FIELDS:
+            assert s[f] is not None
+
+    def test_reset_defaults_cover_every_declared_field(self):
+        # a reset default for a field that is not transferred would be dead
+        for f in SOURCE_RESET_DEFAULTS:
+            assert f in PROFILE_FIELDS
 
 
 class TestRefusals:

@@ -1539,19 +1539,47 @@ async def transfer_cmd(interaction: discord.Interaction, source: discord.User,
         if f in ("tourney_pr", "daily_streak"):
             continue
         t_patch[f] = int(t_patch.get(f, 0) or 0)
+
+    async def _rollback_target():
+        """Put the target back the way it was. The target is written FIRST so
+        that a failure here can never destroy the source's data - which means a
+        later failure has to undo this write, or the stats exist on both
+        accounts."""
+        restore = {f: dst.get(f) for f in t_patch}
+        try:
+            await db._sb_call(lambda: sb.table("bngc_users").update(restore)
+                              .eq("discord_id", tid).execute())
+            return True
+        except Exception as e:
+            print(f"[transfer] ROLLBACK FAILED for {tid}: {e}")
+            return False
+
     try:
         w1 = await db._sb_call(lambda: sb.table("bngc_users").update(t_patch)
                                .eq("discord_id", tid).execute())
+    except Exception as e:
+        print(f"[transfer] target write failed: {e}")
+        return await interaction.followup.send(
+            f"**Write failed - nothing was changed:** {e}", ephemeral=True)
+    if not getattr(w1, "data", None):
+        return await interaction.followup.send(
+            "**DB reported no rows written for the target** - check the account id "
+            f"and whether `add_transfer_v261.sql` is applied.\n{head}", ephemeral=True)
+    try:
         w2 = await db._sb_call(lambda: sb.table("bngc_users").update(s_patch)
                                .eq("discord_id", sid).execute())
+        if not getattr(w2, "data", None):
+            raise RuntimeError("DB reported no rows written for the source account")
     except Exception as e:
-        print(f"[transfer] write failed: {e}")
+        print(f"[transfer] source write failed: {e}")
+        if await _rollback_target():
+            return await interaction.followup.send(
+                f"**Write failed - the target was rolled back, so nothing changed:** {e}",
+                ephemeral=True)
         return await interaction.followup.send(
-            f"**Write failed - nothing else was changed:** {e}", ephemeral=True)
-    if not (getattr(w1, "data", None) and getattr(w2, "data", None)):
-        return await interaction.followup.send(
-            "**DB reported no rows written** - check the account ids and whether "
-            f"`add_transfer_v261.sql` is applied.\n{head}", ephemeral=True)
+            f"**Write failed and the rollback ALSO failed - the data may now be on "
+            f"both accounts. Do NOT retry; check `{tid}` by hand before touching "
+            f"`{sid}` again.**\n{e}", ephemeral=True)
 
     skipped = ""
     if src_pts:
