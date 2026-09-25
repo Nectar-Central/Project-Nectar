@@ -67,6 +67,59 @@ def team_role_id(index) -> str:
         return ""
 
 
+def team_slots(rows) -> list:
+    """(row, slot) for every non-banned row, in the order given.
+
+    The slot is the row's POSITION among live teams, so a team's colour, its
+    role and its number all come from one index and cannot disagree.
+
+    Callers MUST pass rows in a stable order - registration id, which is a
+    monotonic identity. An unstable order is precisely what let a team end up
+    displaying one team's colour while holding another team's role: Postgres
+    guarantees no row order without ORDER BY, so the same team could land in a
+    different slot on every sync. Never raises.
+    """
+    out: list = []
+    try:
+        for r in (rows or []):
+            if str((r or {}).get("status") or "") == "banned":
+                continue
+            out.append((r, len(out)))
+    except Exception:
+        pass
+    return out
+
+
+def team_role_strip_targets(rows, role_ids) -> list:
+    """[(discord_id, role_id)] to strip when a tourney ends. Never raises.
+
+    EVERY configured team role is removed from EVERY member of every
+    registration row - not just the live teams. A duo that was banned, removed
+    or re-signed up with a new partner may still be wearing the role it was
+    granted, and leaving it behind is how a finished tourney's colours keep
+    showing on someone's profile.
+
+    Deliberately mode-agnostic: a solo tourney has no teams of its own, but
+    its players can still hold a team role from an earlier duo tourney, and
+    ending any tourney is the natural moment to clean that up.
+    """
+    out: list = []
+    try:
+        roles = sorted({str(r or "").strip() for r in (role_ids or []) if str(r or "").strip()})
+        if not roles:
+            return out
+        for row in (rows or []):
+            for did in ((row or {}).get("member_ids") or []):
+                did = str(did or "").strip()
+                if not did:
+                    continue
+                for rid in roles:
+                    out.append((did, rid))
+    except Exception:
+        pass
+    return out
+
+
 def configured_team_role_ids() -> set:
     """Every configured team role id - the ones to strip from a member who
     is no longer on that team. Never raises."""
