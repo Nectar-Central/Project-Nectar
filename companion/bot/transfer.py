@@ -44,6 +44,13 @@ PROFILE_FIELDS = (
     "lobby_music_url", "lobby_music_volume",
 )
 
+# PROFILE_FIELDS whose column is NOT NULL with a default. The source is
+# emptied, but these reset to the column default instead of null - writing
+# null here is a 23502 and aborts the whole transfer. Keep this list in step
+# with PROFILE_FIELDS: anything here that is nullable is merely untidy, and
+# anything NOT NULL that is missing is a transfer that cannot be applied.
+SOURCE_RESET_DEFAULTS = {"lobby_music_volume": 0.5}
+
 # Never moved: token (auth), lock state, discord_username (the target's own
 # identity), last_online/last_seen (live presence, not data).
 KEEP_ON_SOURCE = (
@@ -170,10 +177,12 @@ def plan_transfer(source: dict, target: dict, now_iso: str = "",
         moves.append((PLAYTIME_MAP_FIELD, "source map", f"{len(merged)} modes"))
 
     # The source is left empty and stamped, so the same stats cannot be moved
-    # twice or farmed by re-registering the old account.
+    # twice or farmed by re-registering the old account. NOT NULL columns with
+    # a default reset to that default, never to null.
     s_patch: dict = {f: 0 for f in SUM_FIELDS}
     s_patch.update({f: 0 for f in MAX_FIELDS})
     s_patch.update({f: None for f in PROFILE_FIELDS})
+    s_patch.update(SOURCE_RESET_DEFAULTS)
     s_patch["playtime_per_gm"] = {}
     s_patch["transferred_to"] = tid
     s_patch["transferred_at"] = _ts(now_iso) or None
