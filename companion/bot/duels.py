@@ -798,9 +798,11 @@ def kill_race_seal(room_id, match_version, kills_c, kills_o, winner) -> dict:
 def room_evidence(events, since_iso: str = "") -> list:
     """Private rooms with duel evidence, freshest first.
 
-    [{room_id, code, last_ts, count}] — public rooms (no code) are excluded,
+    [{room_id, code, last_ts, count, gm}] — public rooms (no code) are excluded,
     and rows older than the duel started are ignored. This is what a room
-    rebind decides on. Never raises.
+    rebind decides on, and gm is carried so a wager can never bind a room
+    whose game mode is not its own (grouping would drop every row of the
+    real room as "gm != mode"). Never raises.
     """
     out: dict = {}
     try:
@@ -823,10 +825,16 @@ def room_evidence(events, since_iso: str = "") -> list:
                 if t is not None and t.timestamp() < since_ts:
                     continue
             row = out.setdefault(rid, {"room_id": rid, "code": code,
-                                       "last_ts": "", "count": 0})
+                                       "last_ts": "", "count": 0, "gm": ""})
             row["count"] += 1
+            gm = str(gd.get("gm") or "").strip()
             if ts > str(row["last_ts"]):
                 row["last_ts"] = ts
+                if gm:
+                    row["gm"] = gm
+            elif gm and not row["gm"]:
+                # newest row carried no gm: keep the mode this room did show
+                row["gm"] = gm
         except Exception:
             continue
     rows = list(out.values())
@@ -842,21 +850,45 @@ def _rebind_idle_sec() -> int:
         return 180
 
 
+def _room_mode_ok(mode: str, room) -> bool:
+    """Is this room a candidate for a wager on `mode`?
+
+    A room with no gm on any row is kept: unknown mode must never strand a
+    wager that is otherwise working. Never raises.
+    """
+    try:
+        if not mode:
+            return True
+        gm = str((room or {}).get("gm") or "").strip()
+        if not gm:
+            return True
+        return gm_matches(mode, gm)
+    except Exception:
+        return True
+
+
 def choose_bound_room(bound_room: str, rooms, now_iso: str,
-                      bound_code: str = "") -> tuple:
+                      bound_code: str = "", mode: str = "") -> tuple:
     """Which room is this duel in now? (room_id, code, action).
 
     bind    — nothing bound yet: take the room with the FRESHEST evidence
               (binding matches[0] took the OLDEST room ever seen).
     keep    — the bound room is still being played: it wins, so both duelists
               cannot farm unrelated rooms.
-    rebind  — the bound room has been quiet for WAGER_REBIND_IDLE_SEC, so the
-              duel moved (crash → lobby → new room, same or new code).
+    rebind  -bound room has been quiet for WAGER_REBIND_IDLE_SEC, so the
+              duel moved, OR the bound room is a different game mode than
+              this wager (see the mode filter below).
     none    — no usable private room.
     Never raises.
     """
     try:
         rooms = [r for r in (rooms or []) if isinstance(r, dict) and r.get("room_id")]
+        # A room of another game mode can never be this wager's room, and
+        # binding one is fatal: grouping drops every row of the REAL room as
+        # "gm != mode", so the wager tracks no kills and never seals (no
+        # thread embed). This is the second-wager case - after a finished one
+        # the previous room is often still the freshest evidence.
+        rooms = [r for r in rooms if _room_mode_ok(mode, r)]
         if not rooms:
             return (str(bound_room or ""), str(bound_code or ""),
                     "keep" if bound_room else "none")
@@ -3285,17 +3317,23 @@ async def _score_one(bot, w: dict):
         # Which room is this duel in NOW? A crash + void sends both players
         # back to the lobby and the next room has a new room_id (same or new
         # code), so a one-shot binding froze the score forever. Bind/rebind
-        # BEFORE grouping, because grouping filters on room_id.
+        # BEFORE grouping, because grouping filters on room_id - and on the
+        # wager's game mode, which is why the mode rides along here.
         try:
             _rooms = room_evidence(events, since_iso)
+            _bound = str(w.get("room_id") or "")
+            _bound_row = next((r for r in _rooms
+                               if str(r.get("room_id")) == _bound), None)
+            # why the old room lost the binding decides the log line
+            _mode_lost = bool(_bound_row) and not _room_mode_ok(mode, _bound_row)
             _room, _code, _act = choose_bound_room(
-                str(w.get("room_id") or ""), _rooms, _now_iso(),
-                str(w.get("room_code") or ""))
+                _bound, _rooms, _now_iso(), str(w.get("room_code") or ""), mode)
             if _act in ("bind", "rebind") and _room:
                 if _act == "rebind":
                     print(f"[duels] {wid_short} REBIND room="
-                          f"{str(w.get('room_id') or '-')[:8]} -> {_room[:8]} "
-                          f"code={_code or '-'} (bound room went quiet)")
+                          f"{_bound[:8] or '-'} -> {_room[:8]} "
+                          f"code={_code or '-'} mode={mode} "
+                          f"({'bound room was another game mode' if _mode_lost else 'bound room went quiet'})")
                 else:
                     print(f"[duels] {wid_short} bound to room {_room[:8]}")
                 _patch = {"room_id": _room}

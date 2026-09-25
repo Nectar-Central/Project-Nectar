@@ -88,6 +88,122 @@ def _now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+def test_room_evidence_carries_the_room_game_mode():
+    duels = _load_duels()
+    rows = [_ev(OLD_ROOM, "TEPUU", _iso(seconds=30), extra={"gm": "zw_lg"}),
+            _ev(NEW_ROOM, "DFNEW", _iso(seconds=5), extra={"gm": "df"})]
+    rooms = duels.room_evidence(rows, "")
+    assert [r["gm"] for r in rooms] == ["df", "zw_lg"]
+
+
+def test_room_evidence_keeps_a_mode_seen_on_any_row_of_the_room():
+    # newest row has no gm, an older one does: still mode-aware
+    duels = _load_duels()
+    rows = [_ev(NEW_ROOM, "DFNEW", _iso(seconds=30), extra={"gm": "df"}),
+            _ev(NEW_ROOM, "DFNEW", _iso(seconds=5), extra={"gm": ""})]
+    assert duels.room_evidence(rows, "")[0]["gm"] == "df"
+
+
+# --- the mode-blind bind (kills + embeds dead in a second wager) ----------
+
+def test_a_wager_never_binds_a_room_of_another_game_mode():
+    # Second wager, different game mode. The PREVIOUS room is still the
+    # freshest evidence (the opponent is still playing it), so a mode-blind
+    # bind locks the wager onto it - and grouping then drops every row of the
+    # real room as "gm != mode": no kills, no seal, no thread embed.
+    duels = _load_duels()
+    rooms = [{"room_id": OLD_ROOM, "code": "TEPUU", "gm": "zw_lg",
+              "last_ts": _iso(seconds=2)},
+             {"room_id": NEW_ROOM, "code": "DFNEW", "gm": "df",
+              "last_ts": _iso(seconds=30)}]
+    room, code, action = duels.choose_bound_room("", rooms, _now_iso(), "", "df")
+    assert (room, code, action) == (NEW_ROOM, "DFNEW", "bind")
+
+
+def test_a_bound_room_of_another_mode_is_released_not_kept():
+    # the anti-hop guard must not pin a wager to a room of the wrong mode,
+    # even while that room is still being played
+    duels = _load_duels()
+    rooms = [{"room_id": OLD_ROOM, "code": "TEPUU", "gm": "zw_lg",
+              "last_ts": _iso(seconds=2)},
+             {"room_id": NEW_ROOM, "code": "DFNEW", "gm": "df",
+              "last_ts": _iso(seconds=30)}]
+    room, code, action = duels.choose_bound_room(OLD_ROOM, rooms, _now_iso(),
+                                                "TEPUU", "df")
+    assert (room, code, action) == (NEW_ROOM, "DFNEW", "rebind")
+
+
+def test_a_room_without_gm_evidence_is_still_bindable():
+    # no gm on the rows must never strand a working wager: unknown mode
+    # keeps the room a candidate
+    duels = _load_duels()
+    rooms = [{"room_id": OLD_ROOM, "code": "TEPUU", "last_ts": _iso(seconds=2)},
+             {"room_id": NEW_ROOM, "code": "TEPUU", "last_ts": _iso(seconds=1)}]
+    room, _code, action = duels.choose_bound_room("", rooms, _now_iso(), "", "df")
+    assert (room, action) == (NEW_ROOM, "bind")
+
+
+def test_the_anti_hop_guard_still_holds_within_one_mode():
+    # same mode, old room still live: the guard is unchanged
+    duels = _load_duels()
+    rooms = [{"room_id": OLD_ROOM, "code": "TEPUU", "gm": "zw_lg",
+              "last_ts": _iso(seconds=10)},
+             {"room_id": NEW_ROOM, "code": "XXXXX", "gm": "zw_lg",
+              "last_ts": _iso(seconds=2)}]
+    assert duels.choose_bound_room(OLD_ROOM, rooms, _now_iso(), "TEPUU",
+                                   "zw_lg")[2] == "keep"
+
+
+# --- the reported symptom, end to end -------------------------------------
+
+def _second_wager_events():
+    """Previous zw_lg room still producing rows + the new df room."""
+    def row(did, room, code, gm, ts, victim=None):
+        gd = {"room_id": room, "match_version": 0, "gm": gm,
+              "short_code": code, "code": code}
+        if victim:
+            gd["victim"] = victim
+        return {"discord_id": did, "event_type": "kill", "event_data": gd,
+                "created_at": ts}
+    return [
+        # opponent still playing the OLD room (the freshest evidence)
+        row("222", OLD_ROOM, "TEPUU", "zw_lg", _iso(seconds=2), "Nemo"),
+        # the new room, where the second wager is actually played
+        row("111", NEW_ROOM, "DFNEW", "df", _iso(seconds=40), "Nemo"),
+        row("222", NEW_ROOM, "DFNEW", "df", _iso(seconds=39)),
+    ]
+
+
+def test_second_wager_in_a_new_mode_tracks_kills_through_the_grouper():
+    # A finished wager, then a new one with the same player in a different
+    # game mode and a different room. Before the fix the wager bound the old
+    # room (freshest evidence) and every real row was dropped as "gm != mode":
+    # no kills, no seal, no thread embed.
+    duels = _load_duels()
+    events = _second_wager_events()
+    since = _iso(minutes=5)
+    room, code, _act = duels.choose_bound_room(
+        "", duels.room_evidence(events, since), _now_iso(), "", "df")
+    assert (room, code) == (NEW_ROOM, "DFNEW")
+    matches = duels.group_duel_matches(
+        events, "111", "222", "df", room, code, since,
+        opp_name="nemo", creator_name="aqua")
+    assert len(matches) == 1
+    assert matches[0]["kills_c"] == 1          # the creator's kill counts
+    assert duels._match_sealable(matches[0], duels.race_for_mode("df"))
+
+
+def test_the_same_rows_produce_nothing_when_the_old_room_was_bound():
+    # the mechanism, pinned: the old room's mode makes every real row
+    # ungroupable, which is what left kills at zero and no embed posted
+    duels = _load_duels()
+    events = _second_wager_events()
+    since = _iso(minutes=5)
+    assert duels.group_duel_matches(
+        events, "111", "222", "df", OLD_ROOM, "TEPUU", since,
+        opp_name="nemo", creator_name="aqua") == []
+
+
 def test_first_evidence_binds_the_newest_room_not_the_oldest():
     duels = _load_duels()
     rooms = [{"room_id": OLD_ROOM, "code": "TEPUU", "last_ts": _iso(minutes=30)},
