@@ -1418,6 +1418,35 @@ def _removed_list(m: dict) -> list:
         return []
 
 
+async def _duo_partner_sync(match: dict, did: str) -> str | None:
+    """The other member of this player's registration row, or None.
+
+    The dashboard's "remove opponent" control removes a duo together, so a
+    team never leaves one half standing in a match. Banned rows are not live
+    teams and are skipped. Never raises.
+    """
+    try:
+        tid = (match or {}).get("tourney_id")
+        if tid is None or not did:
+            return None
+        res = supabase.table("bngc_comp_registrations").select(
+            "member_ids,status").eq("tourney_id", int(tid)).limit(500).execute()
+        for r in (res.data or []):
+            if str((r or {}).get("status") or "") == "banned":
+                continue
+            try:
+                members = [str(m) for m in ((r or {}).get("member_ids") or []) if m]
+            except Exception:
+                continue
+            if did in members and len(members) > 1:
+                others = [m for m in members if m != did]
+                if others:
+                    return others[0]
+        return None
+    except Exception:
+        return None
+
+
 @router.post("/api/comp/match/remove")
 async def comp_match_remove(request: Request):
     """Remove a player from a match roster (left mid-match).
@@ -1437,6 +1466,8 @@ async def comp_match_remove(request: Request):
         return JSONResponse({"error": "match_id required"}, status_code=400)
     did = str(b.get("discord_id") or "").strip() or None
     aname = str(b.get("actor_name") or "").strip() or None
+    opp_did = str(b.get("opponent_id") or "").strip() or None
+    with_partner = bool(b.get("with_partner"))
     try:
         try:
             mres = supabase.table("bngc_comp_matches").select(
@@ -1475,12 +1506,24 @@ async def comp_match_remove(request: Request):
                 pass
         if not did:
             return JSONResponse({"error": "discord_id required (actor_name did not resolve)"}, status_code=400)
+        # "remove opponent": an explicit id wins, otherwise the duo partner
+        # comes from the tourney roster (no partner -> just this player).
+        partner = None
+        if did and with_partner and not opp_did:
+            partner = await _duo_partner_sync(m, did)
+        extra = [x for x in (opp_did, partner) if x and x != did]
         cur = _removed_list(m)
-        if did not in cur:
-            cur.append(did)
+        changed = False
+        for x in [did] + extra:
+            if x not in cur:
+                cur.append(x)
+                changed = True
+        if changed:
             supabase.table("bngc_comp_matches").update(
                 {"removed_discord_ids": cur}).eq("id", mid).execute()
-        return JSONResponse({"ok": True, "match_id": mid, "removed_discord_ids": cur})
+        return JSONResponse({"ok": True, "match_id": mid,
+                             "removed_discord_ids": cur,
+                             "opponent_id": extra[0] if extra else None})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -1489,8 +1532,11 @@ async def comp_match_remove(request: Request):
 async def comp_match_add_back(request: Request):
     """Add a removed player back to a match roster (/tourney add-back).
 
-    Body: {match_id, discord_id}. Removes from removed_discord_ids so the
-    player scores again. Never raises beyond JSON errors."""
+    Body: {match_id, discord_id, opponent_id?, with_partner?}. Removes from
+    removed_discord_ids so the player scores again. `opponent_id` /
+    `with_partner` restore a duo together, mirroring the remove control so a
+    half-pair can never creep back onto the roster. Never raises beyond JSON
+    errors."""
     err = _need()
     if err:
         return err
@@ -1505,15 +1551,23 @@ async def comp_match_add_back(request: Request):
     try:
         try:
             mres = supabase.table("bngc_comp_matches").select(
-                "id,removed_discord_ids").eq("id", mid).limit(1).execute()
+                "id,tourney_id,removed_discord_ids").eq("id", mid).limit(1).execute()
         except Exception:
             return JSONResponse({"error": "removed_discord_ids column missing — apply add_comp_v237.sql"}, status_code=500)
         if not mres.data:
             return JSONResponse({"error": "match not found"}, status_code=404)
-        cur = [x for x in _removed_list(mres.data[0]) if x != did]
+        m = mres.data[0] or {}
+        opp_did = str(b.get("opponent_id") or "").strip() or None
+        partner = None
+        if b.get("with_partner") and not opp_did:
+            partner = await _duo_partner_sync(m, did)
+        back = {did} | {x for x in (opp_did, partner) if x}
+        cur = [x for x in _removed_list(m) if x not in back]
         supabase.table("bngc_comp_matches").update(
             {"removed_discord_ids": cur}).eq("id", mid).execute()
-        return JSONResponse({"ok": True, "match_id": mid, "removed_discord_ids": cur})
+        return JSONResponse({"ok": True, "match_id": mid,
+                             "removed_discord_ids": cur,
+                             "restored": sorted(back)})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 

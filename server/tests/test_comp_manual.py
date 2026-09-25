@@ -132,6 +132,78 @@ def _match(state, mid):
     return next(r for r in state["bngc_comp_matches"] if r["id"] == mid)
 
 
+def _duo_state():
+    s = _state()
+    s["bngc_comp_registrations"] = [
+        {"id": 1, "tourney_id": 3, "status": "accepted",
+         "member_ids": ["A", "B"], "team_color": "\U0001f535"},
+        {"id": 2, "tourney_id": 3, "status": "accepted",
+         "member_ids": ["C", "D"], "team_color": "\U0001f534"},
+        {"id": 3, "tourney_id": 3, "status": "banned",
+         "member_ids": ["E", "F"], "team_color": "\U0001f7e0"},
+    ]
+    return s
+
+
+def test_remove_with_partner_drops_the_whole_duo(monkeypatch):
+    # a team must never leave one half in the match
+    state = _duo_state()
+    code, j = _call(monkeypatch, state, comp_mod.comp_match_remove,
+                    {"match_id": 11, "discord_id": "A", "with_partner": True})
+    assert code == 200, j
+    assert set(j["removed_discord_ids"]) == {"A", "B"}
+    assert j["opponent_id"] == "B"
+    assert set(_match(state, 11)["removed_discord_ids"]) == {"A", "B"}
+
+
+def test_remove_without_partner_still_removes_only_that_player(monkeypatch):
+    state = _duo_state()
+    code, j = _call(monkeypatch, state, comp_mod.comp_match_remove,
+                    {"match_id": 11, "discord_id": "A"})
+    assert code == 200, j
+    assert j["removed_discord_ids"] == ["A"]
+    assert j.get("opponent_id") is None
+
+
+def test_remove_honours_an_explicit_opponent_over_the_roster(monkeypatch):
+    state = _duo_state()
+    code, j = _call(monkeypatch, state, comp_mod.comp_match_remove,
+                    {"match_id": 11, "discord_id": "A", "opponent_id": "D",
+                     "with_partner": True})
+    assert code == 200, j
+    assert set(j["removed_discord_ids"]) == {"A", "D"}
+
+
+def test_remove_ignores_a_banned_rows_partner(monkeypatch):
+    # a banned registration is not a live team: nobody gets dragged in
+    state = _duo_state()
+    code, j = _call(monkeypatch, state, comp_mod.comp_match_remove,
+                    {"match_id": 11, "discord_id": "E", "with_partner": True})
+    assert code == 200, j
+    assert j["removed_discord_ids"] == ["E"]
+
+
+def test_remove_partner_is_idempotent_and_never_duplicates(monkeypatch):
+    state = _duo_state()
+    _call(monkeypatch, state, comp_mod.comp_match_remove,
+          {"match_id": 11, "discord_id": "A", "with_partner": True})
+    _call(monkeypatch, state, comp_mod.comp_match_remove,
+          {"match_id": 11, "discord_id": "A", "with_partner": True})
+    assert _match(state, 11)["removed_discord_ids"].count("A") == 1
+    assert _match(state, 11)["removed_discord_ids"].count("B") == 1
+
+
+def test_add_back_can_restore_the_whole_duo(monkeypatch):
+    # the inverse must not leave a half-pair on the roster
+    state = _duo_state()
+    _call(monkeypatch, state, comp_mod.comp_match_remove,
+          {"match_id": 11, "discord_id": "A", "with_partner": True})
+    code, j = _call(monkeypatch, state, comp_mod.comp_match_add_back,
+                    {"match_id": 11, "discord_id": "A", "with_partner": True})
+    assert code == 200, j
+    assert set(_match(state, 11)["removed_discord_ids"]) == set()
+
+
 # -- start ---------------------------------------------------------------
 
 def test_start_stamps_open_match(monkeypatch):
