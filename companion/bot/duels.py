@@ -902,12 +902,18 @@ def choose_bound_room(bound_room: str, rooms, now_iso: str,
         by_id = {str(r["room_id"]): r for r in rooms}
         cur = by_id.get(str(bound_room))
         if cur is not None:
+            # The bound room's OWN rows outrank the stored code: the stored one
+            # is whatever a duelist typed earlier, possibly for a room they
+            # abandoned, and grouping drops every row that disagrees with it -
+            # a silently dead wager. The room pins the wager, so its code is
+            # the truth; the stored one is only a fallback.
+            _code = str(cur.get("code") or "") or str(bound_code or "")
             try:
                 last = _parse_ts(cur.get("last_ts"))
                 if last is not None and (now - last).total_seconds() <= idle:
-                    return str(bound_room), str(bound_code or cur.get("code") or ""), "keep"
+                    return str(bound_room), _code, "keep"
             except Exception:
-                return str(bound_room), str(bound_code or cur.get("code") or ""), "keep"
+                return str(bound_room), _code, "keep"
         # Bound room is quiet (or no longer has evidence): follow the live one.
         best = rooms[0]
         if str(best["room_id"]) == str(bound_room):
