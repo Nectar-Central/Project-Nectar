@@ -3259,13 +3259,6 @@ async def tourney_stop_cmd(interaction: discord.Interaction, tourney_id: int,
         except Exception as e:
             print(f"[comp] stop role strip failed: {e}")
         tail = f" ({stripped} role{'s' if stripped != 1 else ''} stripped)" if stripped else ""
-        # team colour roles: handed out at /tourney-start, taken back here so a
-        # finished tourney does not leave its colours on people's profiles
-        team_stripped = await _comp_strip_team_roles(interaction.guild,
-                                                     int(tourney_id))
-        if team_stripped:
-            tail += (f" · 🎨 {team_stripped} team role"
-                     f"{'s' if team_stripped != 1 else ''} removed")
         # auto-compute Tourney PR on close (idempotent; unattributed kills
         # simply don't count — every accepted signup now holds a profile).
         pr_board: list = []
@@ -3645,20 +3638,15 @@ async def tourney_refresh_teams_cmd(interaction: discord.Interaction, tourney_id
             return await interaction.followup.send("No tourney with that ID.",
                                                   ephemeral=True)
         t = trow.data[0] or {}
-        out = await _comp_sync_team_roles(interaction.guild, sb, t)
+        out = await _comp_sync_team_colors(sb, t)
         if out.get("solo"):
             return await interaction.followup.send(
                 f"Tourney **#{tourney_id}** is solo -no teams to refresh.",
                 ephemeral=True)
         lines = [f"**Tourney #{tourney_id}** teams refreshed:",
                  f"Teams: **{out['teams']}** · members: **{out['members']}**",
-                 f"Colors corrected: **{out['recolored']}**",
-                 f"Roles granted: **{out['granted']}** · stale roles stripped: **{out['stripped']}**"]
-        if out.get("no_role_config"):
-            lines.append("_No team roles configured - set `COMP_TEAM_ROLE_1..6` "
-                         "to their role ids and re-run._")
-        lines.append("Team order = signup order, so colours and roles both cycle "
-                     "every six teams.")
+                 f"Colors corrected: **{out['recolored']}**"]
+        lines.append("Team order = signup order, so colours cycle every six teams.")
         return await interaction.followup.send("\n".join(lines), ephemeral=True)
     except Exception as e:
         return await interaction.followup.send(f"Couldn't refresh teams: {e}",
@@ -5490,28 +5478,20 @@ async def tourney_start_cmd(interaction: discord.Interaction, tourney_id: int,
             return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
         t = tres.data[0]
         role_id = (str(role_to_give.id) if role_to_give else None) or t.get("player_role_id") or COMP_PLAYER_ROLE_ID
-        # Team colour roles land HERE, not at signup: this is the first moment
-        # the roster is final, so each member's role is the one matching the
-        # colour already frozen on their signup message. Runs before the
-        # player-role branch so it happens even with no player role set.
+        # Team colours: frozen at intake (they are the reaction players see) and
+        # therefore stale after any roster change, so re-derive them here, when
+        # the roster is final. Runs before the player-role branch so it happens
+        # even with no player role set.
         teams_out = {}
         try:
-            teams_out = await _comp_sync_team_roles(
-                interaction.guild, sb, {"id": int(tourney_id),
-                                        "mode": t.get("mode") or "solo"})
+            teams_out = await _comp_sync_team_colors(
+                sb, {"id": int(tourney_id), "mode": t.get("mode") or "solo"})
         except Exception as e:
-            print(f"[comp] start team role sync failed: {e}")
+            print(f"[comp] start team color sync failed: {e}")
         team_line = ""
         if teams_out and not teams_out.get("solo"):
-            if teams_out.get("no_role_config"):
-                team_line = ("\n:warning: No team roles configured - colours "
-                             "refreshed only.")
-            else:
-                team_line = (f"\nTeam roles: **{teams_out.get('granted', 0)}** granted"
-                             f" · **{teams_out.get('stripped', 0)}** stale removed"
-                             f" across **{teams_out.get('teams', 0)}** teams"
-                             + (f" · **{teams_out['recolored']}** colour(s) corrected"
-                                if teams_out.get("recolored") else ""))
+            team_line = (f"\n🎨 Team colours: **{teams_out.get('recolored', 0)}** corrected"
+                         f" across **{teams_out.get('teams', 0)}** teams")
         if role_to_give is not None:
             try:
                 await db._sb_call(lambda: sb.table("bngc_comp_tourneys").update(
@@ -5562,67 +5542,31 @@ async def tourney_start_cmd(interaction: discord.Interaction, tourney_id: int,
         return await interaction.followup.send(f"Couldn't start: {e}", ephemeral=True)
 
 
-TEAM_COLORS = ["🔵", "🔴", "🟠", "🟡", "🟢", "🟣"]
-
-# One Discord role per team slot, same order as TEAM_COLORS. The mapping and
-# the role-id config live in teams.py so they can be unit-tested without the
-# bot's command tree; these names keep the existing call sites readable.
-from teams import (configured_team_role_ids as _comp_team_role_ids_set,  # noqa: E402
-                   team_color as _comp_team_color,
-                   team_role_id as _comp_team_role_id,
-                   team_role_strip_targets as _comp_team_strip_targets,
+# Team colours (and only colours) live in teams.py so the palette and the slot
+# rule can be unit-tested without the bot's command tree. These aliases keep
+# the existing call sites readable.
+from teams import (team_color as _comp_team_color,  # noqa: E402
                    team_slots as _comp_team_slots)
 
 
-async def _comp_strip_team_roles(guild, tourney_id) -> int:
-    """Take every configured team role back off a tourney's players. Never raises.
+async def _comp_sync_team_colors(sb, tourney) -> dict:
+    """Re-derive each duo team's colour from its slot. Never raises.
 
-    Ends the colours with the tourney: /tourney-start hands them out and
-    /tourney-stop takes them back, so nobody walks away still wearing a team
-    role from a finished cup. Targets every registered member, not just the
-    live teams, because a banned or re-signed duo may still hold theirs.
+    The colour is FROZEN on the registration row because it is the reaction
+    the players see on their signup message, so it drifts as soon as a team is
+    added or removed and every later team shifts up a slot. The slot is the
+    row's position among live teams in registration order (see _comp_reg_rows),
+    which is the only stable order available.
+
+    No Discord roles: they were removed. A role per slot had to agree with a
+    colour the roster could reassign at any moment, and the two kept
+    disagreeing - see the git history for the swap this replaced.
+
+    Called from /tourney-start (roster final) and /tourney-refresh-teams.
+
+    Returns {"teams", "members", "recolored", "solo"}. Never raises.
     """
-    out = 0
-    try:
-        if guild is None:
-            return 0
-        roles = _comp_team_role_ids_set()
-        if not roles:
-            return 0
-        for did, rid in _comp_team_strip_targets(await _comp_reg_rows(tourney_id), roles):
-            if await _comp_remove_role(guild, did, rid,
-                                      reason=f"Comp tourney #{tourney_id} ended"):
-                out += 1
-    except Exception as e:
-        print(f"[comp] stop team role strip failed: {e}")
-    return out
-
-
-async def _comp_sync_team_roles(guild, sb, tourney) -> dict:
-    """Re-derive duo team colors and re-grant each team's Discord roles.
-
-    Colour and role both come from ONE slot per team - the row's position
-    among live teams, in registration order (see _comp_reg_rows). Deriving
-    them separately is what swapped them: the colour used to be frozen from a
-    count taken at intake while the role came from the row's position, and
-    those two disagree whenever the read order does.
-
-    Colors are FROZEN on the registration row because they are the reaction the
-    players see on their signup message, so a drift is corrected here. Roles
-    are stripped-then-granted from the same slot, mirroring
-    _ranked_sync_member_roles, so a player who moved teams never keeps the old
-    colour role.
-
-    Called from /tourney-start (roster final) and /tourney-refresh-teams -
-    NOT at signup, so nobody wears a team role for a tourney that never
-    started.
-
-    Returns {"teams", "members", "granted", "stripped", "recolored",
-    "no_role_config", "solo"}. Never raises.
-    """
-    out = {"teams": 0, "members": 0, "granted": 0, "stripped": 0,
-           "recolored": 0, "no_role_config": not _comp_team_role_ids_set(),
-           "solo": False}
+    out = {"teams": 0, "members": 0, "recolored": 0, "solo": False}
     try:
         t = tourney or {}
         tid = int(t.get("id") or 0)
@@ -5633,10 +5577,8 @@ async def _comp_sync_team_roles(guild, sb, tourney) -> dict:
             return out
         slots = _comp_team_slots(await _comp_reg_rows(tid))
         out["teams"] = len(slots)
-        if not slots:
-            return out
-        # first pass: colours (a write, so do it before the rate-limited grants)
         for r, idx in slots:
+            out["members"] += len((r or {}).get("member_ids") or [])
             try:
                 want = _comp_team_color(idx)
                 if str((r or {}).get("team_color") or "") != want:
@@ -5646,29 +5588,9 @@ async def _comp_sync_team_roles(guild, sb, tourney) -> dict:
                     out["recolored"] += 1
             except Exception:
                 continue
-        if guild is None:
-            return out
-        every = _comp_team_role_ids_set()
-        for r, idx in slots:
-            want_role = _comp_team_role_id(idx)
-            for did in ((r or {}).get("member_ids") or []):
-                did = str(did or "").strip()
-                if not did:
-                    continue
-                out["members"] += 1
-                for other in every:
-                    if other == want_role:
-                        continue
-                    if await _comp_remove_role(guild, did, other,
-                                               reason=f"comp team #{tid} refresh"):
-                        out["stripped"] += 1
-                if want_role and await _comp_grant_role(guild, did, want_role):
-                    out["granted"] += 1
-                if out["members"] % 20 == 0:
-                    await asyncio.sleep(1)  # stay under the role rate limit
         return out
     except Exception as e:
-        print(f"[comp] team role sync failed: {e}")
+        print(f"[comp] team color sync failed: {e}")
         return out
 
 

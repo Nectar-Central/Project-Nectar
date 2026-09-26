@@ -1,19 +1,14 @@
-"""Team colour and team role must be derived from ONE slot, not two.
+"""A team's colour must be derived from ONE slot, read in a stable order.
 
-A team that shows a blue reaction while holding the red team role is not a
-cosmetic bug: the board, the signup reaction and the member list all disagree
-about who is who. It happened because the two were derived from different
-things - the frozen colour from a COUNT taken at registration, the role from
-the row's POSITION in an unordered SELECT. Postgres guarantees no order
-without ORDER BY, so the same team could land in a different slot on every
-sync, and the colour would disagree with the role.
+A team could change colour between syncs, which is not cosmetic: the colour is
+frozen on the signup message as a reaction, so the board and the reaction
+disagreed about who was who. The cause was the read order - the slot is the
+row's position in the result, and Postgres guarantees no order without
+ORDER BY, so the same team could land in a different slot every time.
 
-So: rows are read in a stable order (registration id, which is a monotonic
-identity), and colour + role + slot all come from one pass over that order.
-
-The colour is still frozen at intake - it is the reaction the players see -
-but roles are no longer granted there. They land at /tourney-start, when the
-roster is final, via the same pass.
+So rows are read in registration order (id is a monotonic identity) and the
+slot is that position. There are no team roles any more; the swap that used to
+be visible as "blue reaction, red role" cannot happen without one.
 """
 import asyncio
 import importlib.util
@@ -68,104 +63,6 @@ def test_slots_survive_junk():
     assert t.team_slots(None) == []
     assert t.team_slots([None, {}]) != []
     assert [slot for _r, slot in t.team_slots([{"status": "banned"}])] == []
-
-
-def test_colour_and_role_come_from_the_same_slot():
-    # the invariant the swap broke: one slot -> one colour AND one role
-    t = _teams()
-    for slot in range(6):
-        rows = [{"id": i} for i in range(slot + 1)]
-        _row, got = t.team_slots(rows)[-1]
-        assert got == slot
-        assert t.team_color(got) == t.TEAM_COLORS[got]
-        assert t.team_role_id(got) == t.TEAM_ROLE_IDS[got]
-
-
-def test_no_team_gets_another_teams_colour():
-    t = _teams()
-    seen = {}
-    for slot in range(6):
-        seen[t.team_color(slot)] = t.team_role_id(slot)
-    # each colour maps to exactly one role, and vice versa
-    assert len(seen) == 6
-    assert len(set(seen.values())) == 6
-
-
-def test_the_colour_frozen_at_intake_matches_the_role_granted_at_start():
-    # Intake freezes a colour from a COUNT of the live teams that exist at that
-    # moment; /tourney-start derives the slot from the row's position in
-    # registration order. For the team that just signed up those two must be
-    # the same slot - it is the reaction the players see vs the role they are
-    # given, and they were swapped when they were not.
-    t = _teams()
-    for existing in range(6):
-        rows = [{"id": i + 1, "status": "accepted"} for i in range(existing)]
-        frozen = t.team_color(len(rows))          # what intake writes
-        rows.append({"id": existing + 1, "status": "accepted"})   # the new team
-        _row, slot = t.team_slots(rows)[-1]
-        assert slot == existing
-        assert t.team_color(slot) == frozen
-        assert t.team_role_id(slot) == t.TEAM_ROLE_IDS[slot]
-
-
-def test_a_banned_team_does_not_shift_the_next_teams_colour():
-    # the slot is the position among LIVE teams, so a banned duo leaves a gap
-    # that the teams after it move up into - on both sides of the agreement
-    t = _teams()
-    rows = [{"id": 1, "status": "accepted"},
-            {"id": 2, "status": "banned"},
-            {"id": 3, "status": "accepted"}]
-    live = t.team_slots(rows)
-    assert t.team_color(live[1][1]) == t.team_color(1)   # id 3 -> slot 1
-
-
-# --- ending a tourney takes the team roles back off -----------------------
-
-def test_every_team_role_is_stripped_from_every_member():
-    t = _teams()
-    rows = [{"member_ids": ["A", "B"], "status": "accepted"},
-            {"member_ids": ["C", "D"], "status": "accepted"}]
-    got = t.team_role_strip_targets(rows, t.configured_team_role_ids())
-    assert len(got) == 4 * len(t.configured_team_role_ids())   # every pair
-    assert {d for d, _r in got} == {"A", "B", "C", "D"}
-
-
-def test_a_banned_or_removed_team_is_stripped_too():
-    # it may still be wearing the role it was granted
-    t = _teams()
-    rows = [{"member_ids": ["A"], "status": "banned"},
-            {"member_ids": ["B"], "status": "rejected"},
-            {"member_ids": ["C"], "status": "accepted"}]
-    got = t.team_role_strip_targets(rows, t.configured_team_role_ids())
-    assert {d for d, _r in got} == {"A", "B", "C"}
-
-
-def test_strip_targets_cover_only_configured_roles():
-    t = _teams()
-    got = t.team_role_strip_targets([{"member_ids": ["A"]}], ["111", "", "222"])
-    assert got == [("A", "111"), ("A", "222")]
-
-
-def test_nothing_to_strip_without_configured_roles():
-    t = _teams()
-    assert t.team_role_strip_targets([{"member_ids": ["A"]}], []) == []
-    assert t.team_role_strip_targets([{"member_ids": ["A"]}], None) == []
-
-
-def test_strip_targets_survive_junk():
-    t = _teams()
-    got = t.team_role_strip_targets([None, {}, {"member_ids": [None, "", "A"]}],
-                                    t.configured_team_role_ids())
-    assert {d for d, _r in got} == {"A"}
-
-
-def test_strip_targets_are_deterministic():
-    # a set of role ids would otherwise iterate in arbitrary order
-    t = _teams()
-    rows = [{"member_ids": ["A"]}]
-    roles = t.configured_team_role_ids()
-    assert (t.team_role_strip_targets(rows, roles)
-            == t.team_role_strip_targets(rows, roles))
 
 
 # --- the read order has to be stable ---------------------------------------
