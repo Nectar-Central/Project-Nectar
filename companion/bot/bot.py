@@ -3046,8 +3046,10 @@ async def _comp_remove_role(guild, user_id, role_id, reason="Comp tourney ended"
 def _comp_team_members(user_ids: list, mode: str):
     """Validate mention list for the mode. Pure: ([ids], None) or ([], error).
 
-    Solo wants exactly 1, duo exactly 2 (any separator — separators never
-    reach us, only the mention list does). Bots and dupes rejected.
+    Solo wants exactly 1, duo 1 or 2 - a duo tourney accepts a SOLO entry, so
+    someone can sign up alone and be paired later (or play a solo round). One
+    mention in a duo tourney is therefore valid, not a mistake. Bots and dupes
+    are still rejected, and 3+ is always an error.
     """
     try:
         ids = [str(x) for x in (user_ids or []) if str(x or "").strip()]
@@ -3056,10 +3058,17 @@ def _comp_team_members(user_ids: list, mode: str):
     try:
         if len(ids) != len(set(ids)):
             return [], "duplicate mentions"
-        want = 2 if str(mode or "").lower() == "duo" else 1
-        if len(ids) != want:
-            return [], (f"{mode} needs exactly {want} real mention(s), got {len(ids)} — "
-                        f"type @ and pick from the popup, typed-out names don't count")
+        n = len(ids)
+        if n < 1:
+            return [], "mention yourself to register"
+        if str(mode or "").lower() == "duo":
+            if n > 2:
+                return [], (f"duo takes at most 2 mentions (you + one teammate), "
+                            f"got {n} — type @ and pick from the popup, typed-out "
+                            f"names don't count")
+        elif n != 1:
+            return [], (f"solo needs exactly 1 real mention, got {n} — type @ and "
+                        f"pick from the popup, typed-out names don't count")
         return ids, None
     except Exception:
         return [], "invalid mentions"
@@ -5600,9 +5609,11 @@ def _comp_open_text(mode: str, ping_role_id: str | None = None, name: str = "Tou
         is_duo = str(mode or "").lower() == "duo"
         if is_duo:
             head = (f"## {str(name).upper()} SIGNUPS REGISTRATIONS OPEN:\n\n"
-                    f"*@yourself AND your teammate to register — one message with both mentions, "
-                    f"your own mention first (type @ and pick from the popup — "
+                    f"*@yourself AND your teammate to register as a team — one message with "
+                    f"both mentions, your own mention first (type @ and pick from the popup — "
                     f"typed-out names don't count).*\n"
+                    f"*Signing up alone? Just @yourself — you go in unpaired and a host can "
+                    f"team you up later.*\n"
                     f"*Both players then press **Create comp profile** below so kills map to you.*")
         else:
             head = (f"## {str(name).upper()} SIGNUPS REGISTRATIONS OPEN:\n\n"
@@ -5981,14 +5992,23 @@ async def on_message(message):
             if i not in seen:
                 seen.add(i)
                 clean.append(i)
+        # A message with no mention is not a signup attempt - it is chatter.
+        # Stay completely silent: no cross, no notice, nothing to clean up.
+        if not clean:
+            return
         members, err = _comp_team_members(clean, (t or {}).get("mode") or "solo")
         sb = _comp_sb()
+        _is_duo_tourney = str((t or {}).get("mode") or "solo").lower() == "duo"
 
-        async def _refuse(text):
-            try:
-                await message.add_reaction("❌")
-            except Exception:
-                pass
+        async def _refuse(text, react=True):
+            # Auto-deleted so the signup channel only keeps the reactions, which
+            # are the durable record. A message handler gets no Interaction, so
+            # this is as close to ephemeral as the platform allows here.
+            if react:
+                try:
+                    await message.add_reaction("❌")
+                except Exception:
+                    pass
             try:
                 hint = await message.reply(text)
                 await hint.delete(delay=60)
@@ -6058,7 +6078,11 @@ async def on_message(message):
                         except Exception:
                             pass
                         try:
-                            await message.reply("You're in ✅ — comp profile complete.")
+                            # auto-deleted: the ✅ reaction is the durable
+                            # record, the words are just the confirmation
+                            _done = await message.reply(
+                                "You're in ✅ — comp profile complete.")
+                            await _done.delete(delay=60)
                         except Exception:
                             pass
                         return
@@ -6071,7 +6095,15 @@ async def on_message(message):
                     except Exception:
                         pass
                     return
-                await _refuse("Already registered for this tourney.")
+                # Already on the roster. Say WHO and in what capacity, so the
+                # player knows whether to wait, re-sign with a partner, or ask a
+                # host - "already registered" alone was a dead end.
+                _rows_hit = " / ".join(
+                    f"<@{m}>" for r in _hits for m in ((r or {}).get("member_ids") or []))
+                _states = sorted({str((r or {}).get("status") or "?") for r in _hits})
+                await _refuse(f"Already registered for this tourney — "
+                              f"{_rows_hit} ({', '.join(_states)}). "
+                              f"Ask a host to move you.")
                 return
         except Exception:
             pass
@@ -6108,7 +6140,11 @@ async def on_message(message):
         try:
             existing = await _comp_reg_rows(t["id"])
             team_idx = sum(1 for r in existing if (r or {}).get("status") != "banned")
-            color = _comp_team_color(team_idx) if str((t or {}).get("mode") or "solo") == "duo" else None
+            # A colour means "this is a duo team". A solo entry inside a duo
+            # tourney is not a team, so it takes no colour and consumes no
+            # team slot - a host can pair it later with /tourney-transfer-teammate.
+            _is_team = _is_duo_tourney and len(members or []) >= 2
+            color = _comp_team_color(team_idx) if _is_team else None
             # comp-profile gate: members without bngc_users.game_username sign
             # up as pending (slot reserved) and must create a comp profile.
             _have = await _comp_members_with_profile(sb, members)
@@ -6178,16 +6214,25 @@ async def on_message(message):
                 await _comp_grant_role(message.guild, _did, _rid)
         except Exception as e:
             print(f"[comp] intake role grant failed: {e}")
-        # intake verdict right on the message: team color (duo) / ✅ solo,
+        # intake verdict right on the message: team color (duo team) / ✅ solo,
         # ❌ only on failure paths above. Host ✅/❌ moderation still works:
         # hosts are different users, so their reactions are distinct.
-        # NOTE: no team Discord role is granted here. The roster is still
-        # changing at signup, so a slot (and therefore a colour and a role)
-        # can still move; roles land at /tourney-start, when it is final.
         try:
             await message.add_reaction(color or "✅")
         except Exception as e:
             print(f"[comp] intake reaction failed: {e}")
+        # A solo entry in a duo tourney gets ✅ like any solo, so say plainly
+        # that it is registered and unpaired - otherwise it looks like the
+        # teammate mention was dropped.
+        if _is_duo_tourney and not _is_team:
+            try:
+                _solo_note = await message.reply(
+                    f"{' / '.join(f'<@{m}>' for m in members)} registered as "
+                    f"**solo** in this duo tourney — no teammate. A host can pair "
+                    f"you with `/tourney-transfer-teammate` later.")
+                await _solo_note.delete(delay=60)
+            except Exception:
+                pass
     except Exception as e:
         print(f"[comp] on_message failed: {e}")
     try:
