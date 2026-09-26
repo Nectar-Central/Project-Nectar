@@ -987,11 +987,86 @@ async def comp_calculate(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+def _ratchet_tourney_pr(dids) -> dict:
+    """Current stored PR per discord id, for the ratchet. Never raises.
+
+    Read once for a whole board rather than per row: the write loop is already
+    one UPDATE per player.
+    """
+    out: dict = {}
+    try:
+        ids = [str(d) for d in (dids or []) if str(d or "").strip()]
+        if not ids or not supabase:
+            return out
+        res = supabase.table("bngc_users").select("discord_id,tourney_pr").in_(
+            "discord_id", ids).execute()
+        for u in (res.data or []):
+            did = str((u or {}).get("discord_id") or "")
+            if not did:
+                continue
+            try:
+                out[did] = float((u or {}).get("tourney_pr"))
+            except Exception:
+                out[did] = None      # present but junk: treat as no prior
+    except Exception:
+        return {}
+    return out
+
+
+def _apply_tourney_pr_ratchet(pr_board) -> list:
+    """Write the board into bngc_users.tourney_pr as a HIGH-WATER MARK.
+
+    bngc_users.tourney_pr is one global column, but the score computed for it
+    is per-TOURNEY and carries no memory of the player's previous rating - no
+    expected value, no K-factor. Writing it absolutely therefore meant the last
+    tourney to close decided everybody's rating, so a player who simply did
+    less well next time went DOWN, and /pr-leaderboard (a pure read of this
+    column) showed it.
+
+    So the column only ever ratchets up. bngc_comp_pr_history still records
+    what this tourney actually scored, so a bad tourney stays visible and
+    auditable - it just cannot drag the standing number down.
+
+    The manual override (/tourney-pr-set) stays absolute on purpose: a host
+    setting a number explicitly is not a recompute. Never raises.
+    """
+    try:
+        rows = list(pr_board or [])
+        if not rows or not supabase:
+            return []
+        cur = _ratchet_tourney_pr([r.get("discord_id") for r in rows])
+        wrote = []
+        for r in rows:
+            did = str((r or {}).get("discord_id") or "")
+            if not did:
+                continue
+            try:
+                want = float((r or {}).get("pr"))
+            except Exception:
+                continue
+            old = cur.get(did)
+            if old is not None:
+                try:
+                    want = max(want, float(old))
+                except Exception:
+                    pass
+            try:
+                supabase.table("bngc_users").update(
+                    {"tourney_pr": want}).eq("discord_id", did).execute()
+                wrote.append(did)
+            except Exception:
+                continue
+        return wrote
+    except Exception:
+        return []
+
+
 def compute_and_store_tourney_pr_sync(tid: int) -> list[dict]:
     """Compute Tourney PR once at tourney end + store. Idempotent: when
     bngc_comp_pr_history rows exist for the tourney they are returned as-is
-    (no recompute). Writes bngc_users.tourney_pr per player. Sync. Never
-    raises; returns the PR board (possibly empty)."""
+    (no recompute). Writes bngc_users.tourney_pr per player, as a high-water
+    mark - see _apply_tourney_pr_ratchet. Sync. Never raises; returns the
+    PR board (possibly empty)."""
     try:
         if not supabase:
             return []
@@ -1007,11 +1082,15 @@ def compute_and_store_tourney_pr_sync(tid: int) -> list[dict]:
             if existing.data:
                 rows = sorted((existing.data or []),
                               key=lambda r: float((r or {}).get("pr") or 0), reverse=True)
-                return [{"discord_id": str(r.get("discord_id")), "pr": float(r.get("pr") or 0),
-                         "kills": int(r.get("kills") or 0), "wins": int(r.get("wins") or 0),
-                         "matches": int(r.get("matches") or 0),
-                         "avg_placement": r.get("avg_placement"),
-                         "players": float(r.get("players") or 0)} for r in rows]
+                board = [{"discord_id": str(r.get("discord_id")), "pr": float(r.get("pr") or 0),
+                          "kills": int(r.get("kills") or 0), "wins": int(r.get("wins") or 0),
+                          "matches": int(r.get("matches") or 0),
+                          "avg_placement": r.get("avg_placement"),
+                          "players": float(r.get("players") or 0)} for r in rows]
+                # Still re-apply the ratchet: this path is the one that repairs
+                # a column an older (pre-ratchet) build already lowered.
+                _apply_tourney_pr_ratchet(board)
+                return board
         except Exception:
             pass
         trows = supabase.table("bngc_comp_tourneys").select(
@@ -1030,9 +1109,14 @@ def compute_and_store_tourney_pr_sync(tid: int) -> list[dict]:
         by_mid: dict = {}
         try:
             if mids:
+                # ORDER BY id is load-bearing: an unordered LIMIT lets Postgres
+                # return a DIFFERENT 5000-row window on each call once a tourney
+                # passes ~5000 events, which silently dropped whole players off
+                # the board and moved the shared `players` divisor. A recompute
+                # has to be reproducible or the ratchet below is unexplainable.
                 eres = supabase.table("bngc_comp_events").select(
-                    "match_id,etype,discord_id,actor_name,alive").in_(
-                    "match_id", mids[:200]).limit(5000).execute()
+                    "id,match_id,etype,discord_id,actor_name,alive").in_(
+                    "match_id", mids[:200]).order("id").limit(5000).execute()
                 for e in (eres.data or []):
                     by_mid.setdefault((e or {}).get("match_id"), []).append(e)
         except Exception:
@@ -1051,11 +1135,9 @@ def compute_and_store_tourney_pr_sync(tid: int) -> list[dict]:
                 }, on_conflict="tourney_id,discord_id").execute()
             except Exception:
                 pass
-            try:
-                supabase.table("bngc_users").update(
-                    {"tourney_pr": float(r["pr"])}).eq("discord_id", str(r["discord_id"])).execute()
-            except Exception:
-                pass
+        # one high-water-mark write for the whole board, instead of an absolute
+        # per-row write that let the last tourney to close decide the rating
+        _apply_tourney_pr_ratchet(pr_board)
         return pr_board
     except Exception:
         return []

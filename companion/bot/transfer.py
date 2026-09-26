@@ -148,7 +148,19 @@ def plan_transfer(source: dict, target: dict, now_iso: str = "",
         a, b = src.get(f), dst.get(f)
         if a is None and b is None:
             continue
-        if f in ("tourney_pr", "daily_streak"):
+        if f == "tourney_pr":
+            # NUMERIC max. This went through _ts() (a string helper) once, so
+            # max("100.0", "9.0") == "9.0" and a 100 PR lost to a 9 PR.
+            vals = []
+            for x in (a, b):
+                try:
+                    if x is not None:
+                        vals.append(float(x))
+                except Exception:
+                    continue
+            if vals:
+                t_patch[f] = max(vals)
+        elif f == "daily_streak":
             best = max((_ts(x) for x in (a, b) if _ts(x)), default=None)
             if best is not None:
                 t_patch[f] = best

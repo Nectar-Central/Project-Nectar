@@ -76,6 +76,20 @@ class TestMerges:
         p = plan_transfer(_src(), _dst(tourney_pr=99.0), now_iso=NOW)["target"]
         assert float(p["tourney_pr"]) == 99.0
 
+    def test_rating_max_is_numeric_not_lexicographic(self):
+        # max("100.0", "9.0") is "9.0": a 100 PR used to lose to a 9 PR
+        p = plan_transfer(_src(tourney_pr=100.0), _dst(tourney_pr=9.0),
+                          now_iso=NOW)["target"]
+        assert float(p["tourney_pr"]) == 100.0
+        p2 = plan_transfer(_src(tourney_pr=9.0), _dst(tourney_pr=100.0),
+                           now_iso=NOW)["target"]
+        assert float(p2["tourney_pr"]) == 100.0
+
+    def test_rating_max_survives_junk_and_strings(self):
+        p = plan_transfer(_src(tourney_pr="100.0"), _dst(tourney_pr="bad"),
+                          now_iso=NOW)["target"]
+        assert float(p["tourney_pr"]) == 100.0
+
     def test_account_age_is_the_earliest(self):
         p = plan_transfer(_src(), _dst(), now_iso=NOW)["target"]
         assert p["first_seen"] == "2024-01-01T00:00:00+00:00"
