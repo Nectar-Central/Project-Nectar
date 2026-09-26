@@ -3527,9 +3527,11 @@ async def tourney_remove_host_cmd(interaction: discord.Interaction, tourney_id: 
 
 @bot.tree.command(name="tourney-add-player", description="Add a player to a tourney roster (host)")
 @app_commands.describe(tourney_id="Numeric session ID (from 0)", user="Player to add",
-                       teammate="Duo teammate (required for duo tourneys)")
+                       teammate="Duo teammate (omit for a solo entry)",
+                       play_as_solo="Add unpaired, even in a duo tourney")
 async def tourney_add_player_cmd(interaction: discord.Interaction, tourney_id: int, user: discord.User,
-                                 teammate: discord.User | None = None):
+                                 teammate: discord.User | None = None,
+                                 play_as_solo: bool = False):
     await interaction.response.defer(ephemeral=True)
     sb, me = await _comp_require_manager(interaction, tourney_id)
     if sb is None:
@@ -3543,8 +3545,12 @@ async def tourney_add_player_cmd(interaction: discord.Interaction, tourney_id: i
         is_duo = str((t or {}).get("mode") or "solo").lower() == "duo"
         did = str(user.id)
         rows = await _comp_reg_rows(int(tourney_id))
-        if is_duo:
-            if teammate is None or getattr(teammate, "bot", False):
+        # play_as_solo (or simply no teammate) in a duo tourney: a one-member
+        # row, no team colour, no team slot. The DB constraint allows 1..2, and
+        # a host can pair them later with /tourney-transfer-teammate.
+        want_solo = bool(play_as_solo) or teammate is None
+        if is_duo and not want_solo:
+            if getattr(teammate, "bot", False):
                 return await interaction.followup.send(
                     "Duo tourney: pass both players (`user` + `teammate`).", ephemeral=True)
             mate_id = str(teammate.id)
@@ -3620,21 +3626,25 @@ async def tourney_add_player_cmd(interaction: discord.Interaction, tourney_id: i
             _comp_reg_cache["at"] = 0.0
         except Exception:
             pass
-        return await interaction.followup.send(f"{user.mention} added to tourney **#{tourney_id}** roster.", ephemeral=True)
+        _solo_tail = (" Registered **unpaired** (no team colour) — pair them with "
+                      "`/tourney-transfer-teammate`." if is_duo else "")
+        return await interaction.followup.send(
+            f"{user.mention} added to tourney **#{tourney_id}** roster.{_solo_tail}",
+            ephemeral=True)
     except Exception as e:
         return await interaction.followup.send(f"Couldn't add player: {e}", ephemeral=True)
 
 
 @bot.tree.command(name="tourney-refresh-teams",
-                     description="Re-derive duo team colors and re-grant each team's roles (host)")
+                     description="Re-derive duo team colors after roster changes (host)")
 @app_commands.describe(tourney_id="Numeric session ID (from 0)")
 async def tourney_refresh_teams_cmd(interaction: discord.Interaction, tourney_id: int):
-    """Repair team colors + roles after teams were added, dropped or moved.
+    """Repair team colors after teams were added, dropped or moved.
 
-    Colors are frozen on the registration row at intake, so they drift as soon
-    as a team is removed and later teams shift; roles are granted at signup and
-    never re-checked. This re-derives both from the live roster, stripping any
-    team role a member should no longer hold.
+    Colors are frozen on the registration row at intake, because that is the
+    reaction the players see on their signup message, so they drift as soon as
+    a team is removed and every later team shifts up a slot. This re-derives
+    them from the live roster in registration order.
     """
     await interaction.response.defer(ephemeral=True)
     sb, me = await _comp_require_manager(interaction, tourney_id)
@@ -3663,8 +3673,10 @@ async def tourney_refresh_teams_cmd(interaction: discord.Interaction, tourney_id
 
 
 @bot.tree.command(name="tourney-remove-player", description="Remove a player from a tourney roster (host)")
-@app_commands.describe(tourney_id="Numeric session ID (from 0)", user="Player to remove")
-async def tourney_remove_player_cmd(interaction: discord.Interaction, tourney_id: int, user: discord.User):
+@app_commands.describe(tourney_id="Numeric session ID (from 0)", user="Player to remove",
+                       opponent="Also remove this player (e.g. the other half of a duo)")
+async def tourney_remove_player_cmd(interaction: discord.Interaction, tourney_id: int, user: discord.User,
+                                    opponent: discord.User | None = None):
     await interaction.response.defer(ephemeral=True)
     sb, me = await _comp_require_manager(interaction, tourney_id)
     if sb is None:
@@ -3676,9 +3688,23 @@ async def tourney_remove_player_cmd(interaction: discord.Interaction, tourney_id
             return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
         is_duo = str(((trow.data[0] or {}).get("mode")) or "solo").lower() == "duo"
         did = str(user.id)
+        # Optional second player. In a duo tourney removing one half already
+        # drops the whole team, so `opponent` is for the case where a host wants
+        # to clear TWO rows in one go (two unrelated teams, or a solo entry and
+        # the team it was paired into).
+        opp_id = str(opponent.id) if opponent is not None else ""
+        if opp_id and opp_id == did:
+            return await interaction.followup.send(
+                "`opponent` must be someone other than `user`.", ephemeral=True)
+        targets = [did] + ([opp_id] if opp_id else [])
         rows = await db._sb_call(lambda: sb.table("bngc_comp_registrations").select(
             "id,member_ids").eq("tourney_id", int(tourney_id)).neq("status", "banned").limit(1000).execute())
-        hit = [r for r in (rows.data or []) if did in ((r or {}).get("member_ids") or [])]
+        hit = [r for r in (rows.data or [])
+               if any(t in ((r or {}).get("member_ids") or []) for t in targets)]
+        if not hit:
+            who = f"{user.mention}" + (f" or {opponent.mention}" if opponent else "")
+            return await interaction.followup.send(
+                f"{who} is not on tourney **#{tourney_id}**'s roster.", ephemeral=True)
         removed_ids: list = []
         for r in hit:
             try:
@@ -3689,12 +3715,13 @@ async def tourney_remove_player_cmd(interaction: discord.Interaction, tourney_id
                     removed_ids.extend(members)
                     await db._sb_call(lambda: sb.table("bngc_comp_registrations").delete().eq("id", (r or {}).get("id")).execute())
                 else:
-                    remaining = [m for m in ((r or {}).get("member_ids") or []) if m != did]
+                    gone = [t for t in targets if t in members]
+                    remaining = [m for m in members if m not in gone]
+                    removed_ids.extend(gone)
                     if not remaining:
                         await db._sb_call(lambda: sb.table("bngc_comp_registrations").delete().eq("id", (r or {}).get("id")).execute())
                     else:
                         await db._sb_call(lambda: sb.table("bngc_comp_registrations").update({"member_ids": remaining}).eq("id", (r or {}).get("id")).execute())
-                    removed_ids.append(did)
             except Exception:
                 continue
         try:
@@ -3718,9 +3745,122 @@ async def tourney_remove_player_cmd(interaction: discord.Interaction, tourney_id
             _comp_reg_cache["at"] = 0.0
         except Exception:
             pass
-        return await interaction.followup.send(f"{user.mention} removed from tourney **#{tourney_id}** roster.", ephemeral=True)
+        _gone = sorted(set(removed_ids))
+        _names = " + ".join(f"<@{x}>" for x in _gone) or user.mention
+        return await interaction.followup.send(
+            f"{_names} removed from tourney **#{tourney_id}** roster.", ephemeral=True)
     except Exception as e:
         return await interaction.followup.send(f"Couldn't remove player: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="tourney-transfer-teammate",
+                     description="Swap a duo's teammate for someone else (host)")
+@app_commands.describe(tourney_id="Numeric session ID (from 0)",
+                       user="Player whose teammate is changing",
+                       new_teammate="The new teammate")
+async def tourney_transfer_teammate_cmd(interaction: discord.Interaction, tourney_id: int,
+                                        user: discord.User, new_teammate: discord.User):
+    """Replace one half of a duo, keeping the row (and its colour) intact.
+
+    The only roster edit that does not drop a team: /tourney-remove-player on a
+    duo deletes the whole row, which throws away the slot and the colour and
+    makes every later team shift. This keeps both, so a swap does not reshuffle
+    the board - which matters because the colour is frozen on the row and is the
+    reaction the players already see on their signup message.
+
+    Also the way to pair up a solo entry made in a duo tourney: a one-member row
+    gains its second member here and takes the colour it was missing.
+
+    captain_id is left alone: it is the player who signed the team up.
+    """
+    await interaction.response.defer(ephemeral=True)
+    sb, me = await _comp_require_manager(interaction, tourney_id)
+    if sb is None:
+        return
+    try:
+        trow = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select(
+            "id,mode,player_role_id").eq("id", int(tourney_id)).limit(1).execute())
+        if not trow.data:
+            return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
+        t = trow.data[0] or {}
+        is_duo = str((t or {}).get("mode") or "solo").lower() == "duo"
+        if not is_duo:
+            return await interaction.followup.send(
+                f"Tourney **#{tourney_id}** is solo - there are no teammates to swap.",
+                ephemeral=True)
+        did = str(user.id)
+        new_id = str(new_teammate.id)
+        if getattr(new_teammate, "bot", False):
+            return await interaction.followup.send("That's a bot.", ephemeral=True)
+        if new_id == did:
+            return await interaction.followup.send(
+                "Pick a teammate who is not `user`.", ephemeral=True)
+        rows = await _comp_reg_rows(int(tourney_id))
+        hit = next((r for r in (rows or [])
+                    if (r or {}).get("status") != "banned"
+                    and did in ((r or {}).get("member_ids") or [])), None)
+        if not hit:
+            return await interaction.followup.send(
+                f"{user.mention} is not on tourney **#{tourney_id}**'s roster.",
+                ephemeral=True)
+        members = [str(m) for m in ((hit or {}).get("member_ids") or []) if m]
+        # the new teammate must be free, or they would be on two rows at once
+        clash = next((r for r in (rows or [])
+                      if str((r or {}).get("id")) != str((hit or {}).get("id"))
+                      and (r or {}).get("status") != "banned"
+                      and new_id in ((r or {}).get("member_ids") or [])), None)
+        if clash:
+            return await interaction.followup.send(
+                f"{new_teammate.mention} is already on the roster - remove them "
+                f"first, or pick someone else.", ephemeral=True)
+        old_mate = next((m for m in members if m != did), None)
+        # captain first, so team_label and member_ids keep a stable order
+        new_members = [did, new_id]
+        _patch = {"member_ids": new_members,
+                  "team_label": " / ".join(f"<@{m}>" for m in new_members)}
+        # colour: a promoted solo entry has none yet, so give it the next slot
+        if not str((hit or {}).get("team_color") or "").strip():
+            _idx = sum(1 for r in (rows or []) if (r or {}).get("status") != "banned")
+            _patch["team_color"] = _comp_team_color(_idx)
+        # member_names is display-only; keep the outgoing half off the row
+        try:
+            _mn = dict((hit or {}).get("member_names") or {})
+            if old_mate:
+                _mn.pop(str(old_mate), None)
+            if _mn:
+                _mn[new_id] = {
+                    "username": str(getattr(new_teammate, "name", "") or "")[:32],
+                    "display_name": str(getattr(new_teammate, "display_name", "")
+                                        or getattr(new_teammate, "name", "") or "")[:32],
+                }
+                _patch["member_names"] = _mn
+        except Exception:
+            pass
+        try:
+            await db._sb_call(lambda: sb.table("bngc_comp_registrations")
+                              .update(_patch).eq("id", (hit or {}).get("id")).execute())
+        except Exception as e:
+            return await interaction.followup.send(
+                f"Couldn't save the swap (member_names may be missing): {e}",
+                ephemeral=True)
+        try:
+            _rid = (t or {}).get("player_role_id") or COMP_PLAYER_ROLE_ID
+            await _comp_grant_role(interaction.guild, new_id, _rid)
+        except Exception:
+            pass
+        try:
+            _comp_reg_cache["at"] = 0.0
+        except Exception:
+            pass
+        _was = (f"<@{old_mate}> is off the team. " if old_mate
+                else "Picked up a partner from a solo entry. ")
+        return await interaction.followup.send(
+            f"{user.mention} is now teamed with {new_teammate.mention} in tourney "
+            f"**#{tourney_id}**. {_was}Team colour {_patch.get('team_color') or (hit or {}).get('team_color') or '—'} kept.",
+            ephemeral=True)
+    except Exception as e:
+        return await interaction.followup.send(f"Couldn't transfer teammate: {e}",
+                                               ephemeral=True)
 
 
 @bot.tree.command(name="tourney-add-back", description="Add a player back to the open match roster (host)")
