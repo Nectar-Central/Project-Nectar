@@ -2448,6 +2448,58 @@ async def comp_calculate(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+def _apply_ranked_pr_ratchet(pr_board) -> list:
+    """Write bngc_users.ranked_tourney_pr as a high-water mark. Never raises.
+
+    Mirrors comp._apply_tourney_pr_ratchet: one global column, a per-tourney
+    score, therefore only ever up. The per-tourney history row still records
+    what this tourney actually scored.
+    """
+    wrote: list = []
+    try:
+        rows = list(pr_board or [])
+        if not rows or not supabase:
+            return wrote
+        ids = [str((r or {}).get("discord_id") or "") for r in rows]
+        cur: dict = {}
+        try:
+            res = supabase.table("bngc_users").select(
+                "discord_id,ranked_tourney_pr").in_("discord_id", ids).execute()
+            for u in (res.data or []):
+                did = str((u or {}).get("discord_id") or "")
+                if not did:
+                    continue
+                try:
+                    cur[did] = float((u or {}).get("ranked_tourney_pr"))
+                except Exception:
+                    cur[did] = None
+        except Exception:
+            cur = {}
+        for r in rows:
+            did = str((r or {}).get("discord_id") or "")
+            if not did:
+                continue
+            try:
+                want = float((r or {}).get("pr"))
+            except Exception:
+                continue
+            old = cur.get(did)
+            if old is not None:
+                try:
+                    want = max(want, float(old))
+                except Exception:
+                    pass
+            try:
+                supabase.table("bngc_users").update(
+                    {"ranked_tourney_pr": want}).eq("discord_id", did).execute()
+                wrote.append(did)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return wrote
+
+
 def compute_and_store_tourney_pr_sync(tid: int) -> list[dict]:
     """Compute Tourney PR once at tourney end + store. Idempotent: when
     bngc_ranked_tourney_pr_history rows exist for the tourney they are returned as-is
@@ -2491,9 +2543,14 @@ def compute_and_store_tourney_pr_sync(tid: int) -> list[dict]:
         by_mid: dict = {}
         try:
             if mids:
+                # ORDER BY id: an unordered LIMIT can hand back a different
+                # 5000-row window on every call once a tourney is big, which
+                # drops players off the board and moves the shared `players`
+                # divisor. A recompute that persists a rating has to be
+                # reproducible.
                 eres = supabase.table("bngc_ranked_tourney_events").select(
-                    "match_id,etype,discord_id,actor_name,alive").in_(
-                    "match_id", mids[:200]).limit(5000).execute()
+                    "id,match_id,etype,discord_id,actor_name,alive").in_(
+                    "match_id", mids[:200]).order("id").limit(5000).execute()
                 for e in (eres.data or []):
                     by_mid.setdefault((e or {}).get("match_id"), []).append(e)
         except Exception:
@@ -2513,11 +2570,12 @@ def compute_and_store_tourney_pr_sync(tid: int) -> list[dict]:
                 }, on_conflict="tourney_id,discord_id").execute()
             except Exception:
                 pass
-            try:
-                supabase.table("bngc_users").update(
-                    {"ranked_tourney_pr": float(r["pr"])}).eq("discord_id", str(r["discord_id"])).execute()
-            except Exception:
-                pass
+        # Same high-water-mark rule as comp PR (see
+        # comp._apply_tourney_pr_ratchet): compute_tourney_pr is a
+        # per-TOURNEY score with no memory of the player's previous rating, so
+        # writing it absolutely to the single `ranked_tourney_pr` column let the
+        # last tourney to close decide the rating and players went DOWN.
+        _apply_ranked_pr_ratchet(pr_board)
         return pr_board
     except Exception:
         return []

@@ -881,6 +881,35 @@ def _eff_gm(pkt, pkt_room_gm, gm_val):
     return pkt_gm or pkt_room_gm or gm_val  # Fallback chain: packet → room → session
 
 
+def observed_out_event(gm, subject, room_id, short_code, match_version) -> dict:
+    """Payload for an elimination this session WATCHED rather than suffered.
+
+    A tracker sees the whole room's alv packets, so it routinely watches other
+    players go out. Those were previously discarded, which is unrecoverable for a
+    duel against an opponent with no companion: zone and fall damage never
+    reach a killfeed, so with no persisted row there is no evidence the round
+    happened at all.
+
+    Written as a killfeed row with kill_type="out" - a new value in an existing
+    jsonb field rather than a new event_type, which would leak into stats,
+    insights and play points (they all read bngc_game_events by type). No killer
+    is named and no kill is implied: we did not land it. Whether the subject is
+    the duelist's opponent is decided by NAME, in the wager, exactly as the
+    mobile path already does for a killfeed victim.
+
+    The subject is written under `instigated` AND `player` because the wager's
+    name-key set (_MOBILE_NAME_KEYS in companion/bot/duels.py) is what decides
+    co-presence here; a test pins that the two agree.
+    """
+    try:
+        return {"gm": gm, "instigator": None, "instigated": subject,
+                "player": subject, "kill_type": "out", "via": "alv",
+                "room_id": room_id, "code": short_code,
+                "match_version": match_version}
+    except Exception:
+        return {}
+
+
 def _buf_event(buf, discord_id, session_id, event_type, event_data):
     """Queue one bngc_game_events row for the batch-end bulk insert.
 
@@ -3327,6 +3356,9 @@ async def process_batch(
     # Track which match_versions already had a death counted (dedup alv + killfeed)
     # Prevents double-counting when both killfeed and alv report the same death
     death_counted_for_match = set()  # Set of (discord_id, match_version) tuples
+    # (discord_id, room_id, match_version, subject) for eliminations we WATCHED
+    # rather than suffered - see the non-self alv branch below.
+    out_counted_for_match = set()
     _kf_credited = 0      # kills credited to self this batch (tripwire denominator)
     _kf_unattributed = 0  # valid killfeed kills credited to NOBODY (tripwire numerator)
     me_name = (view.me.username if view.me else None) or user.get("game_username")  # My game username
@@ -3702,6 +3734,47 @@ async def process_batch(
                                 # Wins-only: no immediate defeat (deaths still count above).
                             else:
                                 log_sys(f"PROCESSOR DEATH via alv skip already counted this life")
+
+                    # Someone ELSE went out. The tracker sees the whole room's
+                    # alv packets, not just its own, and the self-death branch
+                    # above throws every one of these away - which is
+                    # unrecoverable for a duel against an opponent with no
+                    # companion: zone and fall damage never reach a killfeed, so
+                    # with no persisted row there is no evidence the round
+                    # happened at all and the duel stalls.
+                    #
+                    # Recorded as a killfeed row with kill_type="out" - a new
+                    # value in an existing jsonb field, not a new event_type,
+                    # which would have leaked into stats, insights and play
+                    # points (they all read bngc_game_events by type). No kill is
+                    # credited to anyone: we did not do it. We cannot know
+                    # whether the subject is the duelist opponent - the wager
+                    # decides that, by name, exactly as the mobile path already
+                    # does for a killfeed victim.
+                    if is_dead_alv and not _me_hosting_only and alv_player:
+                        try:
+                            _mine2 = _is_self(_get_room(pkt_room_id, view), view, user, alv_player)
+                        except Exception:
+                            _mine2 = None
+                        if not _mine2:
+                            try:
+                                _oroom = _get_room(pkt_room_id, view)
+                                _orid = getattr(_oroom, "room_id", None) or pkt_room_id
+                                _orv = getattr(_oroom, "match_version", None)
+                                _orv = _orv if _orv is not None else pkt_match_ver
+                                _okey = (discord_id, str(_orid), int(_orv),
+                                         str(alv_player).strip().lower())
+                                if _okey not in out_counted_for_match:
+                                    out_counted_for_match.add(_okey)
+                                    _buf_event(ev_rows, discord_id, session_id, "killfeed",
+                                               observed_out_event(eff_gm, alv_player,
+                                                                  pkt_room_id, pkt_short,
+                                                                  pkt_match_ver))
+                                    log_engine("proc", session_id[:13], action="out-observed",
+                                               name=alv_player, room=str(_orid)[:8],
+                                               match_version=pkt_match_ver)
+                            except Exception:
+                                pass
                 except Exception as e:
                     log_err(f"processor alv death failed {e}")
 

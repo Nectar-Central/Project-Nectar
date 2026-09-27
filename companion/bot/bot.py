@@ -3046,8 +3046,10 @@ async def _comp_remove_role(guild, user_id, role_id, reason="Comp tourney ended"
 def _comp_team_members(user_ids: list, mode: str):
     """Validate mention list for the mode. Pure: ([ids], None) or ([], error).
 
-    Solo wants exactly 1, duo exactly 2 (any separator — separators never
-    reach us, only the mention list does). Bots and dupes rejected.
+    Solo wants exactly 1, duo 1 or 2 - a duo tourney accepts a SOLO entry, so
+    someone can sign up alone and be paired later (or play a solo round). One
+    mention in a duo tourney is therefore valid, not a mistake. Bots and dupes
+    are still rejected, and 3+ is always an error.
     """
     try:
         ids = [str(x) for x in (user_ids or []) if str(x or "").strip()]
@@ -3056,10 +3058,17 @@ def _comp_team_members(user_ids: list, mode: str):
     try:
         if len(ids) != len(set(ids)):
             return [], "duplicate mentions"
-        want = 2 if str(mode or "").lower() == "duo" else 1
-        if len(ids) != want:
-            return [], (f"{mode} needs exactly {want} real mention(s), got {len(ids)} — "
-                        f"type @ and pick from the popup, typed-out names don't count")
+        n = len(ids)
+        if n < 1:
+            return [], "mention yourself to register"
+        if str(mode or "").lower() == "duo":
+            if n > 2:
+                return [], (f"duo takes at most 2 mentions (you + one teammate), "
+                            f"got {n} — type @ and pick from the popup, typed-out "
+                            f"names don't count")
+        elif n != 1:
+            return [], (f"solo needs exactly 1 real mention, got {n} — type @ and "
+                        f"pick from the popup, typed-out names don't count")
         return ids, None
     except Exception:
         return [], "invalid mentions"
@@ -3259,13 +3268,6 @@ async def tourney_stop_cmd(interaction: discord.Interaction, tourney_id: int,
         except Exception as e:
             print(f"[comp] stop role strip failed: {e}")
         tail = f" ({stripped} role{'s' if stripped != 1 else ''} stripped)" if stripped else ""
-        # team colour roles: handed out at /tourney-start, taken back here so a
-        # finished tourney does not leave its colours on people's profiles
-        team_stripped = await _comp_strip_team_roles(interaction.guild,
-                                                     int(tourney_id))
-        if team_stripped:
-            tail += (f" · 🎨 {team_stripped} team role"
-                     f"{'s' if team_stripped != 1 else ''} removed")
         # auto-compute Tourney PR on close (idempotent; unattributed kills
         # simply don't count — every accepted signup now holds a profile).
         pr_board: list = []
@@ -3525,9 +3527,11 @@ async def tourney_remove_host_cmd(interaction: discord.Interaction, tourney_id: 
 
 @bot.tree.command(name="tourney-add-player", description="Add a player to a tourney roster (host)")
 @app_commands.describe(tourney_id="Numeric session ID (from 0)", user="Player to add",
-                       teammate="Duo teammate (required for duo tourneys)")
+                       teammate="Duo teammate (omit for a solo entry)",
+                       play_as_solo="Add unpaired, even in a duo tourney")
 async def tourney_add_player_cmd(interaction: discord.Interaction, tourney_id: int, user: discord.User,
-                                 teammate: discord.User | None = None):
+                                 teammate: discord.User | None = None,
+                                 play_as_solo: bool = False):
     await interaction.response.defer(ephemeral=True)
     sb, me = await _comp_require_manager(interaction, tourney_id)
     if sb is None:
@@ -3541,8 +3545,12 @@ async def tourney_add_player_cmd(interaction: discord.Interaction, tourney_id: i
         is_duo = str((t or {}).get("mode") or "solo").lower() == "duo"
         did = str(user.id)
         rows = await _comp_reg_rows(int(tourney_id))
-        if is_duo:
-            if teammate is None or getattr(teammate, "bot", False):
+        # play_as_solo (or simply no teammate) in a duo tourney: a one-member
+        # row, no team colour, no team slot. The DB constraint allows 1..2, and
+        # a host can pair them later with /tourney-transfer-teammate.
+        want_solo = bool(play_as_solo) or teammate is None
+        if is_duo and not want_solo:
+            if getattr(teammate, "bot", False):
                 return await interaction.followup.send(
                     "Duo tourney: pass both players (`user` + `teammate`).", ephemeral=True)
             mate_id = str(teammate.id)
@@ -3618,21 +3626,25 @@ async def tourney_add_player_cmd(interaction: discord.Interaction, tourney_id: i
             _comp_reg_cache["at"] = 0.0
         except Exception:
             pass
-        return await interaction.followup.send(f"{user.mention} added to tourney **#{tourney_id}** roster.", ephemeral=True)
+        _solo_tail = (" Registered **unpaired** (no team colour) — pair them with "
+                      "`/tourney-transfer-teammate`." if is_duo else "")
+        return await interaction.followup.send(
+            f"{user.mention} added to tourney **#{tourney_id}** roster.{_solo_tail}",
+            ephemeral=True)
     except Exception as e:
         return await interaction.followup.send(f"Couldn't add player: {e}", ephemeral=True)
 
 
 @bot.tree.command(name="tourney-refresh-teams",
-                     description="Re-derive duo team colors and re-grant each team's roles (host)")
+                     description="Re-derive duo team colors after roster changes (host)")
 @app_commands.describe(tourney_id="Numeric session ID (from 0)")
 async def tourney_refresh_teams_cmd(interaction: discord.Interaction, tourney_id: int):
-    """Repair team colors + roles after teams were added, dropped or moved.
+    """Repair team colors after teams were added, dropped or moved.
 
-    Colors are frozen on the registration row at intake, so they drift as soon
-    as a team is removed and later teams shift; roles are granted at signup and
-    never re-checked. This re-derives both from the live roster, stripping any
-    team role a member should no longer hold.
+    Colors are frozen on the registration row at intake, because that is the
+    reaction the players see on their signup message, so they drift as soon as
+    a team is removed and every later team shifts up a slot. This re-derives
+    them from the live roster in registration order.
     """
     await interaction.response.defer(ephemeral=True)
     sb, me = await _comp_require_manager(interaction, tourney_id)
@@ -3645,20 +3657,15 @@ async def tourney_refresh_teams_cmd(interaction: discord.Interaction, tourney_id
             return await interaction.followup.send("No tourney with that ID.",
                                                   ephemeral=True)
         t = trow.data[0] or {}
-        out = await _comp_sync_team_roles(interaction.guild, sb, t)
+        out = await _comp_sync_team_colors(sb, t)
         if out.get("solo"):
             return await interaction.followup.send(
                 f"Tourney **#{tourney_id}** is solo -no teams to refresh.",
                 ephemeral=True)
         lines = [f"**Tourney #{tourney_id}** teams refreshed:",
                  f"Teams: **{out['teams']}** · members: **{out['members']}**",
-                 f"Colors corrected: **{out['recolored']}**",
-                 f"Roles granted: **{out['granted']}** · stale roles stripped: **{out['stripped']}**"]
-        if out.get("no_role_config"):
-            lines.append("_No team roles configured - set `COMP_TEAM_ROLE_1..6` "
-                         "to their role ids and re-run._")
-        lines.append("Team order = signup order, so colours and roles both cycle "
-                     "every six teams.")
+                 f"Colors corrected: **{out['recolored']}**"]
+        lines.append("Team order = signup order, so colours cycle every six teams.")
         return await interaction.followup.send("\n".join(lines), ephemeral=True)
     except Exception as e:
         return await interaction.followup.send(f"Couldn't refresh teams: {e}",
@@ -3666,8 +3673,10 @@ async def tourney_refresh_teams_cmd(interaction: discord.Interaction, tourney_id
 
 
 @bot.tree.command(name="tourney-remove-player", description="Remove a player from a tourney roster (host)")
-@app_commands.describe(tourney_id="Numeric session ID (from 0)", user="Player to remove")
-async def tourney_remove_player_cmd(interaction: discord.Interaction, tourney_id: int, user: discord.User):
+@app_commands.describe(tourney_id="Numeric session ID (from 0)", user="Player to remove",
+                       opponent="Also remove this player (e.g. the other half of a duo)")
+async def tourney_remove_player_cmd(interaction: discord.Interaction, tourney_id: int, user: discord.User,
+                                    opponent: discord.User | None = None):
     await interaction.response.defer(ephemeral=True)
     sb, me = await _comp_require_manager(interaction, tourney_id)
     if sb is None:
@@ -3679,9 +3688,23 @@ async def tourney_remove_player_cmd(interaction: discord.Interaction, tourney_id
             return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
         is_duo = str(((trow.data[0] or {}).get("mode")) or "solo").lower() == "duo"
         did = str(user.id)
+        # Optional second player. In a duo tourney removing one half already
+        # drops the whole team, so `opponent` is for the case where a host wants
+        # to clear TWO rows in one go (two unrelated teams, or a solo entry and
+        # the team it was paired into).
+        opp_id = str(opponent.id) if opponent is not None else ""
+        if opp_id and opp_id == did:
+            return await interaction.followup.send(
+                "`opponent` must be someone other than `user`.", ephemeral=True)
+        targets = [did] + ([opp_id] if opp_id else [])
         rows = await db._sb_call(lambda: sb.table("bngc_comp_registrations").select(
             "id,member_ids").eq("tourney_id", int(tourney_id)).neq("status", "banned").limit(1000).execute())
-        hit = [r for r in (rows.data or []) if did in ((r or {}).get("member_ids") or [])]
+        hit = [r for r in (rows.data or [])
+               if any(t in ((r or {}).get("member_ids") or []) for t in targets)]
+        if not hit:
+            who = f"{user.mention}" + (f" or {opponent.mention}" if opponent else "")
+            return await interaction.followup.send(
+                f"{who} is not on tourney **#{tourney_id}**'s roster.", ephemeral=True)
         removed_ids: list = []
         for r in hit:
             try:
@@ -3692,12 +3715,13 @@ async def tourney_remove_player_cmd(interaction: discord.Interaction, tourney_id
                     removed_ids.extend(members)
                     await db._sb_call(lambda: sb.table("bngc_comp_registrations").delete().eq("id", (r or {}).get("id")).execute())
                 else:
-                    remaining = [m for m in ((r or {}).get("member_ids") or []) if m != did]
+                    gone = [t for t in targets if t in members]
+                    remaining = [m for m in members if m not in gone]
+                    removed_ids.extend(gone)
                     if not remaining:
                         await db._sb_call(lambda: sb.table("bngc_comp_registrations").delete().eq("id", (r or {}).get("id")).execute())
                     else:
                         await db._sb_call(lambda: sb.table("bngc_comp_registrations").update({"member_ids": remaining}).eq("id", (r or {}).get("id")).execute())
-                    removed_ids.append(did)
             except Exception:
                 continue
         try:
@@ -3721,9 +3745,122 @@ async def tourney_remove_player_cmd(interaction: discord.Interaction, tourney_id
             _comp_reg_cache["at"] = 0.0
         except Exception:
             pass
-        return await interaction.followup.send(f"{user.mention} removed from tourney **#{tourney_id}** roster.", ephemeral=True)
+        _gone = sorted(set(removed_ids))
+        _names = " + ".join(f"<@{x}>" for x in _gone) or user.mention
+        return await interaction.followup.send(
+            f"{_names} removed from tourney **#{tourney_id}** roster.", ephemeral=True)
     except Exception as e:
         return await interaction.followup.send(f"Couldn't remove player: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="tourney-transfer-teammate",
+                     description="Swap a duo's teammate for someone else (host)")
+@app_commands.describe(tourney_id="Numeric session ID (from 0)",
+                       user="Player whose teammate is changing",
+                       new_teammate="The new teammate")
+async def tourney_transfer_teammate_cmd(interaction: discord.Interaction, tourney_id: int,
+                                        user: discord.User, new_teammate: discord.User):
+    """Replace one half of a duo, keeping the row (and its colour) intact.
+
+    The only roster edit that does not drop a team: /tourney-remove-player on a
+    duo deletes the whole row, which throws away the slot and the colour and
+    makes every later team shift. This keeps both, so a swap does not reshuffle
+    the board - which matters because the colour is frozen on the row and is the
+    reaction the players already see on their signup message.
+
+    Also the way to pair up a solo entry made in a duo tourney: a one-member row
+    gains its second member here and takes the colour it was missing.
+
+    captain_id is left alone: it is the player who signed the team up.
+    """
+    await interaction.response.defer(ephemeral=True)
+    sb, me = await _comp_require_manager(interaction, tourney_id)
+    if sb is None:
+        return
+    try:
+        trow = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select(
+            "id,mode,player_role_id").eq("id", int(tourney_id)).limit(1).execute())
+        if not trow.data:
+            return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
+        t = trow.data[0] or {}
+        is_duo = str((t or {}).get("mode") or "solo").lower() == "duo"
+        if not is_duo:
+            return await interaction.followup.send(
+                f"Tourney **#{tourney_id}** is solo - there are no teammates to swap.",
+                ephemeral=True)
+        did = str(user.id)
+        new_id = str(new_teammate.id)
+        if getattr(new_teammate, "bot", False):
+            return await interaction.followup.send("That's a bot.", ephemeral=True)
+        if new_id == did:
+            return await interaction.followup.send(
+                "Pick a teammate who is not `user`.", ephemeral=True)
+        rows = await _comp_reg_rows(int(tourney_id))
+        hit = next((r for r in (rows or [])
+                    if (r or {}).get("status") != "banned"
+                    and did in ((r or {}).get("member_ids") or [])), None)
+        if not hit:
+            return await interaction.followup.send(
+                f"{user.mention} is not on tourney **#{tourney_id}**'s roster.",
+                ephemeral=True)
+        members = [str(m) for m in ((hit or {}).get("member_ids") or []) if m]
+        # the new teammate must be free, or they would be on two rows at once
+        clash = next((r for r in (rows or [])
+                      if str((r or {}).get("id")) != str((hit or {}).get("id"))
+                      and (r or {}).get("status") != "banned"
+                      and new_id in ((r or {}).get("member_ids") or [])), None)
+        if clash:
+            return await interaction.followup.send(
+                f"{new_teammate.mention} is already on the roster - remove them "
+                f"first, or pick someone else.", ephemeral=True)
+        old_mate = next((m for m in members if m != did), None)
+        # captain first, so team_label and member_ids keep a stable order
+        new_members = [did, new_id]
+        _patch = {"member_ids": new_members,
+                  "team_label": " / ".join(f"<@{m}>" for m in new_members)}
+        # colour: a promoted solo entry has none yet, so give it the next slot
+        if not str((hit or {}).get("team_color") or "").strip():
+            _idx = sum(1 for r in (rows or []) if (r or {}).get("status") != "banned")
+            _patch["team_color"] = _comp_team_color(_idx)
+        # member_names is display-only; keep the outgoing half off the row
+        try:
+            _mn = dict((hit or {}).get("member_names") or {})
+            if old_mate:
+                _mn.pop(str(old_mate), None)
+            if _mn:
+                _mn[new_id] = {
+                    "username": str(getattr(new_teammate, "name", "") or "")[:32],
+                    "display_name": str(getattr(new_teammate, "display_name", "")
+                                        or getattr(new_teammate, "name", "") or "")[:32],
+                }
+                _patch["member_names"] = _mn
+        except Exception:
+            pass
+        try:
+            await db._sb_call(lambda: sb.table("bngc_comp_registrations")
+                              .update(_patch).eq("id", (hit or {}).get("id")).execute())
+        except Exception as e:
+            return await interaction.followup.send(
+                f"Couldn't save the swap (member_names may be missing): {e}",
+                ephemeral=True)
+        try:
+            _rid = (t or {}).get("player_role_id") or COMP_PLAYER_ROLE_ID
+            await _comp_grant_role(interaction.guild, new_id, _rid)
+        except Exception:
+            pass
+        try:
+            _comp_reg_cache["at"] = 0.0
+        except Exception:
+            pass
+        _was = (f"<@{old_mate}> is off the team. " if old_mate
+                else "Picked up a partner from a solo entry. ")
+        return await interaction.followup.send(
+            f"{user.mention} is now teamed with {new_teammate.mention} in tourney "
+            f"**#{tourney_id}**. {_was}Team colour {_patch.get('team_color') or (hit or {}).get('team_color') or '—'} kept.",
+            ephemeral=True)
+    except Exception as e:
+        return await interaction.followup.send(f"Couldn't transfer teammate: {e}",
+                                               ephemeral=True)
 
 
 @bot.tree.command(name="tourney-add-back", description="Add a player back to the open match roster (host)")
@@ -5490,28 +5627,20 @@ async def tourney_start_cmd(interaction: discord.Interaction, tourney_id: int,
             return await interaction.followup.send("No tourney with that ID.", ephemeral=True)
         t = tres.data[0]
         role_id = (str(role_to_give.id) if role_to_give else None) or t.get("player_role_id") or COMP_PLAYER_ROLE_ID
-        # Team colour roles land HERE, not at signup: this is the first moment
-        # the roster is final, so each member's role is the one matching the
-        # colour already frozen on their signup message. Runs before the
-        # player-role branch so it happens even with no player role set.
+        # Team colours: frozen at intake (they are the reaction players see) and
+        # therefore stale after any roster change, so re-derive them here, when
+        # the roster is final. Runs before the player-role branch so it happens
+        # even with no player role set.
         teams_out = {}
         try:
-            teams_out = await _comp_sync_team_roles(
-                interaction.guild, sb, {"id": int(tourney_id),
-                                        "mode": t.get("mode") or "solo"})
+            teams_out = await _comp_sync_team_colors(
+                sb, {"id": int(tourney_id), "mode": t.get("mode") or "solo"})
         except Exception as e:
-            print(f"[comp] start team role sync failed: {e}")
+            print(f"[comp] start team color sync failed: {e}")
         team_line = ""
         if teams_out and not teams_out.get("solo"):
-            if teams_out.get("no_role_config"):
-                team_line = ("\n:warning: No team roles configured - colours "
-                             "refreshed only.")
-            else:
-                team_line = (f"\nTeam roles: **{teams_out.get('granted', 0)}** granted"
-                             f" · **{teams_out.get('stripped', 0)}** stale removed"
-                             f" across **{teams_out.get('teams', 0)}** teams"
-                             + (f" · **{teams_out['recolored']}** colour(s) corrected"
-                                if teams_out.get("recolored") else ""))
+            team_line = (f"\n🎨 Team colours: **{teams_out.get('recolored', 0)}** corrected"
+                         f" across **{teams_out.get('teams', 0)}** teams")
         if role_to_give is not None:
             try:
                 await db._sb_call(lambda: sb.table("bngc_comp_tourneys").update(
@@ -5562,67 +5691,31 @@ async def tourney_start_cmd(interaction: discord.Interaction, tourney_id: int,
         return await interaction.followup.send(f"Couldn't start: {e}", ephemeral=True)
 
 
-TEAM_COLORS = ["🔵", "🔴", "🟠", "🟡", "🟢", "🟣"]
-
-# One Discord role per team slot, same order as TEAM_COLORS. The mapping and
-# the role-id config live in teams.py so they can be unit-tested without the
-# bot's command tree; these names keep the existing call sites readable.
-from teams import (configured_team_role_ids as _comp_team_role_ids_set,  # noqa: E402
-                   team_color as _comp_team_color,
-                   team_role_id as _comp_team_role_id,
-                   team_role_strip_targets as _comp_team_strip_targets,
+# Team colours (and only colours) live in teams.py so the palette and the slot
+# rule can be unit-tested without the bot's command tree. These aliases keep
+# the existing call sites readable.
+from teams import (team_color as _comp_team_color,  # noqa: E402
                    team_slots as _comp_team_slots)
 
 
-async def _comp_strip_team_roles(guild, tourney_id) -> int:
-    """Take every configured team role back off a tourney's players. Never raises.
+async def _comp_sync_team_colors(sb, tourney) -> dict:
+    """Re-derive each duo team's colour from its slot. Never raises.
 
-    Ends the colours with the tourney: /tourney-start hands them out and
-    /tourney-stop takes them back, so nobody walks away still wearing a team
-    role from a finished cup. Targets every registered member, not just the
-    live teams, because a banned or re-signed duo may still hold theirs.
+    The colour is FROZEN on the registration row because it is the reaction
+    the players see on their signup message, so it drifts as soon as a team is
+    added or removed and every later team shifts up a slot. The slot is the
+    row's position among live teams in registration order (see _comp_reg_rows),
+    which is the only stable order available.
+
+    No Discord roles: they were removed. A role per slot had to agree with a
+    colour the roster could reassign at any moment, and the two kept
+    disagreeing - see the git history for the swap this replaced.
+
+    Called from /tourney-start (roster final) and /tourney-refresh-teams.
+
+    Returns {"teams", "members", "recolored", "solo"}. Never raises.
     """
-    out = 0
-    try:
-        if guild is None:
-            return 0
-        roles = _comp_team_role_ids_set()
-        if not roles:
-            return 0
-        for did, rid in _comp_team_strip_targets(await _comp_reg_rows(tourney_id), roles):
-            if await _comp_remove_role(guild, did, rid,
-                                      reason=f"Comp tourney #{tourney_id} ended"):
-                out += 1
-    except Exception as e:
-        print(f"[comp] stop team role strip failed: {e}")
-    return out
-
-
-async def _comp_sync_team_roles(guild, sb, tourney) -> dict:
-    """Re-derive duo team colors and re-grant each team's Discord roles.
-
-    Colour and role both come from ONE slot per team - the row's position
-    among live teams, in registration order (see _comp_reg_rows). Deriving
-    them separately is what swapped them: the colour used to be frozen from a
-    count taken at intake while the role came from the row's position, and
-    those two disagree whenever the read order does.
-
-    Colors are FROZEN on the registration row because they are the reaction the
-    players see on their signup message, so a drift is corrected here. Roles
-    are stripped-then-granted from the same slot, mirroring
-    _ranked_sync_member_roles, so a player who moved teams never keeps the old
-    colour role.
-
-    Called from /tourney-start (roster final) and /tourney-refresh-teams -
-    NOT at signup, so nobody wears a team role for a tourney that never
-    started.
-
-    Returns {"teams", "members", "granted", "stripped", "recolored",
-    "no_role_config", "solo"}. Never raises.
-    """
-    out = {"teams": 0, "members": 0, "granted": 0, "stripped": 0,
-           "recolored": 0, "no_role_config": not _comp_team_role_ids_set(),
-           "solo": False}
+    out = {"teams": 0, "members": 0, "recolored": 0, "solo": False}
     try:
         t = tourney or {}
         tid = int(t.get("id") or 0)
@@ -5633,10 +5726,8 @@ async def _comp_sync_team_roles(guild, sb, tourney) -> dict:
             return out
         slots = _comp_team_slots(await _comp_reg_rows(tid))
         out["teams"] = len(slots)
-        if not slots:
-            return out
-        # first pass: colours (a write, so do it before the rate-limited grants)
         for r, idx in slots:
+            out["members"] += len((r or {}).get("member_ids") or [])
             try:
                 want = _comp_team_color(idx)
                 if str((r or {}).get("team_color") or "") != want:
@@ -5646,29 +5737,9 @@ async def _comp_sync_team_roles(guild, sb, tourney) -> dict:
                     out["recolored"] += 1
             except Exception:
                 continue
-        if guild is None:
-            return out
-        every = _comp_team_role_ids_set()
-        for r, idx in slots:
-            want_role = _comp_team_role_id(idx)
-            for did in ((r or {}).get("member_ids") or []):
-                did = str(did or "").strip()
-                if not did:
-                    continue
-                out["members"] += 1
-                for other in every:
-                    if other == want_role:
-                        continue
-                    if await _comp_remove_role(guild, did, other,
-                                               reason=f"comp team #{tid} refresh"):
-                        out["stripped"] += 1
-                if want_role and await _comp_grant_role(guild, did, want_role):
-                    out["granted"] += 1
-                if out["members"] % 20 == 0:
-                    await asyncio.sleep(1)  # stay under the role rate limit
         return out
     except Exception as e:
-        print(f"[comp] team role sync failed: {e}")
+        print(f"[comp] team color sync failed: {e}")
         return out
 
 
@@ -5678,9 +5749,11 @@ def _comp_open_text(mode: str, ping_role_id: str | None = None, name: str = "Tou
         is_duo = str(mode or "").lower() == "duo"
         if is_duo:
             head = (f"## {str(name).upper()} SIGNUPS REGISTRATIONS OPEN:\n\n"
-                    f"*@yourself AND your teammate to register — one message with both mentions, "
-                    f"your own mention first (type @ and pick from the popup — "
+                    f"*@yourself AND your teammate to register as a team — one message with "
+                    f"both mentions, your own mention first (type @ and pick from the popup — "
                     f"typed-out names don't count).*\n"
+                    f"*Signing up alone? Just @yourself — you go in unpaired and a host can "
+                    f"team you up later.*\n"
                     f"*Both players then press **Create comp profile** below so kills map to you.*")
         else:
             head = (f"## {str(name).upper()} SIGNUPS REGISTRATIONS OPEN:\n\n"
@@ -6059,14 +6132,23 @@ async def on_message(message):
             if i not in seen:
                 seen.add(i)
                 clean.append(i)
+        # A message with no mention is not a signup attempt - it is chatter.
+        # Stay completely silent: no cross, no notice, nothing to clean up.
+        if not clean:
+            return
         members, err = _comp_team_members(clean, (t or {}).get("mode") or "solo")
         sb = _comp_sb()
+        _is_duo_tourney = str((t or {}).get("mode") or "solo").lower() == "duo"
 
-        async def _refuse(text):
-            try:
-                await message.add_reaction("❌")
-            except Exception:
-                pass
+        async def _refuse(text, react=True):
+            # Auto-deleted so the signup channel only keeps the reactions, which
+            # are the durable record. A message handler gets no Interaction, so
+            # this is as close to ephemeral as the platform allows here.
+            if react:
+                try:
+                    await message.add_reaction("❌")
+                except Exception:
+                    pass
             try:
                 hint = await message.reply(text)
                 await hint.delete(delay=60)
@@ -6136,7 +6218,11 @@ async def on_message(message):
                         except Exception:
                             pass
                         try:
-                            await message.reply("You're in ✅ — comp profile complete.")
+                            # auto-deleted: the ✅ reaction is the durable
+                            # record, the words are just the confirmation
+                            _done = await message.reply(
+                                "You're in ✅ — comp profile complete.")
+                            await _done.delete(delay=60)
                         except Exception:
                             pass
                         return
@@ -6149,7 +6235,15 @@ async def on_message(message):
                     except Exception:
                         pass
                     return
-                await _refuse("Already registered for this tourney.")
+                # Already on the roster. Say WHO and in what capacity, so the
+                # player knows whether to wait, re-sign with a partner, or ask a
+                # host - "already registered" alone was a dead end.
+                _rows_hit = " / ".join(
+                    f"<@{m}>" for r in _hits for m in ((r or {}).get("member_ids") or []))
+                _states = sorted({str((r or {}).get("status") or "?") for r in _hits})
+                await _refuse(f"Already registered for this tourney — "
+                              f"{_rows_hit} ({', '.join(_states)}). "
+                              f"Ask a host to move you.")
                 return
         except Exception:
             pass
@@ -6186,7 +6280,11 @@ async def on_message(message):
         try:
             existing = await _comp_reg_rows(t["id"])
             team_idx = sum(1 for r in existing if (r or {}).get("status") != "banned")
-            color = _comp_team_color(team_idx) if str((t or {}).get("mode") or "solo") == "duo" else None
+            # A colour means "this is a duo team". A solo entry inside a duo
+            # tourney is not a team, so it takes no colour and consumes no
+            # team slot - a host can pair it later with /tourney-transfer-teammate.
+            _is_team = _is_duo_tourney and len(members or []) >= 2
+            color = _comp_team_color(team_idx) if _is_team else None
             # comp-profile gate: members without bngc_users.game_username sign
             # up as pending (slot reserved) and must create a comp profile.
             _have = await _comp_members_with_profile(sb, members)
@@ -6256,16 +6354,25 @@ async def on_message(message):
                 await _comp_grant_role(message.guild, _did, _rid)
         except Exception as e:
             print(f"[comp] intake role grant failed: {e}")
-        # intake verdict right on the message: team color (duo) / ✅ solo,
+        # intake verdict right on the message: team color (duo team) / ✅ solo,
         # ❌ only on failure paths above. Host ✅/❌ moderation still works:
         # hosts are different users, so their reactions are distinct.
-        # NOTE: no team Discord role is granted here. The roster is still
-        # changing at signup, so a slot (and therefore a colour and a role)
-        # can still move; roles land at /tourney-start, when it is final.
         try:
             await message.add_reaction(color or "✅")
         except Exception as e:
             print(f"[comp] intake reaction failed: {e}")
+        # A solo entry in a duo tourney gets ✅ like any solo, so say plainly
+        # that it is registered and unpaired - otherwise it looks like the
+        # teammate mention was dropped.
+        if _is_duo_tourney and not _is_team:
+            try:
+                _solo_note = await message.reply(
+                    f"{' / '.join(f'<@{m}>' for m in members)} registered as "
+                    f"**solo** in this duo tourney — no teammate. A host can pair "
+                    f"you with `/tourney-transfer-teammate` later.")
+                await _solo_note.delete(delay=60)
+            except Exception:
+                pass
     except Exception as e:
         print(f"[comp] on_message failed: {e}")
     try:
