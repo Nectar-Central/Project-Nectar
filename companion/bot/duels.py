@@ -196,7 +196,8 @@ def short_wager_id(wager_id: str) -> str:
 
 
 def score_match(kills_c: int, kills_o: int, win_id, creator_id, opponent_id,
-                race: str = "wins", opponent_win: bool = False):
+                race: str = "wins", opponent_win: bool = False,
+                creator_win: bool = False):
     """Decide one sealed (room_id, version).
 
     race="wins" (zw_lg/bf): ONLY a win row decides the match. A version with
@@ -208,6 +209,12 @@ def score_match(kills_c: int, kills_o: int, win_id, creator_id, opponent_id,
     authoritative (no win row = they did not win); when their last roster
     combat event in that version is "opponent eliminated tracked player", the
     round is the opponent's. Ignored entirely in a kills race.
+    creator_win=True is the mirror: the tracked player watched the OPPONENT go
+    out (kill_type="out"), which for zone/fall damage is the only evidence there
+    is. The round is the creator's, and no kill is credited to anyone. Checked
+    after win_id, so a real win row still wins outright, and it is a positive flag
+    rather than "not opponent_win" so an unresolved round stays a Draw. Ignored
+    in a kills race like opponent_win.
     race="kills" (df): higher kills wins, equal kills is a draw.
     Returns the winner's discord_id or None for a draw. Never raises.
     """
@@ -224,6 +231,8 @@ def score_match(kills_c: int, kills_o: int, win_id, creator_id, opponent_id,
             return str(creator_id)
         if win_id and str(win_id) == str(opponent_id):
             return str(opponent_id)
+        if creator_win:
+            return str(creator_id)
         if opponent_win:
             return str(opponent_id)
         return None
@@ -254,14 +263,16 @@ def _match_sealable(m: dict, race: str = "wins") -> bool:
 
     wins race: only a real win row seals (a kills-only or leave-noise group
     is a Draw at best — invisible, so kills can never hand out a match win),
-    plus the mobile opponent_win inference (their win row can never exist).
+    plus the mobile opponent_win / creator_win inferences (their win row can
+    never exist). kills race: real combat seals.
     kills race: real combat seals.
     Never raises.
     """
     try:
         if str(race or "wins") == "kills":
             return (int((m or {}).get("kills_c") or 0) + int((m or {}).get("kills_o") or 0)) > 0
-        return bool((m or {}).get("win_id")) or bool((m or {}).get("opponent_win"))
+        return (bool((m or {}).get("win_id")) or bool((m or {}).get("opponent_win"))
+                or bool((m or {}).get("creator_win")))
     except Exception:
         return False
 
@@ -1929,9 +1940,17 @@ def group_duel_matches(events: list[dict], creator_id: str, opponent_id: str,
                 if et == "killfeed":
                     try:
                         _gd0 = (ev or {}).get("event_data") or {}
-                        if str(_gd0.get("kill_type") or "") == "left":
+                        _kt0 = str(_gd0.get("kill_type") or "")
+                        if _kt0 == "left":
                             _why("killfeed=left (not combat)", ev)
                             continue  # leave notification, not combat
+                        if _kt0 == "out":
+                            # A watched elimination, not a kill: nobody landed
+                            # it, so it is not combat on this path. The mobile
+                            # grouper is what gives it meaning.
+                            _why("killfeed=out (observed elimination, no killer)",
+                                 ev)
+                            continue
                     except Exception:
                         pass
                 key = _event_room(ev)
@@ -2119,7 +2138,7 @@ def group_mobile_matches(events: list[dict], creator_id: str, opp_name_norm: str
                 g = groups.setdefault((rid, ver), {
                     "room_id": rid, "match_version": ver, "gm": gm, "code": code,
                     "kills_c": 0, "kills_o": 0, "win_id": None, "death_c": 0,
-                    "seen_o": False, "_strikes": [],
+                    "opp_out_c": 0, "seen_o": False, "_strikes": [],
                 })
                 gd = (ev or {}).get("event_data") or {}
                 # created_at of this row, used to order strikes.
@@ -2167,7 +2186,22 @@ def group_mobile_matches(events: list[dict], creator_id: str, opp_name_norm: str
                     if opp_name_norm in names:
                         g["seen_o"] = True
                         try:
-                            if (str(gd.get("kill_type") or "") == "killed"
+                            _kt = str(gd.get("kill_type") or "")
+                            if _kt == "out":
+                                # The tracked player watched the OPPONENT go out
+                                # (kill_type="out", written by the processor when
+                                # an alv=false names someone who is not the
+                                # capturing account). This is the only evidence
+                                # that exists for zone / fall damage, which never
+                                # reaches a killfeed at all - and for a duel
+                                # against a companion-less opponent it is
+                                # sometimes the ONLY evidence the round happened.
+                                # No kill is credited to anybody: the creator did
+                                # not land it, and the opponent cannot have killed
+                                # themselves. The ROUND is the creator's.
+                                g["opp_out_c"] += 1
+                                _strike("z")
+                            elif (_kt == "killed"
                                     and _norm_duel_name(gd.get("instigator")) == opp_name_norm):
                                 # Roster gate (mobile side): only count when
                                 # the victim is the tracked player.
@@ -2191,9 +2225,16 @@ def group_mobile_matches(events: list[dict], creator_id: str, opp_name_norm: str
         # side is authoritative — no win row for them means they did not win.
         try:
             _st = sorted(g.get("_strikes") or [], key=lambda p: p[0])
-            g["opponent_win"] = bool(_st) and _st[-1][1] in ("o", "d")
+            last = _st[-1][1] if _st else None
+            g["opponent_win"] = last in ("o", "d")
+            # creator_win: the opponent was eliminated last ("z"). Separate from
+            # opponent_win because it is the OTHER way round - and it must be a
+            # distinct flag, not "not opponent_win", or a round with no
+            # resolution at all (a Draw) would silently become the creator's.
+            g["creator_win"] = last == "z"
         except Exception:
             g["opponent_win"] = False
+            g["creator_win"] = False
         try:
             g.pop("_strikes", None)
         except Exception:
@@ -3654,10 +3695,12 @@ async def _score_one(bot, w: dict):
                   f"race={race} kills={m['kills_c']}-{m['kills_o']} "
                   f"win_id={_wsafe(m.get('win_id'))} "
                   f"opponent_win={bool(m.get('opponent_win'))} "
+                  f"creator_win={bool(m.get('creator_win'))} "
                   f"(creator={_wsafe(creator)} opponent={_wsafe(opponent)})")
             winner = score_match(m["kills_c"], m["kills_o"], m.get("win_id"),
                                  creator, opponent, race=race,
-                                 opponent_win=bool(m.get("opponent_win")))
+                                 opponent_win=bool(m.get("opponent_win")),
+                                 creator_win=bool(m.get("creator_win")))
             # bf / zw_lg win validation: a win row only decides a match that
             # actually saw combat between the duelists. A win with zero
             # roster kills means the "winner" never fought (walkover, afk
@@ -3665,7 +3708,8 @@ async def _score_one(bot, w: dict):
             # death IS combat evidence: zone/fall damage kills arrive with no
             # killfeed and therefore no kill counts at all.
             _combat = (int(m["kills_c"]) + int(m["kills_o"])
-                       + int(m.get("death_c") or 0))
+                       + int(m.get("death_c") or 0)
+                       + int(m.get("opp_out_c") or 0))
             if race != "kills" and winner is not None and _combat == 0:
                 print(f"[duels] WIN-REJECTED {wid_short} room={str(m['room_id'])[:8]} "
                       f"v={m['match_version']} winner={winner} but 0 roster kills — "
