@@ -1,5 +1,5 @@
 """
-coins.py — Nectar Coins economy (pure helpers, never raise).
+coins.py -Nectar Coins economy (pure helpers, never raise).
 
 Earning (per user request): daily claim + streaks only.
 Spending: gambling / bets / wagers (coinflip, slots, dice)

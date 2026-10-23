@@ -1,5 +1,5 @@
 """
-chat.py — friend DMs (friends-only, accepted bngc_friends row required).
+chat.py -friend DMs (friends-only, accepted bngc_friends row required).
 
   POST /api/friends/message {from_discord_id, to_discord_id, body(1..500)}
   GET  /api/friends/messages?discord_id=&with=&limit=50[&before_id=]

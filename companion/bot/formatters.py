@@ -1,10 +1,10 @@
-"""Shared formatting helpers — no Discord imports, pure functions."""
+"""Shared formatting helpers -no Discord imports, pure functions."""
 
 import re
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
-# Game modes — human readable labels
+# Game modes -human readable labels
 # ---------------------------------------------------------------------------
 GAME_MODE_NAMES = {
     "zw_lg": "Late Game Zonewars",
@@ -52,7 +52,7 @@ def format_game_mode_short(raw: str | None) -> str:
     return format_game_mode(raw)
 
 # ---------------------------------------------------------------------------
-# Skin names — cct_88_Inspector_Female_01 => Inspector Female
+# Skin names -cct_88_Inspector_Female_01 => Inspector Female
 # ---------------------------------------------------------------------------
 _CCT_PREFIX = re.compile(r"^cct_\d+_", re.IGNORECASE)
 _CCT_PREFIX_SIMPLE = re.compile(r"^cct_", re.IGNORECASE)
@@ -105,7 +105,7 @@ def skin_display(skin_id: str | None) -> str:
     return f"[{name}]({url})"
 
 # ---------------------------------------------------------------------------
-# Token — censor middle
+# Token -censor middle
 # ---------------------------------------------------------------------------
 def censor_token(token: str | None) -> str:
     if not token:

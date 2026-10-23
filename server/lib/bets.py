@@ -1,5 +1,5 @@
 """
-bets.py — match betting pool math + fixed-odds engine (pure, never raise).
+bets.py -match betting pool math + fixed-odds engine (pure, never raise).
 
 Bet types:
   win    parimutuel pool on the match winner (existing behavior).
@@ -11,7 +11,7 @@ Bet types:
 Fixed-odds multipliers lock at placement (odds = payout per 1 staked).
 They price off the player's own ledger history: scoring rate λ (avg
 kills/match) via Poisson for kills lines, win rate + lobby size for
-outs — 8% margin, clamped to [1.05x, 15x]. No-history players get
+outs -8% margin, clamped to [1.05x, 15x]. No-history players get
 conservative priors (flagged provisional).
 
 Pure module: no I/O, no Supabase imports.

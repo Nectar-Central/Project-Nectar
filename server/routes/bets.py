@@ -1,5 +1,5 @@
 """
-bets.py — GET/POST /api/coins/bets/* — parimutuel match betting.
+bets.py -GET/POST /api/coins/bets/* -parimutuel match betting.
 
   GET  /api/coins/bets/open?limit=25
   POST /api/coins/bets             {discord_id, match_key, pick_discord_id, amount}
@@ -122,7 +122,7 @@ def _scan_evidence_sync(limit: int = bets_lib.EVIDENCE_ROW_LIMIT) -> list[dict]:
 def _wager_profit_today_sync(discord_id: str) -> int:
     """Wager profit credited today (bet_won + duel_win ledger meta).
 
-    Reads recent ledger rows (no gte op — postgrest version drift), filters
+    Reads recent ledger rows (no gte op -postgrest version drift), filters
     to today in Python. Legacy rows without a meta.earned stamp count gross
     delta for duel_win (today only) and are skipped for bet_won. Never raises.
     """
@@ -214,7 +214,7 @@ def _load_sess_match_sync(sid: str, version: int):
     """Bettable view for a room-less (lobby-bucket) live session match.
 
     Participants = row-holding dids + registered users resolved from
-    killfeed names. Side bets (kills/out) only — win pools are blocked at
+    killfeed names. Side bets (kills/out) only -win pools are blocked at
     placement since unattributed players can never win one. Returns the
     same view shape as _load_match_sync plus _row_holders. Never raises.
     """
@@ -301,7 +301,7 @@ def _load_sess_match_sync(sid: str, version: int):
 
 def _room_key_of(row) -> tuple[str, int] | None:
     """Grouping key for live discovery. Lobby-bucket rows (joins predate
-    engine memory — the common pub case) group per session instead, so a
+    engine memory -the common pub case) group per session instead, so a
     room-less live match still surfaces. Never raises."""
     try:
         ed = (row or {}).get("event_data") or {}
@@ -638,7 +638,7 @@ def _form_sync(did: str) -> dict:
 def _standings_kills_sync(kind: str, parsed: dict) -> dict | None:
     """Final kills {did: n} for a sealed bracket/room match.
 
-    None when unavailable (kills side bets refund — never guessed).
+    None when unavailable (kills side bets refund -never guessed).
     Never raises.
     """
     try:
@@ -998,7 +998,7 @@ async def bets_open(request: Request):
             except Exception:
                 pass
             # live rooms: any public/private match with fresh evidence
-            # (no engine needed — the ledger already carries room+version)
+            # (no engine needed -the ledger already carries room+version)
             try:
                 now = _time.time()
                 groups: dict[tuple[str, int], dict] = {}
@@ -1072,7 +1072,7 @@ async def bets_open(request: Request):
     except Exception as e:
         if _missing_table(e) or "bngc_match_bets" in str(e):
             return JSONResponse(
-                {"error": "Database migration pending — ask a host to apply "
+                {"error": "Database migration pending -ask a host to apply "
                           "add_match_betting_v253.sql."}, status_code=500)
         return JSONResponse({"error": str(e)[:160]}, status_code=500)
 
@@ -1098,7 +1098,7 @@ async def bets_place(request: Request):
             status_code=400)
     parsed = bets_lib.parse_key(key)
     if not parsed:
-        return JSONResponse({"error": "Bad match_key — comp:{tid}:{ver} | rt:{tid}:{ver} | room:{rid}:{ver} | live:{room_id}:{ver} (see /matches)"},
+        return JSONResponse({"error": "Bad match_key -comp:{tid}:{ver} | rt:{tid}:{ver} | room:{rid}:{ver} | live:{room_id}:{ver} (see /matches)"},
                             status_code=400)
     if not supabase:
         return JSONResponse({"error": "Server not configured"}, status_code=500)
@@ -1109,23 +1109,23 @@ async def bets_place(request: Request):
             if not view:
                 raise LookupError("No such match (or its tourney closed).")
             if str(view.get("status") or "open") != "open":
-                raise ValueError("Betting closed — that match already sealed.")
+                raise ValueError("Betting closed -that match already sealed.")
             if pick not in set(view.get("participants") or []):
                 raise ValueError("That pick is not playing this match.")
             kind = str(parsed.get("kind") or "")
             _sess_match = kind == "live" and str(parsed.get("room_id") or "").startswith("sess-")
             if _sess_match and btype == "win":
-                raise ValueError("Session matches take side bets only (kills/out) — no win pool.")
+                raise ValueError("Session matches take side bets only (kills/out) -no win pool.")
             if not _sess_match and len(set(view.get("participants") or [])) < 2:
                 raise ValueError("Not enough tracked players in that room yet.")
             if btype == "out" and kind != "live":
                 raise ValueError("Out bets are live-room only (elimination "
                                  "is only tracked there).")
             if _sess_match and btype == "out" and pick not in set(view.get("_row_holders") or []):
-                # Mapped names have no death/leave rows — an out bet on them
+                # Mapped names have no death/leave rows -an out bet on them
                 # could never win. Kills lines work for anyone in the room
                 # (folded feed kills), enforced by the participants check above.
-                raise ValueError("That pick has no tracked rows in this match — "
+                raise ValueError("That pick has no tracked rows in this match -"
                                  "pick a tracked player for outs.")
             line_no: int | None = None
             odds: float | None = None
@@ -1185,7 +1185,7 @@ async def bets_place(request: Request):
     except Exception as e:
         if _missing_table(e) or "bngc_match_bets" in str(e):
             return JSONResponse(
-                {"error": "Database migration pending — ask a host to apply "
+                {"error": "Database migration pending -ask a host to apply "
                           "add_match_betting_v253.sql."}, status_code=500)
         return JSONResponse({"error": str(e)[:160]}, status_code=500)
 
@@ -1246,7 +1246,7 @@ async def bets_mine(request: Request):
     except Exception as e:
         if _missing_table(e) or "bngc_match_bets" in str(e):
             return JSONResponse(
-                {"error": "Database migration pending — ask a host to apply "
+                {"error": "Database migration pending -ask a host to apply "
                           "add_match_betting_v253.sql."}, status_code=500)
         return JSONResponse({"error": str(e)[:160]}, status_code=500)
 
@@ -1389,7 +1389,7 @@ async def bets_pool(request: Request):
     except Exception as e:
         if _missing_table(e) or "bngc_match_bets" in str(e):
             return JSONResponse(
-                {"error": "Database migration pending — ask a host to apply "
+                {"error": "Database migration pending -ask a host to apply "
                           "add_match_betting_v253.sql."}, status_code=500)
         return JSONResponse({"error": str(e)[:160]}, status_code=500)
 
@@ -1406,6 +1406,6 @@ async def bets_settle(request: Request):
     except Exception as e:
         if _missing_table(e) or "bngc_match_bets" in str(e):
             return JSONResponse(
-                {"error": "Database migration pending — ask a host to apply "
+                {"error": "Database migration pending -ask a host to apply "
                           "add_match_betting_v253.sql."}, status_code=500)
         return JSONResponse({"error": str(e)[:160]}, status_code=500)

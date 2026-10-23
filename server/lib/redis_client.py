@@ -1,5 +1,5 @@
 """
-redis_client.py — Upstash Redis wrapper with in-memory fallback.
+redis_client.py -Upstash Redis wrapper with in-memory fallback.
 
 If UPSTASH env vars are missing, all operations become no-ops
 (so local dev works without Redis).
@@ -114,7 +114,7 @@ async def _upstash_set(key: str, value: str, ttl: int = 3600) -> bool:
     url, token = _upstash_cfg()
     if not url:
         return False
-    # Session payloads are 10-60KB — must go in the POST body, never the URL
+    # Session payloads are 10-60KB -must go in the POST body, never the URL
     # (GET-style /set/<key>/<value> fails past ~8KB with URI Too Long).
     # Upstash REST accepts a JSON command array: ["SET", key, value, "EX", ttl].
     try:
@@ -146,7 +146,7 @@ async def _upstash_set(key: str, value: str, ttl: int = 3600) -> bool:
 
 
 async def _upstash_ping(timeout: int = 3) -> bool:
-    """Cheap reachability check (GET /ping) — False when unconfigured or unreachable."""
+    """Cheap reachability check (GET /ping) -False when unconfigured or unreachable."""
     url, token = _upstash_cfg()
     if not url:
         return False
@@ -173,7 +173,7 @@ def is_cache_configured() -> bool:
 
 
 class Cache:
-    """Cache helpers — mirrors the old JS `cache` object."""
+    """Cache helpers -mirrors the old JS `cache` object."""
 
     @staticmethod
     async def is_token_blacklisted(token: str) -> bool:
@@ -298,7 +298,7 @@ class Cache:
             payload = _json.dumps(state, separators=(",", ":"))
         except Exception:
             return False
-        # memory (always fresh — local reads never hit network)
+        # memory (always fresh -local reads never hit network)
         _memory_state[session_id] = (payload, time.time() + ttl)
         # throttle Upstash egress (disabled under pytest for determinism)
         try:

@@ -1,4 +1,4 @@
-"""Ranked v1 — host-authored rooms. Data layer + shared helpers.
+"""Ranked v1 -host-authored rooms. Data layer + shared helpers.
 
 Tables (see migration in chat): ranked_rooms, ranked_points, ranked_results,
 ranked_bans. All decisions logged with the public R-ID for admin review.
@@ -29,7 +29,7 @@ LB_CHANNEL_ID = _lb_channel_id()
 LB_POST_EVERY_S = 3 * 24 * 3600
 
 # Tier icons + colors (mirrors the userscript RANKED_TIERS, including the
-# upstream platinium.png filename typo — do NOT "fix" the spelling).
+# upstream platinium.png filename typo -do NOT "fix" the spelling).
 _MILESTONE_ASSETS = "https://mnpwvwjqawmuqmickteu.supabase.co/storage/v1/object/public/assets"
 _MILESTONE_COLORS = {
     "Unranked": "#6b7280", "Bronze": "#CD7F32", "Silver": "#C0C0C0",
@@ -59,7 +59,7 @@ def milestone_color(name: str) -> str:
 # Tier roles: one Discord role id per milestone, via env
 # RANKED_ROLE_UNRANKED/BRONZE/SILVER/GOLD/PLATINUM/DIAMOND/EMERALD/
 # CHAMPION/MASTER/GRANDMASTER. Unset (or unparsable) tiers sync as a
-# no-op with a log line — never blocks seals or commands.
+# no-op with a log line -never blocks seals or commands.
 def _tier_role_env(name: str):
     try:
         v = int(os.getenv(f"RANKED_ROLE_{str(name).upper()}", "") or 0)
@@ -109,7 +109,7 @@ def gm_name(gm: str) -> str:
         return "Unknown"
 
 # Milestone entry fees: at/above each tier you burn the fee on every start.
-# (Unranked <500 pays nothing.) Tune freely — (threshold, name, fee).
+# (Unranked <500 pays nothing.) Tune freely -(threshold, name, fee).
 MILESTONE_FEES = [(25000, "Grandmaster", 1250), (18000, "Master", 900),
                   (13000, "Champion", 650), (9000, "Emerald", 450),
                   (6000, "Diamond", 300), (4000, "Platinum", 200),
@@ -135,13 +135,13 @@ def entry_fee(room: dict, player_points: int) -> int:
 
 
 RULES_TEXT = (
-    "1. Roster only — outsiders earn nothing and may get the room reset.\n"
+    "1. Roster only -outsiders earn nothing and may get the room reset.\n"
     "2. Host's word is final; host must stay in the room.\n"
-    "3. The timer is always 4:30 — no shooting before it hits zero. "
+    "3. The timer is always 4:30 -no shooting before it hits zero. "
     "Shot early? Open a ticket with proof (clip or screenshot). "
     "Caught shooting early? Blacklist + ban from ranked.\n"
-    "4. No smurfing, stream-sniping, teaming in solo, or point boosting — bans apply.\n"
-    "5. No exploiting bugs or glitches — report them instead, bans apply.\n"
+    "4. No smurfing, stream-sniping, teaming in solo, or point boosting -bans apply.\n"
+    "5. No exploiting bugs or glitches -report them instead, bans apply.\n"
     "6. If you crash, rejoin fast and tell the host."
 )
 
@@ -308,7 +308,7 @@ def get_points(discord_id: str) -> int:
 
 def get_points_many(discord_ids) -> dict:
     """Points for many players in one query (keeps the event loop alive during
-    starts — per-player reads starve interactions past the 3s defer window).
+    starts -per-player reads starve interactions past the 3s defer window).
     Missing ids default to 0. Never raises."""
     try:
         ids = [str(x) for x in (discord_ids or []) if x]
@@ -450,9 +450,9 @@ def lobby_embed(room: dict) -> dict:
     except Exception:
         avg_line = "—"
     return {
-        "title": f"Ranked Lobby {room['id']} — {gm_name(room.get('gm'))}",
+        "title": f"Ranked Lobby {room['id']} -{gm_name(room.get('gm'))}",
         "fields": [
-            ("Status", "Lobby — code hidden until start", True),
+            ("Status", "Lobby -code hidden until start", True),
             ("Players", f"{len(roster_ids(room))}/{room.get('max_players')}", True),
             ("Avg", avg_line, True),
             ("Matches", str(room.get("max_matches")), True),
@@ -467,9 +467,9 @@ def lobby_embed(room: dict) -> dict:
 def live_embed(room: dict, thread_id=None, host_status: str = "") -> dict:
     """Spec for the flipped-live lobby embed."""
     return {
-        "title": f"Ranked LIVE {room['id']} — {gm_name(room.get('gm'))}",
+        "title": f"Ranked LIVE {room['id']} -{gm_name(room.get('gm'))}",
         "fields": [
-            ("Status", "Live — code sent to roster DMs", True),
+            ("Status", "Live -code sent to roster DMs", True),
             ("Players", f"{len(roster_ids(room))}/{room.get('max_players')}", True),
             ("Matches", f"{sealed_count(room['id'])}/{room.get('max_matches')}", True),
         ],
@@ -480,7 +480,7 @@ def live_embed(room: dict, thread_id=None, host_status: str = "") -> dict:
 def ended_embed(room: dict, thread_id=None) -> dict:
     """Spec for the ended lobby embed."""
     return {
-        "title": f"Ranked ENDED {room['id']} — {gm_name(room.get('gm'))}",
+        "title": f"Ranked ENDED {room['id']} -{gm_name(room.get('gm'))}",
         "fields": [
             ("Status", "Ended", True),
             ("Players", f"{len(roster_ids(room))}/{room.get('max_players')}", True),

@@ -3,14 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Game {{ game.game_number }} — {{ event.name }}</title>
+    <title>Game {{ game.game_number }} -{{ event.name }}</title>
     <link rel="stylesheet" href="/static/style.css">
     <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
 </head>
 <body>
     <header>
         <div class="header-inner">
-            <h1>{{ event.name }} — Game {{ game.game_number }}</h1>
+            <h1>{{ event.name }} -Game {{ game.game_number }}</h1>
             <div>
                 <a href="/event/{{ event.id }}">Back to Event</a> &nbsp;|&nbsp;
                 <a href="/players">Players</a> &nbsp;|&nbsp;
@@ -68,7 +68,7 @@
                         <td{% if t.is_dq %} style="text-decoration:line-through"{% endif %}>
                             <span class="teammate-name" data-discord="{{ t.lead_id }}" data-team-lead="{{ t.lead_id }}">{{ t.team_name }}{% if lead_ign %} [{{ lead_ign }}]{% endif %}</span>
                             {% if t.team_members %}
-                                — {% for mid in t.team_members.split(',') %}{% set m_name = player_map.get(mid, mid) %}{% set m_ign = ign_map.get(mid, '') %}<span class="teammate-name" data-discord="{{ mid }}" data-team-lead="{{ t.lead_id }}">{{ m_name }}{% if m_ign %} [{{ m_ign }}]{% endif %}</span>{% if not loop.last %}, {% endif %}{% endfor %}
+                                -{% for mid in t.team_members.split(',') %}{% set m_name = player_map.get(mid, mid) %}{% set m_ign = ign_map.get(mid, '') %}<span class="teammate-name" data-discord="{{ mid }}" data-team-lead="{{ t.lead_id }}">{{ m_name }}{% if m_ign %} [{{ m_ign }}]{% endif %}</span>{% if not loop.last %}, {% endif %}{% endfor %}
                             {% endif %}{% if t.is_dq %} DQ{% endif %}
                         </td>
                         <td>{{ t.total_kills }}</td>

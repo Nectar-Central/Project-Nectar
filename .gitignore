@@ -16,6 +16,11 @@ __pycache__/
 downloaded_skins/
 *.spec
 .vercel
+dist/
+logs/
+tools/
+tasks/
+scripts/
 # legacy
 photon-sniffer/captures/
 
@@ -216,3 +221,6 @@ Scripts/
 scripts/**/__pycache__/
 scripts/**/*.py[cod]
 *.db
+tests/
+.freebuff/
+build/

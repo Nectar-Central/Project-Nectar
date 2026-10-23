@@ -25,8 +25,8 @@
 // @connect      *.supabase.co
 // @connect      devtunnels.ms
 // @connect      *.devtunnels.ms
-// @updateURL    https://mnpwvwjqawmuqmickteu.supabase.co/storage/v1/object/public/cdn/nectar-companion.competitive.latest.user.js
-// @downloadURL  https://mnpwvwjqawmuqmickteu.supabase.co/storage/v1/object/public/cdn/nectar-companion.competitive.latest.user.js
+// @updateURL    disabled-for-lite
+// @downloadURL  disabled-for-lite
 // ==/UserScript==
 
 (function () {
@@ -55,7 +55,7 @@
   // Production API default. Override order: stored bnc_api_base (user-set,
   // e.g. http://127.0.0.1:8000 for a local backend) > ?api=local > production.
   // Without the stored override the drawer talks to production even when a
-  // local backend runs — everything reads Offline there. Never throws.
+  // local backend runs -everything reads Offline there. Never throws.
   const SERVER_API = 'https://project-nectar-6n70.onrender.com';
   const LOCAL_API  = 'http://127.0.0.1:8000';
   function normalizeApiBase(raw){
@@ -189,7 +189,7 @@
   // ==== Loading-screen branding (Nectar rebrand of the CrazyGames loading shell) ====
   // The loading shell lives inside an intermediate CrazyGames iframe (not the
   // top page, not the game iframe). This module runs in ALL CrazyGames frames
-  // and overwrites the shell elements every tick — idempotent, safe everywhere.
+  // and overwrites the shell elements every tick -idempotent, safe everywhere.
   const BNC_REBRAND_BANNER = 'https://mnpwvwjqawmuqmickteu.supabase.co/storage/v1/object/public/lobby-music/nectar_banner.png';
   const BNC_REBRAND_TITLE = 'Nectar - Buildnow Enhanced';
   // Always on. The toggle that used to gate this was removed, so it is not a
@@ -268,7 +268,7 @@
 
   // ---- CrazyGames frames: brand the loading shell ----
   // The loading shell lives inside an intermediate iframe (games.crazygames.com),
-  // NOT on the top page. Let the rebrand run in every frame — it's idempotent.
+  // NOT on the top page. Let the rebrand run in every frame -it's idempotent.
   // Only the full tracker is gated to the game frame.
   try{ bncRebrandBoot(); bncRebrandOnce(); }catch(e){}
 
@@ -362,7 +362,7 @@
             if(j.error && String(j.error).toLowerCase().includes('invalid')){
               if(j.current){ currentReqToken=j.current; GMSet('bnc_req_token', currentReqToken); logInfo(`mismatch sync token → ${String(currentReqToken).slice(0,4)}…`); if(!retried){ logInfo(`mismatch retry ${path}`); apiQueue.unshift({path, body: {...origBody, _retried:true}, cb, retried:true, quiet, noLive, noTok, noWipe}); apiBusy=false; setTimeout(processApiQueue,30); return; } }
               // rejected with no resync token: historically wiped the session
-              // on first sight — but that fires on transient DB read misses
+              // on first sight -but that fires on transient DB read misses
               // ("Invalid auth session") too. Retry once, then clear the
               // SESSION only (login token kept) and re-validate silently;
               // full wipe + prompt happens only on explicit rejection
@@ -380,7 +380,7 @@
       if(useGM && hasGM){
         try{
           // Captures carry engine feed + full DB processing server-side, so
-          // match-start bursts legitimately take longer — give them 30s.
+          // match-start bursts legitimately take longer -give them 30s.
           // A 15s timeout here resends a batch the server is still working
           // on, doubling its load (the timed-out work still completes).
           const postTimeout = String(u).includes('/api/capture') ? 30000 : 15000;
@@ -783,7 +783,7 @@
   // --- Packet sender only ---
   const APP_ID='30773790-f9fe-487c-92c2-19517c5c39ad';
   const PHOTON_HOSTS=['exitgames.com','photon'];
-  const ESSENTIAL_OPS=new Set([225,226,227,228,230,231]); // 228 = LeaveRoom/queue-cancel candidate (semantics unconfirmed — watch op#228 lines in server logs before wiring removal)
+  const ESSENTIAL_OPS=new Set([225,226,227,228,230,231]); // 228 = LeaveRoom/queue-cancel candidate (semantics unconfirmed -watch op#228 lines in server logs before wiring removal)
   const ESSENTIAL_EVS=new Set([101,253,254,255]);
   const DROP_EVS_NOISY=new Set([200,201,202,204,206]);
   const BATCH_MAX=40, FLUSH_MS=250;
@@ -825,7 +825,7 @@
   function _isLobbyScene(scn){ const s=_normScn(scn); return s==='mainlobby' || s==='lobby'; }
   function _isSceneLike(scn){ return /[a-z]/i.test(String(scn==null?'':scn).trim()); }
   // Endless-series hold (private zw_lg/wwzw): those rooms run infinite matches
-  // back-to-back under one room code — the victory/intermission screen at every
+  // back-to-back under one room code -the victory/intermission screen at every
   // stG=3 reads as a MainLobby scene while the player never left. Flipping to
   // lobby there swaps every details line (drawer, presence, Discord card, music)
   // mid-series. While the live session still holds the same private code in one
@@ -852,7 +852,7 @@
     // right now) = victory breather, not a leave. Leave/auth have their own
     // paths that clear intent first, so they can never take this branch.
     // Private endless-series rooms (zw_lg/wwzw under one room code) hold the
-    // same way via _privateEndlessHold — except auth/leave stamps (opts.via),
+    // same way via _privateEndlessHold -except auth/leave stamps (opts.via),
     // which always end the series. Holding match mode keeps the overlay (with
     // its pending-seal honesty), music and Discord steady; the 25s server
     // reconcile still flips a genuinely abandoned victory screen, and the
@@ -881,7 +881,7 @@
     if(_holdMatch){ try{ startSealWatch('breather'); }catch{} }
     // RANKED-tagged mirror: scene flips are the lobby<->match transition —
     // keep them visible under a [RANKED] console filter too. (This point is
-    // only reached on actual change — unchanged scenes return early above.)
+    // only reached on actual change -unchanged scenes return early above.)
     try{ logInfo(`[SCENE] scene -> ${curScn} inMatch=${_optimisticState.inMatch}`); }catch{}
     const silent = opts && opts.silent;
     // Audio rule: pause ONLY on scene flip (lobby<->match). Same-side scene
@@ -924,7 +924,7 @@
   // Server-state reconciliation (enter/exit driver for audio + optimistic state).
   // Derives server in-match from EITHER shape: capture POST (full rooms map) or
   // stats GET (flat current-room fields). Flips optimistic state on disagreement
-  // once optimistic is stale (>OPTIMISTIC_TRUST_MS — server trails live packets
+  // once optimistic is stale (>OPTIMISTIC_TRUST_MS -server trails live packets
   // by seconds), which heals stuck flags even when idle (no capture batches
   // flowing). Returns true on flip.
   function _serverInMatch(sess) {
@@ -998,7 +998,7 @@
   }
 
   // Optimistic killfeed dedup: the broadcast + its inbound retransmit arrive
-  // as separate sightings ~0.5s apart — without this every kill shows +2
+  // as separate sightings ~0.5s apart -without this every kill shows +2
   // then "flips back" on the next stats poll. Same pair inside 5s bumps once.
   let _optKfLast = { key: '', at: 0 };
   function _applyOptimisticKillfeed(killer, victim) {
@@ -1024,14 +1024,14 @@
       try { renderInfoPanel(); } catch {}
       // Instant counter: ask the server to price this kill at seal-time
       // economics and layer it over the counter until the seal lands (the
-      // layer is discarded the moment the server total moves — never added
+      // layer is discarded the moment the server total moves -never added
       // to it). Silent when unresolvable; kill-switch below.
       try{ _priceOptimisticKill(killer, victim); }catch{}
     } else if (myNorm && victimNorm && myNorm === victimNorm) {
       statsCache.deaths = (statsCache.deaths || 0) + 1;
       logSys(`[OPTIMISTIC] DEATH +1 → ${statsCache.deaths} killer=${killer}`);
       try { renderInfoPanel(); } catch {}
-      // My death usually ends my match (solo) — a seal lands seconds
+      // My death usually ends my match (solo) -a seal lands seconds
       // later but the steady poll only runs every 15-30s, which is the
       // "toast shows up after the next match started" lag. Chase it.
       try{ startSealWatch('self-death'); }catch{}
@@ -1165,13 +1165,13 @@
   // Defaults use Alt+Shift: Chrome/Edge/Firefox swallow Ctrl+Shift+C/I/J/R/T
   // (DevTools, reload, tabs) before page JS ever sees them, so Ctrl+Shift
   // letter defaults silently never fire. Alt+Shift reaches the page.
-  // Stored binds win over defaults — existing users keep what they set.
+  // Stored binds win over defaults -existing users keep what they set.
   // Defaults are single keys (one press, no combos): panels on F2/F4/F9,
-  // this menu on Backquote — kid-simple on Windows AND Mac (60% boards have
+  // this menu on Backquote -kid-simple on Windows AND Mac (60% boards have
   // Backquote but no F-keys), dodging the Alt+Shift layout-switch trap plus
   // every Ctrl+Shift browser reservation. Stored binds always win, so
   // changing defaults only affects fresh installs. F1/F3/F5 stay
-  // off-limits (browser takes them — see bindWarning). F11/F12 are host
+  // off-limits (browser takes them -see bindWarning). F11/F12 are host
   // panels (rebindable; bare presses may lose to fullscreen/DevTools).
   const BNC_BINDS=[
     {id:'keys', label:'Shortcuts menu', key:'bnc_bind_keys', dev:false, def:{ctrl:false,shift:false,alt:false,meta:false,key:'`'}, run:()=>toggleKeybinds()},
@@ -1205,7 +1205,7 @@
       'ctrl+shift+G':'find previous', 'ctrl+shift+M':'switch profile', 'ctrl+shift+K':'keybinds menu',
       'F5':'reload', 'F1':'help', 'F3':'find next',
     };
-    if(reserved[sig]) return `Browser takes ${formatKeybind(kb)} (${reserved[sig]}) — pick another.`;
+    if(reserved[sig]) return `Browser takes ${formatKeybind(kb)} (${reserved[sig]}) -pick another.`;
     for(const b of BNC_BINDS){
       if(b.id===selfId) continue;
       const cur=getBindKb(b);
@@ -1214,7 +1214,7 @@
       const ck=String(cur.code||'').toUpperCase(), nk=String(kb.code||'').toUpperCase();
       const sameKey=(ck && nk) ? ck===nk : String(cur.key||'').toUpperCase()===k;
       if(sameKey)
-        return `${formatKeybind(kb)} is already ${b.label} — pick another.`;
+        return `${formatKeybind(kb)} is already ${b.label} -pick another.`;
     }
     return null;
   }
@@ -1227,7 +1227,7 @@
   function captureFresh(){ try{ return Date.now()-lastCaptureSentAt<=CAPTURE_FRESH_MS; }catch{ return false; } }
   // WS liveness: stamped on EVERY websocket packet seen by the hook (even
   // non-essential keepalives that never reach /api/capture). An idle lobby
-  // sends almost no essential packets for minutes — WS alive + captures
+  // sends almost no essential packets for minutes -WS alive + captures
   // stale = idle, not dead. Only WS dead + captures dead = hook killed.
   let lastWsSeenAt=0;
   const WS_FRESH_MS=120000;
@@ -1266,7 +1266,7 @@
       }
       _capSnap={at:Date.now(), inMatch:im===true, code, mver};
       // Live-match evidence for the victory-breather hold (server fallback
-      // reads never stamp — only this packet-derived shadow does).
+      // reads never stamp -only this packet-derived shadow does).
       if(im===true){ try{ _lastMatchEvidenceAt=Date.now(); }catch{} }
     }catch{}
   }
@@ -1313,7 +1313,7 @@
           const eff=effInMatch();
           if(srv!==null && eff!==null && srv===eff){
             _burstUntil=0;
-            return; // server confirmed — back to normal cadence
+            return; // server confirmed -back to normal cadence
           }
           try{ fetchStats(false); }catch{}
           _burstTimer=setTimeout(tick, 3000);
@@ -1327,7 +1327,7 @@
   // Optimistic kill layer: priced kills land on the counter in ~300ms
   // instead of at the seal (~2-4s). Display-only and disposable: shown =
   // server_total + pending, and pending resets to zero the moment the
-  // server total moves (seal landed), on room change, or on leave — so a
+  // server total moves (seal landed), on room change, or on leave -so a
   // priced kill the seal never banks can never stick. Kill-switch below.
   const OPTIMISTIC_KILLS=true;
   let _optPending=0, _optBase=null, _optRid=null, _optVer=null, _optAt=0, _optN=0;
@@ -1351,7 +1351,7 @@
   }
   function _optLive(){
     // The layer is spendable only while the server total, room and match
-    // version all still match the pricing moment — and only while fresh.
+    // version all still match the pricing moment -and only while fresh.
     try{
       if(_optBase==null || _optPending<=0) return 0;
       if(Date.now()-_optAt>OPT_STALE_MS) return 0;
@@ -1410,7 +1410,7 @@
   // and stops the moment a new seal is observed (either toast path), on
   // leave, or on timeout. Deliberately NOT on next-match start: a slow
   // seal (host-gated) can land after stG=1, and quitting there strands
-  // the toast on the 30s steady poll — the exact lag above. Every poll
+  // the toast on the 30s steady poll -the exact lag above. Every poll
   // runs the normal render, so toasts queue the instant the seal is visible.
   let _sealWatchUntil=0, _sealWatchTimer=null, _sealWatchBase=null;
   function _sealWatchSnap(){
@@ -1469,7 +1469,7 @@
   // Comp-tourney rooms score manually: every ranked surface (toasts,
   // overlays, lobby card, seal queue) stays dark while holding one. Gates:
   // server comp_tourney block, local _compRoom code match, or tourney/scrim
-  // room tag — the same trio the tourney HUD uses. Never throws.
+  // room tag -the same trio the tourney HUD uses. Never throws.
   function _inCompRoom(code){
     try{
       const sess=statsCache&&statsCache.session;
@@ -1492,7 +1492,7 @@
   // Same gating contract as the comp HUD (updateTourneyHud): no live session
   // short_code -> hidden, always. The server still serves the ranked block
   // from its preserved short_code with no live session (boot, idle-stale),
-  // and that block alone must never paint UI — exactly like comp_tourney
+  // and that block alone must never paint UI -exactly like comp_tourney
   // without a session code never paints the tourney HUD. Local _rankedRoom
   // intent only drives fast refresh (burst + instant re-render on join),
   // never substitutes for the session code. Never throws.
@@ -1516,7 +1516,7 @@
       // same agreement the comp HUD relies on for comp_tourney).
       if(rkCode && rkCode!==sessCode) return null;
       // Hygiene: drop stale local intent so a later session can't agree
-      // with a dead join. Fresh intent needs no check — the session+block
+      // with a dead join. Fresh intent needs no check -the session+block
       // agreement above already rules.
       try{
         if(typeof _rankedRoom!=='undefined' && _rankedRoom && _rankedRoom.code){
@@ -1570,7 +1570,7 @@
   // 10-min freshness like _compRoom; bridges transient block loss. The
   // server stats `ranked` block is the only confirmer (liveRanked above).
   let _rankedRoom=null; // {code, at}
-  // Leave guard: MY leave-op (254 out) means "in no room" — the server can
+  // Leave guard: MY leave-op (254 out) means "in no room" -the server can
   // keep serving the just-left block until it ages out, which would
   // resurrect the UI after disableRanked hid it. While set, liveRanked()
   // hides everything. Cleared on the next join/create with a room code.
@@ -1578,7 +1578,7 @@
   let _rankedLeaveGuard=false;
   function sniffPid(hex){
     // Photon strings are length-prefixed, so the code may glue to a prefix
-    // byte ("07"+"PBS05") — slide a 5-char window over the post-key bytes.
+    // byte ("07"+"PBS05") -slide a 5-char window over the post-key bytes.
     // Trigger-happy by design: the by-code endpoint is authoritative and a
     // wrong guess just resolves to room null (cached 30s).
     try{
@@ -1622,7 +1622,7 @@
   // 254, the first param of that response) and echoes the same number on my own
   // Join / PropertiesChanged events (PlayerProperties."255" == my game name).
   // Tracking it makes an inbound Leave event PROOF: a Leave whose ActorNr is
-  // mine IS my own leave — the same statement as my LeaveRoom op — instead of
+  // mine IS my own leave -the same statement as my LeaveRoom op -instead of
   // matching the leaver's name against my username or assuming every 254-in
   // belongs to somebody else. The number is per-room: cleared on auth (the next
   // room hands out a fresh one) and on a proven self-leave. Never throws.
@@ -1641,7 +1641,7 @@
   }
   // Drops the pin with the room (auth, proven self-leave). The next join/create
   // response pins the next number, so forgetting can only lose a stale actor —
-  // never a live one — and it keeps a recycled number from looking like mine.
+  // never a live one -and it keeps a recycled number from looking like mine.
   function _clearMyActor(why){
     try{
       if(_myActor.nr==null) return;
@@ -1649,7 +1649,7 @@
       _myActor.nr=null; _myActor.at=0; _myActor.via='';
     }catch{}
   }
-  // True only when the number is the one Photon pinned to ME — the proof the
+  // True only when the number is the one Photon pinned to ME -the proof the
   // Leave handler keys on. Unknown on either side is never a match.
   function isMyActor(nr){
     try{ return nr!=null && _myActor.nr!=null && Number(nr)===_myActor.nr; }catch{ return false; }
@@ -1752,7 +1752,7 @@
       if(!Number.isInteger(nr) || nr<1 || nr>255) return {actorNr:null, name:null};
       // PlayerProperties (249) on a Join event / Properties (251) on a 253 hold
       // the name under key "255"; on a join RESPONSE 249 is keyed by actor, so no
-      // name shows up there — none is needed, the response is already mine.
+      // name shows up there -none is needed, the response is already mine.
       let name=null;
       for(const k of [249,251]){
         const bag=params[k];
@@ -1772,7 +1772,7 @@
     }catch{ return false; }
   }
   // Track MY join/create carrying a pID (local intent, comp copy). The
-  // server stats `ranked` block is the only confirmer — this just records
+  // server stats `ranked` block is the only confirmer -this just records
   // which code I meant, clears the leave guard, and kicks a fast stats
   // pull + transition burst so the lobby card lands fast. Never throws.
   function rankedTrack(pid){
@@ -1861,7 +1861,7 @@
   }
   // Layout-proof matching: Alt+Shift switches Windows layouts and Ctrl+Alt
   // composes AltGr chars, so e.key arrives as 'z'/'å'/etc. instead of 'W'.
-  // e.code is the physical key (KeyW) — layout- and modifier-independent.
+  // e.code is the physical key (KeyW) -layout- and modifier-independent.
   // Stored binds without a code (saved before this fix) fall back to e.key.
   function bindMatches(e, kb){
     try{
@@ -1874,7 +1874,7 @@
   function matchBind(e){
     for(const b of BNC_BINDS){
       // drawer + ranked + leaderboard + host panels have their own dispatcher
-      // below (Esc/panel handling) — matching them here too would fire twice:
+      // below (Esc/panel handling) -matching them here too would fire twice:
       // open here, instant close there on the SAME keypress (stopPropagation
       // does not stop same-node listeners; only stopImmediatePropagation
       // would, and registration order makes this one run first).
@@ -2030,7 +2030,7 @@
     showToast(feedPaused ? 'Feed paused' : 'Feed resumed', false);
   }
   // Dev gating: feed UI + dev keybinds exist only when the DB row says so.
-  // Called on every stats render (stats arrive async — hidden until then).
+  // Called on every stats render (stats arrive async -hidden until then).
   function syncDevUI(){
     const dev=isDev();
     try{
@@ -2115,7 +2115,7 @@
 
   let infoPanel=null, infoUpdateTimer=null, statsCache=null, statsPollTimer=null, drawerBackdrop=null;
   let coinsCache=null, _lastCoinsAt=0;
-  // Drawer always starts closed on page load (first open) — never auto-open from storage.
+  // Drawer always starts closed on page load (first open) -never auto-open from storage.
   let drawerOpen = false;
   try { GMSet('bnc_info_open', false); } catch {}
   // Ranked/host shelved: drop stale ranked session hint + force individualist.
@@ -2130,7 +2130,7 @@
   let lobbyAudio=null;
   let bgLobbyPollTimer=null;
   let _audioPlaying=false;
-  let _audioPlayPending=false; // play() in flight (buffering) — blocks duplicate play() calls
+  let _audioPlayPending=false; // play() in flight (buffering) -blocks duplicate play() calls
   let _authCount=0; // outgoing Authenticate packets seen (first = login, never touches audio)
   let _lastPauseReason=null; // reason string of the last _audioPause() call (for STOPPED tracing)
   function ensureLobbyAudio(){
@@ -2145,7 +2145,7 @@
       lobbyAudio.setAttribute('playsinline','');
       lobbyAudio.preload='auto';
       lobbyAudio.crossOrigin='anonymous';
-      // hidden audio tag that auto plays — use off-screen instead of display:none (some browsers block display:none audio)
+      // hidden audio tag that auto plays -use off-screen instead of display:none (some browsers block display:none audio)
       lobbyAudio.style.position='fixed';
       lobbyAudio.style.left='-9999px';
       lobbyAudio.style.width='1px';
@@ -2182,12 +2182,12 @@
       }catch{}
       (document.body||document.documentElement).appendChild(lobbyAudio);
       logInfo(`[AUDIO] appended hidden tag vol=${lobbyAudio.volume} loop=${lobbyAudio.loop} autoplay=${lobbyAudio.autoplay}`);
-      // try resume on user gesture (drawer open) — only if not already playing and not in match
+      // try resume on user gesture (drawer open) -only if not already playing and not in match
       try{ const resume=()=>{ logInfo('[AUDIO] click resume try'); try{ const rs = statsCache && statsCache.session; const rsLobby = effInMatch() !== true; if(lobbyAudio && !_audioPlaying && !_audioPlayPending && rsLobby && lobbyAudio.paused && lobbyAudio.src) { _audioPlayPending=true; lobbyAudio.play().then(()=> logOk('[AUDIO] resume playing')).catch(e=> { _audioPlayPending=false; logErr(`[AUDIO] resume blocked ${e.message||e}`); }); } }catch(e){ logErr(`[AUDIO] resume err ${e.message}`);} }; document.addEventListener('click', resume, {once:true}); }catch{}
     }catch(e){ logErr(`[AUDIO] ensure failed ${e.message}`); }
     return lobbyAudio;
   }
-  // Single choke point for stopping lobby audio — records WHY for STOPPED tracing
+  // Single choke point for stopping lobby audio -records WHY for STOPPED tracing
   function _audioPause(reason){
     try{
       const a = lobbyAudio;
@@ -2219,7 +2219,7 @@
         _audioPause('in-match');
         return;
       }
-      // Lobby (optimistic): never pause here — without a URL there is nothing to start.
+      // Lobby (optimistic): never pause here -without a URL there is nothing to start.
       if(!url){
         logInfo('[AUDIO] no url, nothing to play (no pause)');
         return;
@@ -2236,7 +2236,7 @@
         logInfo('[AUDIO] actually playing, skip everything (no restart)');
         return;
       }
-      // Guard: play() already in flight (buffering) — a second play() restarts the track
+      // Guard: play() already in flight (buffering) -a second play() restarts the track
       if(_audioPlayPending){
         logInfo('[AUDIO] play already pending, skip duplicate play()');
         return;
@@ -2254,7 +2254,7 @@
       logInfo(`[AUDIO] play() try vol=${vol} loop=${audio.loop} autoplay=${audio.autoplay} paused=${audio.paused} readyState=${audio.readyState}`);
       _audioPlayPending = true; // mark play in flight before calling
       const p = audio.play();
-      if(p && p.then) p.then(()=> logOk('[AUDIO] play() ok playing')).catch(e=> { _audioPlayPending=false; logErr(`[AUDIO] play() blocked ${e.message||e} — need user click on page/drawer`); });
+      if(p && p.then) p.then(()=> logOk('[AUDIO] play() ok playing')).catch(e=> { _audioPlayPending=false; logErr(`[AUDIO] play() blocked ${e.message||e} -need user click on page/drawer`); });
       else if(p && p.catch) p.catch(e=> { _audioPlayPending=false; logErr(`[AUDIO] play() blocked ${e.message||e}`); });
       else { _audioPlayPending=false; logInfo('[AUDIO] play() no promise'); }
     }catch{}
@@ -2307,7 +2307,7 @@
       </div>
       <div id="bnc-drawer-footer" style="padding:10px 14px;border-top:1px solid rgba(255,255,255,0.06);display:flex;justify-content:space-between;align-items:center;gap:8px;flex-shrink:0;font-size:11px;color:#6b7280">
         <span id="bnc-drawer-version">v${BNC_VERSION}</span>
-        <span id="bnc-drawer-ranked" style="display:none;cursor:pointer;color:#9ca3af;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45%" title="Click to copy — use it to report abuse"></span>
+        <span id="bnc-drawer-ranked" style="display:none;cursor:pointer;color:#9ca3af;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45%" title="Click to copy -use it to report abuse"></span>
         <span id="bnc-drawer-api" style="display:flex;align-items:center;gap:6px"><span id="bnc-drawer-dot" style="width:8px;height:8px;border-radius:50%;background:#6b7280;display:inline-block"></span><span id="bnc-drawer-api-text">Offline</span></span>
       </div>`;
     // non-passthrough: stop game from seeing wheel/keys inside drawer
@@ -2347,7 +2347,7 @@
         if(isLobby && sc && sc.lobby_music_url){
           const aud=ensureLobbyAudio();
           // Drawer must NEVER restart lobby music: only act when audio is silent, no play
-          // in flight, and we're in lobby (optimistic AND server — server trails, so both).
+          // in flight, and we're in lobby (optimistic AND server -server trails, so both).
           // Ground truth = aud.paused.
           const drawerIsLobby = effInMatch() !== true;
           if(aud && aud.paused && !_audioPlayPending && drawerIsLobby){
@@ -2496,7 +2496,7 @@
     }
     try{ stateGmLine = String(stateGmLine).replace(/\s+-\s*$/, ''); }catch{}
     // ranked overrides party: "In Match - Ranked Match - GM"
-    // liveRanked() also requires fresh captures — a ghost block from a dead
+    // liveRanked() also requires fresh captures -a ghost block from a dead
     // session (kick/reload) never renders as ranked.
     const _ranked = liveRanked();
     if(_ranked){
@@ -2546,7 +2546,7 @@
     const noStats = (kills==null) && (!_gmUname || _gmUname==='-');
     const emptyStatsHtml = `<div style="display:flex;flex-direction:column;gap:8px;align-items:center;width:100%;max-width:240px;padding:18px 14px;background:#171717;border:1px dashed rgba(255,255,255,0.16);border-radius:12px;text-align:center"><div style="font-size:26px">📊</div><div style="font-size:14px;font-weight:800;color:#fff">No stats yet</div><div style="font-size:12px;color:#9ca3af;line-height:1.5">Play 1-2 matches to get your account ready.<br>Kills, deaths, wins and skins will show up here.</div></div>`;
     // ranked arena rows (below K/D): ranked-session ONLY. Casual lobbies and
-    // matches never show points/tier rows — liveRanked() (_ranked above) is
+    // matches never show points/tier rows -liveRanked() (_ranked above) is
     // the gate; values come from the session-independent arena block (your
     // current ladder points), NOT the ranked block's tourney points (0 on a
     // fresh tourney). Never throws.
@@ -2579,7 +2579,7 @@
         if(_st.best_match_kills!=null) arenaRowsHtml += `<div style="display:flex;justify-content:space-between;width:100%;max-width:240px;font-size:12px"><span style="color:#9ca3af">💀 Best match</span><span style="color:#fff;font-weight:700">${_esc(_st.best_match_kills)} kills</span></div>`;
       }
     }catch{}
-    // 🏆 comp rows are "my points in THIS tourney" — only while holding the
+    // 🏆 comp rows are "my points in THIS tourney" -only while holding the
     // tourney room. sc.comp is lifetime open-tourney data (server sends it
     // whenever a tourney is open) and would otherwise linger in the drawer
     // long after leaving. Gate mirrors updateTourneyHud: server comp_tourney
@@ -2725,7 +2725,7 @@
         rkFoot.onclick=(e)=>{
           try{ if(e) e.stopPropagation(); }catch{}
           const mid=String(_ranked.match_id);
-          const done=()=> showToast('Match ID copied — paste it in your abuse report', false);
+          const done=()=> showToast('Match ID copied -paste it in your abuse report', false);
           try{
             if(typeof GM_setClipboard==='function'){ GM_setClipboard(mid); done(); }
             else if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(mid).then(done, done); }
@@ -2750,7 +2750,7 @@
     // ranked points toast follows every stats render
     try{ updatePtsToast(); }catch{}
     // ladder-movement mini toast follows every stats render (match AND
-    // breather — seals land while the lobby card is hidden)
+    // breather -seals land while the lobby card is hidden)
     try{ updateLadderMoveToast(); }catch{}
     // rank up/down toast follows every stats render
     try{ updateRankToast(); }catch{}
@@ -2807,7 +2807,7 @@
   function fetchStats(forceRender){
     if(!sessionId && !discordId) { if(forceRender) renderInfoPanel(); return; }
     // Sequence guard: overlapping polls (15s timer, bg poll, transition
-    // bursts) must never paint stale data over fresh — a slow older response
+    // bursts) must never paint stale data over fresh -a slow older response
     // arriving last used to flip kills +2 back to +1. Only the newest
     // response for each transport applies. Never throws.
     const mySeq=++_statsSeq;
@@ -3006,7 +3006,7 @@
     const pts0=(rk.points==null ? 0 : rk.points);
     const color=rk.milestone_color || '#fff';
     // Optimistic layer: server_total + priced kills until the seal moves
-    // the total (then the layer resets — never stacked onto the seal).
+    // the total (then the layer resets -never stacked onto the seal).
     let _optShow=0;
     try{
       if(typeof OPTIMISTIC_KILLS!=='undefined' && OPTIMISTIC_KILLS){
@@ -3019,7 +3019,7 @@
     }catch{}
     const pts=pts0+_optShow;
     // v1: plain ladder total, no pending marker (the seal-watch refreshes
-    // the number within ~2s of the seal — no honesty footnote needed).
+    // the number within ~2s of the seal -no honesty footnote needed).
     // Rank icon rides before the number and re-renders from the same block
     // every poll, so it flips the instant the milestone does.
     const iconHtml=(rk.milestone_icon_url
@@ -3133,9 +3133,9 @@
     }
     if(!rk || !inMatch){ _lastFeeMver=0; _curScnFlipAt=0; }
   }
-  // ranked tick: drawer poll only runs when open — keep ranked fresh when closed.
+  // ranked tick: drawer poll only runs when open -keep ranked fresh when closed.
   // 5s while a code is tracked (seals/toasts/overlay surface in seconds).
-  // Comp parity: no presence ping, no extra endpoint — stats poll is truth.
+  // Comp parity: no presence ping, no extra endpoint -stats poll is truth.
   setInterval(()=>{ try{
     try{
       let _rkTracked=false;
@@ -3144,7 +3144,7 @@
     }catch{ try{ if(!drawerOpen && rankedActive) fetchStats(false); }catch{} }
     // capture watchdog: logged in but nothing reaching the server. Stats can
     // stay green for hours while captures are dead (the exact shape that hid
-    // the JKVUD session) — say so loudly instead of failing silent.
+    // the JKVUD session) -say so loudly instead of failing silent.
     try{
       if(sessionId && _capFails>=3 && Date.now()-_lastCapWarn>60000){
         _lastCapWarn=Date.now();
@@ -3159,7 +3159,7 @@
   // --- RANKED LOBBY CARD: lobby-only tall card, center-left ---
   // Order: season line / tier icon + big points / progress bar to next /
   // room line (code, players, sealed) / host line. Ranked-session ONLY and
-  // lobby-state only — but it SURVIVES match end: after the last seal the
+  // lobby-state only -but it SURVIVES match end: after the last seal the
   // server stops serving the block, so an ended endpoint verdict renders the
   // cached snapshot (marked Final) until the player leaves the room.
   // Pointer-transparent, game frame only.
@@ -3217,11 +3217,11 @@
     const pts=ptsRaw.toLocaleString('en-US');
     const ms=String(rk.milestone||'Unranked').replace(/</g,'&lt;');
     const season=(sc && sc.arena && sc.arena.season!=null) ? `Nectar Ranked Season ${sc.arena.season}` : 'Nectar Ranked';
-    // Room exists but was never started — seals can't fire. Same card plus
+    // Room exists but was never started -seals can't fire. Same card plus
     // an unmissable amber prompt for the host.
     const notStarted=String(rk.status||'').toLowerCase()==='lobby';
     const sleepingNote=rankedEnabled()?'':'<div style="font-size:11px;font-weight:700;color:#f87171;margin-top:2px">RANKED SLEEPING - matches will not seal</div>';
-    const startLine=notStarted ? `<div style="font-size:12px;font-weight:800;color:#f59e0b;margin-top:4px">NOT STARTED — host: /ranked start</div>` : '';
+    const startLine=notStarted ? `<div style="font-size:12px;font-weight:800;color:#f59e0b;margin-top:4px">NOT STARTED -host: /ranked start</div>` : '';
     el.innerHTML=`<div style="font-size:13px;font-weight:800;color:#fff">${season}</div>${icon}<div style="font-size:22px;font-weight:800;color:${color}">${pts} (${ms})</div><div style="font-size:11px;color:#9ca3af">${roomLine}</div>${startLine}${sleepingNote}`;
     el.style.display='flex';
   }
@@ -3229,7 +3229,7 @@
   // --- RANKED POINTS TOASTS: component queue on seals ---
   // Fires on a match-version bump with a matching last_result. When the
   // server ships the seal breakdown, each nonzero component queues its own
-  // toast (ELIMINATIONS / VICTORY / PLACEMENT / DEFEAT) — losses included,
+  // toast (ELIMINATIONS / VICTORY / PLACEMENT / DEFEAT) -losses included,
   // placement never swallowed into a single total. A capped match appends
   // a MATCH TOTAL summary with the enforced total. Without a breakdown
   // (older servers) falls back to the single total toast with the same
@@ -3242,14 +3242,14 @@
   // identical numbers stay two seals. Legacy single toasts keep the old
   // identical title+delta 60s coalescing behind opts.noCoalesce=false.
   let _prevRankSnap=null, _pendingRankToast=null;
-  // v1 ship switch: seal toasts (rooms + sessions) are OFF — counters are
+  // v1 ship switch: seal toasts (rooms + sessions) are OFF -counters are
   // the source of truth tonight. Flip to true to restore component toasts.
   // Baselines below keep tracking so re-enabling never back-fires old seals.
   const RANKED_SEAL_TOASTS=false;
   // Mini toasts stay ON: one small toast per priced kill (matches the
   // optimistic bump 1:1) and one per ladder movement (matches the counter
   // exactly, seals + streaks + corrections alike). These can never
-  // disagree with the counter — they ARE its movements.
+  // disagree with the counter -they ARE its movements.
   const MINI_TOASTS=true;
   let _lastLobbyServerPts={};
   const _ptsToastQueue=[];
@@ -3401,7 +3401,7 @@
     try{ const el=document.getElementById('bnc-ranked-start'); if(el) el.remove(); }catch{}
   }
   function updateRankedStart(){
-    return;  // v1: "This is a Ranked Match" panel removed — no pre-match popup.
+    return;  // v1: "This is a Ranked Match" panel removed -no pre-match popup.
   }
 
   function getRankedKeybind(){
@@ -3438,7 +3438,7 @@
   }
   function isHost12Keybind(e){ return bindMatches(e, getHost12Keybind()); }
 
-  // --- RANKED PANEL (Phase 8): F9 — milestones map + ranked leaderboard ---
+  // --- RANKED PANEL (Phase 8): F9 -milestones map + ranked leaderboard ---
   const RANKED_ASSETS='https://mnpwvwjqawmuqmickteu.supabase.co/storage/v1/object/public/assets';
   const RANKED_TIERS=[
     {name:'Unranked', min:0, fee:0, color:'#6b7280'},
@@ -3525,7 +3525,7 @@
   // ranked-tourney resolve + rankedTrack (which itself resolves the ranked
   // room, clears the leave guard, kicks a stats pull + transition burst).
   // Mode (comp tourney / ranked tourney / ranked) is decided server-side by
-  // whichever resolve hits — the client just tracks all three and lets the
+  // whichever resolve hits -the client just tracks all three and lets the
   // live blocks + HUD priority sort it out. Never throws.
   function recheckRankedCode(code){
     try{
@@ -3553,7 +3553,7 @@
     Object.assign(card.style,{background:'#0a0a0a',border:'1px solid rgba(255,255,255,0.16)',borderRadius:'14px',padding:'26px',width:'440px',boxSizing:'border-box',boxShadow:'0 8px 32px rgba(0,0,0,0.55)'});
     card.innerHTML='<div style="font-size:30px;margin-bottom:6px">🏆</div>'
       + '<div style="font-size:18px;font-weight:800;color:#fff;margin-bottom:6px">Join ranked / tourney tracking</div>'
-      + '<div style="font-size:13px;color:#9ca3af;line-height:1.6;margin-bottom:14px">No ranked/tourney session tracked yet — the host already started one, or the join was missed. Enter the 5-letter room code to recheck and keep tracking.</div>'
+      + '<div style="font-size:13px;color:#9ca3af;line-height:1.6;margin-bottom:14px">No ranked/tourney session tracked yet -the host already started one, or the join was missed. Enter the 5-letter room code to recheck and keep tracking.</div>'
       + '<input id="bnc-ranked-code-input" type="text" placeholder="Room code (ABC12)" autocomplete="off" spellcheck="false" maxlength="5" style="width:100%;height:40px;padding:0 12px;border:1px solid #374151;border-radius:8px;background:#111;color:#fff;font-size:15px;font-family:monospace;letter-spacing:1.5px;box-sizing:border-box;outline:none;text-transform:uppercase">'
       + '<div style="display:flex;gap:8px;margin-top:12px">'
       +   '<button id="bnc-ranked-code-go" style="flex:1;height:40px;border:0;border-radius:8px;background:#fff;color:#000;font-weight:700;cursor:pointer">Recheck &amp; track</button>'
@@ -3597,11 +3597,11 @@
           try{ rt=!!(statsCache&&statsCache.ranked_tourney); }catch{}
           if(hit || comp || rt){
             const what=comp?'tourney':(hit?'ranked':'ranked tourney');
-            rankedCodeStatus(`Tracked as ${what} — keep playing.`, 'ok');
+            rankedCodeStatus(`Tracked as ${what} -keep playing.`, 'ok');
             try{ showToast(`Tracking ${what} session ${code}`, false); }catch{}
             setTimeout(()=>{ try{ hideRankedCodeModal(); }catch{} try{ toggleRankedPanel(true); }catch{} }, 600);
           } else {
-            rankedCodeStatus('Still no ranked/tourney session for that code — check the code or ask the host to re-set it.', 'bad');
+            rankedCodeStatus('Still no ranked/tourney session for that code -check the code or ask the host to re-set it.', 'bad');
           }
         }catch{}
       }, 2500);
@@ -3625,9 +3625,9 @@
     // inside one (leaderboard/milestones would be a live aid). The blocked
     // path opens the code-recheck modal instead of dead-ending: the host may
     // have started a ranked/tourney room we never sniffed (late inject,
-    // missed pID) — entering the code re-runs the join path and tracking
+    // missed pID) -entering the code re-runs the join path and tracking
     // continues.
-    try{ if(show && GMGet('bnc_host_mode', false)!==true){ showToast('Host mode off — enable bnc_host_mode in Violentmonkey to unlock', true); return; } }catch{} if(show && !liveRanked()){
+    try{ if(show && GMGet('bnc_host_mode', false)!==true){ showToast('Host mode off -enable bnc_host_mode in Violentmonkey to unlock', true); return; } }catch{} if(show && !liveRanked()){
       showToast('No ranked session tracked - enter the room code', true);
       try{ logInfo('[RANKED] panel blocked - not in ranked session (code modal)'); }catch{}
       try{ showRankedCodeModal(currentSessionCode()); }catch{}
@@ -3719,7 +3719,7 @@
         const px=RANKED_ICON_PX(t.name);
         return `<div style="background:#171717;border:1px solid ${isHere?t.color:'rgba(255,255,255,0.10)'};border-radius:10px;padding:14px 8px 12px 8px;text-align:center"><div style="height:72px;display:flex;align-items:center;justify-content:center"><img src="${t.icon}" alt="${t.name}" style="width:${px}px;height:${px}px;object-fit:contain" onerror="this.style.display='none'" /></div><div style="font-size:12px;font-weight:700;color:${t.color};margin-top:10px">${t.name}</div><div style="font-size:11px;color:rgba(255,255,255,0.56);margin-top:2px">${Number(t.min).toLocaleString('en-US')}+</div><div style="font-size:11px;color:rgba(255,255,255,0.36)">Fee ${t.fee}</div>${isHere?`<div style="font-size:11px;font-weight:700;color:#fff;margin-top:8px">● You are here</div>`:''}</div>`;
       }).join('');
-      body.innerHTML=`${summary}<div style="display:grid;grid-template-columns:repeat(5,1fr);grid-auto-rows:1fr;gap:12px">${cards}</div><div style="font-size:11px;color:rgba(255,255,255,0.36);text-align:center;margin-top:12px">Entry fees burn on every ranked start — higher tier, steeper entry.</div>`;
+      body.innerHTML=`${summary}<div style="display:grid;grid-template-columns:repeat(5,1fr);grid-auto-rows:1fr;gap:12px">${cards}</div><div style="font-size:11px;color:rgba(255,255,255,0.36);text-align:center;margin-top:12px">Entry fees burn on every ranked start -higher tier, steeper entry.</div>`;
     } else {
       renderRankedLb(rankedLbCache ? rankedLbCache.rows : null);
     }
@@ -3733,7 +3733,7 @@
       return;
     }
     if(!rows.length){
-      body.innerHTML=`<div style="text-align:center;color:#9ca3af;font-size:13px;padding:40px 0">No ranked players yet — be the first.</div>`;
+      body.innerHTML=`<div style="text-align:center;color:#9ca3af;font-size:13px;padding:40px 0">No ranked players yet -be the first.</div>`;
       return;
     }
     let meDid=null;
@@ -3747,7 +3747,7 @@
     }).join('');
     body.innerHTML=`<div style="display:flex;flex-direction:column;gap:2px">${lines}</div>`;
   }
-  // Privileged GET for the F9 leaderboard (explicit user action — the only
+  // Privileged GET for the F9 leaderboard (explicit user action -the only
   // client-initiated ranked read left). GM_xhr first, bare fetch fallback.
   function rankedApiGet(path, cb){
     let base=''; try{ base=resolveApiBase(); }catch{}
@@ -3869,7 +3869,7 @@
   function fetchHostTourney(){
     const tid=hostTourneyId();
     const body=document.getElementById('bnc-host11-body');
-    if(tid==null){ if(body) body.innerHTML='<span style="color:#9ca3af">No tourney context — join the tourney room first.</span>'; return; }
+    if(tid==null){ if(body) body.innerHTML='<span style="color:#9ca3af">No tourney context -join the tourney room first.</span>'; return; }
     if(body) body.innerHTML='<span style="color:#9ca3af">Loading…</span>';
     rankedApiGet('/api/comp/tourney?id='+encodeURIComponent(tid), (j)=>{
       _hostTourneyCache=j||null;
@@ -3903,7 +3903,7 @@
     createHost11Panel();
     const isHidden=host11Panel.style.display==='none'||!host11Panel.style.display;
     const show=typeof force==='boolean'?force:isHidden;
-    try{ if(show && GMGet('bnc_host_mode', false)!==true){ showToast('Host mode off — enable bnc_host_mode in Violentmonkey to unlock', true); return; } }catch{} if(show && !hostPanelsAllowed()){ showToast('Host roster needs a tourney room', true); return; }
+    try{ if(show && GMGet('bnc_host_mode', false)!==true){ showToast('Host mode off -enable bnc_host_mode in Violentmonkey to unlock', true); return; } }catch{} if(show && !hostPanelsAllowed()){ showToast('Host roster needs a tourney room', true); return; }
     try{ clearTimeout(_hostFadeT); }catch{}
     if(show){ host11Panel.style.display='flex'; requestAnimationFrame(()=>{ requestAnimationFrame(()=>{ try{ host11Panel.style.opacity='1'; }catch{} }); }); fetchHostPanel(); }
     else { try{ host11Panel.style.opacity='0'; }catch{} _hostFadeT=setTimeout(()=>{ try{ host11Panel.style.display='none'; }catch{} }, 180); }
@@ -3919,7 +3919,7 @@
     const body=document.getElementById('bnc-host11-body');
     const title=document.getElementById('bnc-host11-title');
     if(title) title.innerHTML='Ranked roster';
-    if(!ctx){ if(body) body.innerHTML='<span style="color:#9ca3af">No ranked context — join the ranked room first.</span>'; return; }
+    if(!ctx){ if(body) body.innerHTML='<span style="color:#9ca3af">No ranked context -join the ranked room first.</span>'; return; }
     if(body) body.innerHTML='<span style="color:#9ca3af">Loading…</span>';
     const rk=((statsCache||{}).ranked)||{};
     const mver=rk.match_version;
@@ -3999,7 +3999,7 @@
         for(const r of st){ if(String(r.name||'').toLowerCase()===low) return String(r.discord_id); }
       }catch{} return null;
     };
-    q('h12-winGo').onclick=()=>{ const mm=needMatch(); if(!mm) return; const raw=q('h12-winner').value; const did=raw?resolveDid(raw):null; if(raw&&!did){ host12Say('Unknown player — use the F11 name or id.', true); return; } hostApiPost('/api/comp/match/winner',{match_id:mm.id,winner_discord_id:did},(j)=>{ host12Say(j&&!j.error?('Winner set'+(j.placements?' (+P1)':'')):('Failed: '+((j&&j.error)||'no response')), !(j&&!j.error)); fetchHostTourney(); }); };
+    q('h12-winGo').onclick=()=>{ const mm=needMatch(); if(!mm) return; const raw=q('h12-winner').value; const did=raw?resolveDid(raw):null; if(raw&&!did){ host12Say('Unknown player -use the F11 name or id.', true); return; } hostApiPost('/api/comp/match/winner',{match_id:mm.id,winner_discord_id:did},(j)=>{ host12Say(j&&!j.error?('Winner set'+(j.placements?' (+P1)':'')):('Failed: '+((j&&j.error)||'no response')), !(j&&!j.error)); fetchHostTourney(); }); };
     q('h12-sealGo').onclick=()=>{ const mm=needMatch(); if(!mm) return; hostApiPost('/api/comp/match/seal',{match_id:mm.id},(j)=>{ host12Say(j&&!j.error?'Sealed.':'Failed: '+((j&&j.error)||'no response'), !(j&&!j.error)); fetchHostTourney(); }); };
     q('h12-openGo').onclick=()=>{ const tid=hostTourneyId(); if(tid==null){ host12Say('No tourney context.', true); return; } hostApiPost('/api/comp/match/open',{tourney_id:tid},(j)=>{ host12Say(j&&!j.error?('Opened v'+j.version+'.'):'Failed: '+((j&&j.error)||'no response'), !(j&&!j.error)); fetchHostTourney(); }); };
     q('h12-rmGo').onclick=()=>{ const mm=needMatch(); if(!mm) return; const did=resolveDid(q('h12-rm').value); if(!did){ host12Say('Unknown player.', true); return; } hostApiPost('/api/comp/match/remove',{match_id:mm.id,discord_id:did},(j)=>{ host12Say(j&&!j.error?'Removed (ignored in placements).':'Failed: '+((j&&j.error)||'no response'), !(j&&!j.error)); fetchHostTourney(); }); };
@@ -4009,7 +4009,7 @@
     createHost12Panel();
     const isHidden=host12Panel.style.display==='none'||!host12Panel.style.display;
     const show=typeof force==='boolean'?force:isHidden;
-    try{ if(show && GMGet('bnc_host_mode', false)!==true){ showToast('Host mode off — enable bnc_host_mode in Violentmonkey to unlock', true); return; } }catch{} if(show && !hostPanelsAllowed()){ showToast('Host controls need a tourney room', true); return; }
+    try{ if(show && GMGet('bnc_host_mode', false)!==true){ showToast('Host mode off -enable bnc_host_mode in Violentmonkey to unlock', true); return; } }catch{} if(show && !hostPanelsAllowed()){ showToast('Host controls need a tourney room', true); return; }
     try{ clearTimeout(_hostFadeT); }catch{}
     if(show){
       host12Panel.style.display='flex';
@@ -4046,7 +4046,7 @@
       const d=did(); if(!d){ host12Say('Link your Discord account first.', true); return; }
       host12Say('Backing out…');
       hostApiPost('/api/ranked/room/backout',{room_id:c.rid,discord_id:d},(j)=>{
-        host12Say(j&&!j.error?'Backed out — room is lobby. Restart via /ranked start.':'Failed: '+((j&&j.error)||'no response'), !(j&&!j.error));
+        host12Say(j&&!j.error?'Backed out -room is lobby. Restart via /ranked start.':'Failed: '+((j&&j.error)||'no response'), !(j&&!j.error));
       });
     };
     q('h12-rEnd').onclick=()=>{
@@ -4066,7 +4066,7 @@
       const send=(wdid)=>{
         host12Say('Setting winner…');
         hostApiPost('/api/ranked/match/winner',{room_id:c.rid,match_version:mv,discord_id:d,winner_discord_id:wdid},(j)=>{
-          host12Say(j&&!j.error?'Winner set — ledger recalculated.':'Failed: '+((j&&j.error)||'no response'), !(j&&!j.error));
+          host12Say(j&&!j.error?'Winner set -ledger recalculated.':'Failed: '+((j&&j.error)||'no response'), !(j&&!j.error));
         });
       };
       if(!raw){ send(null); return; }
@@ -4075,7 +4075,7 @@
         try{
           const b=(j&&j.board)||[]; const low=raw.toLowerCase();
           const hit=b.find(r=>String(r.discord_id)===raw)||b.find(r=>String(r.name||'').toLowerCase()===low);
-          if(!hit){ host12Say('Unknown player — use the F11 name or id.', true); return; }
+          if(!hit){ host12Say('Unknown player -use the F11 name or id.', true); return; }
           send(String(hit.discord_id));
         }catch{ host12Say('Resolve failed.', true); }
       });
@@ -4096,7 +4096,7 @@
       });
     };
   }
-  // --- LEADERBOARD PANEL: Alt+Shift+L — all players, any time ---
+  // --- LEADERBOARD PANEL: Alt+Shift+L -all players, any time ---
   // Standalone overlay (same card pattern as the ranked panel): sortable
   // columns (points/kills/wins/K-D/playtime), paginated, Esc/backdrop closes.
   // (insights/friends/events/ranked tabs removed; fetchers below kept as dead code)
@@ -4261,7 +4261,7 @@
   }
   // On-screen keyboard for panel text fields (search, chat): clicks always
   // reach the panel, so typing via taps works even when the game eats every
-  // physical keystroke (defaultPrevented at window capture — see diagnosis
+  // physical keystroke (defaultPrevented at window capture -see diagnosis
   // above, which no element-level handler can undo). One ⌨ toggle per input,
   // grid sits below its row, Enter triggers the input's own action. Never throws.
   function attachVkbd(input, onEnter){
@@ -4340,14 +4340,14 @@
   // ranked tracker. Cleared on auth/leave with the room flag.
   let _compRoom=null, _compHudData=null, _publicRoom=false;
   // F7 host-backout reset: drop the local comp-room binding (backed out to
-  // lobby holding no code). No server call — the next pID join re-resolves
+  // lobby holding no code). No server call -the next pID join re-resolves
   // the same code fresh via fetchCompRoom. Never throws.
   function resetCompRoomLocal(){
     try{ _compRoom=null; }catch{}
     try{ _compHudData=null; }catch{}
     try{ _publicRoom=false; }catch{}
     try{ updateTourneyHud(); }catch{}
-    try{ showToast('Comp room cleared (F7) — re-set or rejoin the code', false); }catch{}
+    try{ showToast('Comp room cleared (F7) -re-set or rejoin the code', false); }catch{}
     try{ logInfo('[COMP] room binding cleared via F7 (host backout, no code)'); }catch{}
   }
   function fetchCompRoom(code){
@@ -4418,7 +4418,7 @@
     }catch{}
     if((!d || !sameRoom) && _compRoom){
       // local fallback: join-detected comp room, stats tag not there yet
-      // (or tag missing) — show what we know until stats confirm or deny.
+      // (or tag missing) -show what we know until stats confirm or deny.
       try{
         const cur2=(statsCache&&statsCache.session&&statsCache.session.short_code)||null;
         const fresh=Date.now()-_compRoom.at<600000;
@@ -4560,11 +4560,11 @@
     // VICTORY/ELIMINATION/PLACEMENT toasts entirely.
     try{ updateRtToast(d); }catch{}
     // Session end: sealed == series_len (and len > 0) raises the end
-    // overlay once per tourney — players otherwise never learn the series
+    // overlay once per tourney -players otherwise never learn the series
     // is over until the host stops it.
     try{ updateRankedSessionEnd(d); }catch{}
     try{ if(typeof _inCompRoom==='function' && _inCompRoom()){ el.style.display='none'; return; } }catch{}
-    // Ranked-session economy: no session-standings counter anywhere — the
+    // Ranked-session economy: no session-standings counter anywhere -the
     // ranked overlay and lobby card show the ladder total, toasts/embeds
     // report what each match paid. Toast edges above still fire.
     el.style.display='none';
@@ -4594,7 +4594,7 @@
     const ov=document.createElement('div');
     ov.id='bnc-ranked-end';
     Object.assign(ov.style,{position:'fixed', inset:'0', zIndex:'2147483643', background:'rgba(0,0,0,0.72)', display:'flex', alignItems:'center', justifyContent:'center', padding:'24px', fontFamily:'Inter, system-ui, sans-serif', cursor:'pointer'});
-    ov.innerHTML=`<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:16px;padding:28px;width:420px;max-width:92vw;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,0.5)"><div style="font-size:20px;font-weight:800;color:#fff">Ranked Session ended</div><div style="font-size:13px;color:#e5e7eb;line-height:1.6;margin-top:10px">Series complete — ${sealed}/${series} matches sealed${total!=null?`<br>Your total: <b>${total.toLocaleString('en-US')}</b> pts`:''}</div><div style="font-size:11px;color:#6b7280;margin-top:14px">host: /ranked stop to close · click anywhere to close</div></div>`;
+    ov.innerHTML=`<div style="background:#111;border:1px solid rgba(255,255,255,0.12);border-radius:16px;padding:28px;width:420px;max-width:92vw;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,0.5)"><div style="font-size:20px;font-weight:800;color:#fff">Ranked Session ended</div><div style="font-size:13px;color:#e5e7eb;line-height:1.6;margin-top:10px">Series complete -${sealed}/${series} matches sealed${total!=null?`<br>Your total: <b>${total.toLocaleString('en-US')}</b> pts`:''}</div><div style="font-size:11px;color:#6b7280;margin-top:14px">host: /ranked stop to close · click anywhere to close</div></div>`;
     ov.addEventListener('click', ()=> _dismissSessionEnd());
     try{ (document.body||document.documentElement).appendChild(ov); }catch{ return; }
     _sessionEndTimer=setTimeout(()=> _dismissSessionEnd(), 8000);
@@ -4665,7 +4665,7 @@
       return {ok:true, code:String(code).toUpperCase(), why:''};
     }catch{ return {ok:false, code:null, why:'Unavailable'}; }
   }
-  // Plain JSON POST (no session tokens — friends/party API is discord_id-keyed).
+  // Plain JSON POST (no session tokens -friends/party API is discord_id-keyed).
   function apiPostJson(path, body, cb){
     let base=''; try{ base=resolveApiBase(); }catch{}
     if(!base){ try{cb(null);}catch{} return; }
@@ -4846,8 +4846,8 @@
       let did=null;
       try{ did=(statsCache&&statsCache.discord_id)||GMGet('bnc_discord_id',null)||null; }catch{}
       body.innerHTML=!did
-        ? `<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Link your account first — open the player info drawer to link.</div>`
-        : `<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">No insights yet — play a few matches first.</div>`;
+        ? `<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Link your account first -open the player info drawer to link.</div>`
+        : `<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">No insights yet -play a few matches first.</div>`;
       return;
     }
     const card=(label,val)=>`<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 12px;background:#171717;border:1px solid rgba(255,255,255,0.06);border-radius:10px;font-size:12px"><span style="color:#9ca3af">${label}</span><span style="color:#fff;font-weight:700;text-align:right">${val}</span></div>`;
@@ -4872,7 +4872,7 @@
   }
   // --- FRIENDS TAB: request / accept / decline / invite-to-party / join ---
   // Invite is gated on holding a live private pID (myLiveCode); join copies
-  // the code — the game needs manual entry, no auto-join is possible.
+  // the code -the game needs manual entry, no auto-join is possible.
   function fetchLbFriends(){
     if(!lbPanel || lbTab!=='friends') return;
     stopLbChat();
@@ -4905,7 +4905,7 @@
       lbChatLoading=false;
       lbChat=(j && !j.error && j.messages) ? j.messages : [];
       if(lbTab==='friends' && lbChatWith) renderLbFriends();
-      // reading marks them read server-side — refresh the unread badges
+      // reading marks them read server-side -refresh the unread badges
       try{
         rankedApiGet(`/api/friends/unread?discord_id=${encodeURIComponent(did)}`, (u)=>{
           lbUnread=(u && !u.error) ? u : lbUnread;
@@ -4992,9 +4992,9 @@
     const esc=(v)=> String(v==null?'—':v).replace(/</g,'&lt;');
     if(sub) sub.textContent='Friends & party invites';
     const did=myDiscordId();
-    if(!did){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Link your account first — open the player info drawer to link.</div>`; return; }
+    if(!did){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Link your account first -open the player info drawer to link.</div>`; return; }
     if(lbFriendsLoading){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Loading friends…</div>`; return; }
-    if(!lbFriends && !lbInvites){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Couldn't load friends — server unreachable?</div>`; return; }
+    if(!lbFriends && !lbInvites){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Couldn't load friends -server unreachable?</div>`; return; }
     // chat view replaces the lists while open
     if(lbChatWith){ renderLbChatView(body, esc); wireLbChat(body, did, esc); return; }
     const code=myLiveCode();
@@ -5021,7 +5021,7 @@
     // incoming party invites first (join = copy code)
     const incoming=(lbInvites&&lbInvites.incoming)||[];
     if(incoming.length){
-      html+=`<div style="font-size:11px;font-weight:800;color:#f59e0b;letter-spacing:.06em;padding:4px 12px 0">PARTY INVITES — TAP JOIN, THEN ENTER THE CODE IN-GAME</div>`;
+      html+=`<div style="font-size:11px;font-weight:800;color:#f59e0b;letter-spacing:.06em;padding:4px 12px 0">PARTY INVITES -TAP JOIN, THEN ENTER THE CODE IN-GAME</div>`;
       incoming.forEach((inv,i)=>{
         const from=inv.from_discord_username || inv.from_game_username || String(inv.from_discord_id||'').slice(0,6);
         html+=row(`📨 ${esc(from)} → room ${esc(inv.code||'?')}`, null, `<button data-join="${i}" style="background:#f59e0b;color:#000;border:0;border-radius:6px;padding:4px 12px;cursor:pointer;font-size:11px;font-weight:800;white-space:nowrap">Join</button>`);
@@ -5041,7 +5041,7 @@
         `<button data-chat="${esc(f.discord_id)}" title="Chat" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:4px 10px;cursor:pointer;font-size:11px;font-weight:700;white-space:nowrap">Chat</button>`
         +btn('inv:'+f.discord_id, 'Invite', gate.ok, gate.ok?`Invite to room ${gate.code}`:gate.why));
     }).join('')
-      : `<div style="font-size:12px;color:#9ca3af;padding:5px 12px">No friends yet — search below to add some.</div>`;
+      : `<div style="font-size:12px;color:#9ca3af;padding:5px 12px">No friends yet -search below to add some.</div>`;
     // incoming requests
     const reqs=(lbFriends&&lbFriends.incoming)||[];
     if(reqs.length){
@@ -5060,7 +5060,7 @@
       const _near=((playersCache&&playersCache.players)||[]).filter(p=>
         p && p.in_db && p.discord_id && !p.is_self && String(p.discord_id)!==String(did));
       if(_near.length){
-        html+=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">NEARBY — IN YOUR ROOM (${_near.length})</div>`;
+        html+=`<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:8px 12px 0">NEARBY -IN YOUR ROOM (${_near.length})</div>`;
         _near.slice(0,12).forEach(p=>{
           const label=p.discord_username || p.username || String(p.discord_id).slice(0,6);
           html+=row(esc(label), p.game_username&&p.discord_username?p.game_username:null,
@@ -5127,7 +5127,7 @@
       b.onclick=()=>{
         const inv=incoming[Number(b.dataset.join)];
         if(!inv||!inv.code) return;
-        copyText(inv.code, `Code ${inv.code} copied — enter it in a private room`);
+        copyText(inv.code, `Code ${inv.code} copied -enter it in a private room`);
       };
     });
     body.querySelectorAll('button[data-chat]').forEach(b=>{
@@ -5148,9 +5148,9 @@
     const friends=(lbFriends&&lbFriends.friends)||[];
     const peer=friends.find(f=>String(f.discord_id)===String(lbChatWith))||{discord_id:lbChatWith};
     const name=peer.discord_username || peer.game_username || String(lbChatWith||'').slice(0,6);
-    if(sub) sub.textContent='Chat — '+name;
+    if(sub) sub.textContent='Chat -'+name;
     const did=myDiscordId();
-    // Poll refresh while typing: the input is alive and focused — update ONLY
+    // Poll refresh while typing: the input is alive and focused -update ONLY
     // the message list so the draft and focus survive. Full rebuilds happen
     // on open/send, where losing focus is correct.
     const liveIn=document.getElementById('bnc-chat-in');
@@ -5160,7 +5160,7 @@
         box.innerHTML=(lbChat||[]).map(m=>{
           const mine=String(m.from_discord_id)===String(did);
           return `<div style="align-self:${mine?'flex-end':'flex-start'};max-width:80%;background:${mine?'#fff':'#1f2937'};color:${mine?'#000':'#e5e7eb'};border-radius:10px;padding:6px 10px;font-size:12px;word-break:break-word">${esc(m.body)}</div>`;
-        }).join('') || `<div style="color:#9ca3af;font-size:12px;text-align:center">No messages yet — say hi.</div>`;
+        }).join('') || `<div style="color:#9ca3af;font-size:12px;text-align:center">No messages yet -say hi.</div>`;
         box.scrollTop=box.scrollHeight;
       }
       return;
@@ -5171,7 +5171,7 @@
     }).join('');
     body.innerHTML=`<div style="display:flex;flex-direction:column;gap:6px;height:100%">`
       + `<div style="padding:0 12px"><button id="bnc-chat-back" style="background:#1f2937;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:4px 12px;cursor:pointer;font-size:11px;font-weight:700">‹ Back</button></div>`
-      + `<div id="bnc-chat-msgs" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;padding:6px 12px;min-height:200px;max-height:46vh">${lbChatLoading?`<div style="color:#9ca3af;font-size:12px;text-align:center">Loading…</div>`:((msgs||`<div style="color:#9ca3af;font-size:12px;text-align:center">No messages yet — say hi.</div>`))}</div>`
+      + `<div id="bnc-chat-msgs" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;padding:6px 12px;min-height:200px;max-height:46vh">${lbChatLoading?`<div style="color:#9ca3af;font-size:12px;text-align:center">Loading…</div>`:((msgs||`<div style="color:#9ca3af;font-size:12px;text-align:center">No messages yet -say hi.</div>`))}</div>`
       + `<div style="display:flex;gap:6px;padding:0 12px"><input id="bnc-chat-in" maxlength="500" placeholder="Message ${esc(name)}…" style="flex:1;background:#1f2937;border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:8px 10px;color:#e5e7eb;font-size:12px;outline:none;min-width:0"><button id="bnc-chat-send" style="background:#fff;color:#000;border:0;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:12px;font-weight:800">Send</button></div>`
       + `</div>`;
   }
@@ -5197,7 +5197,7 @@
       try{ inp._vkbdAction=doSend; }catch{}
       try{ untrapInput(inp); }catch{}
       try{ attachVkbd(inp, doSend); }catch{}
-      // refocus only right after OUR send (never on poll refresh — reading
+      // refocus only right after OUR send (never on poll refresh -reading
       // history must not yank focus while the user watches).
       if(_chatRefocus){ _chatRefocus=false; try{ inp.focus(); }catch{} }
     }
@@ -5232,7 +5232,7 @@
     if(sub) sub.textContent='Ranked ladder · top 20';
     if(lbRankedLoading){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Loading ranked…</div>`; return; }
     const rows=lbRanked||[];
-    if(!rows.length){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">No ranked points yet — play a ranked match first.</div>`; return; }
+    if(!rows.length){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">No ranked points yet -play a ranked match first.</div>`; return; }
     const medals=['🥇','🥈','🥉'];
     body.innerHTML=rows.map((r,i)=>{
       const nm=r.game_username||r.discord_username||('…'+String(r.discord_id||'').slice(-4));
@@ -5273,7 +5273,7 @@
     }).join('');
     let html=`<div style="display:flex;gap:6px;margin-bottom:10px">${chipHtml}</div>`;
     if(!rows.length){
-      const hint=lbEventFilter==='running' ? 'No running events — check scheduled.' : lbEventFilter==='ended' ? 'No ended events yet.' : 'No events yet — hosts create them with /tourney-create.';
+      const hint=lbEventFilter==='running' ? 'No running events -check scheduled.' : lbEventFilter==='ended' ? 'No ended events yet.' : 'No events yet -hosts create them with /tourney-create.';
       html+=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">${hint}</div>`;
     } else {
       html+=rows.map(t=>{
@@ -5344,7 +5344,7 @@
     const body=document.getElementById('bnc-lb-body');
     if(!body) return;
     const esc=(v)=> String(v==null?'—':v).replace(/</g,'&lt;');    if(lbLoading){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">Loading…</div>`; return; }
-    if(!lbRows.length){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">No players yet — play a match first.</div>`; return; }
+    if(!lbRows.length){ body.innerHTML=`<div style="color:#9ca3af;font-size:12px;text-align:center;padding:30px 0">No players yet -play a match first.</div>`; return; }
     const prMode=(typeof lbSort!=='undefined' && lbSort==='pr');
     const rows=lbRows.map(r=>{
       const name=r.game_username || r.discord_username || '—';
@@ -5532,7 +5532,7 @@
     const body=document.getElementById('bnc-lb-body');
     if(!body) return;
     const sub=document.getElementById('bnc-lb-sub');
-    if(sub) sub.textContent='Game filters — pick a preset';
+    if(sub) sub.textContent='Game filters -pick a preset';
     const cfg=gfxCfg();
     const presets=Object.keys(GFX_PRESETS).map(k=>{
       const active=cfg.preset===k;
@@ -5542,9 +5542,9 @@
     const css=gfxCss(cfg);
     body.innerHTML='<div style="font-size:11px;font-weight:800;color:#6b7280;letter-spacing:.06em;padding:0 0 6px">PRESETS</div>'
       + '<div style="display:flex;gap:8px;flex-wrap:wrap">'+presets+'</div>'
-      + '<div style="margin-top:12px;font-size:10px;color:#6b7280;line-height:1.7">Applies to the game canvas only — menus and this panel stay untouched.<br>'
+      + '<div style="margin-top:12px;font-size:10px;color:#6b7280;line-height:1.7">Applies to the game canvas only -menus and this panel stay untouched.<br>'
       + (canvases? 'Live on '+canvases+' canvas'+(canvases===1?'':'es')+' in this frame: <code style="color:#e5e7eb">'+(css||'no filter')+'</code>'
-                 : 'No canvas in this frame — press F4 while the game frame has focus so the filter lands on the game surface.')
+                 : 'No canvas in this frame -press F4 while the game frame has focus so the filter lands on the game surface.')
       + '</div>';
     body.querySelectorAll('[data-gfx-preset]').forEach(b=>{
       b.onclick=()=>{ if(b.dataset.gfxPreset==='custom') return; gfxUsePreset(b.dataset.gfxPreset); renderLbGfx(); };
@@ -5556,7 +5556,7 @@
   // feeds with no UI: per-packet net counters, socket ping pairing, socket
   // notes and the captured GL context list. All cheap (integer adds), never
   // sampled on a loop, never sent to the API. Kept because the capture path
-  // and the boot hook already write here — deleting the object would mean
+  // and the boot hook already write here -deleting the object would mean
   // touching those hot paths for zero runtime gain.
   let _nerds={ fps:{frames:0,t0:0,fps:0,ms:0,worstMs:0,hist:[]}, net:{inP:0,inB:0,outP:0,outB:0,rates:{inP:0,inB:0,outP:0,outB:0,avgPkt:0},totalIn:0,totalOut:0,lastAt:0,lastDir:''}, draw:{calls:0,tris:0,verts:0,rates:{calls:0,tris:0},lastCalls:0,lastTris:0}, ws:null, glCtxs:[], raf:null, timer:null, rafLast:0,
     ping:{ samples:[], last:0, avg:0, min:0, max:0, jitter:0, n:0, at:0, op:0, opName:'', pend:{}, api:{samples:[],last:0,avg:0,min:0,max:0,jitter:0,n:0,at:0,fails:0} } };
@@ -5742,7 +5742,7 @@
           // Worst SINGLE frame in this window: the 250ms average above hides
           // individual hitches (fifteen 16ms frames + one 23ms frame still
           // rounds to 60). Unity's in-game counter is instantaneous-ish, so
-          // it swings while we sit pinned — this field moves with it.
+          // it swings while we sit pinned -this field moves with it.
           // Same-thread only: GPU-bound dips without main-thread delay are
           // invisible here, and values above display refresh are unobservable.
           const _d=ts-(c.lastTs||ts);
@@ -5913,7 +5913,7 @@
     };
     step();
   }
-  // Facts only — the bridge owns wording, icons and the join button.
+  // Facts only -the bridge owns wording, icons and the join button.
   function rpcFacts(){
     const sess=(statsCache&&statsCache.session)||null;
     const tag=(sess&&sess.tag)||null;
@@ -6103,9 +6103,9 @@
     const dot=!on?'#6b7280':(live?'#10b981':(up?'#eab308':'#ef4444'));
     // User wording only: what they get, what is missing, what to do about it.
     const state=!on?'Off'
-      :(live?'On — your friends can see what you are playing.'
+      :(live?'On -your friends can see what you are playing.'
           :(up?'The tray is running, but the Discord app is closed. Open Discord and it updates itself.'
-               :(_rpc.probing?'Looking for the tray…':'The tray is not running yet — launch it below.')));
+               :(_rpc.probing?'Looking for the tray…':'The tray is not running yet -launch it below.')));
     const esc=(v)=> String(v==null?'':v).replace(/</g,'&lt;');
     const btn='background:#1f2937;color:#e5e7eb;border:0;border-radius:8px;padding:8px 14px;font-size:11px;font-weight:700;cursor:pointer';
     // No card preview here on purpose: the panel is the switch and the status,
@@ -6122,14 +6122,14 @@
       + '<div style="margin-top:10px;font-size:11px;color:#6b7280;line-height:1.7">'
       + 'The tray is one small app that keeps this and the game connection running in the background: launch it once and leave it in the system tray. Discord must be open for the card to appear.'
       + '</div>'
-      + '<div style="margin-top:14px;font-size:11px;color:#6b7280;line-height:1.7">Friends see your mode, the scene you are in and whether you are in a party — never your rank or points. Two buttons ride along: <b>Join Nectar</b>, and <b>Join my party</b> while your party has a code to share. A lobby with no mode picked yet reads <b>Idle</b> on the card.</div>'
+      + '<div style="margin-top:14px;font-size:11px;color:#6b7280;line-height:1.7">Friends see your mode, the scene you are in and whether you are in a party -never your rank or points. Two buttons ride along: <b>Join Nectar</b>, and <b>Join my party</b> while your party has a code to share. A lobby with no mode picked yet reads <b>Idle</b> on the card.</div>'
       + '<label style="display:flex;align-items:center;gap:6px;margin-top:14px;font-size:11px;color:#9ca3af;cursor:pointer"><input type="checkbox" id="bnc-rpc-auto"'+(cfg.auto?' checked':'')+' style="accent-color:#fff"> Auto-detect the tray</label>';
     const en=document.getElementById('bnc-rpc-enabled');
     if(en) en.onchange=()=>{ rpcSet('enabled', en.checked); };
     const auto=document.getElementById('bnc-rpc-auto');
     if(auto) auto.onchange=()=>{ rpcSet('auto', auto.checked); };
     const tray=document.getElementById('bnc-rpc-tray');
-    if(tray) tray.onclick=()=>{ try{ copyText(RPC_TRAY_CMD, 'Tray ready — launch it once and leave it running'); }catch{} };
+    if(tray) tray.onclick=()=>{ try{ copyText(RPC_TRAY_CMD, 'Tray ready -launch it once and leave it running'); }catch{} };
     const push=document.getElementById('bnc-rpc-push');
     if(push) push.onclick=()=>{ if(!rpcCfg().enabled){ try{ showToast('Turn presence on first', false); }catch{} return; } _rpc.lastSig=''; _rpc.lastErr=''; _rpc.port=null; rpcStart(); };
     const clr=document.getElementById('bnc-rpc-clear');
@@ -6144,7 +6144,7 @@
     Aggressor:'Drops into fights: 3+ kills per match with a strong K/D.',
     Anchor:'Holds ground: solid K/D and wins half or more of the matches.',
     Support:'Plays for the team: fewer kills but a steady win rate.',
-    Wildcard:'Unpredictable mix — every lobby is different.',
+    Wildcard:'Unpredictable mix -every lobby is different.',
   };
 
   // --- KEYBINDS / SETTINGS MENU (Ctrl+Shift+K) ---
@@ -6243,7 +6243,7 @@
     if((e.key||'')!=='Escape'){ try{ if(untrapHoldActive()) return; }catch{} }
     // Held-key auto-repeat must never re-fire toggles: the repeat would
     // instantly undo the press (F9 panel flashing open-shut). Nothing in
-    // this dispatcher is repeat-meaningful — every action is a toggle/menu.
+    // this dispatcher is repeat-meaningful -every action is a toggle/menu.
     if(e.repeat) return;
     if (isModalOrInputFocused() || isTypingKey()) return;
     if((e.key||'')==='Escape' && document.getElementById('bnc-ranked-code')){ e.preventDefault(); try{ hideRankedCodeModal(); }catch{} return; }
@@ -6259,7 +6259,7 @@
     if(modKey(e) && e.shiftKey && (e.key||'').toUpperCase()==='K'){ e.preventDefault(); e.stopPropagation(); toggleKeybinds(); }
   }, true);
 
-  // Ranked UI removed — ranked is not ready. (Host mode toggle removed too;
+  // Ranked UI removed -ranked is not ready. (Host mode toggle removed too;
   // individualist tracking only for now.)
 
   function isPhotonUrl(url){ if(!url) return false; const u=String(url); if(u.includes(APP_ID)) return true; for(const h of PHOTON_HOSTS) if(u.toLowerCase().includes(h)) return true; if(u.includes('wss://')&&u.includes('exitgames')) return true; return false; }
@@ -6289,11 +6289,11 @@
   let lastCaptureBlockedLog=0;
   // Capture health: stamped on every successful /api/capture. The drawer dot
   // is stats-based (green while stats poll), which hides a dead capture
-  // session — these counters let the dot + logs tell them apart. Never raise.
+  // session -these counters let the dot + logs tell them apart. Never raise.
   let lastCaptureOkAt=0, _capFails=0, _capSeen=0, _lastCapWarn=0, _capBackoffMs=0;
   function captureAgeMs(){ try{ return lastCaptureOkAt? Date.now()-lastCaptureOkAt : -1; }catch{ return -1; } }
   // Footer dot truth: Offline (no api) / Login (no session) / Online (capture
-  // fresh <90s) / Idle (hook alive, no essential packets — normal lobby idle)
+  // fresh <90s) / Idle (hook alive, no essential packets -normal lobby idle)
   // / Cap STALE (hook dead too, no WS for 90s+).
   function updateApiDot(){
     try{
@@ -6372,7 +6372,7 @@
   // out) and an inbound Leave event whose ActorNr is PROVEN to be mine
   // (isMyActor). Both are the game telling us directly that the room is gone,
   // so the room flags, the optimistic lobby stamp and the ranked UI all come
-  // down here — and the tracked actor number is dropped with the room (the next
+  // down here -and the tracked actor number is dropped with the room (the next
   // join/create response pins the next one). Never throws.
   function _selfLeftRoom(reason){
     const why=reason||'self-leave';
@@ -6411,7 +6411,7 @@
           if(type===3 && (code===225||code===226||code===227)) _noteMyActor(_ma.actorNr, 'join-resp');
           // Event fallback (capture started mid-room, or the response was never
           // seen): only a packet that NAMES me pins a number, and only while
-          // nothing is pinned yet — a same-named stranger must never re-pin it.
+          // nothing is pinned yet -a same-named stranger must never re-pin it.
           else if(_myActor.nr==null && _ma.name && _isMyGameName(_ma.name)) _noteMyActor(_ma.actorNr, code===255?'join-ev':'props-ev');
         }
       }
@@ -6424,7 +6424,7 @@
     // (server responses/echoes) never touch tracking.
     // Incoming Leave events (254 in) belong to somebody else UNLESS the event's
     // ActorNr is the number Photon pinned to ME (isMyActor): then it is my own
-    // leave and runs the exact same teardown as my leave op — proof, not a guess
+    // leave and runs the exact same teardown as my leave op -proof, not a guess
     // from the leaver's name. Either way the player list is refreshed, because
     // the server prunes on Leave.
     try{
@@ -6452,7 +6452,7 @@
         try{ schedulePlayersRefresh('join-room'); }catch{}
       }
       // stG match markers (match start/end) ride 253s and join/create
-      // responses — hook for the instant win toast + stats pull (no-op untracked).
+      // responses -hook for the instant win toast + stats pull (no-op untracked).
       // (Ranked stG detection removed; stG still drives flush priority below.)
     }catch{}
     if(collectMode){
@@ -6516,7 +6516,7 @@
     }
 
     // Optimistic: detect Authenticate (opCode 230 = 0xE6) outgoing → lobby.
-    // First auth = login: set lobby state silently (never touch audio — it's
+    // First auth = login: set lobby state silently (never touch audio -it's
     // either already starting or will start via stats). Later auths = back to
     // lobby → normal path, which unpauses if we flipped out of a match.
     // via:'auth' ends any endless-series hold: authenticate is the series end.
@@ -6592,7 +6592,7 @@
             }
           }
         } else {
-          // No known verb: never stay silent — raw strings diagnose new formats.
+          // No known verb: never stay silent -raw strings diagnose new formats.
           try{ console.log(`%c[BNC]%c KILL-RAW seq=${rec.seq} strings=${JSON.stringify(strings.slice(0,4))}`, 'color:#f59e0b;font-weight:900',''); }catch{}
         }
       } catch(e) {}
@@ -6601,7 +6601,7 @@
     delete rec._isEssential; delete rec._type; delete rec._code;
     queue.push(rec);
     feedLog('capture', {type, code, dir, label:rec.label, seq:rec.seq, hex:rawHex.slice(0,12)+'..', queued:queue.length});
-    // Priority lane: kills + match markers skip the batch timer — the
+    // Priority lane: kills + match markers skip the batch timer -the
     // toast/seal path needs them now, not in 250ms. Everything else batches.
     try{
       const _isKill=(type===4 && code===101);
@@ -6615,8 +6615,8 @@
   // Heartbeat: every 5s send an empty test-cap batch so the server session
   // stays warm (_cached_at slides, stats/presence stay fresh) through quiet
   // stretches (idle lobby, mobile players). Records carry NO rawHex, so the
-  // server skips them before engine.feed AND the processor — zero effect on
-  // kills/wins/versions/seals — and NO req_token, so no rotation is burned.
+  // server skips them before engine.feed AND the processor -zero effect on
+  // kills/wins/versions/seals -and NO req_token, so no rotation is burned.
   // A 200 response stamps client liveness (dot Online, captureFresh true):
   // the server answered fine, so Cap STALE must not fire while heartbeats
   // land. Ghost safety: the response body is ignored (no noteCaptureSnap),
@@ -6737,7 +6737,7 @@
 
             // Apply server reconciliation from capture response (shared helper)
             // + instant ranked refresh: captures arrive far more often than
-            // stats polls during play — drive ranked UI off them (throttled
+            // stats polls during play -drive ranked UI off them (throttled
             // to 2s; polls + transitions cover the rest).
             let _capFlip=false;
             try{ noteCaptureSnap(j); }catch{}

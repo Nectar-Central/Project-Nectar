@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Comp intake — host-side match recorder for tourneys/scrims.
+ * Comp intake -host-side match recorder for tourneys/scrims.
  *
  * Consumes decoded packets ({rec, msg}, the exact shape updatePresenceFromPacket
  * in decryptor.js receives) and banks matches into Supabase bngc_comp_* tables:
@@ -12,7 +12,7 @@
  *
  * Roster: actorNr -> name from Join ev 255 (255/skid props) + ActorList seeds.
  * Discord mapping: game_username -> discord_id via bngc_users at seal time;
- * twin names (2+ actors, same name, unresolvable) stay null — never guess.
+ * twin names (2+ actors, same name, unresolvable) stay null -never guess.
  *
  * Zero dependencies (global fetch for Supabase REST). Never throws into the
  * caller: every entry point is wrapped. Pure logic (tracker + mapping +
@@ -115,7 +115,7 @@ function createTracker(opts) {
     try {
       room = room ? String(room) : null;
       if (!room) return;
-      // a real pid join ALWAYS ends public state — even rejoining the same
+      // a real pid join ALWAYS ends public state -even rejoining the same
       // room (host backout to lobby + rejoin with the same code). Otherwise
       // a pid-less JoinRandomRoom in between poisons tracking forever until
       // reload (open/seal suppressed, stale drops).
@@ -131,7 +131,7 @@ function createTracker(opts) {
       // have happened while Supabase was unreachable, or the code may have
       // been retagged since. Never clears a live openMatch.
         // auto-tourney: an open tourney tagged with this room code takes
-        // over tracking — no COMP_TOURNEY_ID needed per night. Only when the
+        // over tracking -no COMP_TOURNEY_ID needed per night. Only when the
         // code maps to exactly one open tourney; manual Track always wins
         // (it runs after and overwrites).
         if (/^[A-Z0-9]{5}$/i.test(room) && sink && typeof sink.tourneyByCode === 'function') {
@@ -141,7 +141,7 @@ function createTracker(opts) {
             .then((tid) => {
               if (tid == null) return;
               if (st.tourneyId !== null && String(st.tourneyId) === String(tid)) return;
-              log(`comp room ${code} belongs to tourney #${tid} — auto-tracking`);
+              log(`comp room ${code} belongs to tourney #${tid} -auto-tracking`);
               return setTourney(Number(tid));
             })
             .catch(() => {});
@@ -158,8 +158,8 @@ function createTracker(opts) {
         return null;
       }
       // room gate: a coded tourney only scores its own room. Playing
-      // elsewhere (public matchmaking, another room) must not open — and
-      // therefore never seal — into the tracked tourney. Codeless tourneys
+      // elsewhere (public matchmaking, another room) must not open -and
+      // therefore never seal -into the tracked tourney. Codeless tourneys
       // and explicit manual opens bypass the gate. Unknown room fails open
       // (missed join packet must not eat a real match).
       if (!manual && st.publicRoom) {
@@ -176,7 +176,7 @@ function createTracker(opts) {
         manual: !!manual,
         openedAt: new Date().toISOString(),
         events: [],
-        leaves: [], // actorNames seen leaving (event 254) — auto-removed at seal
+        leaves: [], // actorNames seen leaving (event 254) -auto-removed at seal
       };
       log(`match v${st.openMatch.version} OPEN${manual ? ' (manual)' : ''} room=${(st.room || '?').slice(0, 8)}${st.tourneyCode ? ' code=' + st.tourneyCode : ''}`);
       return st.openMatch;
@@ -229,7 +229,7 @@ function createTracker(opts) {
         const kills = m.events.filter(e => e.etype === 'kill').length;
         const alive = m.events.filter(e => e.etype === 'alv' && !e.alive);
         const winner = alive.length > 0 ? alive[alive.length - 1].actorName : null;
-        log(`match v${m.version} SEALED — kills=${kills} winner=${winner || '?'}`);
+        log(`match v${m.version} SEALED -kills=${kills} winner=${winner || '?'}`);
       } else {
         st.dropped++;
       }
@@ -500,7 +500,7 @@ function createRankedTracker(opts) {
         log(`ranked room -> ${room.slice(0, 8)}`);
       }
       // auto-bind: a live ranked room carrying this code takes over (manual
-      // track always wins — it runs after and overwrites).
+      // track always wins -it runs after and overwrites).
       if (/^[A-Z0-9]{5}$/i.test(room) && sink && typeof sink.rankedRoomByCode === 'function') {
         const code = room.toUpperCase();
         Promise.resolve()
@@ -508,7 +508,7 @@ function createRankedTracker(opts) {
           .then((rid) => {
             if (rid == null) return;
             if (st.rid !== null && String(st.rid) === String(rid)) return;
-            log(`ranked room ${code} belongs to ${rid} — auto-tracking`);
+            log(`ranked room ${code} belongs to ${rid} -auto-tracking`);
             return trackRid(rid);
           })
           .catch(() => {});
@@ -617,7 +617,7 @@ function createRankedTracker(opts) {
         const kills = m.events.filter(e => e.etype === 'kill').length;
         const alive = m.events.filter(e => e.etype === 'alv' && !e.alive);
         const winner = alive.length > 0 ? alive[alive.length - 1].actorName : null;
-        log(`ranked match v${m.version} SEALED — kills=${kills} winner=${winner || '?'}`);
+        log(`ranked match v${m.version} SEALED -kills=${kills} winner=${winner || '?'}`);
       } else {
         st.dropped++;
       }
@@ -795,7 +795,7 @@ function createRankedTracker(opts) {
 
 function mapNamesToDiscord(names, usersByGame) {
   // usersByGame: {game_username: discord_id} (may hold several dids per name
-  // only if the caller passes arrays — duplicate accounts never auto-map).
+  // only if the caller passes arrays -duplicate accounts never auto-map).
   const out = {};
   try {
     const seen = {};

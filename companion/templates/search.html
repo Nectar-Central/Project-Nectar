@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Player Search — Scrim Dashboard</title>
+    <title>Player Search -Scrim Dashboard</title>
     <link rel="stylesheet" href="/static/style.css">
     <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
 </head>
@@ -73,7 +73,7 @@
                 return '<div><a href="/account/' + r.discord_id + '">' +
                     $('<span>').text(r.username).html() +
                     (r.game_username ? ' <em>[' + $('<span>').text(r.game_username).html() + ']</em>' : '') +
-                    '</a> — PR ' + r.pr + '</div>';
+                    '</a> -PR ' + r.pr + '</div>';
             }).join('');
             $('#auto').html(html);
         });

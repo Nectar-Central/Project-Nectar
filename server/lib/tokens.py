@@ -1,5 +1,5 @@
 """
-tokens.py — HMAC-based one-time request tokens.
+tokens.py -HMAC-based one-time request tokens.
 
 Each session gets a random 16-byte hex secret (32 chars).
 For counter N, token = first 10 hex of HMAC-SHA256(secret, str(N)) + hex checksum.
@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 
 # ---------------------------------------------------------------------------
-# Session expiry — sessions live 2 days, then must be refreshed (re-validate)
+# Session expiry -sessions live 2 days, then must be refreshed (re-validate)
 # ---------------------------------------------------------------------------
 
 SESSION_TTL_DAYS = 2
@@ -22,7 +22,7 @@ SESSION_TTL_DAYS = 2
 def is_session_expired(sess: dict | None) -> bool:
     """True if a bngc_sessions row is older than SESSION_TTL_DAYS.
 
-    Missing created_at (legacy rows) counts as NOT expired — only explicit
+    Missing created_at (legacy rows) counts as NOT expired -only explicit
     timestamps expire, so old rows without dates keep working until re-linked.
     """
 
@@ -68,7 +68,7 @@ def _sha256_pure_js(message: str) -> str:
     Only used for legacy compat tokens.
     """
 
-    # This is a direct port of the JS sha256Impl — kept for compat.
+    # This is a direct port of the JS sha256Impl -kept for compat.
     h = [
         1779033703, 3144134277, 1013904242, 2773480762,
         1359893119, 2600822924, 528734635, 1541459225,

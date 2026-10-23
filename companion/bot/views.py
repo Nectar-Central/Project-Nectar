@@ -1,4 +1,4 @@
-"""Discord UI components — selects and buttons for session -> match drill-down."""
+"""Discord UI components -selects and buttons for session -> match drill-down."""
 
 import discord
 import database as db
@@ -22,8 +22,8 @@ def sessions_overview_embed(sessions: list[dict]) -> discord.Embed:
         stats = f"K:{s.get('kills',0)} D:{s.get('deaths',0)} W:{s.get('wins',0)}"
         if s.get("match_count"):
             stats += f" · {s['match_count']} match{'es' if s['match_count']!=1 else ''}"
-        # No raw IDs — show human session label
-        e.add_field(name=f"{i+1}. {ts} — {gm_label}", value=stats, inline=False)
+        # No raw IDs -show human session label
+        e.add_field(name=f"{i+1}. {ts} -{gm_label}", value=stats, inline=False)
     e.set_footer(text="Use the menu below to pick a session")
     return e
 
@@ -61,7 +61,7 @@ def matches_in_session_embed(session_id: str, events: list[dict], session_meta: 
         if session_meta:
             e.set_footer(text=f"{fmt.fmt_date(session_meta.get('created_at'))} · {len(events)} events")
         return e
-    # Multiple matches in session — list each (with last played per match)
+    # Multiple matches in session -list each (with last played per match)
     for idx, (rid, evs) in enumerate(list(groups.items())[:10], 1):
         gms = list({(ev.get("event_data") or {}).get("gm") for ev in evs if (ev.get("event_data") or {}).get("gm")})
         gm_label = ", ".join(fmt.format_game_mode(g) for g in gms[:1]) or "Match"
@@ -74,8 +74,8 @@ def matches_in_session_embed(session_id: str, events: list[dict], session_meta: 
             last_ts = fmt.fmt_date(last_ev.get("created_at"))
         except: pass
         suffix = f" · {last_ts}" if last_ts else ""
-        e.add_field(name=f"Match {idx} — {gm_label}", value=f"{kills} eliminations · {len(evs)} events{suffix}", inline=False)
-    e.set_footer(text=f"{len(groups)} matches in this session — pick one below")
+        e.add_field(name=f"Match {idx} -{gm_label}", value=f"{kills} eliminations · {len(evs)} events{suffix}", inline=False)
+    e.set_footer(text=f"{len(groups)} matches in this session -pick one below")
     return e
 
 def recent_matches_embed(matches: list[dict]) -> discord.Embed:
@@ -92,7 +92,7 @@ def recent_matches_embed(matches: list[dict]) -> discord.Embed:
         ts = fmt.fmt_date(m.get("ts"))
         result = "Victory" if m.get("win") else "—"
         stats = f"K:{m.get('kills',0)} D:{m.get('deaths',0)} · {result}"
-        e.add_field(name=f"{i}. {ts} — {gm_label}", value=f"{stats} · `{m.get('room_short','?')}`", inline=False)
+        e.add_field(name=f"{i}. {ts} -{gm_label}", value=f"{stats} · `{m.get('room_short','?')}`", inline=False)
     e.set_footer(text="Use /replay <session> or /killfeed <session> with the session id from /sessions")
     return e
 
@@ -218,7 +218,7 @@ def replay_lines_for_events(events: list[dict], room_id: str | None = None) -> l
             lines.append(f"`{ts}` Zone Phase {phase}{time_str}")
         elif et == "win":
             gm = fmt.format_game_mode(gd.get("gm", ""))
-            lines.append(f"`{ts}` **Victory** — {gm}")
+            lines.append(f"`{ts}` **Victory** -{gm}")
         elif et == "kill":
             victim = gd.get("victim", "?")
             lines.append(f"`{ts}` You eliminated {victim}")
@@ -253,13 +253,13 @@ class SessionSelectView(discord.ui.View):
         super().__init__(timeout=timeout)
         self.discord_id = discord_id
         self.sessions = sessions
-        # Build select options — label must be <=100 chars
+        # Build select options -label must be <=100 chars
         options = []
         for s in sessions[:25]:
             gms = s.get("game_modes") or []
             gm_label = ", ".join(fmt.format_game_mode(g) for g in gms[:2]) or "Unknown"
             ts = fmt.fmt_date(s.get("created_at"))
-            label = f"{ts} — {gm_label}"[:100]
+            label = f"{ts} -{gm_label}"[:100]
             # value is full session_id
             options.append(discord.SelectOption(label=label, value=s["session_id"], description=f"K:{s.get('kills',0)} D:{s.get('deaths',0)}"[:100]))
         select = discord.ui.Select(placeholder="Choose a session", options=options, min_values=1, max_values=1)
@@ -319,7 +319,7 @@ class MatchSelectView(discord.ui.View):
             gms = list({(ev.get("event_data") or {}).get("gm") for ev in evs if (ev.get("event_data") or {}).get("gm")})
             gm_label = fmt.format_game_mode(gms[0]) if gms else f"Match {idx}"
             kills = sum(1 for ev in evs if ev.get("event_type") == "killfeed" and (ev.get("event_data") or {}).get("kill_type") == "killed")
-            label = f"Match {idx} — {gm_label}"[:100]
+            label = f"Match {idx} -{gm_label}"[:100]
             options.append(discord.SelectOption(label=label, value=rid, description=f"{kills} eliminations"[:100]))
         select = discord.ui.Select(placeholder="Choose a match", options=options, min_values=1, max_values=1)
         select.callback = self.on_select  # type: ignore
@@ -345,7 +345,7 @@ class MatchSelectView(discord.ui.View):
 
     async def on_back(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        # Go back to sessions overview — need to refetch sessions
+        # Go back to sessions overview -need to refetch sessions
         sessions = await db.get_recent_matches(self.discord_id, limit=10)
         embed = sessions_overview_embed(sessions)
         view = SessionSelectView(sessions, self.discord_id)
@@ -398,7 +398,7 @@ class MatchActionsView(discord.ui.View):
     @discord.ui.button(label="Players", style=discord.ButtonStyle.secondary, emoji="👥")
     async def players_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        # Build players embed from events — scoped to current room_id so matches don't merge
+        # Build players embed from events -scoped to current room_id so matches don't merge
         seen: dict[str, str] = {}
         # Filter events to current room if room_id set (composite key supported)
         src_events = self.events

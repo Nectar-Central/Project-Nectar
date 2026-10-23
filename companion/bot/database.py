@@ -16,8 +16,8 @@ DB_PATH = str(Path(__file__).resolve().parent / "data.db")
 # supabase-py is a BLOCKING client. A call made inline from a coroutine holds
 # the event loop for its full timeout, and discord.py declares the gateway dead
 # after 10s of silence ("heartbeat blocked for more than 10 seconds"). This
-# library's postgrest default is 120 SECONDS, not httpx's 5s — far past that
-# window — so the timeout must be set explicitly and verified, not assumed.
+# library's postgrest default is 120 SECONDS, not httpx's 5s -far past that
+# window -so the timeout must be set explicitly and verified, not assumed.
 POSTGREST_TIMEOUT_SEC = 4
 
 
@@ -25,7 +25,7 @@ def _create_supabase_client(url: str, key: str):
     """Build the client with a short, VERIFIED postgrest timeout.
 
     `create_client(url, key, options=SyncClientOptions(...))` is the only
-    supported spelling on supabase-py 2.31 — it takes no `http_client=`
+    supported spelling on supabase-py 2.31 -it takes no `http_client=`
     kwarg, and passing one silently costs you the timeout entirely (it raises,
     and the obvious fallback restores the 120s default). So: set it, then read
     it back off the live session and complain loudly if it did not stick.
@@ -67,7 +67,7 @@ if USE_SUPABASE:
         USE_SUPABASE = False
 # Per spec Task 7: force Supabase when env present, warn if fallback will cause stale data (Vercel writes to Supabase only)
 if not USE_SUPABASE:
-    print("[db] WARNING: Supabase not configured — bot will read sqlite data.db which will be stale vs Vercel. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY per spec.md")
+    print("[db] WARNING: Supabase not configured -bot will read sqlite data.db which will be stale vs Vercel. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY per spec.md")
 
 
 async def _sb_call(call):
@@ -376,7 +376,7 @@ async def delete_user(discord_id):
 
 
 # ---------------------------------------------------------------------------
-# Leaderboard — /leaderboard
+# Leaderboard -/leaderboard
 # ---------------------------------------------------------------------------
 
 async def get_leaderboard(stat: str = "kills", limit: int = 10):
@@ -412,7 +412,7 @@ async def get_leaderboard(stat: str = "kills", limit: int = 10):
 
 
 # ---------------------------------------------------------------------------
-# Match helpers — /matches, /replay, /killfeed
+# Match helpers -/matches, /replay, /killfeed
 # ---------------------------------------------------------------------------
 
 async def get_recent_matches(discord_id: str, limit: int = 10):
@@ -425,7 +425,7 @@ async def get_recent_matches(discord_id: str, limit: int = 10):
         return []
 
     try:
-        # Get sessions for this user — ordered by most recent
+        # Get sessions for this user -ordered by most recent
         sess_res = await _sb_call(lambda: (
             supabase.table("bngc_sessions")
             .select("session_id, created_at")
@@ -443,7 +443,7 @@ async def get_recent_matches(discord_id: str, limit: int = 10):
             sid = sess.get("session_id")
             if not sid:
                 continue
-            # Get event counts for this session — ordered so last is most recent
+            # Get event counts for this session -ordered so last is most recent
             try:
                 ev_res = await _sb_call(lambda: (
                     supabase.table("bngc_game_events")
@@ -562,7 +562,7 @@ async def get_match_by_short_id(discord_id: str, short_id: str):
         if len(sessions) == 1:
             return sessions[0]["session_id"]
         if len(sessions) > 1:
-            # Ambiguous — return first but caller should warn
+            # Ambiguous -return first but caller should warn
             return sessions[0]["session_id"]
         return None
 
@@ -597,7 +597,7 @@ async def get_match_events_grouped(session_id: str, discord_id: str) -> dict[str
 
 
 # ---------------------------------------------------------------------------
-# Nectar Coins — /balance /daily /pay /coinflip /slots /dice /coins-leaderboard
+# Nectar Coins -/balance /daily /pay /coinflip /slots /dice /coins-leaderboard
 # ---------------------------------------------------------------------------
 
 COIN_DAILY_MIN = 1  # random payout per daily claim, inclusive
@@ -762,7 +762,7 @@ async def add_coin_delta(discord_id: str, delta: int, reason: str,
     try:
         bal = int(row.get("nectar_coins") or 0) + int(delta)
     except Exception:
-        raise RuntimeError("Database migration pending — apply add_nectar_coins_v252.sql.")
+        raise RuntimeError("Database migration pending -apply add_nectar_coins_v252.sql.")
     if bal < 0:
         raise ValueError("Insufficient balance.")
     if not USE_SUPABASE or not supabase:
@@ -783,7 +783,7 @@ async def add_coin_delta(discord_id: str, delta: int, reason: str,
         }).eq("discord_id", str(discord_id)).execute())
     except Exception as e:
         if "nectar" in str(e).lower() or "42703" in str(e):
-            raise RuntimeError("Database migration pending — apply add_nectar_coins_v252.sql.")
+            raise RuntimeError("Database migration pending -apply add_nectar_coins_v252.sql.")
         raise
     await _coin_ledger_insert(discord_id, int(delta), bal, reason, meta)
     return bal
@@ -826,7 +826,7 @@ async def claim_daily_coins(discord_id: str):
         raise
     except Exception as e:
         if "nectar" in str(e).lower() or "42703" in str(e):
-            raise RuntimeError("Database migration pending — apply add_nectar_coins_v252.sql.")
+            raise RuntimeError("Database migration pending -apply add_nectar_coins_v252.sql.")
         raise
 
 
@@ -864,7 +864,7 @@ async def get_coin_leaderboard(limit: int = 10):
 
 
 # ---------------------------------------------------------------------------
-# Wager-earnings cap — duel_win + bet_won profit per day (shared with the
+# Wager-earnings cap -duel_win + bet_won profit per day (shared with the
 # server's WAGER_EARN_CAP; tourney prizes, daily, earn_play and casino are
 # NOT capped). Profit comes from ledger meta.earned stamps; legacy rows
 # without the stamp fall back to gross delta for duel_win (today only).
@@ -940,7 +940,7 @@ async def wager_profit_today(discord_id: str, limit: int = 500) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Presence — /afk, /presence, wager online gate
+# Presence -/afk, /presence, wager online gate
 # ---------------------------------------------------------------------------
 
 async def recent_combat_activity(discord_id: str, window_sec: int = 180,
@@ -948,7 +948,7 @@ async def recent_combat_activity(discord_id: str, window_sec: int = 180,
     """Fresh kill/death/win rows (any room incl. lobby) for live-match fallback.
 
     Modes without scene/stG signals (bf/DF lobby play) never flip room
-    state, so the engine can't mark them In Match — but flowing combat rows
+    state, so the engine can't mark them In Match -but flowing combat rows
     prove live play anyway. Returns (active, gm|None, created_at|None).
     Never raises.
     """
@@ -1018,7 +1018,7 @@ async def set_afk(discord_id: str, is_afk: bool, message: str | None = None):
         }).eq("discord_id", str(discord_id)).execute())
     except Exception as e:
         if "is_afk" in str(e) or "afk_message" in str(e) or "42703" in str(e):
-            raise RuntimeError("Database migration pending — apply add_presence_v258.sql.")
+            raise RuntimeError("Database migration pending -apply add_presence_v258.sql.")
         raise
     if is_afk:
         return True, (str(message or "").strip()[:140] or None)

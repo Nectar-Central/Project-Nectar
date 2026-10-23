@@ -1,5 +1,5 @@
 """
-discovery.py — GET /api/search, GET /api/leaderboard, GET /api/user, GET /api/matches
+discovery.py -GET /api/search, GET /api/leaderboard, GET /api/user, GET /api/matches
 
 Search: ?q=xxx → users matching discord_username / game_username / game_id
 Leaderboard: ?sort=kills|wins|kd|playtime|pr&limit=20&offset=0 -> ordered bngc_users + computed fields
@@ -282,7 +282,7 @@ async def leaderboard(request: Request):
                 r["rank"] = offset + i + 1
             return JSONResponse({"sort": sort, "order": order, "limit": limit, "offset": offset, "count": len(rows), "results": rows})
         else:
-            # kd / comp — computed in python over a candidate window.
+            # kd / comp -computed in python over a candidate window.
             # comp: open-tourney totals per user (best tourney each); the Points
             # column carries the comp total under this sort (milestones are the
             # play-points ladder and don't apply here).
@@ -405,13 +405,13 @@ async def ranked_verify(request: Request):
                     break
         # feed evidence (no fight needed): the host's own companion stamps
         # their discord_id on every lobby row it captures (kills, leaves,
-        # deaths) — a did-tagged row for this code proves the host feed is
+        # deaths) -a did-tagged row for this code proves the host feed is
         # in the room even when the host never appears in a killfeed line.
         if not host_in_room and host_did and host_did in dids:
             host_in_room = True
             via = "feed"
         # presence heartbeat (quiet lobby): the userscript pings while it
-        # tracks the code — joins write no event rows, so a silent room has
+        # tracks the code -joins write no event rows, so a silent room has
         # no other evidence. Fresh ping + matching code = host is there.
         if not host_in_room and host_did:
             try:
@@ -489,7 +489,7 @@ async def ranked_ping(request: Request):
 # ---------------------------------------------------------------------------
 @router.get("/api/user")
 async def get_user(request: Request):
-    """Public player profile for website embeds — stats only, never secrets."""
+    """Public player profile for website embeds -stats only, never secrets."""
     qp = request.query_params
     discord_id = (qp.get("discord_id") or "").strip()
     game_username = (qp.get("game_username") or "").strip()

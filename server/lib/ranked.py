@@ -1,5 +1,5 @@
 """
-ranked.py — Ranked v2 (thin): tiers, static awards, direct-DB room lookup, seal.
+ranked.py -Ranked v2 (thin): tiers, static awards, direct-DB room lookup, seal.
 
 Flow (one-way, no chatter):
   client POST /api/capture {records} -> engine.feed + processor writes
@@ -12,7 +12,7 @@ compute_match_points (kill +8, win +50, no placement purse); every
 involved non-winner still takes the flat -5 loss. Placements derive
 from reverse alv order with the snapshot winner cohered to P1.
 Supabase is the source of truth; every read hits the DB (2 queries per seal
-max — negligible). Nothing here raises.
+max -negligible). Nothing here raises.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from .logger import log_ranked
 RANKED_ENABLED = os.getenv("RANKED_ENABLED", "1") == "1"
 # Dynamic awards are deliberately switchable while the rollout is observed.
 # Dynamic awards are the live economy: per-kill upset values with taper,
-# lobby-scaled placement/win purses, tier-scaled losses — all frozen per
+# lobby-scaled placement/win purses, tier-scaled losses -all frozen per
 # seal. Set RANKED_DYNAMIC=0 to fall back to the legacy lobby-average
 # purse (kill/win scaled by lobby avg, flat -5 loss).
 RANKED_DYNAMIC = os.getenv("RANKED_DYNAMIC", "1") == "1"
@@ -45,15 +45,15 @@ def ranked_sleeping() -> bool:
         return True
 
 # ---------------------------------------------------------------------------
-# Tuning constants — flat awards (identical for every tier)
+# Tuning constants -flat awards (identical for every tier)
 # ---------------------------------------------------------------------------
 
 KILL_POINTS = 8    # per kill
 WIN_POINTS = 50    # alive at stG=3
-LOSS_POINTS = -5   # dead at stG=3 (flat: zone, unknown, or killed — no branches)
+LOSS_POINTS = -5   # dead at stG=3 (flat: zone, unknown, or killed -no branches)
 
 # ---------------------------------------------------------------------------
-# Play points — activity ledger on bngc_users (all modes, not just ranked).
+# Play points -activity ledger on bngc_users (all modes, not just ranked).
 # Unlike the ranked ledger above, defeats cost nothing here: play points
 # only ever go up. Hourly pay is derived from the cumulative playtime
 # counter (floor(total/3600) - hours_already_paid), so batch splits and
@@ -169,7 +169,7 @@ def next_milestone(points: Any) -> tuple[dict[str, Any] | None, int, int]:
 
 
 # ---------------------------------------------------------------------------
-# Static rewards (flat — kills + win only)
+# Static rewards (flat -kills + win only)
 # ---------------------------------------------------------------------------
 
 def kill_reward() -> int:
@@ -298,7 +298,7 @@ def detect_ranked_placements(events: list | None, winner_discord_id: Any = None,
 
 
 # ---------------------------------------------------------------------------
-# Room lookup (direct DB — no cache, no refresh loop)
+# Room lookup (direct DB -no cache, no refresh loop)
 # ---------------------------------------------------------------------------
 
 def _norm_code(short_code: Any) -> str:
@@ -474,7 +474,7 @@ def _bump_points_many(deltas: dict[str, int]) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
-# Sealing — comp math (kills + win + placements) with the ranked economy
+# Sealing -comp math (kills + win + placements) with the ranked economy
 # ---------------------------------------------------------------------------
 
 # Base static table (avg-0 lobby): kill +8 / win +50 mirror the legacy flat
@@ -586,7 +586,7 @@ def loss_for(points: Any) -> int:
 
 
 # Per-match arena clamp. Asymmetric by design: winning big caps fast (grind
-# protection — no multi-rank jumps in one session), losing big hurts (stakes).
+# protection -no multi-rank jumps in one session), losing big hurts (stakes).
 MATCH_DELTA_MIN = -50
 MATCH_DELTA_MAX = 30
 
@@ -977,7 +977,7 @@ def seal_match(*, rid: str, match_version: int, gm: str,
     Scoring: compute_match_points with the lobby-strength static table
     (scaled_table_for(avg_points): kill/win/placement purse scaled by lobby
     avg, 8/50/[10,7,5,3,1] at avg 0), then the loss for every involved
-    non-winner — flat -5 static, tier-scaled and frozen per did under
+    non-winner -flat -5 static, tier-scaled and frozen per did under
     dynamic (loss_awards in the stored table). The table used is stored on
     the results row so boards/recalc reproduce the seal-time economics
     (pre-migration DBs skip the column and keep sealing).
@@ -1025,7 +1025,7 @@ def seal_match(*, rid: str, match_version: int, gm: str,
         if winner in removed:
             winner = None
         # Duo co-winners share the crown: no loss, full win bonus (same as
-        # a P1 placement tie). Solo callers leave this empty — behavior
+        # a P1 placement tie). Solo callers leave this empty -behavior
         # bit-identical to before.
         try:
             _tied = {str(d).strip() for d in (tied_winners or []) if str(d or "").strip()} - removed
@@ -1263,7 +1263,7 @@ def seal_match(*, rid: str, match_version: int, gm: str,
 # The room seal above pays the ladder immediately, so it IS the arena pay.
 # The tourney bridge stores the seal's deltas on its match row (stored
 # deltas) instead of recomputing a second economy, and the tourney board
-# replays them verbatim — board == ladder movement, per seal, no lump
+# replays them verbatim -board == ladder movement, per seal, no lump
 # payout at stop. The two seals run in the same processor sweep (room
 # first), so the row usually exists at bridge-seal time; when it lands
 # later, the bridge stores pending join keys and calculate resolves them.
@@ -1339,9 +1339,9 @@ def seal_bundle_for(rid: str, match_version: int) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Seasons (compat: static season 1 — table lookup deleted)
+# Seasons (compat: static season 1 -table lookup deleted)
 # ---------------------------------------------------------------------------
 
 def get_current_season() -> tuple:
-    """(season_number, reset_at). Static (1, None) — seasons table deleted."""
+    """(season_number, reset_at). Static (1, None) -seasons table deleted."""
     return (1, None)

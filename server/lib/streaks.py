@@ -1,5 +1,5 @@
 """
-streaks.py — v2.19.0 reward-path math (daily / win / kill streaks).
+streaks.py -v2.19.0 reward-path math (daily / win / kill streaks).
 
 Pure helpers, never raise. Tunables at top. Used by processor
 (batch-end accrual) and stats (read path). Bonus paid in arena

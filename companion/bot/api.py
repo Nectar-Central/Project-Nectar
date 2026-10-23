@@ -58,7 +58,7 @@ async def validate_token(req: ValidateReq):
         except: pass
         if lt.get("used"):
             await db.lock_user(lt["discord_id"], "Login token reuse", None)
-            await _dm_lock(lt["discord_id"], "Login token reuse — token already used. If this was you, ignore; otherwise your account was locked for security.")
+            await _dm_lock(lt["discord_id"], "Login token reuse -token already used. If this was you, ignore; otherwise your account was locked for security.")
             raise HTTPException(403, "Token already used - account locked. Use /unlock to unlock.")
         await db.use_login_token(req.token, None)
         # ensure user exists and mark first_seen false after first use

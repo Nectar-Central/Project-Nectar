@@ -1,25 +1,25 @@
 """
-precision.py — server-side processing precision score for kills, deaths, wins, defeats.
+precision.py -server-side processing precision score for kills, deaths, wins, defeats.
 
 How it works:
   1. The processor calls schedule() right AFTER each successful DB write
      (kill / death / win / defeat), capturing an immutable snapshot of what
      was written (expected counter value + identifying event fields).
   2. Each scheduled item becomes due VERIFY_DELAY_S (2.0s) later.
-  3. Due items are verified opportunistically — at the start of the next
-     process_batch() and on every GET /api/health poll — via fresh DB reads:
+  3. Due items are verified opportunistically -at the start of the next
+     process_batch() and on every GET /api/health poll -via fresh DB reads:
        - the user's counter is still >= the expected value (write persisted,
          not rolled back or overwritten), AND
        - a matching bngc_game_events row exists for this session/action.
      Both must hold -> precise. Either fails -> imprecise.
      When Supabase is unreachable or the row can't be checked, the item is
-     counted as "skipped" (unknown), never as a failure — infra blips must
+     counted as "skipped" (unknown), never as a failure -infra blips must
      not masquerade as processing errors. The skipped count is exposed so
      consumers can see how much evidence the score is based on.
   4. The score is a rolling window (last WINDOW_N outcomes) smoothed with a
      Bayesian prior (PRIOR_OK / PRIOR_N = 99.0%). A healthy pipeline therefore
      reads 99.0% fresh, climbs through 99.9% with volume, and rounds to 100.0%
-     at high volume — while a real streak of bad writes can still pull it
+     at high volume -while a real streak of bad writes can still pull it
      below 99, which is the honest behavior (the score is a measurement,
      not a badge).
 
@@ -42,7 +42,7 @@ from .supabase_client import db_io
 
 from .logger import log_sys, log_err
 
-VERIFY_DELAY_S = 2.0       # "2s later it checks" — delay between write and verification
+VERIFY_DELAY_S = 2.0       # "2s later it checks" -delay between write and verification
 WINDOW_N = 500             # rolling window of recent outcomes
 PRIOR_OK = 198             # prior pseudo-observations…
 PRIOR_N = 200              # …so a fresh/healthy score starts at exactly 99.0%
@@ -55,7 +55,7 @@ _SNAPSHOT_TTL = 86400      # 24h sliding window on the shared snapshot
 _pending: deque[dict[str, Any]] = deque()   # items awaiting their 2s verification
 _outcomes: deque[bool] = deque(maxlen=WINDOW_N)
 _per_action: dict[str, dict[str, int]] = {a: {"ok": 0, "fail": 0} for a in ACTIONS}
-_skipped = 0               # unverifiable (infra/unknown) — not counted either way
+_skipped = 0               # unverifiable (infra/unknown) -not counted either way
 _snapshot_loaded = False
 
 
@@ -155,7 +155,7 @@ async def verify_due(max_items: int = 10) -> int:
         due = []
         while _pending and _pending[0]["due"] <= now and len(due) < max_items:
             due.append(_pending.popleft())
-        # Drop overdue-but-uncapped backlog silently? No — keep for next call.
+        # Drop overdue-but-uncapped backlog silently? No -keep for next call.
         for item in due:
             res, reason = await db_io(_verify_item, item)
             if res is None:

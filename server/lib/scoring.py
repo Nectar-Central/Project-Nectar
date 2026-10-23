@@ -1,5 +1,5 @@
 """
-scoring.py — the one scoring brain for comp and ranked.
+scoring.py -the one scoring brain for comp and ranked.
 
 Every surface (comp dashboard, /ranked tourney mirror, /ranked/rooms admin,
 userscript overlays, bot embeds) must read the same standings from the same
@@ -36,7 +36,7 @@ def compute_match_points(events: list[dict], table: dict | None = None,
 
     events: event rows {etype, discord_id, actor_name, alive}.
     Kills count per mapped discord_id only (twins stay null upstream).
-    excluded: discord IDs removed mid-match (left) — ignored in kills,
+    excluded: discord IDs removed mid-match (left) -ignored in kills,
     placement, winner and output rows.
     awards: manual point awards {did: pts} (dashboard +pts) folded per row.
     Placement: manual map first ({did: place}), else reverse alv-death order

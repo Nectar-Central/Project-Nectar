@@ -63,7 +63,7 @@ def main() -> int:
                     print(f"Guild {guild_id} unreachable (bot not a member?): {e}")
                     return 2
             roles = sorted(guild.roles, key=lambda r: (r.position, r.id))
-            print(f"{guild.name} ({guild.id}) — {len(roles)} roles, "
+            print(f"{guild.name} ({guild.id}) -{len(roles)} roles, "
                   f"bot top role: {guild.me.top_role if guild.me else '?'}")
             print(f"{'pos':>4}  {'id':<20} members  name")
             for r in roles:

@@ -1,10 +1,10 @@
 """
-logger.py — Clean, colored, consistent logging.
+logger.py -Clean, colored, consistent logging.
 
 Every log line is timestamped and tagged so you can filter:
   [SYS] / [OK] / [ERR] / [EVT] / [CAPTURE]
 
-Colors are 24-bit ANSI — works in Windows Terminal and PowerShell.
+Colors are 24-bit ANSI -works in Windows Terminal and PowerShell.
 """
 
 from datetime import datetime, timezone
@@ -22,8 +22,8 @@ except Exception:
     pass
 
 # ---------------------------------------------------------------------------
-# File handlers — JSON + YAML (rotating, 10MB each, 5 backups)
-# Vercel's filesystem is read-only except /tmp — fall back gracefully.
+# File handlers -JSON + YAML (rotating, 10MB each, 5 backups)
+# Vercel's filesystem is read-only except /tmp -fall back gracefully.
 # ---------------------------------------------------------------------------
 
 import os as _os
@@ -34,7 +34,7 @@ _struct_logger.setLevel(logging.INFO)
 _struct_logger.propagate = False
 
 # ---------------------------------------------------------------------------
-# Verbose switch — ALL logs enabled by default.
+# Verbose switch -ALL logs enabled by default.
 # Set BNC_QUIET=1 to re-enable the old gated behavior.
 # ---------------------------------------------------------------------------
 
@@ -67,7 +67,7 @@ try:
     _struct_logger.addHandler(_json_handler)
     _struct_logger.addHandler(_yaml_handler)
 except (OSError, PermissionError) as _e:
-    # Read-only FS (Vercel) or other FS error — log to stdout only
+    # Read-only FS (Vercel) or other FS error -log to stdout only
     # Keep _struct_logger with no file handlers; console prints still work.
     pass
 
@@ -136,7 +136,7 @@ def _ts_iso() -> str:
 
 
 def log_sys(message: str) -> None:
-    """System/infrastructure chatter (violet). ALL logs enabled — always prints."""
+    """System/infrastructure chatter (violet). ALL logs enabled -always prints."""
 
     try:
         if not _verbose():
@@ -160,7 +160,7 @@ def log_err(message: str) -> None:
 
 
 def log_info(message: str) -> None:
-    """Info log (gray). ALL logs enabled — always prints."""
+    """Info log (gray). ALL logs enabled -always prints."""
 
     try:
         if not _verbose():
@@ -180,7 +180,7 @@ def log_human(message: str) -> None:
 
 
 def log_dbg(message: str) -> None:
-    """Per-batch/per-packet chatter: ALL logs enabled — always prints."""
+    """Per-batch/per-packet chatter: ALL logs enabled -always prints."""
     try:
         if not _verbose():
             if _os.getenv("BNC_DEBUG") != "1":
@@ -191,7 +191,7 @@ def log_dbg(message: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Ranked file log — logs/ranked.log (rotating, 10MB, 3 backups)
+# Ranked file log -logs/ranked.log (rotating, 10MB, 3 backups)
 # ---------------------------------------------------------------------------
 
 _ranked_logger = logging.getLogger("ranked.file")
@@ -233,7 +233,7 @@ def log_ranked(message: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Comp file log — logs/comp.log (rotating, 10MB, 3 backups)
+# Comp file log -logs/comp.log (rotating, 10MB, 3 backups)
 # ---------------------------------------------------------------------------
 
 _comp_logger = logging.getLogger("comp.file")
@@ -272,8 +272,8 @@ def log_comp(message: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Match file log — logs/match.log (rotating, 10MB, 3 backups)
-# MATCH START / MATCH END / WIN / DEFEAT — the four lines every duel, wager
+# Match file log -logs/match.log (rotating, 10MB, 3 backups)
+# MATCH START / MATCH END / WIN / DEFEAT -the four lines every duel, wager
 # and ranked seal is diagnosed from. Same shape as the RANK stream.
 # ---------------------------------------------------------------------------
 
@@ -302,7 +302,7 @@ def log_match(verb: str, event: str = "", session: str = "", tag: str = "MATCH",
 
     `verb` is the short word shown first (START / END / new_version / WIN /
     DEFEAT) and doubles as the JSON `action`; the keyword fields are rendered
-    as key=value. `tag` picks the console color block. Never raises — a
+    as key=value. `tag` picks the console color block. Never raises -a
     logging failure must not break a match.
     """
     try:
@@ -360,7 +360,7 @@ def banner(port: int) -> None:
     """
 
     print(art, flush=True)
-    print(f"{TAG['SYS']} {COL['info']('Ready — waiting for packets…')}", flush=True)
+    print(f"{TAG['SYS']} {COL['info']('Ready -waiting for packets…')}", flush=True)
     print(DIM + "─" * 88 + RESET, flush=True)
     # The port above is the PORT env var, NOT the bound socket: uvicorn's
     # --port flag wins. If the bot logs "Cannot connect", relaunch with
@@ -370,7 +370,7 @@ def banner(port: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Structured logging — JSON / YAML
+# Structured logging -JSON / YAML
 # ---------------------------------------------------------------------------
 
 def log_engine_json(event: str, session: str = "", **fields) -> None:
@@ -390,7 +390,7 @@ def log_engine_yaml(event: str, session: str = "", **fields) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Pretty console events — color-coded by event type
+# Pretty console events -color-coded by event type
 # ---------------------------------------------------------------------------
 
 _EVENT_TAG = {
@@ -418,7 +418,7 @@ def log_engine(event: str, session: str = "", **fields) -> None:
     """
     Pretty console log with color tag + key=value fields.
     JSON aggregation goes to logs/engine.jsonl only (never the console).
-    ALL events print — including actor/debug/props/zone/team_pt/unknown.
+    ALL events print -including actor/debug/props/zone/team_pt/unknown.
     """
     if event in _ENGINE_DEBUG_EVENTS:
         try:

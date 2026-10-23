@@ -1,5 +1,5 @@
 """
-ranked_api.py — ranked live-client endpoints (userscript + bot).
+ranked_api.py -ranked live-client endpoints (userscript + bot).
 
 Kept routes (all have live callers outside any dashboard):
   GET  /api/ranked/table                      userscript room-detect economics
@@ -15,7 +15,7 @@ Comp-dashboard equivalents live under /api/comp/*, mirrored for the
 /ranked page under /api/ranked/* in server/routes/ranked_mirror.py.
 
 NOTE: ranked_match_detail / ranked_match_winner below are plain functions
-on purpose — their paths are registered once, as dispatchers, in
+on purpose -their paths are registered once, as dispatchers, in
 ranked_tourney.py (query/body decides ranked-room vs comp-tourney shape).
 """
 
@@ -120,7 +120,7 @@ def _price_kill_sync(code: str, did: str, killer_name: str,
     Resolves both names against the live roster (room roster or session
     regs + game names), verifies the killer IS the caller, and returns the
     exact per-kill award the seal would pay for a first kill (no taper
-    state mid-match — later kills reconcile at seal). {ok, award, mode}.
+    state mid-match -later kills reconcile at seal). {ok, award, mode}.
     Unresolvable/ambiguous → {ok: False}. No writes.
     """
     try:
@@ -237,7 +237,7 @@ async def ranked_kill_price(request: Request):
 
     Display-only helper: the seal stays the single source of truth (the
     client shows server_total + priced kills and discards the layer at
-    seal). Best-effort — unresolvable names resolve to ok:false, never 500.
+    seal). Best-effort -unresolvable names resolve to ok:false, never 500.
     """
     try:
         b = await request.json()
@@ -258,7 +258,7 @@ async def ranked_room_by_code(request: Request):
     """Room carrying this room code (userscript join detection).
 
     Returns the single non-ended room for the code, else {room: null}.
-    Ambiguous (2+ open rows, same code) resolves to null — never guess.
+    Ambiguous (2+ open rows, same code) resolves to null -never guess.
     Same contract as GET /api/comp/tourney/by-code.
     """
     if supabase is None:
@@ -281,7 +281,7 @@ async def ranked_room_by_code(request: Request):
             "id": r.get("id"), "short_code": r.get("short_code"),
             "status": r.get("status")}})
     except Exception as e:
-        # Join-detection polls this every few seconds — a pool blip must
+        # Join-detection polls this every few seconds -a pool blip must
         # resolve to null (retry on next poll), never a 500 that the
         # userscript treats as fatal.
         if is_transient_error(e):
@@ -663,7 +663,7 @@ def _recalc_sync(rid: str, mver: int) -> dict | None:
                 {"kills": new_kills, "points": new_points}).eq(
                 "room_id", str(rid)).eq("match_version", int(mver)).execute()
             # NOTE: point_awards on bngc_ranked_matches is the bot's MANUAL
-            # map, never the final totals — recalc must not mirror
+            # map, never the final totals -recalc must not mirror
             # new_points back into it or the next recalc double-pays.
         except Exception as exc:
             ranked_mod.log_ranked(f"[ranked] recalc write failed {rid} v{mver}: {exc}")

@@ -1,5 +1,5 @@
 """
-ranked_rooms.py — admin API + gate for the ranked ROOMS ladder
+ranked_rooms.py -admin API + gate for the ranked ROOMS ladder
 (page at /ranked/rooms).
 
 This is the repair surface comp always had and ranked rooms lost when the
@@ -10,7 +10,7 @@ admin gate).
 
 Admin model (fail closed): every request must carry the caller's
 discord_id, and that id must be a row in the `ranked_admins` table
-(allowlist managed directly in Supabase — same trust level as the bot's
+(allowlist managed directly in Supabase -same trust level as the bot's
 operator commands, no self-serve promotion). Unknown id / missing id /
 DB down -> 403. This is stronger than the userscript host gates, which
 only prevent accidents; points edits move the ladder, so they get a real
@@ -347,7 +347,7 @@ async def admin_link(request: Request):
                 upd = upd.is_("discord_id", "null")
             else:
                 # unlink clears ANY attribution for this actor name in the
-                # seal (the comp handler can't do this — its update is
+                # seal (the comp handler can't do this -its update is
                 # null-scoped, so unlink never matched); deliberate here
                 pass
             if seal_id:

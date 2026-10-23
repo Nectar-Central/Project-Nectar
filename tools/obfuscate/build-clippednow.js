@@ -7,7 +7,7 @@
  * Same medium preset as build.js: string-array (base64, 50%) + hex
  * identifiers + string splitting. Deliberately OFF:
  * controlFlowFlattening / deadCodeInjection / debugProtection /
- * selfDefending — those bloat runtime, hurt low-end PCs, and
+ * selfDefending -those bloat runtime, hurt low-end PCs, and
  * selfDefending breaks Tampermonkey GM_* bridges.
  */
 const fs = require("fs");

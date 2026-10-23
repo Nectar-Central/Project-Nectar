@@ -16,5 +16,5 @@ if str(ROOT) not in sys.path:
 
 from server.main import app  # noqa: E402  (import after sys.path fix)
 
-# Vercel looks for `app` or `handler` — export both for compatibility
+# Vercel looks for `app` or `handler` -export both for compatibility
 handler = app

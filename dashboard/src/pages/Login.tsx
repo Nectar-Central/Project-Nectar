@@ -1,5 +1,6 @@
 import { useSearchParams } from "react-router-dom";
 import { Alert, Button } from "@/components/ui";
+import { useAuth } from "@/lib/auth";
 
 const REASONS: Record<string, string> = {
   cancelled: "You cancelled the Discord login.",
@@ -12,6 +13,7 @@ const REASONS: Record<string, string> = {
 export function LoginPage() {
   const [params] = useSearchParams();
   const reason = params.get("error");
+  const { login } = useAuth();
 
   return (
     <div className="mx-auto flex min-h-screen w-full max-w-md flex-col justify-center px-6">
@@ -37,11 +39,9 @@ export function LoginPage() {
         </div>
       ) : null}
 
-      <a href="/auth/discord" className="mt-7">
-        <Button size="lg" className="w-full">
-          <DiscordGlyph /> Continue with Discord
-        </Button>
-      </a>
+      <Button size="lg" className="w-full" onClick={login}>
+        <DiscordGlyph /> Continue with Discord
+      </Button>
 
       <p className="mt-6 text-xs leading-relaxed text-muted">
         Not staff on any server yet? Ask a server owner to register the server with

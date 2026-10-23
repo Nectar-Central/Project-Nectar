@@ -1,5 +1,5 @@
 """
-health.py — GET /api/health (lightweight) + GET /api/ready (deep check).
+health.py -GET /api/health (lightweight) + GET /api/ready (deep check).
 
 /api/health is hit by Render healthchecks + uptime probes every few
 seconds. It must NOT do Service-Initiated egress per poll (no Upstash
@@ -43,7 +43,7 @@ async def _cached_ping() -> bool:
 
 @router.get("/api/health")
 async def health():
-    """Liveness only — zero outbound network. Safe to poll every 5s."""
+    """Liveness only -zero outbound network. Safe to poll every 5s."""
     try:
         from .capture import engine as capture_engine
         engine_sessions = len(getattr(capture_engine, "_sessions", {}) or {})
@@ -63,7 +63,7 @@ async def health():
 
 @router.get("/api/ready")
 async def ready():
-    """Readiness — real backend reachability + precision score. Poll sparingly."""
+    """Readiness -real backend reachability + precision score. Poll sparingly."""
     upstash_configured = cache.is_configured()
     upstash_reachable = await _cached_ping() if upstash_configured else False
     try:

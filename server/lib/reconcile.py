@@ -3,17 +3,17 @@
 The ladder economy (server/lib/ranked.py + companion/bot) has exactly one
 points store: ``ranked_points``.  Streams that legitimately move it:
 
-1. Seal awards    — recorded in ranked_results.points
+1. Seal awards    -recorded in ranked_results.points
                      (seal_match -> _bump_points_many)
-2. Recalc fixes   — differential by construction, self-zeroing
-3. Tourney pay    — flagged bngc_ranked_tourneys.points_paid = true
-4. Entry fees     — charged at room start (bot add_points -fee),
+2. Recalc fixes   -differential by construction, self-zeroing
+3. Tourney pay    -flagged bngc_ranked_tourneys.points_paid = true
+4. Entry fees     -charged at room start (bot add_points -fee),
                      attributed from the room's frozen start roster
-5. Season reset   — deletes every ranked_points row (bot reset_points)
+5. Season reset   -deletes every ranked_points row (bot reset_points)
 
 Store minus ledger therefore has legitimate nonzero shapes.  This module
 classifies them; it never touches the database.  The runner
-(server/scripts/reconcile_ranked.py) reads, attributes, reports — and
+(server/scripts/reconcile_ranked.py) reads, attributes, reports -and
 does not write.
 """
 
@@ -32,7 +32,7 @@ STATUS_DRIFT = "drift"
 STATUS_CRITICAL = "critical"
 
 # Deltas within this absolute size (and not eligible for a pending-seal
-# explanation) are still drift, but graded "minor" — small enough that a
+# explanation) are still drift, but graded "minor" -small enough that a
 # lost -5 loss or a rounding edge is the likely story.
 MINOR_DRIFT_ABS = 5
 
@@ -123,7 +123,7 @@ def classify_deltas(
             continue
         # 3. Positive delta: store above ledger (overpaid / fee not
         #    modeled / lost results row). Negative: ledger above store
-        #    (deficit — double-pay or charge raced an unpaid fee) and is
+        #    (deficit -double-pay or charge raced an unpaid fee) and is
         #    ALWAYS critical: the ladder pays out what evidence denies.
         absd = abs(delta)
         if delta > 0:
@@ -159,7 +159,7 @@ def build_report(
     tourneys_paid_recent: int = 0,
     fees_attributed: int = 0,
 ) -> dict:
-    """Assemble the report dict. Pure — the runner adds IO facts around it."""
+    """Assemble the report dict. Pure -the runner adds IO facts around it."""
     counts = {STATUS_OK: 0, STATUS_PENDING: 0, STATUS_DRIFT: 0, STATUS_CRITICAL: 0}
     # classified carries only problem players (the runner skips zero
     # deltas); everyone in store/ledger not flagged here is clean OK.

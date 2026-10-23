@@ -1,7 +1,7 @@
 """Play-to-earn: credit Nectar Coins for tracked kills/wins.
 
 1 coin per kill, 2 per win, capped at 50/day (all env-tunable).
-Runs as a background loop from bot.py on_ready — deliberately bot-side
+Runs as a background loop from bot.py on_ready -deliberately bot-side
 (not in the capture path) so a bug here can never slow down ingest.
 
 Idempotency: bngc_earn_watermarks stores the last credited
@@ -33,7 +33,7 @@ import database as db
 
 
 # ---------------------------------------------------------------------------
-# Pure helpers (no I/O — unit-testable, never raise)
+# Pure helpers (no I/O -unit-testable, never raise)
 # ---------------------------------------------------------------------------
 
 def credit_for_events(events, kill_rate: int = EARN_KILL_COINS,
@@ -257,7 +257,7 @@ async def earn_user(discord_id: str) -> int:
         payable = cap_credit(total, today)
         await set_watermark(uid, top)
         if payable <= 0:
-            return 0  # capped — excess forfeited
+            return 0  # capped -excess forfeited
         try:
             await db.add_coin_delta(uid, payable, "earn_play",
                                     {"kills": kills, "wins": wins,

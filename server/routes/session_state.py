@@ -1,8 +1,8 @@
 """
-session_state.py — GET /api/session/{session_id}/state
+session_state.py -GET /api/session/{session_id}/state
 
 Read-only view of the live Engine SessionView for a session_id.
-No token rotation, no DB writes — just returns what Engine currently holds
+No token rotation, no DB writes -just returns what Engine currently holds
 for that session_id (populated by POST /api/capture → engine.feed).
 
 This is what photon-client / overlay polls.
@@ -57,4 +57,4 @@ async def get_session_state(session_id: str):
         resp.headers["Cache-Control"] = "public, max-age=3"
         return resp
 
-    raise HTTPException(status_code=404, detail="session not found — no packets fed yet")
+    raise HTTPException(status_code=404, detail="session not found -no packets fed yet")

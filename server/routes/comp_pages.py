@@ -1,5 +1,5 @@
 """
-comp_pages.py — Python-first comp dashboard + admin panel + decryptor-compat.
+comp_pages.py -Python-first comp dashboard + admin panel + decryptor-compat.
 
 Replaces the Node split-brain (companion/decryptor.js serves HTML on :8765,
 companion/comp-dashboard.html fetches SRV + local Node URLs). Everything here
@@ -176,7 +176,7 @@ async def capture_alias(request: Request):
     from .capture import capture_handler
     from fastapi.background import BackgroundTasks
 
-    # capture_handler reads authSessionId/token + sessionId/records — shape matches.
+    # capture_handler reads authSessionId/token + sessionId/records -shape matches.
     return await capture_handler(request, BackgroundTasks())
 
 

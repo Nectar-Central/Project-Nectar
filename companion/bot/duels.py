@@ -1,4 +1,4 @@
-"""PvP Nectar-Coin duel wagers — targeted (@opponent) + open (first-join-locks 1v1).
+"""PvP Nectar-Coin duel wagers -targeted (@opponent) + open (first-join-locks 1v1).
 
 Economy is reused from the existing coins system: balances live on
 ``bngc_users.nectar_coins`` and every escrow/refund/payout flows through
@@ -25,7 +25,7 @@ Rules (locked spec):
   Public fallback (unboosted servers) stays spectator read-only via
   message deletion.
 - Room codes are typed in the thread by a duelist (whole message is the
-  5-char code) — re-typable until the first match seals.
+  5-char code) -re-typable until the first match seals.
 
 Wiring: bot.py calls ``register(bot.tree, bot)`` at import time, adds
 ``DuelView()`` as a persistent view in on_ready, and starts
@@ -45,7 +45,7 @@ from discord import app_commands
 
 import database as db
 
-# The bot process may load env from the repo root — read our own .env too so
+# The bot process may load env from the repo root -read our own .env too so
 # WAGER_CHANNEL_ID (and friends) resolve no matter the working directory.
 try:
     from dotenv import load_dotenv
@@ -101,7 +101,7 @@ PUBLIC_THREADS: set[str] = set()
 THREAD_PAIRS: dict[str, tuple[str, str]] = {}
 
 # ---------------------------------------------------------------------------
-# Pure helpers (no I/O — unit-testable, never raise)
+# Pure helpers (no I/O -unit-testable, never raise)
 # ---------------------------------------------------------------------------
 
 MODE_CHOICES = (
@@ -201,7 +201,7 @@ def score_match(kills_c: int, kills_o: int, win_id, creator_id, opponent_id,
     """Decide one sealed (room_id, version).
 
     race="wins" (zw_lg/bf): ONLY a win row decides the match. A version with
-    no win row is a draw — kills must NEVER hand out a match win in a wins
+    no win row is a draw -kills must NEVER hand out a match win in a wins
     race (kills are a tiebreak display, not the objective; falling back to
     them let a kills-decided seal inflate a first-to-N match-wins score).
     opponent_win=True is the mobile path: the opponent has no capture, so the
@@ -210,11 +210,11 @@ def score_match(kills_c: int, kills_o: int, win_id, creator_id, opponent_id,
     combat event in that version is "opponent eliminated tracked player", the
     round is the opponent's. Ignored entirely in a kills race.
     creator_win=True is the mirror: the tracked player watched the OPPONENT go
-    out (kill_type="out"), which for zone/fall damage is the only evidence there
-    is. The round is the creator's, and no kill is credited to anyone. Checked
-    after win_id, so a real win row still wins outright, and it is a positive flag
-    rather than "not opponent_win" so an unresolved round stays a Draw. Ignored
-    in a kills race like opponent_win.
+    out (kill_type="out"), which for zone/fall damage is the only evidence
+    there is. The round is the creator's, and no kill is credited to anyone.
+    Checked after win_id, so a real win row still wins outright, and it is a
+    positive flag rather than "not opponent_win" so an unresolved round stays a
+    Draw. Ignored in a kills race like opponent_win.
     race="kills" (df): higher kills wins, equal kills is a draw.
     Returns the winner's discord_id or None for a draw. Never raises.
     """
@@ -262,10 +262,9 @@ def _match_sealable(m: dict, race: str = "wins") -> bool:
     """A grouped version worth sealing.
 
     wins race: only a real win row seals (a kills-only or leave-noise group
-    is a Draw at best — invisible, so kills can never hand out a match win),
+    is a Draw at best -invisible, so kills can never hand out a match win),
     plus the mobile opponent_win / creator_win inferences (their win row can
     never exist). kills race: real combat seals.
-    kills race: real combat seals.
     Never raises.
     """
     try:
@@ -327,7 +326,7 @@ async def _sb_first(table: str, select: str, filters: list[tuple[str, str, objec
 async def get_wager(wager_id: str, include_ended: bool = False):
     """Fetch one wager by full id or id prefix. Never raises (None on miss).
 
-    NOTE: ``id`` is uuid — Postgres has no LIKE/~~ operator for uuid, so
+    NOTE: ``id`` is uuid -Postgres has no LIKE/~~ operator for uuid, so
     prefix matching is done in Python over recent non-terminal rows (small
     table, single round trip) instead of a server-side like().
 
@@ -394,7 +393,7 @@ def is_busy_row(row, uid: str, ignore_id: str = "") -> bool:
     """Does this wager row block `uid` from starting/joining another duel?
 
     An incoming PENDING challenge (someone challenged YOU, it is not yours
-    yet) is NOT a conflict — otherwise accepting it fails the very eligibility
+    yet) is NOT a conflict -otherwise accepting it fails the very eligibility
     check it has to pass, and the challenged player cannot run their own duel
     while an offer is pending. Busy = your own open/pending wager, or one you
     have already joined. `ignore_id` skips the wager being acted on (Accept).
@@ -436,21 +435,21 @@ def challenge_dm_text(creator_name, opponent_name, first_to, pot, stake,
         except Exception:
             p = st = 0
         money = (f"**{p:,}** Nectar Coins pot ({st:,} each)" if p > 0
-                 else "for fun — no pot, no stakes")
+                 else "for fun -no pot, no stakes")
         return (f"⚔️ **{cname}** challenged you to a Nectar duel "
                 f"(first to {ft}, {money}).\n"
                 f"Hit **Accept** on the wager in {board_mention} to lock it in "
-                f"(`{wid_short}`) — the duel thread opens after you accept. "
+                f"(`{wid_short}`) -the duel thread opens after you accept. "
                 f"You have 15 minutes; declining refunds the creator.")
     except Exception:
-        return "You have been challenged to a Nectar duel — check the wager channel."
+        return "You have been challenged to a Nectar duel -check the wager channel."
 
 
 async def get_user_active(discord_id: str, *, ignore_id: str = ""):
     """A wager that blocks this user from starting/joining another duel.
 
     Uses is_busy_row, so an incoming PENDING challenge (they were challenged,
-    it is not their duel yet) does not count — otherwise accepting the
+    it is not their duel yet) does not count -otherwise accepting the
     challenge fails the very eligibility check it has to pass. `ignore_id`
     skips the wager being acted on. Never raises.
     """
@@ -493,18 +492,18 @@ async def create_wager_row(payload: dict):
     """Insert a wager row. Returns (row, None) or (None, err). Never raises."""
     sb = _sb()
     if sb is None:
-        return None, "Database not configured — Supabase is required for wagers."
+        return None, "Database not configured -Supabase is required for wagers."
     try:
         r = await db._sb_call(lambda: sb.table("bngc_duel_wagers").insert(payload).execute())
         rows = (r.data if hasattr(r, "data") else []) or []
         if not rows:
-            return None, "Could not create the wager — try again."
+            return None, "Could not create the wager -try again."
         print(f"[duels] created {rows[0].get('id', '?')[:8]} "
               f"{payload.get('kind')} {payload.get('stake')} stake")
         return rows[0], None
     except Exception as e:
         print(f"[duels] create_wager_row failed: {e}")
-        return None, "Could not create the wager — try again."
+        return None, "Could not create the wager -try again."
 
 
 async def update_wager(wager_id: str, fields: dict) -> bool:
@@ -611,13 +610,13 @@ async def _creator_live(creator_id: str):
     """
     uid = str(creator_id)
     if _sb() is None:
-        return False, "Database not configured — try again later."
+        return False, "Database not configured -try again later."
     try:
         row = await db.get_by_discord(uid)
     except Exception:
         row = None
     if not row or not (row.get("game_username") or "").strip():
-        return False, "The creator has no linked game — mobile joins need a tracked creator."
+        return False, "The creator has no linked game -mobile joins need a tracked creator."
     try:
         locked = row.get("is_locked")
         locked = bool(locked) if isinstance(locked, bool) else bool(locked)
@@ -625,19 +624,19 @@ async def _creator_live(creator_id: str):
         if locked or bool(row.get("is_admin_locked")) or scope == "admin":
             return False, "The creator's account is locked."
     except Exception:
-        return False, "Could not verify the creator — try again."
+        return False, "Could not verify the creator -try again."
     try:
         online, _ts = db.online_status(row.get("last_online"), WAGER_ONLINE_SEC)
     except Exception:
         online, _ts = False, None
     if not online:
-        return False, "The creator is offline — mobile joins need them in game right now."
+        return False, "The creator is offline -mobile joins need them in game right now."
     try:
         sessions = await user_sessions_recent(uid)
     except Exception:
         sessions = []
     if not sessions:
-        return False, "The creator has no live session — ask them to play first."
+        return False, "The creator has no live session -ask them to play first."
     return True, ""
 
 
@@ -651,7 +650,7 @@ async def _set_mobile_flag(wager_id: str):
             {"is_mobile_duel": True}).eq("id", str(wager_id)).execute())
     except Exception as e:
         if "is_mobile" in str(e) or "42703" in str(e):
-            print("[duels] is_mobile_duel column missing — apply add_duel_wagers_v259_mobile.sql")
+            print("[duels] is_mobile_duel column missing -apply add_duel_wagers_v259_mobile.sql")
         else:
             print(f"[duels] mobile flag failed: {e}")
 
@@ -695,7 +694,7 @@ async def wager_ban(discord_id: str, reason: str = "", banned_by: str = "") -> t
             return False, "Need a user."
         sb = _sb()
         if sb is None:
-            return False, "Database not configured — Supabase is required for wagers."
+            return False, "Database not configured -Supabase is required for wagers."
         await db._sb_call(lambda: sb.table(WAGER_BANS_TABLE).upsert({
             "discord_id": uid,
             "reason": str(reason or "").strip()[:300],
@@ -707,7 +706,7 @@ async def wager_ban(discord_id: str, reason: str = "", banned_by: str = "") -> t
         return True, ""
     except Exception as e:
         print(f"[duels] wager_ban failed: {e}")
-        return False, ("Could not save the ban — is "
+        return False, ("Could not save the ban -is "
                        "add_wager_bans_v260.sql applied?")
 
 
@@ -719,14 +718,14 @@ async def wager_unban(discord_id: str) -> tuple:
             return False, "Need a user."
         sb = _sb()
         if sb is None:
-            return False, "Database not configured — Supabase is required for wagers."
+            return False, "Database not configured -Supabase is required for wagers."
         await db._sb_call(lambda: sb.table(WAGER_BANS_TABLE)
                           .delete().eq("discord_id", uid).execute())
         print(f"[duels] WAGER UNBAN {uid}")
         return True, ""
     except Exception as e:
         print(f"[duels] wager_unban failed: {e}")
-        return False, "Could not remove the ban — try again."
+        return False, "Could not remove the ban -try again."
 
 
 def _is_guild_owner(interaction) -> bool:
@@ -744,9 +743,9 @@ def kills_race_timeline(events, creator_id: str, opponent_id: str,
     """Cumulative kills for a first-to-N-kills duel, in kill order.
 
     Free Mode never ends a match (stG stays at 1), so the whole duel is one
-    growing match. Counts only roster kills — the creator's self-credited
+    growing match. Counts only roster kills -the creator's self-credited
     `kill` rows on the opponent, and `killfeed` rows where the opponent killed
-    the creator — and reports the FIRST duelist to reach `target`, because the
+    the creator -and reports the FIRST duelist to reach `target`, because the
     bot polls long after the deciding kill (whoever is merely ahead at poll
     time must not win). Never raises.
     """
@@ -816,7 +815,7 @@ def kill_race_seal(room_id, match_version, kills_c, kills_o, winner) -> dict:
 def room_evidence(events, since_iso: str = "") -> list:
     """Private rooms with duel evidence, freshest first.
 
-    [{room_id, code, last_ts, count, gm}] — public rooms (no code) are excluded,
+    [{room_id, code, last_ts, count, gm}] -public rooms (no code) are excluded,
     and rows older than the duel started are ignored. This is what a room
     rebind decides on, and gm is carried so a wager can never bind a room
     whose game mode is not its own (grouping would drop every row of the
@@ -1009,14 +1008,14 @@ def choose_bound_room(bound_room: str, rooms, now_iso: str,
                       bound_code: str = "", mode: str = "") -> tuple:
     """Which room is this duel in now? (room_id, code, action).
 
-    bind    — nothing bound yet: take the room with the FRESHEST evidence
+    bind    -nothing bound yet: take the room with the FRESHEST evidence
               (binding matches[0] took the OLDEST room ever seen).
-    keep    — the bound room is still being played: it wins, so both duelists
+    keep    -the bound room is still being played: it wins, so both duelists
               cannot farm unrelated rooms.
     rebind  -bound room has been quiet for WAGER_REBIND_IDLE_SEC, so the
               duel moved, OR the bound room is a different game mode than
               this wager (see the mode filter below).
-    none    — no usable private room.
+    none    -no usable private room.
     Never raises.
     """
     try:
@@ -1066,7 +1065,7 @@ def totals_from_seals(sealed, race: str, creator_id, opponent_id) -> dict:
     """Running score/kill totals derived from the seal history. Never raises.
 
     The seal list is the source of truth, so recomputing from it (instead of
-    adding up deltas over time) can never drift — which is what makes removing
+    adding up deltas over time) can never drift -which is what makes removing
     a sealed round safe.
     """
     out = {"score_c": 0, "score_o": 0, "kills_c": 0, "kills_o": 0}
@@ -1152,7 +1151,7 @@ def void_round(w: dict, room_id, match_version, *, by: str,
     Grants nobody anything: the round is dropped from the seals (or, if it never
     sealed, recorded so it can never seal) and the running totals are
     recomputed from what remains. Creator-only, once per match, and refused
-    while the creator is behind — the one button that edits history.
+    while the creator is behind -the one button that edits history.
     Never raises.
     """
     try:
@@ -1174,7 +1173,7 @@ def void_round(w: dict, room_id, match_version, *, by: str,
         else:
             behind = sc < so
         if behind:
-            return False, ("You are behind — a void is only allowed while level "
+            return False, ("You are behind -a void is only allowed while level "
                            "or ahead, so it can never be used to erase a loss."), {}
         sealed = [s for s in (w.get("sealed") or [])
                   if isinstance(s, dict)
@@ -1296,7 +1295,7 @@ def wager_stats_embed(name: str, s: dict, balance=None) -> discord.Embed:
     """Render a wager record. Never raises."""
     try:
         s = s if isinstance(s, dict) else {}
-        e = discord.Embed(title=f"🎲 Wager stats — {name or 'unknown'}",
+        e = discord.Embed(title=f"🎲 Wager stats -{name or 'unknown'}",
                           color=discord.Color.gold())
         e.add_field(
             name="Record",
@@ -1337,7 +1336,7 @@ def wager_stats_embed(name: str, s: dict, balance=None) -> discord.Embed:
                 m = modes[mode] or {}
                 lines.append(f"{_mode_label(mode)}: **{m.get('w', 0)}W - {m.get('l', 0)}L**")
             e.add_field(name="By mode", value="\n".join(lines[:6]) or "—", inline=False)
-        e.set_footer(text="Wagers only — duels you created or joined.")
+        e.set_footer(text="Wagers only -duels you created or joined.")
         return e
     except Exception as e:
         print(f"[duels] stats embed failed: {e}")
@@ -1364,7 +1363,7 @@ async def user_wagers(discord_id: str, limit: int = 500) -> list:
 
 async def check_eligibility(discord_id: str, stake: int, *, mobile: bool = False,
                             ignore_wager_id: str = ""):
-    """(ok, reason). Never raises — reason is user-facing on failure.
+    """(ok, reason). Never raises -reason is user-facing on failure.
 
     mobile=True skips the session + online checks (joiners without a
     companion); the caller must ALSO pass _creator_live for the creator.
@@ -1373,7 +1372,7 @@ async def check_eligibility(discord_id: str, stake: int, *, mobile: bool = False
     """
     uid = str(discord_id)
     if _sb() is None:
-        return False, "Database not configured — try again later."
+        return False, "Database not configured -try again later."
     try:
         _ban = await wager_ban_reason(uid)
     except Exception:
@@ -1390,19 +1389,19 @@ async def check_eligibility(discord_id: str, stake: int, *, mobile: bool = False
         return False, "You need **/register** first."
     try:
         if not (row.get("game_username") or "").strip():
-            return False, ("No game name linked — run **/fix-empty** with your "
+            return False, ("No game name linked -run **/fix-empty** with your "
                             "in-game name first. Wagers need identity to score.")
         locked = row.get("is_locked")
         locked = bool(locked) if isinstance(locked, bool) else bool(locked)
         scope = str(row.get("lock_scope") or "default").lower()
         if locked or bool(row.get("is_admin_locked")) or scope == "admin":
-            return False, "Your account is locked — resolve that before wagering."
+            return False, "Your account is locked -resolve that before wagering."
     except Exception:
-        return False, "Could not verify your account — try again."
+        return False, "Could not verify your account -try again."
     try:
         bal = int(row.get("nectar_coins") or 0)
     except Exception:
-        return False, "Coin migration pending — ask a host to apply add_nectar_coins_v252.sql."
+        return False, "Coin migration pending -ask a host to apply add_nectar_coins_v252.sql."
     if bal < int(stake):
         return False, f"Insufficient balance ({bal:,} Nectar Coins for a {int(stake):,} stake)."
     if mobile:
@@ -1411,21 +1410,21 @@ async def check_eligibility(discord_id: str, stake: int, *, mobile: bool = False
         except Exception:
             busy = None
         if busy:
-            return False, "You already have an open wager — finish it first."
+            return False, "You already have an open wager -finish it first."
         return True, ""
     try:
         sessions = await user_sessions_recent(uid)
     except Exception:
         sessions = []
     if not sessions:
-        return False, ("No recent game session found — play a tracked match first "
+        return False, ("No recent game session found -play a tracked match first "
                         "(sessions expire after 2 days).")
     try:
         busy = await get_user_active(uid, ignore_id=ignore_wager_id)
     except Exception:
         busy = None
     if busy:
-        return False, "You already have an open wager — finish it first."
+        return False, "You already have an open wager -finish it first."
     try:
         _lo = row.get("last_online")
     except Exception:
@@ -1438,7 +1437,7 @@ async def check_eligibility(discord_id: str, stake: int, *, mobile: bool = False
                 _rel = f"<t:{int(_ts.timestamp())}:R>" if _ts is not None else "a while"
             except Exception:
                 _rel = "a while"
-            return False, ("You appear offline — open the game so your companion "
+            return False, ("You appear offline -open the game so your companion "
                            f"reconnects (last seen {_rel}). Wagers need both duelists online.")
     return True, ""
 
@@ -1463,7 +1462,7 @@ def _room_code_line(w) -> str:
         code = str((w or {}).get("room_code") or "").strip().upper()
         if code:
             return f"Room code: `{code}`"
-        return ("No code pre-set — play a private room together, "
+        return ("No code pre-set -play a private room together, "
                 "first shared private room binds the duel.")
     except Exception:
         return ""
@@ -1519,7 +1518,7 @@ def _add_count_fields(e, w) -> None:
     """Score field, only once there is something to show.
 
     Score only. A kills race (df) reports its kill totals HERE, because that is
-    the objective it scores on; there is no separate "Kills" row — a bf/zw_lg
+    the objective it scores on; there is no separate "Kills" row -a bf/zw_lg
     duel's kill count decides nothing, and showing it as if it did confused
     players into reading it as the score. Never raises.
     """
@@ -1545,13 +1544,13 @@ def challenge_embed(w, creator_name: str, opponent_name: str | None) -> discord.
     ended = _is_ended(w)
     title = ("Wager ended" if ended else
              (f"For fun duel `{wid}`" if for_fun
-              else f"Duel wager `{wid}` — {stake:,} coins each"))
-    stakes_line = ("For fun — no stakes, no pot" if for_fun
+              else f"Duel wager `{wid}` -{stake:,} coins each"))
+    stakes_line = ("For fun -no stakes, no pot" if for_fun
                    else f"Pot: **{int(w.get('pot', 0)):,}** Nectar Coins")
-    mobile_line = ("\n📱 Mobile duel — opponent verified by game name." if w.get("is_mobile_duel") else "")
+    mobile_line = ("\n📱 Mobile duel -opponent verified by game name." if w.get("is_mobile_duel") else "")
     e = discord.Embed(
         title=title,
-        description=(f"**{creator_name}** vs **{opponent_name or 'OPEN — anyone can join'}**\n"
+        description=(f"**{creator_name}** vs **{opponent_name or 'OPEN -anyone can join'}**\n"
                      f"Mode: **{_mode_label(w.get('mode'))}** · "
                      f"First to **{int(w.get('first_to', 1))}** {race} · "
                      f"{stakes_line}\n"
@@ -1563,17 +1562,17 @@ def challenge_embed(w, creator_name: str, opponent_name: str | None) -> discord.
     else:
         e.add_field(name="Expires", value="—", inline=True)
     if ended:
-        e.set_footer(text="Wager ended — this duel is closed.")
+        e.set_footer(text="Wager ended -this duel is closed.")
     elif str(w.get("status")) == "open":
         e.set_footer(text="Hit Join below.")
     elif str(w.get("status")) == "pending":
         e.set_footer(text="Accept or Decline below.")
     elif str(w.get("status")) == "active":
-        e.set_footer(text="Duel live — sealed results post in the thread.")
+        e.set_footer(text="Duel live -sealed results post in the thread.")
     elif str(w.get("kind")) == "open":
-        e.set_footer(text="Locked — duel live. Sealed results post in the thread.")
+        e.set_footer(text="Locked -duel live. Sealed results post in the thread.")
     else:
-        e.set_footer(text="Targeted challenge — Accept or Decline below.")
+        e.set_footer(text="Targeted challenge -Accept or Decline below.")
     _add_count_fields(e, w)
     _add_rules_field(e)
     return e
@@ -1600,7 +1599,7 @@ def score_embed(w, creator_name: str, opponent_name: str) -> discord.Embed:
     e = discord.Embed(title=title,
                       description=(f"Mode **{_mode_label(w.get('mode'))}** · "
                                    + (f"Pot **{pot:,}** Nectar Coins" if pot > 0
-                                      else "For fun — no pot") + mobile_line),
+                                      else "For fun -no pot") + mobile_line),
                       color=discord.Color.gold())
     try:
         e.add_field(name="Score",
@@ -1637,7 +1636,7 @@ def score_embed(w, creator_name: str, opponent_name: str) -> discord.Embed:
     try:
         st = str(w.get("status") or "").lower()
         if st == "active":
-            status = "Started — duel live"
+            status = "Started -duel live"
         elif st == "resolved":
             status = "Ended"
         elif st == "expired":
@@ -1645,7 +1644,7 @@ def score_embed(w, creator_name: str, opponent_name: str) -> discord.Embed:
         elif st == "cancelled":
             status = "Cancelled"
         else:
-            status = "Created — waiting"
+            status = "Created -waiting"
         e.add_field(name="Status", value=status, inline=True)
     except Exception:
         pass
@@ -1667,10 +1666,10 @@ def sealed_match_embed(n: int, seal: dict, creator_name: str,
                        opponent_name: str) -> discord.Embed:
     try:
         win = seal.get("winner_name") or "Draw"
-        desc = f"Match {n} sealed 🔒 — **{win}**"
+        desc = f"Match {n} sealed 🔒 -**{win}**"
     except Exception:
         desc = f"Match {n} sealed 🔒"
-    return discord.Embed(title=f"🔒 Sealed — Match {n}", description=desc,
+    return discord.Embed(title=f"🔒 Sealed -Match {n}", description=desc,
                          color=discord.Color.green())
 
 
@@ -1681,8 +1680,8 @@ def sealed_match_embed(n: int, seal: dict, creator_name: str,
 async def _make_thread(message: discord.Message, name: str) -> tuple[discord.Thread | None, bool]:
     """Private duel thread (duelists + mods with Manage Threads see it).
 
-    Private threads are standalone — Discord forbids attaching them to a
-    message — so they are created on the channel. The public fallback stays
+    Private threads are standalone -Discord forbids attaching them to a
+    message -so they are created on the channel. The public fallback stays
     message-attached. (discord.py 2.7 dropped the `type` kwarg on
     Message/PartialMessage.create_thread, which made EVERY duel thread fail
     with `... got an unexpected keyword argument 'type'`.) Falls back to
@@ -1868,7 +1867,7 @@ async def _payout(discord_id: str, pot: int, wager_short: str, earned: int | Non
 
 
 # ---------------------------------------------------------------------------
-# Scoring — shared private rooms from bngc_game_events
+# Scoring -shared private rooms from bngc_game_events
 # ---------------------------------------------------------------------------
 
 def _event_room(ev: dict):
@@ -2010,7 +2009,7 @@ def group_duel_matches(events: list[dict], creator_id: str, opponent_id: str,
                             g["kills_c"] += 1
                         else:
                             g["kills_o"] += 1
-                        _why("opponent game name unknown — kill counted WITHOUT "
+                        _why("opponent game name unknown -kill counted WITHOUT "
                              "roster check", ev, rid, ver, gm, code)
                     elif _v == _target:
                         if did == str(creator_id):
@@ -2041,7 +2040,7 @@ def group_duel_matches(events: list[dict], creator_id: str, opponent_id: str,
                     _miss = [n for n, ok in (("creator", g["seen_c"]),
                                              ("opponent", g["seen_o"])) if not ok]
                     trace.append(f"group room={g['room_id'][:8]} v={g['match_version']} "
-                                 f"incomplete (missing {','.join(_miss)} presence) — dropped")
+                                 f"incomplete (missing {','.join(_miss)} presence) -dropped")
                 except Exception:
                     pass
     out.sort(key=lambda g: (g["room_id"], g["match_version"]))
@@ -2060,7 +2059,7 @@ def group_mobile_matches(events: list[dict], creator_id: str, opp_name_norm: str
     Same output shape as group_duel_matches. Co-presence: the opponent's
     game name appears in killfeed names (instigator/instigated/...) of that
     (room_id, match_version), OR the tracked player has a `death` row in that
-    version — zone damage and fall damage never reach a killfeed, so a death
+    version -zone damage and fall damage never reach a killfeed, so a death
     is the only evidence such a room ever produces. kills_o counts killfeed
     'killed' rows by that name; kills_c counts the creator's self-credited
     'kill' rows. win_id carries the creator's win row if any. The opponent has
@@ -2219,10 +2218,10 @@ def group_mobile_matches(events: list[dict], creator_id: str, opp_name_norm: str
     out = []
     for g in groups.values():
         # opponent_win: the LAST roster combat event in this version was the
-        # tracked player's elimination — killed by the opponent ("o"), or the
+        # tracked player's elimination -killed by the opponent ("o"), or the
         # zone/fall damage that never reaches a killfeed ("d"). Their win row
         # can never exist (no capture on their side), and the tracked player's
-        # side is authoritative — no win row for them means they did not win.
+        # side is authoritative -no win row for them means they did not win.
         try:
             _st = sorted(g.get("_strikes") or [], key=lambda p: p[0])
             last = _st[-1][1] if _st else None
@@ -2245,7 +2244,7 @@ def group_mobile_matches(events: list[dict], creator_id: str, opp_name_norm: str
             try:
                 trace.append(f"group room={g['room_id'][:8]} v={g['match_version']} "
                              f"opponent '{opp_name_norm}' never appears in killfeed "
-                             f"names — no co-presence proof, dropped")
+                             f"names -no co-presence proof, dropped")
             except Exception:
                 pass
     out.sort(key=lambda g: (g["room_id"], g["match_version"]))
@@ -2301,11 +2300,11 @@ class DuelView(discord.ui.View):
             me = str(interaction.user.id)
             if me == str(w.get("creator_id")):
                 return await interaction.followup.send(
-                    "You created this wager — wait for someone to join.", ephemeral=True)
+                    "You created this wager -wait for someone to join.", ephemeral=True)
             ok, reason = await check_eligibility(me, int(w.get("stake", 0)))
             _mobile = False
             if not ok:
-                # Mobile path: no companion, no captures — allowed only when
+                # Mobile path: no companion, no captures -allowed only when
                 # the creator is live + tracked right now (their client
                 # verifies the room; the joiner is scored by game name).
                 mok, mreason = await check_eligibility(me, int(w.get("stake", 0)),
@@ -2336,7 +2335,7 @@ class DuelView(discord.ui.View):
             if not ok_up:
                 await _refund(me, int(w.get("stake", 0)), wid_short, "lock_failed")
                 return await interaction.followup.send(
-                    "Could not lock the wager — stake refunded.", ephemeral=True)
+                    "Could not lock the wager -stake refunded.", ephemeral=True)
             if _mobile:
                 await _set_mobile_flag(str(w.get("id")))
             w2 = await get_wager(str(w.get("id")))
@@ -2389,11 +2388,11 @@ class DuelView(discord.ui.View):
                                                               "opponent_id": me})
             except Exception:
                 pass
-            _locked = (f"Locked in — for fun duel, good luck!"
+            _locked = (f"Locked in -for fun duel, good luck!"
                        if int(w.get("stake", 0) or 0) <= 0
-                       else f"Locked in for **{int(w.get('stake', 0)):,}** Nectar Coins — good luck!")
+                       else f"Locked in for **{int(w.get('stake', 0)):,}** Nectar Coins -good luck!")
             if thread is None:
-                _locked += ("\n⚠️ Results thread could not be created — "
+                _locked += ("\n⚠️ Results thread could not be created -"
                             "ask a mod to check my thread permissions.")
             await interaction.followup.send(_locked, ephemeral=True)
             try:
@@ -2404,13 +2403,13 @@ class DuelView(discord.ui.View):
                 except Exception:
                     pass
                 await _dm(interaction.client, str((w2 or w).get("creator_id")),
-                          f"<@{me}> joined your open wager (`{wid_short}`) — duel is live.{_thr}")
+                          f"<@{me}> joined your open wager (`{wid_short}`) -duel is live.{_thr}")
             except Exception as e:
                 print(f"[duels] join dm failed: {e}")
         except Exception as e:
             print(f"[duels] join failed: {e}")
             try:
-                await interaction.followup.send("Something went wrong — try again.",
+                await interaction.followup.send("Something went wrong -try again.",
                                                 ephemeral=True)
             except Exception:
                 pass
@@ -2430,13 +2429,13 @@ class DuelView(discord.ui.View):
                 return await interaction.followup.send(
                     "Only the challenged player can accept.", ephemeral=True)
             # The challenge being accepted must not count as "you already have
-            # an open wager" — that is this very row.
+            # an open wager" -that is this very row.
             _ignore = str(w.get("id") or "")
             ok, reason = await check_eligibility(me, int(w.get("stake", 0)),
                                                  ignore_wager_id=_ignore)
             _mobile = False
             if not ok:
-                # Mobile path: same deal as open joins — creator must be live.
+                # Mobile path: same deal as open joins -creator must be live.
                 mok, mreason = await check_eligibility(me, int(w.get("stake", 0)),
                                                        mobile=True,
                                                        ignore_wager_id=_ignore)
@@ -2511,7 +2510,7 @@ class DuelView(discord.ui.View):
                 await refresh_board_embed(interaction.client, w2 or w)
             except Exception as e:
                 print(f"[duels] accept board refresh failed: {e}")
-            await interaction.followup.send("Accepted — duel is live.", ephemeral=True)
+            await interaction.followup.send("Accepted -duel is live.", ephemeral=True)
             try:
                 _thr = ""
                 try:
@@ -2520,13 +2519,13 @@ class DuelView(discord.ui.View):
                 except Exception:
                     pass
                 await _dm(interaction.client, str((w2 or w).get("creator_id")),
-                          f"<@{me}> accepted your challenge (`{wid_short}`) — duel is live.{_thr}")
+                          f"<@{me}> accepted your challenge (`{wid_short}`) -duel is live.{_thr}")
             except Exception as e:
                 print(f"[duels] accept dm failed: {e}")
         except Exception as e:
             print(f"[duels] accept failed: {e}")
             try:
-                await interaction.followup.send("Something went wrong — try again.",
+                await interaction.followup.send("Something went wrong -try again.",
                                                 ephemeral=True)
             except Exception:
                 pass
@@ -2550,7 +2549,7 @@ class DuelView(discord.ui.View):
                           wid_short, "declined")
             await update_wager(str(w.get("id")), {"status": "cancelled",
                                                   "resolved_at": _now_iso()})
-            print(f"[duels] END {wid_short} DECLINED by {me} — stake refunded")
+            print(f"[duels] END {wid_short} DECLINED by {me} -stake refunded")
             await refresh_board_embed(interaction.client, w)
             try:
                 _stake = int(w.get("stake", 0) or 0)
@@ -2560,7 +2559,7 @@ class DuelView(discord.ui.View):
                     await _dm(interaction.client, str(w.get("creator_id")),
                               f"<@{me}> declined your wager (`{wid_short}`). "
                               + (f"**{_stake:,}** Nectar Coins refunded." if _stake > 0
-                                 else "It was a for-fun duel — nothing to refund."))
+                                 else "It was a for-fun duel -nothing to refund."))
                 elif me == str(w.get("creator_id")) and _opp:
                     # Creator cancelled a targeted challenge -> tell the opponent.
                     await _dm(interaction.client, _opp,
@@ -2580,11 +2579,11 @@ class DuelView(discord.ui.View):
                     await interaction.message.edit(embed=e, view=None)
             except Exception:
                 pass
-            await interaction.followup.send("Cancelled — creator refunded.", ephemeral=True)
+            await interaction.followup.send("Cancelled -creator refunded.", ephemeral=True)
         except Exception as e:
             print(f"[duels] decline failed: {e}")
             try:
-                await interaction.followup.send("Something went wrong — try again.",
+                await interaction.followup.send("Something went wrong -try again.",
                                                 ephemeral=True)
             except Exception:
                 pass
@@ -2614,7 +2613,7 @@ class DuelView(discord.ui.View):
                     await _delete_thread(thread)
                 _untrack_thread(str(w.get("thread_id") or ""))
                 return await interaction.followup.send(
-                    "Wager cancelled — stake refunded.", ephemeral=True)
+                    "Wager cancelled -stake refunded.", ephemeral=True)
             if status != "active":
                 return await interaction.followup.send(
                     "Only a live duel can be forfeited.", ephemeral=True)
@@ -2627,16 +2626,16 @@ class DuelView(discord.ui.View):
             try:
                 _pot = int(w.get("pot", 0) or 0)
                 await _dm(interaction.client, winner,
-                          f"<@{me}> forfeited wager `{short_wager_id(w.get('id'))}` — you take "
+                          f"<@{me}> forfeited wager `{short_wager_id(w.get('id'))}` -you take "
                           + (f"**{_pot:,}** Nectar Coins." if _pot > 0 else "the win."))
             except Exception as e:
                 print(f"[duels] forfeit dm failed: {e}")
-            await interaction.followup.send("Forfeited — opponent takes the pot.",
+            await interaction.followup.send("Forfeited -opponent takes the pot.",
                                             ephemeral=True)
         except Exception as e:
             print(f"[duels] forfeit failed: {e}")
             try:
-                await interaction.followup.send("Something went wrong — try again.",
+                await interaction.followup.send("Something went wrong -try again.",
                                                 ephemeral=True)
             except Exception:
                 pass
@@ -2647,11 +2646,11 @@ class DuelThreadView(discord.ui.View):
 
     The board strips its buttons once the duel goes live, so the thread is the
     only place a duelist can act. Fixed custom_ids make it restart-safe.
-      Forfeit     — live duel: opponent takes the pot.
-      Void round  — creator only: discard the current match (opponent crashed
+      Forfeit     -live duel: opponent takes the pot.
+      Void round  -creator only: discard the current match (opponent crashed
                     or false start). Awards nobody; the round is removed from
                     the score and can never seal again.
-      Cancel      — any state: refund BOTH escrows, no winner, close out.
+      Cancel      -any state: refund BOTH escrows, no winner, close out.
     Never raises.
     """
 
@@ -2690,7 +2689,7 @@ class DuelThreadView(discord.ui.View):
             wid_short = short_wager_id(w.get("id"))
             stake = int(w.get("stake", 0) or 0)
             if status in ("open", "pending"):
-                # Not started — forfeiting = cancelling, no winner.
+                # Not started -forfeiting = cancelling, no winner.
                 await _refund(creator, stake, wid_short, "forfeited_pre_start")
                 await update_wager(str(w.get("id")), {"status": "cancelled",
                                                       "resolved_at": _now_iso()})
@@ -2699,7 +2698,7 @@ class DuelThreadView(discord.ui.View):
                                                     str(w.get("thread_id") or "")))
                 _untrack_thread(str(w.get("thread_id") or ""))
                 return await interaction.followup.send(
-                    "Wager cancelled before it started — refunded.", ephemeral=True)
+                    "Wager cancelled before it started -refunded.", ephemeral=True)
             if status != "active":
                 return await interaction.followup.send("This duel is already over.",
                                                         ephemeral=True)
@@ -2708,16 +2707,16 @@ class DuelThreadView(discord.ui.View):
             try:
                 _pot = int(w.get("pot", 0) or 0)
                 await _dm(interaction.client, winner,
-                          f"<@{me}> forfeited wager `{wid_short}` — you take "
+                          f"<@{me}> forfeited wager `{wid_short}` -you take "
                           + (f"**{_pot:,}** Nectar Coins." if _pot > 0 else "the win."))
             except Exception as e:
                 print(f"[duels] thread forfeit dm failed: {e}")
-            await interaction.followup.send("Forfeited — opponent takes the pot.",
+            await interaction.followup.send("Forfeited -opponent takes the pot.",
                                             ephemeral=True)
         except Exception as e:
             print(f"[duels] thread forfeit failed: {e}")
             try:
-                await interaction.followup.send("Something went wrong — try again.",
+                await interaction.followup.send("Something went wrong -try again.",
                                                 ephemeral=True)
             except Exception:
                 pass
@@ -2753,13 +2752,13 @@ class DuelThreadView(discord.ui.View):
                 me, room, str(w.get("active_since") or ""))
             if ver is None:
                 return await interaction.followup.send(
-                    f"Can't tell which match this is — {verr}.", ephemeral=True)
+                    f"Can't tell which match this is -{verr}.", ephemeral=True)
             ok, note, fields = void_round(w, room, ver, by=me, reason="creator void")
             if not ok:
                 return await interaction.followup.send(note, ephemeral=True)
             if not await update_wager(str(w.get("id")), fields):
                 return await interaction.followup.send(
-                    "Could not save the void — is add_duel_wagers_v261_voided.sql "
+                    "Could not save the void -is add_duel_wagers_v261_voided.sql "
                     "applied?", ephemeral=True)
             wid_short = short_wager_id(w.get("id"))
             print(f"[duels] VOID {wid_short} room={room[:8]} v={ver} by={me} "
@@ -2780,7 +2779,7 @@ class DuelThreadView(discord.ui.View):
                 try:
                     e = discord.Embed(
                         title="⚠️ Match voided",
-                        description=(f"<@{me}> voided match v{ver} — no score for "
+                        description=(f"<@{me}> voided match v{ver} -no score for "
                                      f"either duelist.\n_Score is now "
                                      f"{fields['score_creator']}-"
                                      f"{fields['score_opponent']}._"),
@@ -2793,12 +2792,12 @@ class DuelThreadView(discord.ui.View):
                     print(f"[duels] void thread note failed: {ex}")
             await refresh_board_embed(interaction.client, w2)
             return await interaction.followup.send(
-                f"Voided match v{ver} — it scored nobody. {note}.",
+                f"Voided match v{ver} -it scored nobody. {note}.",
                 ephemeral=True)
         except Exception as e:
             print(f"[duels] thread void failed: {e}")
             try:
-                await interaction.followup.send("Something went wrong — try again.",
+                await interaction.followup.send("Something went wrong -try again.",
                                                 ephemeral=True)
             except Exception:
                 pass
@@ -2825,7 +2824,7 @@ class DuelThreadView(discord.ui.View):
                                                         ephemeral=True)
             wid_short = short_wager_id(w.get("id"))
             stake = int(w.get("stake", 0) or 0)
-            # Refund BOTH escrowed stakes — cancel pays nobody.
+            # Refund BOTH escrowed stakes -cancel pays nobody.
             await _refund(creator, stake, wid_short, "cancelled")
             if opponent:
                 await _refund(opponent, stake, wid_short, "cancelled")
@@ -2836,13 +2835,13 @@ class DuelThreadView(discord.ui.View):
             if thread is not None:
                 await _delete_thread(thread)
             _untrack_thread(str(w.get("thread_id") or ""))
-            print(f"[duels] END {wid_short} CANCELLED by {me} — both stakes refunded, thread deleted")
-            await interaction.followup.send("Duel cancelled — both stakes refunded.",
+            print(f"[duels] END {wid_short} CANCELLED by {me} -both stakes refunded, thread deleted")
+            await interaction.followup.send("Duel cancelled -both stakes refunded.",
                                             ephemeral=True)
         except Exception as e:
             print(f"[duels] thread cancel failed: {e}")
             try:
-                await interaction.followup.send("Something went wrong — try again.",
+                await interaction.followup.send("Something went wrong -try again.",
                                                 ephemeral=True)
             except Exception:
                 pass
@@ -2866,7 +2865,7 @@ def _mention_names(w: dict):
 async def _resolve_names(guild, w: dict):
     """(creator_name, opponent_name|None) from any guild-bearing source. Never raises.
 
-    Real usernames only — thread titles must never read `user-129547…`.
+    Real usernames only -thread titles must never read `user-129547…`.
     Order: guild member cache -> fetch_member (missed cache) -> linked game
     username -> Discord id as a last resort.
     """
@@ -2970,7 +2969,7 @@ async def refresh_board_embed(bot, w: dict) -> bool:
 
     The board lives in the wager channel, so every state change that a player
     would look for (lock-in, each sealed match, resolve/forfeit/cancel) has to
-    be reflected there — the thread is not where people look afterwards. The
+    be reflected there -the thread is not where people look afterwards. The
     row is re-fetched so the embed always shows the committed state. Buttons
     survive only while the wager is still joinable. Returns True when the
     message was edited. Never raises.
@@ -3057,16 +3056,16 @@ async def _delete_board_message_later(bot, w, delay: int = 15):
 def payout_public_text(pay_amount, pot, capped: bool = False, new_bal=None) -> str:
     """The thread line for a resolved wager: the FACT, never the money detail.
 
-    No mention and no balance — the winner is DMed instead, so a resolution
+    No mention and no balance -the winner is DMed instead, so a resolution
     never broadcasts somebody's coins (or pings them) in a channel other
     duelists can read. Never raises.
     """
     try:
         if int(pot or 0) > 0:
             line = (f"**{int(pay_amount or 0):,}** Nectar Coins paid to the winner"
-                    + (" _(daily cap reached — trimmed)_" if capped else ""))
+                    + (" _(daily cap reached -trimmed)_" if capped else ""))
         else:
-            line = "The win goes to the duel winner 🏆\n_For fun duel — no pot._"
+            line = "The win goes to the duel winner 🏆\n_For fun duel -no pot._"
         return line
     except Exception:
         return "The duel resolved."
@@ -3080,10 +3079,10 @@ def payout_dm_text(wid_short, pay_amount, new_bal=None, capped: bool = False,
             amt = int(pay_amount or 0)
         except Exception:
             amt = 0
-        head = (f"🏆 Wager `{wid_short}` resolved — you won "
+        head = (f"🏆 Wager `{wid_short}` resolved -you won "
                 f"**{amt:,}** Nectar Coins."
                 if amt > 0 else
-                f"🏆 Wager `{wid_short}` resolved — you won the duel (for fun, no pot).")
+                f"🏆 Wager `{wid_short}` resolved -you won the duel (for fun, no pot).")
         try:
             bal = (f"\nNew balance: **{int(new_bal):,}** Nectar Coins."
                    if new_bal is not None else "")
@@ -3150,7 +3149,7 @@ async def _settle(w: dict, winner_id: str, bot, how: str):
                 await _post_thread(thread, embed=e)
             except Exception as ex:
                 print(f"[duels] resolve announce failed: {ex}")
-            # Forfeit/cancel are abandoned duels — the thread is deleted, not
+            # Forfeit/cancel are abandoned duels -the thread is deleted, not
             # left as an archived ghost. A completed duel keeps its record.
             if str(how) == "forfeit":
                 await _delete_thread(thread)
@@ -3164,7 +3163,7 @@ async def _settle(w: dict, winner_id: str, bot, how: str):
             print(f"[duels] payout dm to {str(winner_id)[:6]} failed: {e}")
         _untrack_thread(str(w.get("thread_id") or ""))
         # The board embed in the wager channel is the record people screenshot
-        # — it has to show the final score, winner and ended state too.
+        # -it has to show the final score, winner and ended state too.
         await refresh_board_embed(bot, w)
     except Exception as e:
         print(f"[duels] _settle failed: {e}")
@@ -3183,19 +3182,19 @@ async def _expire_wager(bot, w: dict):
             await _refund(creator, stake, wid_short, "open_expired")
             await update_wager(wid, {"status": "expired",
                                      "resolved_at": _now_iso()})
-            print(f"[duels] END {wid_short} EXPIRED (open, no joiner) — creator refunded stake={stake}")
+            print(f"[duels] END {wid_short} EXPIRED (open, no joiner) -creator refunded stake={stake}")
             await _dm(bot, creator,
                       f"Your open wager `{wid_short}` expired with no joiner. "
                       + (f"**{stake:,}** Nectar Coins refunded." if stake > 0
-                         else "It was a for-fun duel — nothing to refund."))
+                         else "It was a for-fun duel -nothing to refund."))
         elif status == "pending":
             await _refund(creator, stake, wid_short, "challenge_expired")
             await update_wager(wid, {"status": "expired",
                                      "resolved_at": _now_iso()})
-            print(f"[duels] END {wid_short} EXPIRED (challenge unanswered) — creator refunded stake={stake}")
+            print(f"[duels] END {wid_short} EXPIRED (challenge unanswered) -creator refunded stake={stake}")
             thread = _resolve_thread(bot, str(w.get("thread_id") or ""))
             if thread is not None:
-                await _post_thread(thread, content="Challenge expired — stake refunded.")
+                await _post_thread(thread, content="Challenge expired -stake refunded.")
                 await _close_thread(thread)
             _untrack_thread(str(w.get("thread_id") or ""))
             opp = str(w.get("opponent_id") or "")
@@ -3203,7 +3202,7 @@ async def _expire_wager(bot, w: dict):
                       f"Your challenge to {f'<@{opp}>' if opp else 'your opponent'} "
                       f"(`{wid_short}`) expired with no answer. "
                       + (f"**{stake:,}** Nectar Coins refunded." if stake > 0
-                         else "It was a for-fun duel — nothing to refund."))
+                         else "It was a for-fun duel -nothing to refund."))
         # Best-effort board embed update (deleted 15s later below).
         try:
             if bot is not None and w.get("channel_id") and w.get("message_id"):
@@ -3228,7 +3227,7 @@ async def _expire_wager(bot, w: dict):
 
 
 async def _stall_refund(bot, w: dict):
-    """No shared private match in 24h — refund both stakes. Never raises."""
+    """No shared private match in 24h -refund both stakes. Never raises."""
     try:
         wid_short = short_wager_id(w.get("id"))
         await _refund(str(w.get("creator_id")), int(w.get("stake", 0)),
@@ -3238,13 +3237,13 @@ async def _stall_refund(bot, w: dict):
                           wid_short, "stall_refund")
         await update_wager(str(w.get("id")), {"status": "expired",
                                               "resolved_at": _now_iso()})
-        print(f"[duels] END {wid_short} STALLED 24h — both stakes refunded "
+        print(f"[duels] END {wid_short} STALLED 24h -both stakes refunded "
               f"(score={w.get('score_creator')}-{w.get('score_opponent')}, "
               f"sealed={len(w.get('sealed') or [])})")
         thread = _resolve_thread(bot, str(w.get("thread_id") or ""))
         if thread is not None:
             await _post_thread(thread, content=(
-                "No shared private match found in 24h — both stakes refunded."))
+                "No shared private match found in 24h -both stakes refunded."))
             await _close_thread(thread)
         _untrack_thread(str(w.get("thread_id") or ""))
     except Exception as e:
@@ -3341,7 +3340,7 @@ async def _afk_guard(bot, w: dict) -> bool:
         wid_short = short_wager_id(wid)
         who = ", ".join(f"{u}(idle {int(i/60)}m)" for u, i in offline)
         print(f"[duels] AFK {wid_short} age={int(age/60)}m offline={who} "
-              f"(limit {int(limit/60)}m) — auto-cancelling, both stakes refunded")
+              f"(limit {int(limit/60)}m) -auto-cancelling, both stakes refunded")
         stake = int(w.get("stake", 0) or 0)
         for uid in (str(w.get("creator_id") or ""), str(w.get("opponent_id") or "")):
             if uid:
@@ -3355,7 +3354,7 @@ async def _afk_guard(bot, w: dict) -> bool:
         try:
             for uid in rows:
                 await _dm(bot, uid,
-                          f"Wager `{wid_short}` was cancelled — a duelist was offline "
+                          f"Wager `{wid_short}` was cancelled -a duelist was offline "
                           f"too long. Your stake was refunded.")
         except Exception:
             pass
@@ -3422,7 +3421,7 @@ async def _score_kills_race(bot, w: dict, events, matches, mode: str,
 
     Free Mode has no phase end: every kill of the session lands in the same
     (room, version) group, so the totals grow in place and the duel resolves
-    the moment a duelist REACHES the target — decided by kill order, not by
+    the moment a duelist REACHES the target -decided by kill order, not by
     who is ahead when the bot happens to poll.
     """
     try:
@@ -3444,7 +3443,7 @@ async def _score_kills_race(bot, w: dict, events, matches, mode: str,
             cre_name = ""
         if not opp_name or not cre_name:
             print(f"[duels] {wid_short} kills race degraded: missing game_username "
-                  f"(creator={cre_name or '-'} opponent={opp_name or '-'}) — "
+                  f"(creator={cre_name or '-'} opponent={opp_name or '-'}) -"
                   f"kill victims cannot be roster-checked")
         tl = kills_race_timeline(events, creator, opponent, opp_name, first_to,
                                  cre_name)
@@ -3564,7 +3563,7 @@ async def _score_one(bot, w: dict):
         mobile = bool(w.get("is_mobile_duel"))
         _trace = [] if _wdebug() else None
         if mobile:
-            # Cross-verified: opponent has no rows — score by game name
+            # Cross-verified: opponent has no rows -score by game name
             # against the tracked creator's room events.
             opp_norm = ""
             try:
@@ -3595,7 +3594,7 @@ async def _score_one(bot, w: dict):
             if not _opp_name or not _cre_name:
                 print(f"[duels] {wid_short} roster gate degraded: missing "
                       f"game_username (creator={_cre_name or '-'} "
-                      f"opponent={_opp_name or '-'}) — kill victims cannot be "
+                      f"opponent={_opp_name or '-'}) -kill victims cannot be "
                       f"roster-checked")
             matches = group_duel_matches(events, creator, opponent, mode,
                                          w.get("room_id"), w.get("room_code"),
@@ -3622,7 +3621,7 @@ async def _score_one(bot, w: dict):
                 print(f"[duels] {wid_short} NO MATCH: {len(events)} combat/win rows "
                       f"but 0 groupable matches (mode={mode} race={race} "
                       f"bound_room={str(w.get('room_id') or '-')[:8]} "
-                      f"bound_code={w.get('room_code') or '-'}) — "
+                      f"bound_code={w.get('room_code') or '-'}) -"
                       f"check pub-vs-private, mode mismatch, room binding, "
                       f"or a zone/fall death outside the bound room")
             else:
@@ -3657,7 +3656,7 @@ async def _score_one(bot, w: dict):
         # the phase-end win (see `PROCESSOR WIN denied`). Say so explicitly —
         # this is the "match not tracked / wins denied" symptom. Mobile groups
         # whose last strike was the opponent eliminating the tracked player are
-        # NOT denials (their win row can never exist) — they seal above.
+        # NOT denials (their win row can never exist) -they seal above.
         if race != "kills":
             for m in matches:
                 if (str(m["room_id"]), int(m["match_version"])) in seen:
@@ -3667,7 +3666,7 @@ async def _score_one(bot, w: dict):
                 if not m.get("win_id") and (int(m["kills_c"]) + int(m["kills_o"])) > 0:
                     print(f"[duels] WIN-DENIED? {wid_short} room={str(m['room_id'])[:8]} "
                           f"v={m['match_version']} had {m['kills_c']}-{m['kills_o']} kills "
-                          f"but NO win row — server may have denied the phase-end win "
+                          f"but NO win row -server may have denied the phase-end win "
                           f"(grep 'PROCESSOR WIN denied' in server logs); not sealed")
         if not fresh:
             _wlog(f"{wid_short} tick nothing new to seal "
@@ -3679,7 +3678,7 @@ async def _score_one(bot, w: dict):
         kills_o = int(w.get("kills_opponent") or 0)
         thread = _resolve_thread(bot, str(w.get("thread_id") or ""))
         if thread is None:
-            # Repair: went live while thread creation was broken — create it
+            # Repair: went live while thread creation was broken -create it
             # now so sealed results actually land in a thread.
             try:
                 thread, _ww = await _ensure_duel_thread(bot, w)
@@ -3704,15 +3703,17 @@ async def _score_one(bot, w: dict):
             # bf / zw_lg win validation: a win row only decides a match that
             # actually saw combat between the duelists. A win with zero
             # roster kills means the "winner" never fought (walkover, afk
-            # quit, misattributed win) — that must never score. A tracked
+            # quit, misattributed win) -that must never score. A tracked
             # death IS combat evidence: zone/fall damage kills arrive with no
-            # killfeed and therefore no kill counts at all.
+            # killfeed and therefore no kill counts at all. So is an observed
+            # OPPONENT elimination (kill_type="out") - the round demonstrably
+            # happened, and it is often the only trace of it.
             _combat = (int(m["kills_c"]) + int(m["kills_o"])
                        + int(m.get("death_c") or 0)
                        + int(m.get("opp_out_c") or 0))
             if race != "kills" and winner is not None and _combat == 0:
                 print(f"[duels] WIN-REJECTED {wid_short} room={str(m['room_id'])[:8]} "
-                      f"v={m['match_version']} winner={winner} but 0 roster kills — "
+                      f"v={m['match_version']} winner={winner} but 0 roster kills -"
                       f"win without combat ignored (mode={mode})")
                 winner = None
             kills_c += int(m["kills_c"])
@@ -3729,7 +3730,7 @@ async def _score_one(bot, w: dict):
                     winner_name = oname
                 else:
                     winner_name = "Draw"
-            # WIN / DEFEAT / DRAW trace — the evidence behind every call.
+            # WIN / DEFEAT / DRAW trace -the evidence behind every call.
             if winner == creator:
                 print(f"[duels] WIN {wid_short} room={str(m['room_id'])[:8]} "
                       f"v={m['match_version']} -> {creator} ({_wsafe(cname)}) "
@@ -3745,7 +3746,7 @@ async def _score_one(bot, w: dict):
                 print(f"[duels] DRAW {wid_short} room={str(m['room_id'])[:8]} "
                       f"v={m['match_version']} race={race} "
                       f"kills={m['kills_c']}-{m['kills_o']} win_id="
-                      f"{_wsafe(m.get('win_id'))} — no score awarded")
+                      f"{_wsafe(m.get('win_id'))} -no score awarded")
             seal = {"room_id": m["room_id"], "match_version": int(m["match_version"]),
                     "winner": winner, "winner_name": winner_name,
                     "kills_c": int(m["kills_c"]), "kills_o": int(m["kills_o"]),
@@ -3844,7 +3845,7 @@ async def _duel_on_message(message: discord.Message):
                 return
         author_id = str(getattr(message.author, "id", ""))
         is_duelist = author_id in (str(pair[0]), str(pair[1]))
-        # 1. typed room code — duelists only.
+        # 1. typed room code -duelists only.
         if is_duelist:
             code = _extract_typed_code(getattr(message, "content", ""))
             if code:
@@ -3852,7 +3853,7 @@ async def _duel_on_message(message: discord.Message):
                 if w is not None and str(w.get("status")) in ("open", "pending", "active"):
                     if (w.get("sealed") or []):
                         try:
-                            await ch.send("Room code is locked — matches already sealed.",
+                            await ch.send("Room code is locked -matches already sealed.",
                                           delete_after=10)
                         except Exception:
                             pass
@@ -3861,7 +3862,7 @@ async def _duel_on_message(message: discord.Message):
                         print(f"[duels] {short_wager_id(w.get('id'))} code bound "
                               f"to {code} by {author_id[:6]}")
                         try:
-                            await ch.send(f"Room code bound: `{code}` — "
+                            await ch.send(f"Room code bound: `{code}` -"
                                           f"private-room matches there score the duel.")
                         except Exception:
                             pass
@@ -3884,7 +3885,7 @@ async def _duel_on_message(message: discord.Message):
             pass
         try:
             await message.delete()
-            warn = (f"{getattr(message.author, 'mention', 'Spectator')} — this duel "
+            warn = (f"{getattr(message.author, 'mention', 'Spectator')} -this duel "
                     f"thread is read-only for spectators.")
             try:
                 await ch.send(warn, delete_after=10)
@@ -3907,16 +3908,16 @@ def _board_channel(interaction: discord.Interaction):
         cid = _wager_channel_id()
         if cid and interaction.guild:
             if not cid.isdigit():
-                print(f"[duels] WAGER_CHANNEL_ID={cid!r} is not numeric — "
+                print(f"[duels] WAGER_CHANNEL_ID={cid!r} is not numeric -"
                       f"falling back to command channel")
             else:
                 ch = interaction.guild.get_channel(int(cid))
                 if ch is not None:
                     return ch
                 print(f"[duels] WAGER_CHANNEL_ID={cid} not found in guild "
-                      f"{interaction.guild.id} — falling back to command channel")
+                      f"{interaction.guild.id} -falling back to command channel")
         elif not cid:
-            print("[duels] WAGER_CHANNEL_ID unset — posting in command channel")
+            print("[duels] WAGER_CHANNEL_ID unset -posting in command channel")
     except Exception as e:
         print(f"[duels] board channel resolve failed: {e}")
     return interaction.channel
@@ -4019,7 +4020,7 @@ def register(tree: app_commands.CommandTree, bot=None):
                   f"{nmode} first_to={first_to}")
             # Board message: EVERY wager posts in the wager channel
             # (WAGER_CHANNEL_ID, current channel as fallback). A targeted
-            # challenge gets NO thread and pulls nobody in — the challenged
+            # challenge gets NO thread and pulls nobody in -the challenged
             # player is DM'd and the thread opens when they accept.
             board = _board_channel(interaction)
             print(f"[duels] {wid_short} board -> channel {getattr(board, 'id', '?')}")
@@ -4036,8 +4037,8 @@ def register(tree: app_commands.CommandTree, bot=None):
                 await update_wager(str(w.get("id")), {"status": "cancelled",
                                                       "resolved_at": _now_iso()})
                 return await interaction.followup.send(
-                    "Could not post the wager — stake refunded.", ephemeral=True)
-            # No duel thread is created at challenge time — for ANY kind. An
+                    "Could not post the wager -stake refunded.", ephemeral=True)
+            # No duel thread is created at challenge time -for ANY kind. An
             # open wager gets its thread when someone joins, a targeted one
             # when the challenged player accepts. Creating it here and force-
             # adding the challenged player pulled them into a duel they had not
@@ -4067,16 +4068,16 @@ def register(tree: app_commands.CommandTree, bot=None):
             where = f"<#{getattr(board, 'id', '')}>"
             _st0 = int(stake or 0)
             await interaction.followup.send(
-                f"Wager `{wid_short}` posted {where} — "
+                f"Wager `{wid_short}` posted {where} -"
                 + (f"for fun duel (no stakes)." if _st0 <= 0
                    else f"**{_st0:,}** Nectar Coins escrowed.")
-                + (" DM sent — waiting for Accept." if opponent is not None
-                   else " Open to anyone — first join locks it in."),
+                + (" DM sent -waiting for Accept." if opponent is not None
+                   else " Open to anyone -first join locks it in."),
                 ephemeral=True)
         except Exception as e:
             print(f"[duels] wager-create failed: {e}")
             try:
-                await interaction.followup.send("Something went wrong — try again.",
+                await interaction.followup.send("Something went wrong -try again.",
                                                 ephemeral=True)
             except Exception:
                 pass
@@ -4090,7 +4091,7 @@ def register(tree: app_commands.CommandTree, bot=None):
             rows = await list_open_wagers(gid, 10)
             if not rows:
                 return await interaction.followup.send(
-                    "No open wagers — create one with **/wager create** (omit opponent).")
+                    "No open wagers -create one with **/wager create** (omit opponent).")
             lines = []
             for w in rows:
                 try:
@@ -4103,7 +4104,7 @@ def register(tree: app_commands.CommandTree, bot=None):
                     _tail = ("For fun" if _st <= 0
                              else f"**{_st:,}** Nectar Coins · ")
                     lines.append(
-                        f"`{short_wager_id(w.get('id'))}` — {_tail}"
+                        f"`{short_wager_id(w.get('id'))}` -{_tail}"
                         f"{nmode} first to {int(w.get('first_to', 1))} {race}")
                 except Exception:
                     continue
@@ -4115,7 +4116,7 @@ def register(tree: app_commands.CommandTree, bot=None):
         except Exception as e:
             print(f"[duels] wager-board failed: {e}")
             try:
-                await interaction.followup.send("Something went wrong — try again.")
+                await interaction.followup.send("Something went wrong -try again.")
             except Exception:
                 pass
 
@@ -4134,7 +4135,7 @@ def register(tree: app_commands.CommandTree, bot=None):
         except Exception as e:
             print(f"[duels] wager-status failed: {e}")
             try:
-                await interaction.followup.send("Something went wrong — try again.")
+                await interaction.followup.send("Something went wrong -try again.")
             except Exception:
                 pass
 
@@ -4151,7 +4152,7 @@ def register(tree: app_commands.CommandTree, bot=None):
             if not rows:
                 return await interaction.followup.send(
                     f"{target.mention} has no duels yet."
-                    if user else "You have no duels yet — `/wager create` to start one.")
+                    if user else "You have no duels yet -`/wager create` to start one.")
             balance = None
             try:
                 info = await db.get_coin_balance(uid)
@@ -4167,7 +4168,7 @@ def register(tree: app_commands.CommandTree, bot=None):
         except Exception as e:
             print(f"[duels] wager-stats failed: {e}")
             try:
-                await interaction.followup.send("Something went wrong — try again.")
+                await interaction.followup.send("Something went wrong -try again.")
             except Exception:
                 pass
 
@@ -4393,16 +4394,16 @@ def register(tree: app_commands.CommandTree, bot=None):
             try:
                 _pot = int(w.get("pot", 0) or 0)
                 await _dm(interaction.client, winner,
-                          f"<@{me}> forfeited wager `{short_wager_id(w.get('id'))}` — you take "
+                          f"<@{me}> forfeited wager `{short_wager_id(w.get('id'))}` -you take "
                           + (f"**{_pot:,}** Nectar Coins." if _pot > 0 else "the win."))
             except Exception as e:
                 print(f"[duels] wager-forfeit dm failed: {e}")
-            await interaction.followup.send("Forfeited — opponent takes the pot.",
+            await interaction.followup.send("Forfeited -opponent takes the pot.",
                                             ephemeral=True)
         except Exception as e:
             print(f"[duels] wager-forfeit failed: {e}")
             try:
-                await interaction.followup.send("Something went wrong — try again.",
+                await interaction.followup.send("Something went wrong -try again.",
                                                 ephemeral=True)
             except Exception:
                 pass
@@ -4435,11 +4436,11 @@ def register(tree: app_commands.CommandTree, bot=None):
                     "Winner must be one of the duelists.", ephemeral=True)
             await _settle(w, str(winner.id), interaction.client, how="admin decision")
             await interaction.followup.send(
-                f"Resolved — <@{winner.id}> takes the pot.", ephemeral=True)
+                f"Resolved -<@{winner.id}> takes the pot.", ephemeral=True)
         except Exception as e:
             print(f"[duels] wager-resolve failed: {e}")
             try:
-                await interaction.followup.send("Something went wrong — try again.",
+                await interaction.followup.send("Something went wrong -try again.",
                                                 ephemeral=True)
             except Exception:
                 pass
@@ -4460,7 +4461,7 @@ def register(tree: app_commands.CommandTree, bot=None):
             ok, err = await wager_ban(uid, reason, banned_by=str(interaction.user.id))
         except Exception as e:
             print(f"[duels] /wager ban failed: {e}")
-            ok, err = False, "Something went wrong — try again."
+            ok, err = False, "Something went wrong -try again."
         if not ok:
             return await interaction.followup.send(err, ephemeral=True)
         try:
@@ -4486,7 +4487,7 @@ def register(tree: app_commands.CommandTree, bot=None):
             ok, err = await wager_unban(uid)
         except Exception as e:
             print(f"[duels] /wager unban failed: {e}")
-            ok, err = False, "Something went wrong — try again."
+            ok, err = False, "Something went wrong -try again."
         if not ok:
             return await interaction.followup.send(err, ephemeral=True)
         if not was:
@@ -4502,5 +4503,5 @@ def register(tree: app_commands.CommandTree, bot=None):
     tree.add_command(wager_group)
     print(f"[duels] registered /wager group (9 subcommands, "
           f"{len(tree.get_commands())} top-level on tree)", flush=True)
-    print(f"[duels] WAGER_CHANNEL_ID={_wager_channel_id() or '(unset — using command channel)'}",
+    print(f"[duels] WAGER_CHANNEL_ID={_wager_channel_id() or '(unset -using command channel)'}",
           flush=True)

@@ -1,5 +1,5 @@
 """
-supabase_client.py — Supabase helpers with clean error handling.
+supabase_client.py -Supabase helpers with clean error handling.
 
 All functions return {"data": ..., "error": ...} dicts to keep
 call sites explicit. Uses service_role key (server-side only).
@@ -83,7 +83,7 @@ class _SupabaseProxy:
 
 supabase = _SupabaseProxy()
 
-# Transient pool/disconnect signatures — safe to retry once with a fresh client.
+# Transient pool/disconnect signatures -safe to retry once with a fresh client.
 _TRANSIENT_MARKERS = (
     "Server disconnected",
     "connection closed",
@@ -153,7 +153,7 @@ def _close_session(client) -> None:
 
 def refresh_client():
     """Rebuild the singleton after a pool disconnect. Repoints the proxy
-    target FIRST, then closes the old session — holders never observe a
+    target FIRST, then closes the old session -holders never observe a
     closed client. Returns the new client (or the current one on failure)."""
     global supabase
     if not _supabase_url or not _supabase_key:
@@ -207,7 +207,7 @@ else:
 # ---------------------------------------------------------------------------
 
 class DB:
-    """Database helpers — mirrors the old JS `db` object but with Python style."""
+    """Database helpers -mirrors the old JS `db` object but with Python style."""
 
     @staticmethod
     async def get_user(discord_id: str) -> dict:
@@ -272,7 +272,7 @@ class DB:
         except Exception as exc:
             if "PGRST116" in str(exc):
                 return {"data": None, "error": None}
-            # Join failed (or pool blip) — retry without the join once.
+            # Join failed (or pool blip) -retry without the join once.
             try:
                 result = _query(supabase, False)
                 return {"data": result.data, "error": None}
@@ -283,7 +283,7 @@ class DB:
 
     @staticmethod
     def update_session_sync(session_id: str, updates: dict) -> dict:
-        """Update session (sync) — tries with last_used_at, falls back without."""
+        """Update session (sync) -tries with last_used_at, falls back without."""
 
         if not supabase:
             return {"data": None, "error": "no supabase"}

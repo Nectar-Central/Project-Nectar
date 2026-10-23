@@ -1,5 +1,5 @@
 """
-ranked_tourney.py — ranked tourney API (comp clone, ladder-scored) (pure compute + thin endpoints).
+ranked_tourney.py -ranked tourney API (comp clone, ladder-scored) (pure compute + thin endpoints).
 
   GET /api/ranked/tourneys?status=scheduled|running|ended
       -> [{id, code, name, status, series_len, sealed, players, leader, ...}]
@@ -10,7 +10,7 @@ Statuses are DERIVED (never stored beyond scheduled/open/closed):
   closed -> ended; scheduled -> scheduled; open + >=1 sealed match -> running;
   open + 0 matches -> scheduled.
 
-Standings math (shared by bot, dashboard, Events tab — one implementation):
+Standings math (shared by bot, dashboard, Events tab -one implementation):
   per sealed match: kills per discord (kill events, mapped only) +
   win bonus (manual winner_discord_id, else last alive from alv order) +
   placement table by reverse alv-death order (last alive = 1st).
@@ -189,7 +189,7 @@ def tourney_win_delta(winner_pts: Any, n: Any) -> int:
     Bounded 12..30, deliberately under the +30 per-match clamp: weak
     winners in small lobbies feel the scale (12+), strong lobbies still
     saturate the cap. A legacy-sized purse would cap every single win and
-    make scaling moot — that saturation was the "every win pays +30" bug.
+    make scaling moot -that saturation was the "every win pays +30" bug.
     """
     try:
         w = max(0.0, float(winner_pts or 0))
@@ -297,7 +297,7 @@ def freeze_match_table(mid: int) -> dict | None:
             if isinstance(_existing, dict) and str(_existing.get("mode") or "") in (
                     "room-seal-v1", "room-seal-pending-v1"):
                 # bridge-owned: the room seal's deltas (or its pending join
-                # keys) — tourney-dynamic math must never overwrite them.
+                # keys) -tourney-dynamic math must never overwrite them.
                 return _existing if _existing.get("mode") == "room-seal-v1" else None
         except Exception:
             pass
@@ -394,7 +394,7 @@ def freeze_match_table(mid: int) -> dict | None:
         except Exception:
             pass
         # Eliminated victims never own a kill row (discord_id is the
-        # killer's) and their alv row can be unmapped — without this they
+        # killer's) and their alv row can be unmapped -without this they
         # drop out of parts entirely: no loss, no board row, no toast.
         # Resolve kill targets into parts so every death pays.
         try:
@@ -430,7 +430,7 @@ def freeze_match_table(mid: int) -> dict | None:
         except Exception:
             pass
         # Intruder exclusion: banned session members and per-match ignored
-        # names score nowhere — not in parts, not as killers/victims, never
+        # names score nowhere -not in parts, not as killers/victims, never
         # the winner. Dashboard Ban / match Ignore feed both lists.
         _banned: set = set()
         try:
@@ -532,7 +532,7 @@ def freeze_match_table(mid: int) -> dict | None:
         except Exception:
             wdid = None
         # Duo co-winners: teammates of the winner who survived (no kill
-        # evidence against them) share P1 — otherwise the surviving
+        # evidence against them) share P1 -otherwise the surviving
         # partner "wins" the game and still pays a defeat. Solo regs
         # (single member), removed players, dead teammates (their death
         # placement + loss stand) and manually-placed teammates are
@@ -811,7 +811,7 @@ def _score_frozen_with_breakdown(ft: dict, m: dict, events: list) -> tuple[list,
             except Exception:
                 continue
         # Victims with no engine row (no kills, no mapped alv, no manual
-        # placement) still paid the frozen loss at seal time — they must
+        # placement) still paid the frozen loss at seal time -they must
         # board as loss-only rows or they vanish: no board, no ladder pay,
         # no toast. Winner never lands here.
         try:
@@ -860,7 +860,7 @@ def _score_tourney_match(tourney: dict | None, m: dict, events: list) -> list[di
     on a kill-0 base, win/placement come from the frozen table, non-winners
     pay the frozen loss (current-ladder loss when the did postdates the
     freeze, e.g. linked after sealing). Legacy (no frozen table): the exact
-    old static replay — comp math on the tourney table, no loss.
+    old static replay -comp math on the tourney table, no loss.
     Never raises; [] on failure.
     """
     try:
@@ -1010,7 +1010,7 @@ def code_tourney_points(code: str | None, discord_id: str | None) -> dict | None
         per_match, board = ranked_standings_for_matches(
             t, attached, by_mid, _tourney_adjustments(t.get("id")))
         # Latest sealed result for me (drives component toasts): stored
-        # room-seal bundle or frozen dynamic breakdown — the exact deltas
+        # room-seal bundle or frozen dynamic breakdown -the exact deltas
         # the board paid. Legacy rows (no stored components) stay None and
         # the client falls back to its single-delta toast.
         last_result = None
@@ -1320,7 +1320,7 @@ async def tourney_detail(request: Request):
         except Exception:
             pass
         # Rank display: per-player ranked-ladder points + tourney average.
-        # Display only — tourney scoring reads the ladder at seal time and
+        # Display only -tourney scoring reads the ladder at seal time and
         # freezes it per match; this snapshot just labels the board.
         try:
             _rost = sorted({str(x) for r in regs for x in (r.get("member_ids") or []) if x})
@@ -1529,7 +1529,7 @@ async def comp_match_open(request: Request):
     """Manual blank match (dashboard). Never raises beyond JSON errors.
 
     Manual matches start with started_at set (the dashboard Match Started
-    bookend) and status manual — the bridge never auto-seals or writes to
+    bookend) and status manual -the bridge never auto-seals or writes to
     manual rows, so hosts own them end to end."""
     err = _need()
     if err:
@@ -1908,7 +1908,7 @@ async def comp_tourney_code(request: Request):
 
     Body: {tourney_id, code}. Empty code clears. A set code must be 5
     letters/digits and unused by any other non-ended session (the bridge
-    binds by code — duplicates would stall both sessions). Same rules as
+    binds by code -duplicates would stall both sessions). Same rules as
     the bot's /ranked change-code. Never raises beyond JSON errors."""
     err = _need()
     if err:
@@ -2000,7 +2000,7 @@ async def comp_reg_remove(request: Request):
     """Remove a player from a session roster by hand (dashboard remove).
 
     Body: {tourney_id, discord_id}. Deletes their accepted solo rows (duo
-    rows untouched — same rule as leaving via Discord). Missing player
+    rows untouched -same rule as leaving via Discord). Missing player
     returns ok/not-present. Never raises beyond JSON errors."""
     err = _need()
     if err:
@@ -2068,7 +2068,7 @@ def reset_loser_streaks_sync(mid: int) -> int:
     """Reset win_streak for a sealed match's losers. Sync. Never raises.
 
     No code banks "defeat" rows, so the batch streak logic can never reset
-    on a loss — the seal is the one place the loser is known exactly.
+    on a loss -the seal is the one place the loser is known exactly.
     Leavers (removed_discord_ids) are spared: leaves are ignored by design
     (crashes happen). Winner None (total wipe) resets everyone involved.
     Returns reset count. One UPDATE.
@@ -2832,7 +2832,7 @@ async def comp_match_kills(request: Request):
 async def comp_match_elim(request: Request):
     """Hand-adjust a player's eliminations in a match (dashboard elim buttons).
 
-    Positive delta inserts manual alv (alive=False) rows — they join the
+    Positive delta inserts manual alv (alive=False) rows -they join the
     reverse death order for placement like bridge-banked rows. Negative
     removes that many of the player's manual alv rows (newest first).
     Tracked (non-manual) rows are never touched. On bridge-owned open
@@ -2989,7 +2989,7 @@ async def comp_match_remove(request: Request):
             mres = supabase.table("bngc_ranked_tourney_matches").select(
                 "id,tourney_id,removed_discord_ids").eq("id", mid).limit(1).execute()
         except Exception:
-            return JSONResponse({"error": "removed_discord_ids column missing — apply add_comp_v237.sql"}, status_code=500)
+            return JSONResponse({"error": "removed_discord_ids column missing -apply add_comp_v237.sql"}, status_code=500)
         if not mres.data:
             return JSONResponse({"error": "match not found"}, status_code=404)
         m = mres.data[0] or {}
@@ -3070,7 +3070,7 @@ async def comp_match_add_back(request: Request):
             mres = supabase.table("bngc_ranked_tourney_matches").select(
                 "id,removed_discord_ids").eq("id", mid).limit(1).execute()
         except Exception:
-            return JSONResponse({"error": "removed_discord_ids column missing — apply add_comp_v237.sql"}, status_code=500)
+            return JSONResponse({"error": "removed_discord_ids column missing -apply add_comp_v237.sql"}, status_code=500)
         if not mres.data:
             return JSONResponse({"error": "match not found"}, status_code=404)
         drop = {did} if did else set()
@@ -3286,7 +3286,7 @@ async def comp_match_delete(request: Request):
         except Exception:
             pass
         supabase.table("bngc_ranked_tourney_matches").delete().eq("id", mid).execute()
-# Retire the version so the bridge treats the slot as consumed and never
+        # Retire the version so the bridge treats the slot as consumed and never
         # re-issues the number (which re-created the match on the next sweep).
         # Best effort: pre-migration column, the delete still stands.
         try:
@@ -3427,7 +3427,7 @@ async def comp_match_tie(request: Request):
 async def comp_match_unmapped(request: Request):
     """Actor names in a match with no discord link (dashboard link UI).
 
-    Returns {unmapped: [{name, kills, deaths}], ignored: [name]} — ignored
+    Returns {unmapped: [{name, kills, deaths}], ignored: [name]} -ignored
     intruder names are listed separately so the dashboard can un-ignore
     them. Ignored names never appear in unmapped.
     """
@@ -3506,7 +3506,7 @@ async def comp_match_link(request: Request):
                     "removed_discord_ids").eq("id", mid).limit(1).execute()
                 if mchk.data and _norm_ignored_name(name) in _ignored_names(mchk.data[0]):
                     return JSONResponse(
-                        {"error": "name is ignored for this match — un-ignore it first"},
+                        {"error": "name is ignored for this match -un-ignore it first"},
                         status_code=400)
             except Exception:
                 pass
@@ -3546,7 +3546,7 @@ async def comp_tourney_by_code(request: Request):
     """Tourney carrying this room code (userscript join detection + bridge).
 
     Returns the single non-ended tourney for the code, else {tourney: null}.
-    Ambiguous (2+ open rows, same code) resolves to null — never guess.
+    Ambiguous (2+ open rows, same code) resolves to null -never guess.
     """
     err = _need()
     if err:
@@ -3570,7 +3570,7 @@ async def comp_tourney_by_code(request: Request):
             "status": t.get("status"), "mode": t.get("mode"),
             "series_len": t.get("series_len") or 0}})
     except Exception as e:
-        # Join-detection polls this every few seconds — a pool blip must
+        # Join-detection polls this every few seconds -a pool blip must
         # resolve to null (retry on next poll), never a 500 that the
         # userscript treats as fatal.
         if is_transient_error(e):

@@ -1,5 +1,5 @@
 """
-coins.py — GET/POST /api/coins/* — Nectar Coins economy.
+coins.py -GET/POST /api/coins/* -Nectar Coins economy.
 
   GET  /api/coins/balance?discord_id=xxx
   POST /api/coins/daily        {discord_id}
@@ -32,7 +32,7 @@ from ..lib import streaks as streaks_lib
 
 router = APIRouter()
 
-_MISSING_HINT = "Database migration pending — ask a host to apply add_nectar_coins_v252.sql."
+_MISSING_HINT = "Database migration pending -ask a host to apply add_nectar_coins_v252.sql."
 
 
 def _missing_table(exc: Exception) -> bool:
@@ -200,7 +200,7 @@ async def coins_daily(request: Request):
         return JSONResponse({"claimed": False,
                              "balance": int(u.get("nectar_coins") or 0),
                              "daily_streak": int(u.get("daily_streak") or 0),
-                             "message": "Already claimed today — come back tomorrow."})
+                             "message": "Already claimed today -come back tomorrow."})
     try:
         log_sys(f"[coins] daily did={did[:6]} streak={out['streak']} +{out['payout']}")
     except Exception:

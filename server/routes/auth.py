@@ -182,6 +182,7 @@ async def discord_login(request: Request):
         "code_challenge_method": "s256",
         "redirect_to": _callback_uri(request),
         "state": state,
+        "scopes": "identify guilds",
     }
     url = f"{SUPABASE_URL}/auth/v1/authorize?" + "&".join(
         f"{k}={_quote(v)}" for k, v in params.items()
@@ -247,13 +248,15 @@ async def discord_callback(request: Request, code: str = "", state: str = "",
 
         payload = tok_res.json() or {}
         user = payload.get("user") or {}
+        provider_token = payload.get("access_token")  # Discord access token
         discord_id, username, avatar = _discord_identity(user)
         if not discord_id:
             log_err("AUTH no Discord id on the Supabase user "
                     f"(provider={((user.get('app_metadata') or {}).get('provider'))!r})")
             return _bounce(dashboard, "discord")
 
-        token = await guilds_mod.create_session(discord_id, username, avatar)
+        token = await guilds_mod.create_session(discord_id, username, avatar,
+                                                provider_token=provider_token)
         if not token:
             return _bounce(dashboard, "server")
 
@@ -275,13 +278,14 @@ async def auth_me(request: Request):
         return JSONResponse({"error": "not logged in"}, status_code=401)
     await guilds_mod.touch_session(token)
     discord_id = str(session.get("discord_id") or "")
+    provider_token = session.get("provider_token")
     return {
         "user": {
             "id": discord_id,
             "username": session.get("discord_username"),
             "avatar_url": session.get("avatar_url"),
         },
-        "guilds": await guilds_mod.list_user_guilds(discord_id),
+        "guilds": await guilds_mod.list_user_guilds(discord_id, provider_token),
     }
 
 

@@ -1,5 +1,5 @@
 """
-alerts.py — insert into bngc_alerts + bngc_security_logs for bot DMs.
+alerts.py -insert into bngc_alerts + bngc_security_logs for bot DMs.
 
 Country is read from Vercel/CF geo headers (x-vercel-ip-country, cf-ipcountry,
 x-country). Falls back to ip only if header missing.

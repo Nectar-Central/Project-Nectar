@@ -1,4 +1,4 @@
-// Optimistic UI for dashboard — fast feedback for kills/points/wins
+// Optimistic UI for dashboard -fast feedback for kills/points/wins
 // Intercepts .opt-* buttons, updates DOM instantly, syncs via fetch, rolls back on failure.
 // No external deps besides jQuery already loaded. Uses fetch + X-Requested-With.
 (function() {
@@ -44,7 +44,7 @@
     let targetCell = null;
     let prevVal = 0;
     if (kind === 'kill') {
-      // kills cell is last or second last depending on team vs solo — search by header
+      // kills cell is last or second last depending on team vs solo -search by header
       // Solo: # | Player | Points | Kills  -> kills is index 3
       // Team: # | Players | Points | Kills -> kills is index 3
       targetCell = cells[3] || cells[cells.length - 1];
@@ -105,7 +105,7 @@
       return json;
     } catch (e) {
       handle.revert();
-      toast(e.message || 'Failed — reverted', false);
+      toast(e.message || 'Failed -reverted', false);
       throw e;
     } finally {
       if (btn) { btn.disabled = prevDisabled; btn.textContent = prevText; btn.classList.remove('opt-btn-pending'); }
@@ -133,7 +133,7 @@
     } else if (btn.classList.contains('opt-add-point')) {
       const pts = parseInt(btn.dataset.points || '1', 10);
       url = `/event/${EVT}/ajax/update-points`;
-      // This endpoint expects point_kill/point_win/placement_scale — we reuse quick-kill's points logic
+      // This endpoint expects point_kill/point_win/placement_scale -we reuse quick-kill's points logic
       // For generic point add, use quick-kill with custom points? Fallback to quick-kill
       url = `/event/${EVT}/ajax/quick-kill`;
       data = { discord_id: discordId, game_number: gameNumber };
@@ -211,7 +211,7 @@
         setTimeout(() => entry.remove(), 4000);
       }
     }, { capture: true });
-    // Prevent double handler (original jQuery handler still there) — remove it by cloning
+    // Prevent double handler (original jQuery handler still there) -remove it by cloning
     // The original handler is jQuery; our fetch handler runs first and we already preventedDefault, so jQuery's handler is also prevented by our early return? Actually we called preventDefault, so jQuery's handler (also preventDefault) will still run but its $.post will double-send. To avoid double, we stopPropagation and remove jQuery handler.
     // Clone form to drop jQuery listeners and re-add only ours (we already added ours)
     // Instead, just off jQuery's handler if present
@@ -244,7 +244,7 @@
       } catch (err) {
         input.value = prev;
         status.textContent = err.message || 'Error saving'; status.style.color = '#e74c3c';
-        toast('Save failed — reverted', false);
+        toast('Save failed -reverted', false);
       }
       setTimeout(() => status.textContent = '', 2500);
     });

@@ -17,7 +17,7 @@ async def fetch_unnotified(limit: int = 20):
         # Explicit columns only: select("*") ships every new column on every
         # poll (Service-Initiated egress 24/7). These are all build_embed needs.
         # MUST go through _sb_call: supabase-py is blocking, and this poll runs
-        # on the event loop every few seconds — inline .execute() here is what
+        # on the event loop every few seconds -inline .execute() here is what
         # produced "heartbeat blocked for more than 10 seconds".
         r = await db._sb_call(
             lambda: db.supabase.table("bngc_alerts").select(
@@ -40,7 +40,7 @@ async def mark_notified(alert_id: int):
     except Exception:
         pass
 
-# Detail keys that may carry an IP — never rendered to users (DB keeps them).
+# Detail keys that may carry an IP -never rendered to users (DB keeps them).
 _IP_DETAIL_KEYS = {"ip", "ip_address", "ipaddress", "used_ip", "locked_ip", "client_ip", "remote_ip"}
 
 
@@ -59,7 +59,7 @@ def build_embed(a: dict) -> discord.Embed:
         e.add_field(name="Game ID", value=str(a["game_id"])[:32], inline=True)
     if a.get("country"):
         e.add_field(name="Country", value=str(a["country"]), inline=True)
-    # NEVER show IPs to users — country only. IP stays in DB for enforcement.
+    # NEVER show IPs to users -country only. IP stays in DB for enforcement.
     details = a.get("details") or {}
     if isinstance(details, dict) and details:
         # show reason if present
@@ -107,7 +107,7 @@ async def send_alert(bot: discord.Client, a: dict):
 
 async def alert_loop(bot: discord.Client):
     await bot.wait_until_ready()
-    print("[alerts] loop started — polling bngc_alerts every 60s (idle) / 15s (active)")
+    print("[alerts] loop started -polling bngc_alerts every 60s (idle) / 15s (active)")
     _idle = 0
     while not bot.is_closed():
         try:

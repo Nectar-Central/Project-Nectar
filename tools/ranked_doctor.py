@@ -9,7 +9,7 @@ Usage (run from the repo root):
     python tools/ranked_doctor.py --ended          # also list ended tourneys
 
 Config: SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY, loaded from server/.env
-(or root .env). Never writes — every query is a SELECT.
+(or root .env). Never writes -every query is a SELECT.
 
 Exit codes: 0 ok, 1 findings need attention, 2 config/connection problem.
 """
@@ -96,7 +96,7 @@ def _match_stats(sb, tids):
 
 def _fmt_code(code):
     c = str(code or "").strip()
-    return c if c else "— codeless —"
+    return c if c else "-codeless —"
 
 
 def _show_tourney(t, ms):
@@ -201,7 +201,7 @@ def main() -> int:
                   "New rooms bind only via matching code.")
             problems += 1
         else:
-            print(f"Verdict: auto-tag STAYS MANUAL — {len(codeless)} codeless "
+            print(f"Verdict: auto-tag STAYS MANUAL -{len(codeless)} codeless "
                   f"tourney(s): {[t.get('id') for t in codeless]}. "
                   f"End the stale one(s) or tag by hand.")
             problems += 1

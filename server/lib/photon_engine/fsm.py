@@ -1,5 +1,5 @@
 """
-fsm.py — Strict per-room FSM for LOBBY <-> MATCH.
+fsm.py -Strict per-room FSM for LOBBY <-> MATCH.
 
 Owner: engine.py  (called once per packet, after room resolution)
 
@@ -46,12 +46,12 @@ def _names_equal(a, b) -> bool:
 
 class RoomFSM:
     """
-    Strict two-state machine.  One instance is stateless — all state lives on RoomView.
+    Strict two-state machine.  One instance is stateless -all state lives on RoomView.
     Call RoomFSM.transition(room, view, packet, gpb, cur_scn, session_id) per packet.
     Returns (did_transition: bool, from_state, to_state, via).
     """
 
-    # Canonical triggers — nothing else may flip state
+    # Canonical triggers -nothing else may flip state
     TRIGGER_SCENE = "scene"          # gpb curScn present
     TRIGGER_AUTH  = "authenticate"   # opName Authenticate/AuthenticateOnce
     TRIGGER_LEAVE = "leave_self"     # Leave where player_name == me
@@ -103,7 +103,7 @@ class RoomFSM:
         #   LOBBY  --scene(!=MainLobby)--> MATCH
         #   MATCH  --auth/leave--> LOBBY
         #   MATCH  --scene(MainLobby)--> LOBBY   (symmetric; allowed even though spec lists
-        #                                          match exit as auth/leave only — scene MainLobby
+        #                                          match exit as auth/leave only -scene MainLobby
         #                                          is the only way back without auth in practice)
         cur = room.state
 
@@ -135,7 +135,7 @@ class RoomFSM:
                 # scene !=MainLobby while already in MATCH -> no transition (stay)
                 if cs == "MainLobby":
                     # Endless-series hold: private zw_lg/wwzw rooms run infinite
-                    # matches back-to-back in one coded room — the victory /
+                    # matches back-to-back in one coded room -the victory /
                     # intermission screen reads as a MainLobby scene at every
                     # stG=3, but the player never left. Flipping to LOBBY here
                     # swaps every details line (drawer, presence, Discord card)
@@ -175,7 +175,7 @@ class RoomFSM:
 
         log_engine("state", session_id[:13], old=old.value, new=target.value, room=room.room_id[:8], via=via,
                    curScn=cur_scn or packet.cur_scn or "-")
-        # keep playtime last_state in sync — engine tick reads this
+        # keep playtime last_state in sync -engine tick reads this
         try:
             room.match_playtime.last_state = target.value
             view.playtime.last_state = target.value
@@ -190,10 +190,10 @@ class RoomFSM:
         scene packet arrived to re-enter MATCH (continuous party series with
         no lobby return, or a public room parked by an intermission blip), so
         without this the room sits in LOBBY and phase-end drains never fire
-        — wins silently lost after the first match.
+        -wins silently lost after the first match.
 
         Guards (all must hold): currently LOBBY, not the lobby pseudo-room,
-        and I'm still on the roster — leavers (row pruned on leave) and empty
+        and I'm still on the roster -leavers (row pruned on leave) and empty
         rooms stay lobby. Public rooms prove the match via match_version > 0,
         but a first public match (v0) still qualifies when I'm on the roster:
         stG=1 with me present means the match is starting even though no scene
@@ -254,7 +254,7 @@ class RoomFSM:
     @staticmethod
     def _on_exit(room, view, old: State, new: State, via, session_id, packet, gpb):
         # MATCH -> LOBBY : clear zone-active, keep gm/match_version for post-match drain
-        # do NOT clear game_mode here — processor drains win/defeat after exit; clear on next MATCH enter
+        # do NOT clear game_mode here -processor drains win/defeat after exit; clear on next MATCH enter
         if old == State.MATCH and new == State.LOBBY:
             room.zone_match_active = False
             # Lobby-bucket exception: it never drains (the processor skips
@@ -267,7 +267,7 @@ class RoomFSM:
             except Exception:
                 pass
             # usernameChangeCount reset is handled on AUTH/SCENE MainLobby; keep here for leave
-            # do not bump match_version here — stG 3 bumps it in engine's stG handler
+            # do not bump match_version here -stG 3 bumps it in engine's stG handler
 
     @staticmethod
     def _on_enter(room, view, old: State, new: State, via, session_id, packet, gpb, cur_scn):
@@ -275,7 +275,7 @@ class RoomFSM:
         if old == State.LOBBY and new == State.MATCH:
             # Lobby bucket has no continuity: a new match means a new mode.
             # Without this, a stale concrete gm (previous match, or a restored
-            # Upstash snapshot) blocks DF forever — adopt_game_mode never lets
+            # Upstash snapshot) blocks DF forever -adopt_game_mode never lets
             # DF clobber concrete, so DF matches stay invisible (wrong mode on
             # playtime/kills/drawer, flicker-suppressed logs). Drains are safe:
             # the lobby pseudo-room never drains wins, and real rooms keep gm.

@@ -1,4 +1,4 @@
-"""Ranked tourneys — Discord data layer + embed specs.
+"""Ranked tourneys -Discord data layer + embed specs.
 
 Tables (migration supabase/add_ranked_tourney_v247.sql): bngc_ranked_tourneys
 and friends. Solo-first: the Join/Leave buttons write single-member
@@ -77,7 +77,7 @@ def create_tourney(*, name=None, series_len=0, mode="solo",
 
     No room code here: the code is set at /ranked start and dispatched
     to the roster (create embed shows "Wait for start"). Sessions are
-    auto-named "ranked session #<id>" — the name field is gone from create.
+    auto-named "ranked session #<id>" -the name field is gone from create.
     An explicit name still wins when passed (dashboard/legacy callers).
     """
     try:
@@ -405,9 +405,9 @@ def session_title(t: dict, suffix: str = "") -> str:
         nm = str(t.get("name") or "").strip()
         base = f"Ranked Session #{tid}" if tid is not None else "Ranked Session"
         if nm and nm.lower() != f"ranked session #{tid}".lower():
-            base = f"{base} — {nm[:60]}"
+            base = f"{base} -{nm[:60]}"
         if suffix:
-            base = f"{base} — {suffix}"
+            base = f"{base} -{suffix}"
         return base
     except Exception:
         return "Ranked Session"
@@ -474,7 +474,7 @@ def live_spec(t: dict, thread_id=None) -> dict:
         return {
             "title": session_title(t, "LIVE"),
             "fields": [
-                ("Status", "Live — scoring on the /ranked dashboard", True),
+                ("Status", "Live -scoring on the /ranked dashboard", True),
                 ("Players", str(len(rids)), True),
                 ("Series", f"{played}/{series or '∞'}", True),
             ],

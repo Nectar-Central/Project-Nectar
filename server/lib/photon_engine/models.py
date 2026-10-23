@@ -1,7 +1,7 @@
 """
-models.py — Real-named dataclasses for the engine.
+models.py -Real-named dataclasses for the engine.
 
-No more `properties['255']` or `params[254]` — you get `Player.username`
+No more `properties['255']` or `params[254]` -you get `Player.username`
 and `Player.actor_nr`. Every field is documented with the JSON packet
 that sets it and a use case.
 
@@ -19,7 +19,7 @@ from .enums import GameMode, PacketType, State
 @dataclass
 class Player:
     """
-    A player in the room — live-mutated as packets arrive.
+    A player in the room -live-mutated as packets arrive.
 
     JSON source (first Create/Join):
         {
@@ -40,7 +40,7 @@ class Player:
     is_ready: bool = False     # ready
     is_alive: bool = True      # alv
     is_self: bool = False      # true if this is the session's own player (me)
-    pt: str | None = None      # _pt / pt — team id for duos (wwzw/BF2V2/DF duo), maps to RoomView.teams
+    pt: str | None = None      # _pt / pt -team id for duos (wwzw/BF2V2/DF duo), maps to RoomView.teams
     late_join: bool = False       # joined while room.state == MATCH (mid-match join, not pre-match lobby)
     last_seen_at: float | None = None  # epoch of the last packet mentioning this player (a crash stops it)
 
@@ -50,7 +50,7 @@ class Player:
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "Player | None":
-        """Rebuild from to_dict() — tolerant of missing keys (old caches)."""
+        """Rebuild from to_dict() -tolerant of missing keys (old caches)."""
         if not isinstance(d, dict):
             return None
         try:
@@ -75,7 +75,7 @@ class Player:
 @dataclass
 class Room:
     """
-    Room info — from CreateRoom/JoinRoom.
+    Room info -from CreateRoom/JoinRoom.
 
     JSON source:
         {
@@ -95,7 +95,7 @@ class Room:
 @dataclass
 class Party:
     """
-    Party state — from GameProperties.Party and RoomName.
+    Party state -from GameProperties.Party and RoomName.
 
     JSON source:
         {"GameProperties": {"Party": true}, "RoomName": "ABC123"}
@@ -109,7 +109,7 @@ class Party:
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "Party":
-        """Rebuild from to_dict() — tolerant of missing keys (old caches)."""
+        """Rebuild from to_dict() -tolerant of missing keys (old caches)."""
         if not isinstance(d, dict):
             return cls()
         try:
@@ -121,7 +121,7 @@ class Party:
 @dataclass
 class Zone:
     """
-    Zone timing — from stG / bz_*.
+    Zone timing -from stG / bz_*.
 
     JSON source:
         {"properties": {"stG": 30}} or {"properties": {"bz_phase_start": 10, "bz_zone": "2"}}
@@ -192,7 +192,7 @@ class Zone:
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "Zone":
-        """Rebuild from to_dict() — ignores computed keys, tolerant of missing."""
+        """Rebuild from to_dict() -ignores computed keys, tolerant of missing."""
         if not isinstance(d, dict):
             return cls()
         try:
@@ -220,7 +220,7 @@ class Zone:
 @dataclass
 class KillInfo:
     """
-    Killfeed event — from Event 101 Data.
+    Killfeed event -from Event 101 Data.
 
     JSON source:
         {"evName": "Killfeed", "killfeed": "<color> true jew </color> killed <color> Bob </color>"}
@@ -240,7 +240,7 @@ class KillInfo:
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "KillInfo | None":
-        """Rebuild from to_dict() — skips entries with no names."""
+        """Rebuild from to_dict() -skips entries with no names."""
         if not isinstance(d, dict):
             return None
         try:
@@ -261,7 +261,7 @@ class KillInfo:
 @dataclass
 class AbstractPacket:
     """
-    One parsed packet — what engine.feed() returns per hex.
+    One parsed packet -what engine.feed() returns per hex.
 
     Use case:
         pkt = engine.feed("sess_abc", hex)
@@ -293,7 +293,7 @@ class AbstractPacket:
 
 @dataclass
 class Team:
-    """Duo/team grouping — for WWZW/BF2V2 etc."""
+    """Duo/team grouping -for WWZW/BF2V2 etc."""
 
     team_id: str                      # Party code or auto id
     members: list[str] = field(default_factory=list)  # usernames
@@ -304,7 +304,7 @@ class Team:
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "Team | None":
-        """Rebuild from to_dict() — needs a team_id."""
+        """Rebuild from to_dict() -needs a team_id."""
         if not isinstance(d, dict) or not d.get("team_id"):
             return None
         try:
@@ -321,24 +321,24 @@ class Team:
 @dataclass
 class RoomView:
     """
-    Scoped view of one Photon room — created on CreateRoom/JoinRoom/JoinRandomRoom.
+    Scoped view of one Photon room -created on CreateRoom/JoinRoom/JoinRandomRoom.
     All players/zone/kills/state are scoped to this room, not the parent session.
     Each room has its own me (per-room identity, actor_nr may differ per room).
     """
 
     room_id: str                                    # RoomName UUID e.g. 3a0596a5-f50c-45ef-bbdb-ef4842e89c6d
     code: str | None = None                          # full RoomName UUID
-    short_code: str | None = None                    # 5-char pID e.g. PBS05 — private party join code (players type this)
+    short_code: str | None = None                    # 5-char pID e.g. PBS05 -private party join code (players type this)
     created_by_me: bool = False                   # True when OUR client sent CreateRoom for
     # this room (vs JoinRoom/JoinRandomRoom into someone else's). Set by the
-    # engine from the op name — CreateRoom is client→server only, so it can
+    # engine from the op name -CreateRoom is client→server only, so it can
     # only be our own creation. Used by the ranked auto-tag (tag my tourney
     # with the code of a room I created, never a room I joined).
     me: Player | None = None                         # per-room me (not session-wide)
     players: dict[int, Player] = field(default_factory=dict)
     actor_map: dict[int, str] = field(default_factory=dict)  # actorNr -> username, built from ActorList + Join 255 (for alv without 255)
     pending_pt: dict[int, str] = field(default_factory=dict)  # actorNr -> team id stashed from _pt packets for late joiners
-    gv: str | None = None  # game variant from Create/Join GameProperties ("solo"/"duo"/...) — duo modes have gv != solo
+    gv: str | None = None  # game variant from Create/Join GameProperties ("solo"/"duo"/...) -duo modes have gv != solo
 
     @property
     def is_duo(self) -> bool:
@@ -386,7 +386,7 @@ class RoomView:
         """Adopt a game variant, correcting mid-room lobby changes.
 
         First value inits; a DIFFERENT later value updates (the host changed
-        the mode on a live room, e.g. wwzw->zw_lg+solo — gv used to be
+        the mode on a live room, e.g. wwzw->zw_lg+solo -gv used to be
         write-once, so solo matches ran duo rules and defeats held forever).
         Same value (any case) is a no-op. A flip to solo purges stale duo
         remnants (_pt teams, player pts, pending pts) or _team_alive_for_me
@@ -495,7 +495,7 @@ class RoomView:
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "RoomView | None":
-        """Rebuild from to_dict() — tolerant of missing keys (old caches).
+        """Rebuild from to_dict() -tolerant of missing keys (old caches).
 
         Used to restore engine state on serverless workers (Upstash cache).
         Int-keyed maps (players/actor_map/pending_pt) are restored to ints.
@@ -638,7 +638,7 @@ class Playtime:
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "Playtime":
-        """Rebuild from to_dict() — tolerant of missing keys (old caches)."""
+        """Rebuild from to_dict() -tolerant of missing keys (old caches)."""
         if not isinstance(d, dict):
             return cls()
         try:
@@ -662,7 +662,7 @@ class Playtime:
 @dataclass
 class SessionView:
     """
-    Live view of one session — holds many rooms.
+    Live view of one session -holds many rooms.
     Query: session → rooms[room_id] → scoped players/zone/kills.
     Back-compat: top-level players/zone/state proxy to current room.
     """
@@ -681,7 +681,7 @@ class SessionView:
     # stale. Stamped by capture.py on the VIEW (not the response dict) so
     # stats' _session_fresh sees it on the in-memory path too.
 
-    # Back-compat proxies — point to current room or empty defaults
+    # Back-compat proxies -point to current room or empty defaults
     @property
     def current_room(self) -> RoomView | None:
         if self.current_room_id and self.current_room_id in self.rooms:
@@ -808,7 +808,7 @@ class SessionView:
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "SessionView | None":
-        """Rebuild from to_dict() — tolerant of missing keys (old caches).
+        """Rebuild from to_dict() -tolerant of missing keys (old caches).
 
         Used to restore engine state on serverless workers (Upstash cache).
         Proxy-only top-level keys (players/state/...) are derived, not restored.

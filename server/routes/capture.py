@@ -1,11 +1,11 @@
 """
-capture.py — Thin ingest that feeds the Engine and returns abstract data.
+capture.py -Thin ingest that feeds the Engine and returns abstract data.
 
 This replaces the old authoritative handler that did DB writes for kills/wins.
 Now it just: validate token → engine.feed(session_id, hex) per record → return
 {new_req_token, packets: [AbstractPacket], session: SessionView}
 
-No win/kills math here — caller does it from the returned packets/session.
+No win/kills math here -caller does it from the returned packets/session.
 """
 
 import asyncio
@@ -22,7 +22,7 @@ from ..lib.alerts import create_alert
 
 router = APIRouter()
 
-# Global engine — one per FastAPI worker, many sessions inside
+# Global engine -one per FastAPI worker, many sessions inside
 engine = Engine()
 
 # Once-per-worker flag for the missing-Upstash warning (else it spams every batch)
@@ -68,12 +68,12 @@ def _cached_ranked_room(code_r):
 # A slow/timeout DB must never turn a capture into a 500 (see capture_handler).
 # The client requeues on a 5xx, but a failure AFTER the token rotation write
 # makes the retry fail validation, and the client then throws its queue away
-# and demands a re-link — so every DB wait here is bounded and degrades.
+# and demands a re-link -so every DB wait here is bounded and degrades.
 SESSION_LOOKUP_TIMEOUT_SEC = 6.0
 
 
 async def _db_bounded(fn, *args, **kwargs):
-    """db_io with a hard deadline — a hanging database must not stall a capture.
+    """db_io with a hard deadline -a hanging database must not stall a capture.
 
     The client's fetch gives up first, and the cancelled request surfaces as a
     500 with a CancelledError through the ASGI middleware. Every DB wait in
@@ -102,7 +102,7 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
     body_game_id = body.get("game_id") or body.get("gameId")
     ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "-")
 
-    # CALL LINE — every single capture call, always visible
+    # CALL LINE -every single capture call, always visible
     try:
         _sid = str(auth_session_id or session_id or "?")[:13]
         _nrec = len(records) if isinstance(records, list) else "?"
@@ -128,16 +128,16 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
         except Exception as e:
             res = {"data": None, "error": f"{type(e).__name__}: {e}"[:120]}
             log_err(f"CAPTURE session lookup FAILED {auth_session_id[:13]} "
-                    f"{type(e).__name__}: {str(e)[:80]} — passing through")
+                    f"{type(e).__name__}: {str(e)[:80]} -passing through")
         sess = res.get("data")
         db_err = res.get("error")
         # DB connection blip ("Server disconnected"): the session probably
-        # still exists — skip rotation but DON'T 401. The client retries
+        # still exists -skip rotation but DON'T 401. The client retries
         # with the same token on the next batch; if the session was truly
         # deleted the next call will see data=None without an error and
         # return 401 then.
         if db_err and not sess:
-            log_err(f"CAPTURE session lookup DB error ({db_err[:40]}) — passing through")
+            log_err(f"CAPTURE session lookup DB error ({db_err[:40]}) -passing through")
             sess = None  # fall through to the token-free path below
         elif not sess:
             return JSONResponse({"error": "Invalid auth session"}, status_code=401)
@@ -147,7 +147,7 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
                                  {"is_active": False})
             except Exception:
                 pass
-            log_sys(f"CAPTURE expired session {auth_session_id[:13]} — client must re-link")
+            log_sys(f"CAPTURE expired session {auth_session_id[:13]} -client must re-link")
             return JSONResponse({"error": "Session expired - please re-link"}, status_code=401)
         if sess and sess.get("is_locked"):
             scope = str(sess.get("lock_scope") or ("admin" if sess.get("is_admin_locked") else "default")).lower()
@@ -180,23 +180,23 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
                                   "token_counter": new_counter})
             except Exception as e:
                 # The token is minted and the client needs it: a 500 here would
-                # cost the whole batch. Hand it over anyway — the DB counter
+                # cost the whole batch. Hand it over anyway -the DB counter
                 # simply lags by one and self-corrects via the 401 `expected`.
                 log_err(f"CAPTURE token rotate write FAILED "
                         f"{auth_session_id[:13]} {type(e).__name__}: {str(e)[:60]}"
-                        f" — handing the new token to the client anyway")
+                        f" -handing the new token to the client anyway")
             log_sys(f"CAPTURE token ok auth={str(auth_session_id)[:8]} req={req_token} → new {new_token} counter {sess['token_counter']}->{new_counter}")
     _ct["tok"] = _t.time()
 
     # Serverless: restore engine state from Upstash when this worker has none.
     # Without this, every fresh lambda starts from a blank session (rooms/players/
-    # FSM rebuilt per batch in isolation) — the states bug seen on Vercel.
+    # FSM rebuilt per batch in isolation) -the states bug seen on Vercel.
     if auth_session_id and engine.get_session(auth_session_id) is None:
         if not cache.is_configured():
             global _logged_no_upstash
             if not _logged_no_upstash:
                 _logged_no_upstash = True
-                log_err("CAPTURE Upstash NOT configured — engine state cannot survive across serverless instances (set UPSTASH_REDIS_REST_URL/TOKEN)")
+                log_err("CAPTURE Upstash NOT configured -engine state cannot survive across serverless instances (set UPSTASH_REDIS_REST_URL/TOKEN)")
         try:
             cached = await cache.get_session_state(auth_session_id)
             if cached:
@@ -209,7 +209,7 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
             log_err(f"CAPTURE restore failed {auth_session_id[:13]} {e}")
     _ct["restore"] = _t.time()
 
-    # Feed engine per session — no DB writes, just abstract data
+    # Feed engine per session -no DB writes, just abstract data
     # Build one packet dict PER record (processor needs every packet, not just the last)
     packets = []
     for rec in records:
@@ -238,7 +238,7 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
         except Exception:
             pass
         packets.append(d)
-        # RANKED/PACKET LINE — every single packet, always visible
+        # RANKED/PACKET LINE -every single packet, always visible
         try:
             _pt = d.get("packet") or d.get("packet_type") or "?"
             _human = str(d.get("human") or "")[:120]
@@ -247,7 +247,7 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
             pass
     _ct["feed"] = _t.time()
 
-    # persist host_mode on SessionView (lifetime of session) — individualist vs host collab
+    # persist host_mode on SessionView (lifetime of session) -individualist vs host collab
     if auth_session_id and host_mode:
         try:
             vw = engine.get_session(auth_session_id)
@@ -259,7 +259,7 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
     # Client identity adopt: when the engine never resolved view.me (join
     # props without a 255 username) but the client tells us who it is, adopt
     # it into the view AND heal a blank bngc_users.game_username at the
-    # source. Only fills blanks — never overwrites a known identity.
+    # source. Only fills blanks -never overwrites a known identity.
     if auth_session_id and (body_game_username or body_game_id):
         try:
             vw2 = engine.get_session(auth_session_id)
@@ -311,7 +311,7 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
                 global _logged_no_presence_cols
                 if not _logged_no_presence_cols:
                     _logged_no_presence_cols = True
-                    log_err("CAPTURE presence columns missing — apply supabase/add_presence_v258.sql")
+                    log_err("CAPTURE presence columns missing -apply supabase/add_presence_v258.sql")
             else:
                 log_err(f"CAPTURE online touch failed {e}")
 
@@ -320,7 +320,7 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
     # Presence stamp on the VIEW (not just the response dict): EVERY batch
     # counts, including heartbeat-only ones with zero packets. An idle but
     # connected lobby (sit still, wait for players) must not go stale after
-    # 120s — game silence is not absence. Tab closed/reloaded stops all
+    # 120s -game silence is not absence. Tab closed/reloaded stops all
     # batches so both timestamps still age out; kicks arrive as loud leave
     # events that park current off the ranked room first.
     if view is not None:
@@ -331,7 +331,7 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
             pass
     session_dict = view.to_dict() if view else None
 
-    # Run DB writes inline (awaited) — BackgroundTasks are unreliable on serverless
+    # Run DB writes inline (awaited) -BackgroundTasks are unreliable on serverless
     # (frozen after response) and this keeps local + Vercel behavior identical.
     # Never let DB failures break the 200 response (token already rotated inline).
     # Your script (server/scripts/processor.py) uses `packets` + `session` for kills/wins.
@@ -340,21 +340,21 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
             from server.scripts.processor import process_batch
             try:
                 await process_batch(auth_session_id, packets, view)
-                # PROCESSOR LINE — every batch result, always visible
+                # PROCESSOR LINE -every batch result, always visible
                 log_ok(f"CAPTURE→PROCESSOR OK sid={auth_session_id[:13]} n={len(packets)} players={view.players_count if view else '?'}")
             except Exception as e:
                 log_err(f"PROCESSOR FAILED session={auth_session_id[:13]} {type(e).__name__}: {e}")
         except Exception as e:
-            log_err(f"CAPTURE processor import failed {e} — packets still returned, DB write skipped")
+            log_err(f"CAPTURE processor import failed {e} -packets still returned, DB write skipped")
     elif auth_session_id and packets:
         # Gameplay packets that will NEVER reach the processor (no view):
-        # this is the silent-drop hole — log it loud.
-        log_err(f"CAPTURE skip processor session={auth_session_id[:13]} pkts={len(packets)} view={'none' if view is None else 'no-dict'} — DB write skipped")
+        # this is the silent-drop hole -log it loud.
+        log_err(f"CAPTURE skip processor session={auth_session_id[:13]} pkts={len(packets)} view={'none' if view is None else 'no-dict'} -DB write skipped")
     _ct["proc"] = _t.time()
 
     # Persist Engine state to Upstash ONCE, after the processor (finally
     # semantics): it mutates flags/markers/counters/winner that must survive
-    # for the next lambda (Vercel serverless) — without this the next lambda
+    # for the next lambda (Vercel serverless) -without this the next lambda
     # restores stale markers and re-records defeats/wins (doubles). A second
     # persist before the processor only doubles the biggest cost of this
     # endpoint (full session serialize + REST) for no durability gain.
@@ -365,7 +365,7 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
             _final["_cached_at"] = _t2.time()
             _final_ok = await cache.set_session_state(auth_session_id, _final, ttl=3600)
             if not _final_ok:
-                log_err(f"CAPTURE persist FAILED for {auth_session_id[:13]} — next lambda starts blank")
+                log_err(f"CAPTURE persist FAILED for {auth_session_id[:13]} -next lambda starts blank")
         except Exception:
             pass
     _ct["persist"] = _t.time()
@@ -383,13 +383,13 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
 
     # Ranked bind for live UI: which ranked room (if any) this room code
     # belongs to. The client renders optimistic deltas locally (+8 kill /
-    # +50 win / -5 loss) and corrects from this + /api/stats — it never
+    # +50 win / -5 loss) and corrects from this + /api/stats -it never
     # polls ranked endpoints. No point rules: both sides hardcode 8/50/-5.
     if view and discord_id:
         try:
             for room_id_r, room_r in view.rooms.items():
                 code_r = getattr(room_r, "short_code", None)
-                # RANKED LINE — every room code seen per batch, always visible
+                # RANKED LINE -every room code seen per batch, always visible
                 try:
                     if code_r:
                         log_ranked(f"[ranked] capture sid={str(auth_session_id or '')[:13]} room={str(room_id_r)[:8]} code={code_r} state={getattr(getattr(room_r, 'state', None), 'value', '?')} ver={getattr(room_r, 'match_version', '?')}")
@@ -439,7 +439,7 @@ async def capture_handler(request: Request, background_tasks: BackgroundTasks):
             pass
 
     # If we have a token, always return 200 with token; else 200 with an
-    # empty object — never 204: the {} body is still serialized while the
+    # empty object -never 204: the {} body is still serialized while the
     # status forbids one, and uvicorn 500s ("Response content longer than
     # Content-Length"). Heartbeats land here every 5s, so this must not 500.
     if new_token:

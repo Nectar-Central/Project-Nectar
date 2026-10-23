@@ -233,10 +233,19 @@ async def list_admins(guild_id: int) -> list[dict]:
         return []
 
 
-async def list_user_guilds(user_id: str) -> list[dict]:
-    """Guilds where this Discord user is staff, with their role attached."""
+async def list_user_guilds(user_id: str, provider_token: str | None = None) -> list[dict]:
+    """All Discord servers where the user has Manage Server, merged with Nectar.
+
+    Returns both registered (has a Nectar row, user is staff) and unregistered
+    (user has MANAGE_GUILD on Discord but the server hasn't run /setup yet).
+    Registered servers are clickable; unregistered ones are dimmed with an
+    invite-bot link.
+    """
     if not supabase or not user_id:
         return []
+
+    # Fetch Nectar-registered guilds where this user is staff
+    nectar_guilds = {}
     try:
         res = await db_io(
             lambda: supabase.table("nectar_guild_admins")
@@ -244,23 +253,72 @@ async def list_user_guilds(user_id: str) -> list[dict]:
             .eq("user_id", str(user_id))
             .execute()
         )
-        out = []
         for row in (res.data or []):
             guild = row.get("nectar_guilds") or {}
             if not guild or guild.get("is_active") is False:
                 continue
-            out.append({
-                "id": guild.get("id"),
+            gid = int(row.get("guild_id"))  # outer table's FK, not the join's id
+            nectar_guilds[gid] = {
+                "id": gid,
                 "name": guild.get("name"),
                 "icon_url": guild.get("icon_url"),
                 "role": row.get("role"),
                 "settings": guild.get("settings") or {},
-            })
-        out.sort(key=lambda g: str(g.get("name") or "").lower())
-        return out
+                "registered": True,
+            }
     except Exception as e:
-        log_err(f"GUILDS list_user_guilds {user_id}: {e}")
-        return []
+        log_err(f"GUILDS list_user_guilds nectar query {user_id}: {e}")
+
+    # Fetch Discord guilds where the user has MANAGE_GUILD (0x20 = 32)
+    discord_guilds = []
+    if provider_token:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(
+                    "https://discord.com/api/v10/users/@me/guilds",
+                    headers={"Authorization": f"Bearer {provider_token}"},
+                )
+            if r.status_code == 200:
+                for g in (r.json() or []):
+                    perms = int(g.get("permissions") or 0)
+                    # MANAGE_GUILD = 0x20, ADMINISTRATOR = 0x8
+                    if perms & 0x20 or perms & 0x8:
+                        discord_guilds.append({
+                            "id": int(g["id"]),
+                            "name": g.get("name"),
+                            "icon": g.get("icon"),
+                        })
+        except Exception as e:
+            log_err(f"GUILDS fetch Discord guilds {user_id}: {e}")
+
+    # Merge: Discord guilds that aren't in Nectar yet appear as unregistered
+    merged = {}
+    for dg in discord_guilds:
+        gid = dg["id"]
+        if gid in nectar_guilds:
+            merged[gid] = nectar_guilds[gid]
+        else:
+            icon_url = None
+            if dg.get("icon"):
+                icon_url = f"https://cdn.discordapp.com/icons/{gid}/{dg['icon']}.png?size=128"
+            merged[gid] = {
+                "id": gid,
+                "name": dg["name"],
+                "icon_url": icon_url,
+                "role": None,
+                "settings": {},
+                "registered": False,
+            }
+
+    # Include Nectar-only guilds too (in case the token expired or scope missing)
+    for gid, ng in nectar_guilds.items():
+        if gid not in merged:
+            merged[gid] = ng
+
+    out = list(merged.values())
+    out.sort(key=lambda g: (not g.get("registered"), str(g.get("name") or "").lower()))
+    return out
 
 
 async def is_staff(guild_id: int, user_id: str) -> bool:
@@ -282,7 +340,8 @@ async def can_manage(guild_id: int, user_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 async def create_session(discord_id: str, username: str | None = None,
-                         avatar_url: str | None = None) -> str | None:
+                         avatar_url: str | None = None,
+                         provider_token: str | None = None) -> str | None:
     if not supabase:
         return None
     token = secrets.token_urlsafe(32)
@@ -293,6 +352,7 @@ async def create_session(discord_id: str, username: str | None = None,
                 "discord_id": str(discord_id),
                 "discord_username": username,
                 "avatar_url": avatar_url,
+                "provider_token": provider_token,
                 "expires_at": _iso(_now() + timedelta(days=SESSION_TTL_DAYS)),
             }).execute()
         )

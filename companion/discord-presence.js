@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * BuildNow Companion — Discord Rich Presence
+ * BuildNow Companion -Discord Rich Presence
  * Reads companion decryptor's /presence and shows on your Discord profile:
- *   • Game mode (gm: DF, BR etc) — human readable
+ *   • Game mode (gm: DF, BR etc) -human readable
  *   • In Lobby / In Game / Loading
  *   • Players in game / max (255 from GameProperties)
  *   • Kills / alive
@@ -22,7 +22,7 @@
 const http = require('http');
 let RPC;
 try { RPC = require('discord-rpc'); } catch (e) {
-  console.error('[presence] discord-rpc not found — run `npm install` in repo root. Rich Presence disabled, decryptor still works.');
+  console.error('[presence] discord-rpc not found -run `npm install` in repo root. Rich Presence disabled, decryptor still works.');
   console.error('  ' + e.message);
   // keep process alive so tray doesn't restart-loop, but do nothing
   setInterval(()=>{}, 1<<30);
@@ -111,7 +111,7 @@ async function buildActivity(p){
   const inParty = p.inParty === true || p.Party === true;
 
   let details = mode;
-  if (gm) details = `BuildNow — ${mode}`;
+  if (gm) details = `BuildNow -${mode}`;
   else details = 'BuildNow GG';
 
   let state = '';
@@ -137,7 +137,7 @@ async function buildActivity(p){
     details: details.slice(0,128),
     state: state.slice(0,128),
     largeImageKey: 'buildnow',
-    largeImageText: `${mode} — ${curScn || status}`.slice(0,128),
+    largeImageText: `${mode} -${curScn || status}`.slice(0,128),
     smallImageKey: smallKey,
     smallImageText: smallText.slice(0,128),
     startTimestamp: startTs,
@@ -156,7 +156,7 @@ async function tick(){
     if (hadPresence) {
       hadPresence = false;
       lastActivity = '';
-      try { await rpc.clearActivity(); console.log('[presence] cleared — tab closed / idle'); } catch {}
+      try { await rpc.clearActivity(); console.log('[presence] cleared -tab closed / idle'); } catch {}
     }
     return;
   }
@@ -180,7 +180,7 @@ rpc.on('ready', ()=>{
 });
 
 rpc.login({ clientId: CLIENT_ID }).catch(e=>{
-  console.error('[presence] Discord login failed — is Discord desktop running? ', e.message);
+  console.error('[presence] Discord login failed -is Discord desktop running? ', e.message);
   console.error('If you use Vesktop/ArmCord, set env: set RPC_IPC_PATH=\\\\?\\pipe\\discord-ipc-0');
   process.exit(1);
 });

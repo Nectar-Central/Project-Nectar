@@ -1,9 +1,9 @@
-# Nectar Companion — Public Website API
+# Nectar Companion -Public Website API
 
 Base URL: `https://project-nectar.onrender.com`
 
 All endpoints below are `GET`, return JSON, need no auth, and allow
-cross-origin browser calls — embed them directly in the website.
+cross-origin browser calls -embed them directly in the website.
 
 ```js
 const API = "https://project-nectar.onrender.com";
@@ -17,7 +17,7 @@ async function getUser(gameUsername) {
 
 ---
 
-## GET /api/search — find players
+## GET /api/search -find players
 
 | Param | Required | Notes |
 |---|---|---|
@@ -51,7 +51,7 @@ Errors: `400` missing/short `q` · `500` server not configured.
 
 ---
 
-## GET /api/stats — full stats + live session
+## GET /api/stats -full stats + live session
 
 | Param | Required | Notes |
 |---|---|---|
@@ -92,7 +92,7 @@ GET /api/stats?discord_id=129547...
 ```
 
 `session` is `null` when the player has no live engine session (offline or
-no packets fed yet) — user stats are still returned. Raw `game_mode` values:
+no packets fed yet) -user stats are still returned. Raw `game_mode` values:
 `DF`, `zw`, `zw_lg`, `wwzw`, `WW`, `BF`, `BF2V2`, `VA`, `tdm_bvr`, `R_1V1`.
 Map them to display names client-side.
 
@@ -100,7 +100,7 @@ Errors: `400` no identifier · `500` server not configured.
 
 ---
 
-## GET /api/user — public player profile
+## GET /api/user -public player profile
 
 | Param | Required | Notes |
 |---|---|---|
@@ -127,16 +127,16 @@ GET /api/user?game_username=dc:%20cis6led
 }
 ```
 
-Only public stat fields are returned — no tokens, secrets, lock IPs, or
+Only public stat fields are returned -no tokens, secrets, lock IPs, or
 session data. Errors: `400` no identifier · `404` user not found.
 
 ---
 
 ## Notes for website embeds
 
-- Users with no matches yet return zeros — show an empty state ("play a
+- Users with no matches yet return zeros -show an empty state ("play a
   match to appear here") instead of a broken card.
-- `game_username` values may carry a `dc: ` prefix — display as-is.
+- `game_username` values may carry a `dc: ` prefix -display as-is.
 - Full per-match history lives behind the Discord bot (`/sessions`,
   `/recentmatches`, `/replay`, `/killfeed`); the endpoints above are the
   website-safe surface.

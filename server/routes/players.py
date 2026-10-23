@@ -1,5 +1,5 @@
 """
-players.py — GET /api/players?session_id=xxx
+players.py -GET /api/players?session_id=xxx
 
 Returns live players in current room, enriched with DB info if present.
 Per spec: show discord username + gameid + skin image if in DB, else just name.
@@ -58,7 +58,7 @@ def dedup_players(enriched: list) -> list:
     """Collapse duplicate rows for the same person (multi-device joins,
     ghost actors): one row per game_id/discord_id/username. The winner is
     self > alive > in_db (stable: first-seen on ties); missing discord /
-    skin / game fields merge from the loser. Pure — unit-tested."""
+    skin / game fields merge from the loser. Pure -unit-tested."""
     groups: dict = {}
     order: list = []
     for i, p in enumerate(enriched or []):
@@ -125,7 +125,7 @@ async def get_players(request: Request):
         except Exception:
             pass
     if not live:
-        return JSONResponse({"error": "session not found — no packets fed yet"}, status_code=404)
+        return JSONResponse({"error": "session not found -no packets fed yet"}, status_code=404)
 
     rooms = live.get("rooms") or {}
     cur_id = live.get("current_room_id")
@@ -215,7 +215,7 @@ async def get_players(request: Request):
             enriched.append({**p, "discord_username": None, "discord_id": None, "in_db": False})
 
     # Dedup: same person under two actor numbers (mobile + desktop,
-    # ghost actors) shares game_id/discord_id — show once.
+    # ghost actors) shares game_id/discord_id -show once.
     try:
         enriched = dedup_players(enriched)
     except Exception:

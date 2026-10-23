@@ -182,7 +182,7 @@ async function refreshDetail() {
       + ` · gates ${esc(room.min_points)}–${esc(room.max_points == null ? '∞' : room.max_points)}</span>`
       + `<div class="dim" style="margin-top:4px">Creator: <b style="color:#000">${hostLabel}</b> · ${esc(hsHuman)}</div>`
       + `<div class="dim" style="margin-top:4px">Session rank: avg <b>${esc(sess.avg_points)} pts (${esc(sess.avg_milestone)})</b> · total ${esc(sess.total_points)} pts</div>`
-      + `<div class="dim" style="margin-top:4px">Series: <b>${series}</b>${j.series_complete ? ' <span class="bad">— series complete · no auto-open</span>' : ''}</div>`;
+      + `<div class="dim" style="margin-top:4px">Series: <b>${series}</b>${j.series_complete ? ' <span class="bad">-series complete · no auto-open</span>' : ''}</div>`;
     if (!$('hDid').value) $('hDid').value = room.host_discord_id || '';
     const ros = j.roster || [];
     $('roster').innerHTML = ros.length
@@ -245,7 +245,7 @@ async function roomAct(path) {
   $('hSay').textContent = '…';
   try {
     const j = await api(path, post({ room_id: selRoom, discord_id: did }));
-    $('hSay').textContent = `OK — ${j.status}.`;
+    $('hSay').textContent = `OK -${j.status}.`;
     log(`${path} ${selRoom} -> ${j.status}`);
     refreshRooms(); refreshDetail();
   } catch (e) { $('hSay').textContent = 'Failed: ' + e.message; log(path + ': ' + e.message, true); }
@@ -306,13 +306,13 @@ function renderLinkRes() {
 async function linkDo(cand) {
   const name = $('linkName').value.trim();
   if (!cand || !name) { $('linkSay').textContent = 'Search first.'; return; }
-  if (cand.locked) { $('linkSay').textContent = '🔒 That identity is locked — unlock it first.'; return; }
+  if (cand.locked) { $('linkSay').textContent = '🔒 That identity is locked -unlock it first.'; return; }
   $('linkSay').textContent = '…';
   try {
     const body = { discord_id: cand.discord_id, game_username: name };
     if (selRoom && selMatch != null) { body.room_id = selRoom; body.match_version = selMatch; }
     const j = await api('/api/ranked/link', post(body));
-    $('linkSay').textContent = `OK — linked. Backfilled ${j.backfilled || 0} row(s); run Recalc to rescore.`;
+    $('linkSay').textContent = `OK -linked. Backfilled ${j.backfilled || 0} row(s); run Recalc to rescore.`;
     log(`link ${cand.discord_id} -> "${name}" (backfilled ${j.backfilled || 0})`);
     linkSearch(); refreshBoard();
   } catch (e) { $('linkSay').textContent = 'Failed: ' + e.message; log('link: ' + e.message, true); }
@@ -333,8 +333,8 @@ function linkAuto() {
   if (!top) { $('linkSay').textContent = 'Search first.'; return; }
   if (top.locked) { $('linkSay').textContent = '🔒 Best candidate is locked.'; return; }
   const same = (top.game_username || '').toLowerCase() === q.toLowerCase();
-  if ((top.confidence || 0) < 0.85) { $('linkSay').textContent = `Best is only ${Math.round((top.confidence || 0) * 100)}% — link manually.`; return; }
-  if (top.game_username && !same) { $('linkSay').textContent = 'Best candidate already has a different name — link manually.'; return; }
+  if ((top.confidence || 0) < 0.85) { $('linkSay').textContent = `Best is only ${Math.round((top.confidence || 0) * 100)}% -link manually.`; return; }
+  if (top.game_username && !same) { $('linkSay').textContent = 'Best candidate already has a different name -link manually.'; return; }
   linkDo(top);
 }
 $('linkSearch').onclick = linkSearch;
@@ -353,7 +353,7 @@ $('wGo').onclick = async () => {
   $('mSay').textContent = '…';
   try {
     const j = await api('/api/ranked/match/winner', post({ room_id: selRoom, match_version: selMatch, discord_id: did, winner_discord_id: who }));
-    $('mSay').textContent = `OK — winner ${j.winner_discord_id || 'cleared'}.`;
+    $('mSay').textContent = `OK -winner ${j.winner_discord_id || 'cleared'}.`;
     log(`winner ${selRoom} v${selMatch} -> ${j.winner_discord_id}`);
     refreshBoard(); refreshDetail();
   } catch (e) { $('mSay').textContent = 'Failed: ' + e.message; log('winner: ' + e.message, true); }
@@ -367,7 +367,7 @@ $('mRecalc').onclick = async () => {
     const j = await api('/api/ranked/match/recalc', post({ room_id: selRoom, match_version: selMatch, discord_id: did }));
     const d = j.diffs || {};
     const keys = Object.keys(d);
-    $('mSay').textContent = keys.length ? `OK — ledger moved (${keys.map((k) => `${k}:${d[k] > 0 ? '+' : ''}${d[k]}`).join(', ')}).` : 'OK — no changes.';
+    $('mSay').textContent = keys.length ? `OK -ledger moved (${keys.map((k) => `${k}:${d[k] > 0 ? '+' : ''}${d[k]}`).join(', ')}).` : 'OK -no changes.';
     log(`recalc ${selRoom} v${selMatch} diffs=${JSON.stringify(d)}`);
     refreshBoard(); refreshDetail();
   } catch (e) { $('mSay').textContent = 'Failed: ' + e.message; log('recalc: ' + e.message, true); }

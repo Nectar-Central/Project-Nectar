@@ -1,5 +1,5 @@
 """
-enums.py — Real names for Photon magic numbers.
+enums.py -Real names for Photon magic numbers.
 
 Instead of `properties['255']` or `opCode 227`, you get `GameMode.ZW_LG`
 or `PacketType.CREATE_ROOM`. All values are documented with the JSON
@@ -79,7 +79,7 @@ class GameMode(str, Enum):
 
         Live public matches report curScn="Game" (no mode substring) while the
         JoinRandomRoom/pending gm carries the real mode (e.g. zw_lg). In that
-        case the hint is ground truth — return it when concrete. Without a
+        case the hint is ground truth -return it when concrete. Without a
         concrete hint, generic names return None (caller keeps pending/repair).
         """
         """
@@ -163,7 +163,7 @@ class GameMode(str, Enum):
 
 class PacketType(str, Enum):
     """
-    High-level packet categories — hides opCode/evCode numbers.
+    High-level packet categories -hides opCode/evCode numbers.
 
     JSON packet examples:
         AUTHENTICATE: {"op": 230, "opName": "Authenticate"}
@@ -192,7 +192,7 @@ class PacketType(str, Enum):
 
 
 class State(str, Enum):
-    """Session state — lobby vs match."""
+    """Session state -lobby vs match."""
 
     LOBBY = "lobby"   # curScn == "MainLobby" or Authenticate just happened
     MATCH = "match"   # curScn != "MainLobby" and game_mode is known

@@ -134,11 +134,11 @@ async def view_dev_team(interaction: discord.Interaction):
         description=(
             "<:people:1543709237987909682> "
             "Here are the main developers for Nectar.\n\n"
-            "**<@1295478685876617299>** — Senior Developer\n"
-            "**<@1267528889383784513>** — Founder\n"
-            "**<@1143465561548927037>** — Web Developer\n"
-            "**<@1526807976801865870>** — Bot Developer\n"
-            "**<@1484202460577796178>** — Manager"
+            "**<@1295478685876617299>** -Senior Developer\n"
+            "**<@1267528889383784513>** -Founder\n"
+            "**<@1143465561548927037>** -Web Developer\n"
+            "**<@1526807976801865870>** -Bot Developer\n"
+            "**<@1484202460577796178>** -Manager"
         ),
         color=discord.Color.gold()
     )

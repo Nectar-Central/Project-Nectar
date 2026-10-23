@@ -1,5 +1,5 @@
 """
-friends.py — friend requests + party invites (Discord-registered users only).
+friends.py -friend requests + party invites (Discord-registered users only).
 
 Tables (supabase/add_friends_v220.sql): bngc_friends, bngc_party_invites.
 

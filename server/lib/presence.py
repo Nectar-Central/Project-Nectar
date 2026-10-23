@@ -1,5 +1,5 @@
 """
-presence.py — friend status from live session state (pure, unit-tested).
+presence.py -friend status from live session state (pure, unit-tested).
 
 Computes one presence dict from a cached SessionView dict (same shape as
 /api/stats serves) plus room tags:

@@ -13,9 +13,16 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    host: "127.0.0.1",  // match the API's host
     proxy: {
-      "/api": { target: "http://127.0.0.1:3000", changeOrigin: true },
-      "/auth": { target: "http://127.0.0.1:3000", changeOrigin: true },
+      "/api": {
+        target: "http://127.0.0.1:3000",
+        changeOrigin: false,  // same host, don't change origin
+      },
+      "/auth": {
+        target: "http://127.0.0.1:3000",
+        changeOrigin: false,
+      },
     },
   },
   build: {

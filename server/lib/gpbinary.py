@@ -1,10 +1,10 @@
 """
-gpbinary.py — Photon GpBinaryV16 LE minimal parser.
+gpbinary.py -Photon GpBinaryV16 LE minimal parser.
 
 Ported from app/lib/gpbinary.js. Parses F3 (GpBinary) packets
 into human-readable structures for server-side handling.
 
-Only parses essential packets (is_useful) — noise is ignored.
+Only parses essential packets (is_useful) -noise is ignored.
 """
 
 from typing import Any
@@ -575,8 +575,8 @@ def parse_gpbinary(hex_str: str) -> dict | None:
         }
 
         # Operation request AND response (responses carry the RoomName for
-        # CreateRoom/JoinRoom — e.g. an inbound CreateRoom response holds
-        # Address + RoomName — without this the room is never created and
+        # CreateRoom/JoinRoom -e.g. an inbound CreateRoom response holds
+        # Address + RoomName -without this the room is never created and
         # every later packet routes to the lobby pseudo-room as unknown).
         _op_msg = None
         if "req" in msg:
@@ -691,7 +691,7 @@ def is_useful(gpb: dict | None) -> bool:
 
 
 def _strip_color_tags(text: str) -> str:
-    """Remove <color> tags from killfeed text — handles truncated </col and <#hex>.
+    """Remove <color> tags from killfeed text -handles truncated </col and <#hex>.
 
     Usernames may legitimately contain '<' (e.g. 'jesus loves u <3'), so the
     fallback only removes known formatting tags and truncated tail fragments —
@@ -704,7 +704,7 @@ def _strip_color_tags(text: str) -> str:
     # Truncated </col, </color without >, and hex colors like <color=#FC2> or <#000520>
     text = re.sub(r"</?color[^>]*>?", "", text, flags=re.IGNORECASE)
     text = re.sub(r"<#?[0-9a-fA-F]{3,6}>", "", text)
-    # Other known formatting tags (<b>, <i>, <size=..>) — NOT a generic <...> fallback
+    # Other known formatting tags (<b>, <i>, <size=..>) -NOT a generic <...> fallback
     text = re.sub(r"</?(?:b|i|u|s|size|align)[^>]*>?", "", text, flags=re.IGNORECASE)
     # Truncated tail fragment at end of string (packet cut mid-tag, e.g. 'Bob</col')
     text = re.sub(r"</?[a-zA-Z#][^<>]*$", "", text)
@@ -720,7 +720,7 @@ def _has_tag_fragment(s: str) -> bool:
 
 
 def parse_killfeed_text(raw: str) -> dict:
-    """Parse killfeed text into killer/victim/type — drops empty victims and truncated tags."""
+    """Parse killfeed text into killer/victim/type -drops empty victims and truncated tags."""
     clean = _strip_color_tags(raw).strip()
     result = {"raw": raw, "text": clean, "type": None, "killer": None, "victim": None}
 
@@ -735,7 +735,7 @@ def parse_killfeed_text(raw: str) -> dict:
         result["killer"] = killer
         result["victim"] = victim
     elif " eliminated " in clean:
-        # DF elimination variant ("X eliminated Y") — same as a kill
+        # DF elimination variant ("X eliminated Y") -same as a kill
         killer, victim = clean.split(" eliminated ", 1)
         killer, victim = killer.strip(), victim.strip()
         if not killer or not victim or _has_tag_fragment(killer) or _has_tag_fragment(victim):
@@ -786,7 +786,7 @@ def human_sentence(gpb: dict | None) -> str | None:
             room = _unwrap(room)
         party = "party yes" if gpb.get("Party") else "party no"
         gm = f" in {gpb['gm']}" if gpb.get("gm") else ""
-        return f"Room created: code {room} — {party}{gm}" if room else f"Room created — {party}{gm}"
+        return f"Room created: code {room} -{party}{gm}" if room else f"Room created -{party}{gm}"
 
     # Join
     if gpb.get("opName") in ("JoinRoom", "JoinRandomRoom"):

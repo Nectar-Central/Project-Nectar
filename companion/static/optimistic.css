@@ -1,4 +1,4 @@
-/* Optimistic UI — pending states */
+/* Optimistic UI -pending states */
 .opt-pending { font-weight: 700; }
 .opt-row-pending { opacity: 0.85; }
 .opt-btn-pending { opacity: 0.6; cursor: wait; pointer-events: none; }

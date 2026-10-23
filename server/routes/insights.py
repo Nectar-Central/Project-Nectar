@@ -1,5 +1,5 @@
 """
-insights.py — GET /api/insights?discord_id=... | ?game_username=... | ?game_id=...
+insights.py -GET /api/insights?discord_id=... | ?game_username=... | ?game_id=...
 
 Player insights computed from stored game events + user row. Pure compute
 (compute_insights) is unit-tested; the endpoint only resolves identity,

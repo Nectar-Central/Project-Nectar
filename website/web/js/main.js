@@ -316,7 +316,7 @@ async function loadLeaderboard() {
 
         let data = await response.json();
         if (typeof data === "string") data = JSON.parse(data);
-        // API returns {results:[...]} — accept a bare array too
+        // API returns {results:[...]} -accept a bare array too
         const rows = Array.isArray(data) ? data : (data.results || []);
 
         if (!Array.isArray(rows) || rows.length === 0) {

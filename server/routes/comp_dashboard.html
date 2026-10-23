@@ -68,7 +68,7 @@
 </div>
 <div id="wrap">
   <div id="pane-status" role="tabpanel">
-    <fieldset><legend>Live tracker — this box</legend><div id="tracker">…</div>
+    <fieldset><legend>Live tracker -this box</legend><div id="tracker">…</div>
       <div class="rowline">Tourney #
         <input id="tSet" size="6" placeholder="0">
         <button id="tSetGo">Track</button>
@@ -94,7 +94,7 @@ const esc = (v) => String(v == null ? '—' : v).replace(/</g, '&lt;');
 let SRV = localStorage.getItem('comp_server') || location.origin;
 let selTid = null;
 try {
-  // getItem returns null when missing — Number(null) is 0, which would
+  // getItem returns null when missing -Number(null) is 0, which would
   // wrongly select tourney #0. (Tourney ids can start at 0, so only null
   // is rejected here; a stale non-listed id is re-selected in refreshList.)
   const savedRaw = localStorage.getItem('comp_sel_tid');
@@ -112,7 +112,7 @@ let rosterCache = [];
 let namesCache = {};
 let _shellTid = null;
 try {
-  // getItem returns null when missing — Number(null) is 0, which is never a
+  // getItem returns null when missing -Number(null) is 0, which is never a
   // valid match id (identity starts at 1) and would 404 as ?id=0.
   const savedMRaw = localStorage.getItem('comp_sel_match');
   const savedM = savedMRaw == null ? NaN : Number(savedMRaw);
@@ -202,7 +202,7 @@ async function refreshList() {
       `<div><span class="tlink" data-t="${t.id}"><b>#${t.id} ${esc(t.name)}</b></span> ` +
       `<span class="pill ${cls[t.status] || 'end'}">${esc(t.status)}</span> ` +
       `<span class="dim">${t.sealed || 0}/${t.series_len || '∞'} · ${t.players || 0} players</span></div>`
-    ).join('') || '<span class="dim">None yet — create one with /tourney-create.</span>';
+    ).join('') || '<span class="dim">None yet -create one with /tourney-create.</span>';
     // auto-select: keep the saved tourney if still listed, else pick the
     // newest non-ended one so Save/Calculate never fire with no selection.
     try {
@@ -263,12 +263,12 @@ async function refreshDetail() {
         `<label>win <input id="tbW" size="3" inputmode="numeric" value="${table.win != null ? table.win : 3}"></label> ` +
         `<button id="tbSave">Save table</button> <button id="calc" class="primary">Calculate</button> <button id="dmOpen">Open blank match</button></div></fieldset>` +
         `<fieldset style="margin-top:8px"><legend>Standings</legend><div id="board">…</div></fieldset>` +
-        `<fieldset style="margin-top:8px"><legend>Matches — pick one</legend><div id="matchlist">…</div></fieldset>` +
+        `<fieldset style="margin-top:8px"><legend>Matches -pick one</legend><div id="matchlist">…</div></fieldset>` +
         `<div class="cols" style="margin-top:8px">` +
         `<fieldset><legend id="mLeftLeg">Match</legend><div id="matchLeft"><span class="dim">Pick a match above.</span></div></fieldset>` +
         `<fieldset><legend>Killfeed</legend><div id="matchFeed" class="feed"><span class="dim">Pick a match above.</span></div></fieldset>` +
         `</div>` +
-        `<fieldset style="margin-top:8px"><legend>Unmapped names — link to players</legend><div id="unmapped">…</div></fieldset>` +
+        `<fieldset style="margin-top:8px"><legend>Unmapped names -link to players</legend><div id="unmapped">…</div></fieldset>` +
         `<fieldset style="margin-top:8px"><legend>Players &amp; banned</legend><div id="regs">…</div></fieldset>`;
       wireTableButtons();
       _shellTid = selTid;
@@ -514,7 +514,7 @@ async function refreshMatch() {
     } catch { rosterCache = []; }
     // names for roster-only rows (never just did prefixes): real names from
     // board + tourney players first, then one bulk lookup for the rest.
-    // A name that is just the id again counts as unknown — keep looking.
+    // A name that is just the id again counts as unknown -keep looking.
     try {
       const known = {};
       const good = (nm, k) => nm && String(nm) !== k && !/^\d+$/.test(String(nm));
@@ -761,7 +761,7 @@ async function mutMatch(btn, patch, fn, what, liteToo) {
     log(what);
     try {
       if (res && res.tracked_kept > 0 && (res.removed_manual || 0) < (res.requested || 0)) {
-        log(`kept ${res.tracked_kept} tracked kill(s) — remove wins/placements separately`, true);
+        log(`kept ${res.tracked_kept} tracked kill(s) -remove wins/placements separately`, true);
       }
     } catch {}
     btn.disabled = false;
@@ -841,7 +841,7 @@ function renderMatchPanel() {
       : '<span class="dim">No scoring events yet.</span>') +
     aliveStrip() +
     ((m.removed_discord_ids && m.removed_discord_ids.length)
-      ? `<div class="gap"><span class="muted">REMOVED (left — ignored in placements, untouched globally)</span>` +
+      ? `<div class="gap"><span class="muted">REMOVED (left -ignored in placements, untouched globally)</span>` +
         m.removed_discord_ids.map((did) =>
           `<div style="margin:4px 0"><span class="dim" title="${esc(String(did))}">🚪 ${esc(nameOfDid(String(did)))}</span> ` +
           `<button data-addback="${esc(String(did))}">Add back</button></div>`).join('') + `</div>`
@@ -861,7 +861,7 @@ function renderMatchPanel() {
     if (wgo) wgo.onclick = () => {
       const inp = $('mWinner');
       const raw = (inp && inp.value.trim()) || '';
-      if (raw && !resolveDid(raw)) { log('winner: unknown player — pick from the list or paste a discord id', true); return; }
+      if (raw && !resolveDid(raw)) { log('winner: unknown player -pick from the list or paste a discord id', true); return; }
       const who = raw ? resolveDid(raw) : null;
       mutMatch(wgo, () => optWinner(who),
         () => api('/api/comp/match/winner', post({ match_id: editMatchId, winner_discord_id: who })),
@@ -883,7 +883,7 @@ function renderMatchPanel() {
       if (!raw) { log('add player: type a name or discord id first', true); return; }
       let who = resolveDid(raw);
       if (!who && /^\d{4,}$/.test(raw)) who = raw;  // raw discord id (sub off-roster)
-      if (!who) { log('add player: unknown — pick a roster name or paste a discord id', true); return; }
+      if (!who) { log('add player: unknown -pick a roster name or paste a discord id', true); return; }
       apgo.disabled = true;
       api('/api/comp/match/add-player', post({ match_id: editMatchId, discord_id: who }))
         .then(() => { log('added ' + nameOfDid(who) + ' at 0 pts'); apgo.disabled = false; refreshMatch(); })
@@ -1048,7 +1048,7 @@ function wireMatchList(matches) {
   const box = $('matchlist');
   if (!box) return;
   const list = matches || [];
-  if (!list.length) { box.innerHTML = '<span class="dim">None yet — play a match or open a blank one.</span>'; return; }
+  if (!list.length) { box.innerHTML = '<span class="dim">None yet -play a match or open a blank one.</span>'; return; }
   // keep selection if still listed; else the live (open/manual) match, else latest
   if (!list.some((m) => m.id === editMatchId)) {
     const live = list.find((m) => m.status === 'open' || m.status === 'manual');

@@ -1,5 +1,5 @@
 """
-stats.py — GET /api/stats
+stats.py -GET /api/stats
 Returns live user stats + session state for the drawer overlay.
 
 Query:
@@ -124,7 +124,7 @@ def better_than_pct(total: int, above: int) -> int:
 _SESSION_STALE_S = 120  # no packets this long = kicked/closed/reloaded
 
 _LOBBY_BLIP_RESCUE_S = 20  # lone Authenticate parks current on the lobby
-# pseudo-room while the game keeps capturing in the real room — the rescue
+# pseudo-room while the game keeps capturing in the real room -the rescue
 # covers that blip (seconds). A real leave also parks on lobby, but then no
 # new packets arrive for the old room, so it ages out of this window fast
 # instead of haunting stats (with its ranked BLOCK) for the full 120s.
@@ -133,8 +133,8 @@ _LOBBY_BLIP_RESCUE_S = 20  # lone Authenticate parks current on the lobby
 def _session_fresh(live_session) -> bool:
     """False when the session stopped capturing (kick/close/reload).
 
-    Without this the drawer keeps showing the last cached room — including
-    the ranked block with its match ID — for up to the cache TTL. Fresh if
+    Without this the drawer keeps showing the last cached room -including
+    the ranked block with its match ID -for up to the cache TTL. Fresh if
     the NEWEST of (last game packet, last capture batch) is within the
     window: heartbeats stamp the view's _cached_at every batch, so an idle
     but connected lobby (sit still, wait for players) stays live, while a
@@ -292,7 +292,7 @@ async def get_stats(request: Request):
     session_out = None
     cur_room = None  # current room dict (for ranked match_version/warnings)
     if live_session:
-        # live_session is SessionView dict — extract current room fields
+        # live_session is SessionView dict -extract current room fields
         try:
             cur_room = None
             rooms = live_session.get("rooms") or {}
@@ -304,7 +304,7 @@ async def get_stats(request: Request):
                 cur_room = next(reversed(list(rooms.values())), None)
             # Lobby-blip rescue: a lone Authenticate (or self-leave echo) parks
             # current on the lobby pseudo-room while the game keeps capturing
-            # in a real room — no join follows, the player never actually left.
+            # in a real room -no join follows, the player never actually left.
             # If current is the lobby pseudo-room but another room has packets
             # within _LOBBY_BLIP_RESCUE_S, serve it. Deliberately much shorter
             # than _SESSION_STALE_S: a real leave freezes the old room's
@@ -599,7 +599,7 @@ async def get_stats(request: Request):
                     pass
                 # last sealed result for this tourney (drives the points
                 # toast, same shape as rooms): replayed from the match's
-                # stored seal — room-seal bundle verbatim, or the frozen
+                # stored seal -room-seal bundle verbatim, or the frozen
                 # tourney-dynamic breakdown (same deltas the ladder paid).
                 # Non-bundle rows (legacy/manual) stay None: no second
                 # economy to report.
@@ -691,7 +691,7 @@ async def get_stats(request: Request):
         ranked_out = None
     # Per-poll verdict log, sampled: a BLOCK line only when the verdict
     # flips (none<->BLOCK, version/points change) or every 60s. Polls land
-    # every few seconds per client — an unconditional line buries real logs.
+    # every few seconds per client -an unconditional line buries real logs.
     try:
         _rk_state = (session_out or {}).get("state")
         _rk_code = (session_out or {}).get("short_code") or _stale_short_code
@@ -757,7 +757,7 @@ async def get_stats(request: Request):
         pass
 
     # Identity diagnostics: kills/skins attach to view.me while playtime is
-    # session-scoped — when me never resolved (null game_username in the DB
+    # session-scoped -when me never resolved (null game_username in the DB
     # with playtime ticking), everything silently misses. Cheap: already in
     # the live view dict. Null me + ticking session = broken client identity.
     identity = None

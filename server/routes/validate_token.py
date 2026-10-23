@@ -1,5 +1,5 @@
 """
-validate_token.py — One-time login token → session + first request token.
+validate_token.py -One-time login token → session + first request token.
 
 Flow:
     1. Client posts {token: "A1B2C3D4..."} from /register
@@ -95,10 +95,10 @@ async def validate_token(request: Request):
         session_expired_refresh = False
         if login_token.get("used"):
             # If there's already an active, fresh session for this discord_id, return it
-            # instead of locking — prevents userscript re-validate loops.
+            # instead of locking -prevents userscript re-validate loops.
             # NOTE: limit(1) (not single()) so an empty result is data, not an
             # exception. Only a PROVEN empty lookup may fall through to the
-            # lock below — a transport/DB error returns 503 transient instead,
+            # lock below -a transport/DB error returns 503 transient instead,
             # so a blip during auto re-validation can never lock an account.
             _lookup_ok = False
             _existing = None
@@ -116,12 +116,12 @@ async def validate_token(request: Request):
                 _rows = _res.data or []
                 _existing = _rows[0] if _rows else None
             except Exception as e:
-                log_err(f"VALIDATE session lookup failed ({e}) — transient, not reuse")
+                log_err(f"VALIDATE session lookup failed ({e}) -transient, not reuse")
                 return JSONResponse({"error": "Lookup failed - try again"}, status_code=503)
             if _lookup_ok and _existing and not is_session_expired(_existing):
                 sess = _existing
                 log_sys(
-                    f"VALIDATE reuse but active session exists {str(sess['session_id'])[:8]} — returning existing"
+                    f"VALIDATE reuse but active session exists {str(sess['session_id'])[:8]} -returning existing"
                 )
 
                 # Fetch user for extra fields
@@ -143,19 +143,19 @@ async def validate_token(request: Request):
                     "reused": True,
                 })
             if _lookup_ok and _existing:
-                # Active session is older than 2 days — deactivate it and fall through
+                # Active session is older than 2 days -deactivate it and fall through
                 # to fresh creation below (refresh, NOT a lock)
                 try:
                     supabase.table("bngc_sessions").update({"is_active": False}).eq("session_id", _existing["session_id"]).execute()
                 except Exception:
                     pass
-                log_sys(f"VALIDATE refresh expired session {str(_existing['session_id'])[:8]} — issuing new")
+                log_sys(f"VALIDATE refresh expired session {str(_existing['session_id'])[:8]} -issuing new")
                 session_expired_refresh = True
 
             if session_expired_refresh:
                 pass  # fall through to fresh creation below (refresh, NOT a lock)
             else:
-                # Otherwise, lock the account (real reuse) — friend-account enforcement (default lock, user can /unlock)
+                # Otherwise, lock the account (real reuse) -friend-account enforcement (default lock, user can /unlock)
                 try:
                     supabase.table("bngc_users").update({
                         "is_locked": True,
@@ -167,7 +167,7 @@ async def validate_token(request: Request):
                     pass
 
                 await cache.blacklist_token(token, 300)
-                create_alert(login_token["discord_id"], "locked", request, details={"reason": "token reuse — possible friend account sharing", "token_prefix": str(token)[:4], "ip": ip, "scope": "default"}, severity="critical")
+                create_alert(login_token["discord_id"], "locked", request, details={"reason": "token reuse -possible friend account sharing", "token_prefix": str(token)[:4], "ip": ip, "scope": "default"}, severity="critical")
                 create_alert(login_token["discord_id"], "blacklist", request, details={"reason": "token reuse", "scope": "default"}, severity="critical")
 
                 return JSONResponse(
@@ -175,7 +175,7 @@ async def validate_token(request: Request):
                     status_code=403,
                 )
 
-        # Check expiry (skipped on session refresh — the 2-day session TTL governs, not the login token)
+        # Check expiry (skipped on session refresh -the 2-day session TTL governs, not the login token)
         if not session_expired_refresh:
             try:
                 expires = login_token.get("expires_at")

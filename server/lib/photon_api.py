@@ -1,7 +1,7 @@
 """
-DEPRECATED — photon_api.py is legacy. Engine is now standalone (gpbinary only).
+DEPRECATED -photon_api.py is legacy. Engine is now standalone (gpbinary only).
 
-photon_api.py — Simple, developer-friendly wrapper over the Photon parser/decryptor.
+photon_api.py -Simple, developer-friendly wrapper over the Photon parser/decryptor.
 Kept for examples/back-compat only. Production path (Engine/processor/capture) no longer imports it.
 Use server.lib.photon_engine.Engine instead.
 
@@ -43,15 +43,15 @@ for you, so kills/deaths/players don't leak across matches:
     # call this for every packet as it arrives, IN ORDER
     tracker.feed(hex_string)
 
-IMPORTANT — MatchTracker / GameSession are NOT thread-safe. If packets
+IMPORTANT -MatchTracker / GameSession are NOT thread-safe. If packets
 arrive from multiple threads (or multiple asyncio tasks), route them
 through a single consumer (one queue.Queue + one dedicated thread, or
 one asyncio task per match) rather than calling feed() concurrently.
 For multiple simultaneous matches (e.g. tracking several players at
-once), keep one MatchTracker per player/connection in a dict — do not
+once), keep one MatchTracker per player/connection in a dict -do not
 share a single tracker across matches.
 
-The wrapper keeps full control — you can still access raw fields via
+The wrapper keeps full control -you can still access raw fields via
 `packet.raw` or `packet.gpb` if you need low-level details.
 
 Design principles (from code-simplification skill):
@@ -74,7 +74,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Any
 from threading import Lock
 
-# Reuse the existing low-level parser — we wrap it, we don't duplicate it
+# Reuse the existing low-level parser -we wrap it, we don't duplicate it
 from .gpbinary import (
     parse_gpbinary,
     is_useful,
@@ -95,14 +95,14 @@ PHOTON_API_DEBUG = False
 
 
 def _debug(tag: str, msg: str) -> None:
-    """Internal debug print — no-ops unless PHOTON_API_DEBUG is True."""
+    """Internal debug print -no-ops unless PHOTON_API_DEBUG is True."""
 
     if PHOTON_API_DEBUG:
         print(f"[photon_api:{tag}] {msg}")
 
 
 # ---------------------------------------------------------------------------
-# Enums — clear, discoverable names for developers
+# Enums -clear, discoverable names for developers
 # ---------------------------------------------------------------------------
 
 class GameMode(str, Enum):
@@ -169,7 +169,7 @@ class GameMode(str, Enum):
 
 
 class PacketType(str, Enum):
-    """High-level packet categories — hides opCode/evCode numbers."""
+    """High-level packet categories -hides opCode/evCode numbers."""
 
     AUTHENTICATE = "authenticate"
     JOIN_ROOM = "join_room"
@@ -186,13 +186,13 @@ class PacketType(str, Enum):
 
 
 # ---------------------------------------------------------------------------
-# PhotonPacket — one parsed packet, simple properties
+# PhotonPacket -one parsed packet, simple properties
 # ---------------------------------------------------------------------------
 
 @dataclass
 class PhotonPacket:
     """
-    One parsed Photon packet — the only object a developer needs.
+    One parsed Photon packet -the only object a developer needs.
 
     Attributes are all plain Python types, no Gp wrappers.
 
@@ -280,12 +280,12 @@ class PhotonPacket:
 
 
 # ---------------------------------------------------------------------------
-# Photon — stateless parser (simple functions)
+# Photon -stateless parser (simple functions)
 # ---------------------------------------------------------------------------
 
 class Photon:
     """
-    Stateless parser — no state, just converts hex → PhotonPacket.
+    Stateless parser -no state, just converts hex → PhotonPacket.
 
     This is the simplest entry point. No need to understand F3 framing.
 
@@ -300,7 +300,7 @@ class Photon:
         """
         Parse a single hex-encoded packet into a PhotonPacket.
 
-        Never raises — on failure returns a packet with packet_type=UNKNOWN.
+        Never raises -on failure returns a packet with packet_type=UNKNOWN.
         """
 
         # Default packet (unknown)
@@ -422,7 +422,7 @@ class Photon:
             packet.sentence = human_sentence(gpb)
 
         except Exception as exc:
-            # Never crash the caller — return unknown packet, but log why
+            # Never crash the caller -return unknown packet, but log why
             # in debug mode so failures aren't silently swallowed.
             _debug("Photon.parse", f"EXCEPTION while parsing hex (len={len(hex_string) if hex_string else 0}): {exc!r}")
 
@@ -433,7 +433,7 @@ class Photon:
         """
         Quick check: should this packet be sent to the server?
 
-        Checks only the first 3 bytes (type + code) — no full parse.
+        Checks only the first 3 bytes (type + code) -no full parse.
         Mirrors the userscript's isEssentialBytes for speed.
         """
 
@@ -484,17 +484,17 @@ class Photon:
 
 
 # ---------------------------------------------------------------------------
-# GameSession — stateful helper for win/defeat/players/zone
+# GameSession -stateful helper for win/defeat/players/zone
 # ---------------------------------------------------------------------------
 
 @dataclass
 class GameSession:
     """
-    Stateful game session — tracks players, kills, wins, zone.
+    Stateful game session -tracks players, kills, wins, zone.
 
     You feed it hex packets via `feed_hex()`, it updates state and
     fires callbacks for kills/wins. No need to understand alv or
-    ActorNr — the session does it.
+    ActorNr -the session does it.
 
     Example:
         session = GameSession(self_name="true jew", game_mode=GameMode.ZW_LG)
@@ -537,12 +537,12 @@ class GameSession:
     _lock: Lock = field(default_factory=Lock, repr=False, compare=False)
 
     def __enter__(self) -> "GameSession":
-        """Context manager entry — returns self."""
+        """Context manager entry -returns self."""
 
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Context manager exit — clears callbacks (no hanging refs)."""
+        """Context manager exit -clears callbacks (no hanging refs)."""
 
         # Clear callbacks to avoid leaks, but keep state for inspection
         self._on_kill.clear()
@@ -628,7 +628,7 @@ class GameSession:
 
     def feed_hex(self, hex_string: str) -> PhotonPacket | None:
         """
-        Feed a raw hex packet — updates state, fires callbacks, returns packet.
+        Feed a raw hex packet -updates state, fires callbacks, returns packet.
 
         Thread-safe via internal Lock.
         This is the main method. Call it for every captured packet.
@@ -638,7 +638,7 @@ class GameSession:
             return self._feed_hex_inner(hex_string)
 
     def _feed_hex_inner(self, hex_string: str) -> PhotonPacket | None:
-        """Inner implementation — assumes lock is held."""
+        """Inner implementation -assumes lock is held."""
 
         packet = Photon.parse(hex_string)
 
@@ -677,7 +677,7 @@ class GameSession:
             except Exception:
                 actor_nr = None
 
-        # Join / Leave — track actual actor numbers when available
+        # Join / Leave -track actual actor numbers when available
         if packet.is_join and packet.player_name:
             key = int(actor_nr) if actor_nr is not None else hash(packet.player_name) % 100000
             # Only add if not already present
@@ -738,7 +738,7 @@ class GameSession:
                 self.deaths += 1
                 self._pending_self_death = True
 
-            # Update players — remove victim
+            # Update players -remove victim
             for key, info in list(self.players.items()):
                 if info["name"] == packet.victim:
                     self.players.pop(key, None)
@@ -751,14 +751,14 @@ class GameSession:
 
 
 # ---------------------------------------------------------------------------
-# MatchTracker — the recommended entrypoint for real-time / live capture
+# MatchTracker -the recommended entrypoint for real-time / live capture
 # ---------------------------------------------------------------------------
 
 class MatchTracker:
     """
     Real-time-friendly wrapper around GameSession.
 
-    A bare GameSession has no concept of "match over" — kills, deaths,
+    A bare GameSession has no concept of "match over" -kills, deaths,
     and players just keep accumulating forever, and win-detection breaks
     after the first match if you keep feeding it packets from match #2.
     MatchTracker fixes that: it owns a GameSession internally and swaps
@@ -774,11 +774,11 @@ class MatchTracker:
     locking. If packets can arrive from more than one thread/task,
     route them through a single consumer (one queue.Queue + one
     dedicated thread, or one asyncio task) rather than calling feed()
-    concurrently — concurrent calls can race on the players dict and
+    concurrently -concurrent calls can race on the players dict and
     produce false or missed win detections.
 
     MULTIPLE SIMULTANEOUS MATCHES: don't share one MatchTracker across
-    players/connections — keep a dict of `player_id -> MatchTracker`
+    players/connections -keep a dict of `player_id -> MatchTracker`
     so each match has fully isolated state.
 
     Example (real-time WebSocket handler):
@@ -788,18 +788,18 @@ class MatchTracker:
         tracker.on_win(lambda gm: print(f"WIN in {gm.human_name}"))
 
         async for hex_string in websocket:
-            tracker.feed(hex_string)   # order matters — feed as it arrives
+            tracker.feed(hex_string)   # order matters -feed as it arrives
     """
 
     def __init__(self, self_name: str) -> None:
         self.self_name = self_name
 
-        # Internal — recreated on every match reset. Access via the
+        # Internal -recreated on every match reset. Access via the
         # public properties below (players_left, self_alive, etc.)
         # rather than reaching into `_session` directly.
         self._session: GameSession | None = None
 
-        # Callbacks registered by the caller — re-attached to every
+        # Callbacks registered by the caller -re-attached to every
         # fresh GameSession created on reset, so callers only need to
         # call on_kill/on_win/on_eliminated once, not per-match.
         self._on_kill_callbacks: list[Callable[[str, str], None]] = []
@@ -825,7 +825,7 @@ class MatchTracker:
     def on_kill(self, callback: Callable[[str, str], None]) -> None:
         """Register a callback for kills: `callback(killer, victim)`.
 
-        Persists across match resets — register once, fires for every match.
+        Persists across match resets -register once, fires for every match.
         """
 
         self._on_kill_callbacks.append(callback)
@@ -834,7 +834,7 @@ class MatchTracker:
     def on_win(self, callback: Callable[[GameMode], None]) -> None:
         """Register a callback for wins: `callback(game_mode)`.
 
-        Persists across match resets — register once, fires for every match.
+        Persists across match resets -register once, fires for every match.
         """
 
         self._on_win_callbacks.append(callback)
@@ -843,7 +843,7 @@ class MatchTracker:
     def on_eliminated(self, callback: Callable[[str], None]) -> None:
         """Register a callback for eliminations: `callback(player_name)`.
 
-        Persists across match resets — register once, fires for every match.
+        Persists across match resets -register once, fires for every match.
         """
 
         self._on_eliminated_callbacks.append(callback)
@@ -852,7 +852,7 @@ class MatchTracker:
     def feed(self, hex_string: str) -> PhotonPacket | None:
         """
         Feed one live packet. Call this for every packet, in order, as
-        it arrives — do not call concurrently from multiple threads.
+        it arrives -do not call concurrently from multiple threads.
 
         Automatically resets to a fresh session when a return to
         MainLobby is detected, so kills/deaths/players never leak

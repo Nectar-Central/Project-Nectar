@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Nectar Buildnow Presence — decryptor + rich presence in system tray, headless background.
+Nectar Buildnow Presence -decryptor + rich presence in system tray, headless background.
 Bundle with PyInstaller to .exe.
 """
 import os, sys, subprocess, threading, time, webbrowser, json
@@ -79,7 +79,7 @@ def ensure_modules():
 def run_node(script, env_extra=None):
     node = find_node()
     if not node:
-        log("node not found in PATH — install from https://nodejs.org")
+        log("node not found in PATH -install from https://nodejs.org")
         return None
     if not Path(script).exists():
         log(f"script not found: {script}")
@@ -112,7 +112,7 @@ def start_services():
     try:
         r = requests.get("http://127.0.0.1:8765/status", timeout=1)
         if r.ok:
-            log("8765 already listening — skipping decryptor start")
+            log("8765 already listening -skipping decryptor start")
             dec_proc = None
         else:
             dec_proc = run_node(DEC)
@@ -125,7 +125,7 @@ def start_services():
         if not r.ok: log(f"decryptor status {r.status_code} {r.text[:200]}")
         else: log("decryptor OK")
     except Exception as e:
-        log(f"decryptor not reachable: {e} — check log at {LOG} and that node is installed")
+        log(f"decryptor not reachable: {e} -check log at {LOG} and that node is installed")
     if not start_presence():
         try:
             pres_proc = run_node(PRES_NODE)
@@ -174,7 +174,7 @@ def stop_services():
             try: p.wait(timeout=1.5)
             except: p.terminate()
         except: pass
-    # if decryptor still has presence, force clear via stale timeout — also try direct clear
+    # if decryptor still has presence, force clear via stale timeout -also try direct clear
     try:
         # fire-and-forget clear via dummy presence idle
         requests.post("http://127.0.0.1:8765/clear", timeout=1)
@@ -218,7 +218,7 @@ def on_show(icon, item):
         try: icon.notify(line, "Nectar Buildnow Presence")
         except: pass
     else:
-        try: icon.notify(f"Presence bridge not answering on 8765 — see {LOG}", "Nectar Buildnow Presence — error")
+        try: icon.notify(f"Presence bridge not answering on 8765 -see {LOG}", "Nectar Buildnow Presence -error")
         except: pass
     # also open log on status click if failed
     if not j:

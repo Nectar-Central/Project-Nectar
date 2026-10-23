@@ -2,7 +2,7 @@
 'use strict';
 
 /**
- * BuildNow Companion — Decryptor / Live Viewer (Node, zero deps)
+ * BuildNow Companion -Decryptor / Live Viewer (Node, zero deps)
  *
  * Listens on 127.0.0.1:8765 for raw Photon frames forwarded by
  * buildnow-companion.user.js and decodes them with rich ANSI-colored logging.
@@ -10,14 +10,14 @@
  * Transports (all loopback-safe, all accepted):
  *   POST http://127.0.0.1:8765/capture  {sessionId, records:[{seq,t,dir,url,rawHex}]}
  *   POST http://localhost:8765/capture  (same)
- *   WS   ws://127.0.0.1:8765/ws          (same JSON over WebSocket — preferred, not PNA-gated)
+ *   WS   ws://127.0.0.1:8765/ws          (same JSON over WebSocket -preferred, not PNA-gated)
  *   GET  http://127.0.0.1:8765/status    (health + stats)
  *
  * Also doubles as offline decoder:
  *   node decryptor.js captures/foo.jsonl            (pretty-prints + summary)
  *   node decryptor.js --json captures/foo.jsonl     (json output)
  *
- * Decoder is byte-identical to tools/decoder.js — GpBinaryV16 LE minimal.
+ * Decoder is byte-identical to tools/decoder.js -GpBinaryV16 LE minimal.
  * Reference: photon-capture-*.jsonl + docs/websocket-packets.md
  */
 
@@ -72,7 +72,7 @@ try {
 }
 
 // ---------------------------------------------------------------------------
-// ANSI — zero-dep, 24-bit, works in PowerShell + Windows Terminal
+// ANSI -zero-dep, 24-bit, works in PowerShell + Windows Terminal
 // ---------------------------------------------------------------------------
 const R = '\x1b[0m';
 const B = '\x1b[1m';
@@ -87,12 +87,12 @@ const COL = {
   err: (s) => c(239, 68, 68, s),           // red
   warn: (s) => c(245, 158, 11, s),         // amber
   info: (s) => c(156, 163, 175, s),        // gray
-  in: (s) => c(6, 182, 212, s),            // cyan  — inbound
-  out: (s) => c(251, 191, 36, s),          // yellow — outbound
-  ns: (s) => c(96, 165, 250, s),           // blue — NameServer
-  game: (s) => c(244, 114, 182, s),        // pink — GCAMS/game
-  op: (s) => c(251, 146, 60, s),           // orange — Operation
-  ev: (s) => c(167, 139, 250, s),          // purple — Event
+  in: (s) => c(6, 182, 212, s),            // cyan  -inbound
+  out: (s) => c(251, 191, 36, s),          // yellow -outbound
+  ns: (s) => c(96, 165, 250, s),           // blue -NameServer
+  game: (s) => c(244, 114, 182, s),        // pink -GCAMS/game
+  op: (s) => c(251, 146, 60, s),           // orange -Operation
+  ev: (s) => c(167, 139, 250, s),          // purple -Event
   hex: (s) => c(110, 231, 183, s),
   ascii: (s) => c(156, 163, 175, s),
   dim: (s) => D + s + R,
@@ -133,7 +133,7 @@ function tagForLabel(lbl) {
 }
 
 // ---------------------------------------------------------------------------
-// Decoder — ported from tools/decoder.js (browser-safe, no deps)
+// Decoder -ported from tools/decoder.js (browser-safe, no deps)
 // ---------------------------------------------------------------------------
 const OPERATIONS = {
   255: 'Join', 254: 'Leave', 253: 'RaiseEvent', 252: 'SetProperties',
@@ -379,7 +379,7 @@ function humanSentenceFromMsg(msg){
       const gp=msg.req.params.find(p=>p.keyName==='GameProperties');
       const party=gp && gp.value && gp.value.value && gp.value.value.Party ? gp.value.value.Party.value : null;
       const partyStr=party? 'party yes':'party no';
-      return code ? `Room created: code ${code} — ${partyStr}` : `Room created — ${partyStr}`;
+      return code ? `Room created: code ${code} -${partyStr}` : `Room created -${partyStr}`;
     }
     if(msg.req.opName==='JoinRoom' || msg.req.opName==='JoinRandomRoom'){
       const gp=msg.req.params.find(p=>p.keyName==='GameProperties');
@@ -535,7 +535,7 @@ function summarize(rec, msg) {
 }
 
 // ---------------------------------------------------------------------------
-// Decryptor log — one packet
+// Decryptor log -one packet
 // ---------------------------------------------------------------------------
 let totalIn = 0, totalOut = 0, totalDecoded = 0, totalErr = 0;
 const seenOps = new Map(), seenEvs = new Map();
@@ -571,18 +571,18 @@ function logPacket(rec) {
   if(sentence){
     console.log(`${tStr} ${dirTag} ${lblTag} ${seqStr} ${COL.ok(sentence)}  ${D}${rec.url}${R}`);
   } else if(isUseful){
-    // fallback if humanSentence returned null but isUseful true (e.g. unrealistic curScn) — still show minimal
+    // fallback if humanSentence returned null but isUseful true (e.g. unrealistic curScn) -still show minimal
     const sum = msg ? summarize(rec, msg) : (err ? COL.err(` decode error: ${err}`) : COL.dim(' (empty)'));
     console.log(`${tStr} ${dirTag} ${lblTag} ${seqStr} ${COL.dim(sum)}  ${D}${rec.url}${R}`);
   } else {
-    // Noise — only show when verbose
+    // Noise -only show when verbose
     if(verbose){
       const sum = msg ? summarize(rec, msg) : (err ? COL.err(` decode error: ${err}`) : COL.dim(' (empty)'));
-      console.log(`${tStr} ${dirTag} ${lblTag} ${seqStr} ${COL.dim(sum + ' — noise')}  ${D}${rec.url}${R}`);
+      console.log(`${tStr} ${dirTag} ${lblTag} ${seqStr} ${COL.dim(sum + ' -noise')}  ${D}${rec.url}${R}`);
       if(warnings.length) console.log(`  ${COL.warn('⚠ warnings:')} ${warnings.join('; ')}`);
       if(plainSummaryNeeded(msg) && verbose) logVerboseDetails(msg);
     } else {
-      // silent for noise — only count
+      // silent for noise -only count
       // keep minimal dim line only if useful check wants audit? per spec, noise is silent
     }
   }
@@ -662,13 +662,13 @@ function banner() {
    ${c(124,58,237, '  ██████╗ ██╗  ██╗ ██████╗ ████████╗ ██████╗ ███╗   ██╗')}   ${B}BUILDNOW COMPANION${R}  ${D}decryptor v2.0.0${R}
   ${c(124,58,237, '  ██╔══██╗██║  ██║██╔═══██╗╚══██╔══╝██╔═══██╗████╗  ██║')}   ${COL.info('listening on')} ${B}http://127.0.0.1:${PORT}${R}  ${D}and${R}  ${B}http://localhost:${PORT}${R}
   ${c(124,58,237, '  ██████╔╝███████║██║   ██║   ██║   ██║   ██║██╔██╗ ██║')}   ${D}transports: POST /capture  +  WS /ws${R}
-  ${c(124,58,237, '  ██╔═══╝ ██╔══██║██║   ██║   ██║   ██║   ██║██║╚██╗██║')}   ${COL.dim('zero deps — ANSI colors — GpBinaryV16 decoder — live hexdump')}
+  ${c(124,58,237, '  ██╔═══╝ ██╔══██║██║   ██║   ██║   ██║   ██║██║╚██╗██║')}   ${COL.dim('zero deps -ANSI colors -GpBinaryV16 decoder -live hexdump')}
   ${c(124,58,237, '  ██║     ██║  ██║╚██████╔╝   ██║   ╚██████╔╝██║ ╚████║')}
   ${c(124,58,237, '  ╚═╝     ╚═╝  ╚═╝ ╚═════╝    ╚═╝    ╚═════╝ ╚═╝  ╚═══╝')}   ${COL.ok('CONNECT userscript →')} ${B}companion/buildnow-companion.user.js${R}
   `;
   console.log(art);
   console.log(`${TAG.SYS} ${COL.info('Photon targets:')}  ${c(96,165,250,'ns.exitgames.com:19093')}  ${c(244,114,182,'gcams*.exitgames.com:1909*')}  ${D}app=${'30773790-f9fe-487c-92c2-19517c5c39ad'.slice(0,8)}…${R}`);
-  console.log(`${TAG.SYS} ${COL.info('Tip:')} filter console by ${B}[BNC]${R} in DevTools — every packet is %c-colored on the page too`);
+  console.log(`${TAG.SYS} ${COL.info('Tip:')} filter console by ${B}[BNC]${R} in DevTools -every packet is %c-colored on the page too`);
   console.log(`${TAG.SYS} ${COL.info('Offline:')} ${D}node decryptor.js captures/foo.jsonl${R}  ${D}|${R}  ${D}node decryptor.js --json foo.jsonl > decoded.json${R}`);
   console.log(D + '─'.repeat(88) + R);
 }
@@ -695,7 +695,7 @@ function validateBatch(body) {
 }
 
 // ---------------------------------------------------------------------------
-// Rich Presence — derived from essential packets (for Discord)
+// Rich Presence -derived from essential packets (for Discord)
 // ---------------------------------------------------------------------------
 const SKIN_BASE = 'https://buildnow-api.netlify.app/skins';
 const presence = {
@@ -817,7 +817,7 @@ function updatePresenceFromPacket(rec, msg) {
     }
     if (msg && msg.ev) {
       presence.raw.lastEvent = `${msg.ev.evName}(${msg.ev.evCode})`;
-      if (msg.ev.evCode === 255) { // Join — player joined (real username from 255, not Player X)
+      if (msg.ev.evCode === 255) { // Join -player joined (real username from 255, not Player X)
         presence.status = 'in_game';
         let actorNr = null, name = null, skin = null;
         for (const p of msg.ev.params) {
@@ -896,7 +896,7 @@ function updatePresenceFromPacket(rec, msg) {
                   if (presence.gameMode) { presence.playersCount = 1; if(!presence.players.length) presence.players=[{actorNr:1,name:presence.self.name||'You',kills:0,deaths:0,alive:true}]; }
                   else { presence.playersCount = 0; presence.players = []; }
                 }
-                // playtime: leaving game — win disabled until real victory packet captured (curScn "Victory" or last-alive)
+                // playtime: leaving game -win disabled until real victory packet captured (curScn "Victory" or last-alive)
                 // Previous heuristic (alive → win) caused false wins every lobby return (gm=unknown).
                 if (prev==='in_game' && presence.status==='in_lobby' && playStart) {
                   const secs = Math.floor((Date.now()-playStart.t)/1000);
@@ -910,7 +910,7 @@ function updatePresenceFromPacket(rec, msg) {
                   // else: alive but not victory → no win/defeat (just playtime) to avoid false positives like "WIN gm=unknown"
                   playStart=null;
                 } else if (prev!=='in_game' && presence.status==='in_game' && !playStart) {
-                  // wwzw same as zone wars — track playtime with gm=wwzw
+                  // wwzw same as zone wars -track playtime with gm=wwzw
                   playStart={ gm: presence.gameMode||'unknown', t:Date.now() };
                 }
                 // ensure wwzw also counts as zone wars for status
@@ -973,7 +973,7 @@ function updatePresenceFromPacket(rec, msg) {
       }
       // also catch Data containing Hashtable with kill info
       if (msg.ev.evCode === 101 || msg.ev.evCode === 200) {
-        // generic — presence updated
+        // generic -presence updated
       }
     }
   } catch {}
@@ -994,7 +994,7 @@ function handleBatch(parsed, sock) {
     return { status: 400, body: { error: { code: 'VALIDATION_ERROR', message: v.error, details: v.details } } };
   }
   const isTest = v.records.some(r => String(r.url).includes('self-test'));
-  if (isTest) console.log(`\n${TAG.OK} ${COL.ok('SELF-TEST')} ${D}received ${v.records.length} test frame(s) — transport OK!${R}\n`);
+  if (isTest) console.log(`\n${TAG.OK} ${COL.ok('SELF-TEST')} ${D}received ${v.records.length} test frame(s) -transport OK!${R}\n`);
   for (const r of v.records) {
     if (r.dir === 'in') totalIn++; else totalOut++;
     // full decode + presence update (lightweight)
@@ -1012,7 +1012,7 @@ function handleBatch(parsed, sock) {
     r.decoded = dec;
     r._decoded = msg ? { typeName: msg.typeName, req: msg.req ? { opName: msg.req.opName, opCode: msg.req.opCode } : undefined, ev: msg.ev ? { evName: msg.ev.evName, evCode: msg.ev.evCode } : undefined } : null;
   }
-  // mirror to server :3000 — capture uses session id only, secret stays server-side
+  // mirror to server :3000 -capture uses session id only, secret stays server-side
   try{
     const authId = v.authSessionId || parsed?.authSessionId || null;
     const capToken = authId ? undefined : (v.token || parsed?.token || sessionToken);
@@ -1021,7 +1021,7 @@ function handleBatch(parsed, sock) {
     const u=new URL(target);
     const opts={ method:'POST', hostname:u.hostname, port:u.port, path:u.pathname, headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(payload)} };
     const req=http.request(opts, res=>{ res.on('data',()=>{}); if(res.statusCode!==204) console.log(`${TAG.SYS} mirror ${target} → ${res.statusCode}`); });
-    req.on('error',(e)=>{ console.log(`${TAG.ERR} mirror ${target} failed ${e.message} — is app/dev.js :3000 running?`); });
+    req.on('error',(e)=>{ console.log(`${TAG.ERR} mirror ${target} failed ${e.message} -is app/dev.js :3000 running?`); });
     req.write(payload); req.end();
   }catch(e){ console.log(`${TAG.ERR} mirror exception ${e.message}`); }
   try {
@@ -1198,7 +1198,7 @@ function handleWsUpgrade(req,res){
   res.end();
   const sock=req.socket;
   try { sock.setKeepAlive(true, 30000); sock.setNoDelay(true); sock.setTimeout(0); } catch {}
-  console.log(`\n${TAG.OK} ${COL.ok('WS CONNECT')} ${D}${req.url}${R}  from ${sock.remoteAddress}:${sock.remotePort}  origin=${origin} host=${host}  — streaming (PNA header sent)…\n`);
+  console.log(`\n${TAG.OK} ${COL.ok('WS CONNECT')} ${D}${req.url}${R}  from ${sock.remoteAddress}:${sock.remotePort}  origin=${origin} host=${host}  -streaming (PNA header sent)…\n`);
   let acc=Buffer.alloc(0);
   sock.on('data', ch=>{
     acc=Buffer.concat([acc,ch]);
@@ -1220,7 +1220,7 @@ function handleWsUpgrade(req,res){
 }
 
 server.on('error', err=>{
-  if(err.code==='EADDRINUSE'){ console.error(`${TAG.ERR} port ${PORT} in use — stop other decryptor or:  PHOTON_SNIFFER_PORT=8766 node decryptor.js`); }
+  if(err.code==='EADDRINUSE'){ console.error(`${TAG.ERR} port ${PORT} in use -stop other decryptor or:  PHOTON_SNIFFER_PORT=8766 node decryptor.js`); }
   else console.error(`${TAG.ERR} server error: ${err.message}`);
   process.exitCode=1;
 });
@@ -1243,8 +1243,8 @@ server.headersTimeout = 31000;
 server.listen(PORT, '127.0.0.1', ()=>{
   console.log(`${TAG.OK} ${COL.ok('READY')}  http://127.0.0.1:${PORT}/capture  (POST)   ws://127.0.0.1:${PORT}/ws  (WS)   http://localhost:${PORT}/status`);
   console.log(`${TAG.SYS} captures also appended to ${path.relative(process.cwd(), CAPTURES_DIR)}/<sessionId>.jsonl`);
-  console.log(`${TAG.SYS} ${COL.info('WS PNA:')} server sends ${B}Access-Control-Allow-Private-Network: true${R} — if browser blocks ws:// from https, GM_xhr fallback will still deliver`);
+  console.log(`${TAG.SYS} ${COL.info('WS PNA:')} server sends ${B}Access-Control-Allow-Private-Network: true${R} -if browser blocks ws:// from https, GM_xhr fallback will still deliver`);
   console.log(`${D}waiting for Tampermonkey frames…  open the game and watch packets fly ✈  (test: __PHOTON_SNIFFER__.test() or curl POST)${R}\n`);
 });
-process.on('SIGINT', ()=>{ console.log(`\n${TAG.SYS} shutting down — in ${totalIn} out ${totalOut} decoded ${totalDecoded} err ${totalErr}`); server.close(()=>process.exit(0)); setTimeout(()=>process.exit(0),1500).unref(); });
+process.on('SIGINT', ()=>{ console.log(`\n${TAG.SYS} shutting down -in ${totalIn} out ${totalOut} decoded ${totalDecoded} err ${totalErr}`); server.close(()=>process.exit(0)); setTimeout(()=>process.exit(0),1500).unref(); });
 process.on('SIGTERM', ()=>{ server.close(()=>process.exit(0)); setTimeout(()=>process.exit(0),1500).unref(); });

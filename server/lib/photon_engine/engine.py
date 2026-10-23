@@ -71,7 +71,7 @@ def _op_has_alv(gpb) -> bool:
 
 
 def _touch_player(p, now: float | None = None) -> None:
-    """Stamp a player as seen — the crash signal.
+    """Stamp a player as seen -the crash signal.
 
     Anything a packet proves about a player (their props, a killfeed line, a
     join) refreshes `last_seen_at`. A player who stops sending (crash) keeps a
@@ -120,7 +120,7 @@ def _clean_username(raw) -> str:
     The game wraps names in tags (e.g. '<color=black>Nryx!hhhj') in some
     props; storing them raw leaks tags into game_username, player lists and
     the actor map. Falls back to the original when stripping empties it, and
-    leaves innocent '<' content ('jesus loves u <3') untouched — the stripper
+    leaves innocent '<' content ('jesus loves u <3') untouched -the stripper
     has no generic <...> fallback on purpose. Never raises.
     """
     try:
@@ -140,7 +140,7 @@ def _apply_roster_pt(room, actor_nr, uname, pt_raw) -> bool:
     """Fill a missing team id from roster data (ActorList + PlayerProperties).
 
     Late joiners receive the full roster including teams, while the targeted
-    _pt broadcasts from before capture began are missed forever — without this
+    _pt broadcasts from before capture began are missed forever -without this
     their duo teams stay unknown and every death records immediately instead
     of deferring to the surviving teammate. Actor key first, then username
     match, else stash in pending_pt for a later JOIN. Never overwrites a live
@@ -210,8 +210,8 @@ def _pending_ts(stored) -> float:
 def _scrub_stale_lobby(room, max_age_s: float = 120) -> bool:
     """Clear gm/short_code on a STALE lobby pseudo-room. Returns True if cleared.
 
-    A fresh lobby is live play — a game running in the lobby bucket because
-    its CreateRoom response was lost in a reconnect — and its mode/code are
+    A fresh lobby is live play -a game running in the lobby bucket because
+    its CreateRoom response was lost in a reconnect -and its mode/code are
     live truth that must survive (scene repair sets them; per-packet
     scrubbing would erase them before presence/processor ever read them).
     A stale lobby is a restored snapshot or dead bucket: scrub it so old
@@ -246,7 +246,7 @@ def _match_log_fields(room, **extra) -> dict:
     """Field set for one MATCH stream line (START / END / new_version).
 
     Room, party code, mode and version are the four things every consumer of
-    a match boundary needs (wager seals, ranked seals, duel scoring) — they
+    a match boundary needs (wager seals, ranked seals, duel scoring) -they
     must be on the same line, not spread across packet dumps. The verb itself
     is passed separately to log_match (it becomes the JSON `action`). Never
     raises.
@@ -267,7 +267,7 @@ def _match_log_fields(room, **extra) -> dict:
 def _stg_starts_new_life(stg, last_stg) -> bool:
     """True only on a fresh stG=1 (match start) arrival.
 
-    Per-life death/defeat flags reset here — NOT at the stG=3 version bump
+    Per-life death/defeat flags reset here -NOT at the stG=3 version bump
     (match end), where resetting wipes the just-ended match's guards and the
     drain re-records its death+defeat (double defeat). Edge-triggered so
     mid-match stG=1 repeats can't wipe a life mid-flight.
@@ -282,7 +282,7 @@ def _stg_bumps_version(stg, last_stg, armed) -> bool:
     """True only on a fresh stG=3 enter with a live one-shot arm.
 
     The arm is consumed by the bump and re-armed at each stG=1 (or match
-    entry), so a 3->2->3 flap can't bump twice — the second bump would seal
+    entry), so a 3->2->3 flap can't bump twice -the second bump would seal
     an empty version (missed toasts/awards). Timer ticks through 3
     (last_stg == 3) never bump. Never raises.
     """
@@ -300,12 +300,12 @@ def _stg_bumps_version(stg, last_stg, armed) -> bool:
 
 def room_enter_on_combat(room, view, session_id, killer, victim, game_mode=None) -> bool:
     """First combat in a LOBBY-state real room means the match is live even
-    though no scene packet ever arrived (Create/Join carry no curScn) — enter
+    though no scene packet ever arrived (Create/Join carry no curScn) -enter
     MATCH so drains, drawer, and playtime stop starving in lobby forever.
 
     Deliberately light and idempotent: flips state + adopts a concrete gm +
     syncs playtime clocks. No roster/map/kill wipe and no flag/marker touches
-    (those stay on the stG/rejoin/revive/scene paths — wiping the actor map
+    (those stay on the stG/rejoin/revive/scene paths -wiping the actor map
     built from lobby joins would break attribution for the rest of the
     match). Skips the lobby pseudo-room and tag-garbage names. Never raises.
     """
@@ -363,7 +363,7 @@ def _last_live_room(view, now_s: float, max_age_s: float = 180):
     """Most recently active real room, for re-homing lobby-bound stG packets.
 
     After a death-leave the session's current room is the lobby pseudo-room,
-    so room-less match markers (stG) would arm lobby — where the version never
+    so room-less match markers (stG) would arm lobby -where the version never
     bumps and the win drain always skips. The client sending stG means a match
     is live on screen, so hand it to the room that was active most recently.
 
@@ -406,7 +406,7 @@ def _last_live_room(view, now_s: float, max_age_s: float = 180):
 def _resolve_alv_subject(room, player_name, gpb, actor_nr):
     """Return (name|None, actor|None) for a nameless alv packet.
     TargetActorNr (the subject) wins over sender ActorNr (often the room
-    master, not the subject) — sender-first resolution misattributed
+    master, not the subject) -sender-first resolution misattributed
     teammate deaths to whoever the sender mapped to. Falls back to the
     sender map only when the target is unknown, preserving old behavior
     (including keeping the sender actor) for that case.
@@ -443,7 +443,7 @@ def _resolve_alv_subject(room, player_name, gpb, actor_nr):
 
 def _resolve_actor(room, nr: int | None) -> str | None:
     """Resolve actorNr -> player username via actor_map, room.players key, or player.actor_nr.
-    Actor 0 = room-level properties (curScn/stG/pID), never a player — returns "room".
+    Actor 0 = room-level properties (curScn/stG/pID), never a player -returns "room".
 
     Two self-healing rules keep late joiners resolvable:
     1. Map repair: a player whose actor_nr matches re-links a pruned map entry
@@ -451,7 +451,7 @@ def _resolve_actor(room, nr: int | None) -> str | None:
     2. Single-unknown backfill: players learned from killfeed ("existing"
        joins arrive without props) carry actor_nr -1. When exactly one such
        player exists, an unmapped number must be theirs (numbers are unique
-       per room). Ambiguous otherwise — returns None.
+       per room). Ambiguous otherwise -returns None.
     """
     if nr is None:
         return None
@@ -470,7 +470,7 @@ def _resolve_actor(room, nr: int | None) -> str | None:
         if nr_int is not None and nr_int in room.actor_map:
             return str(room.actor_map[nr_int])
         # NOTE: room.players dict keys are opaque slot ids (actor-or-bumped-
-        # key), NOT actor numbers — never resolve nr via dict key (that
+        # key), NOT actor numbers -never resolve nr via dict key (that
         # misattributed teammate alvs to whoever sat in the numbered slot).
         for p in room.players.values():
             try:
@@ -500,7 +500,7 @@ def _resolve_actor(room, nr: int | None) -> str | None:
 def _find_player(room, actor=None, target=None, name=None):
     """Resolve (key, player): TargetActorNr subject first, then sender ActorNr, then name.
     _pt/skin packets address the subject ONLY via TargetActorNr (actor is the room
-    master), so target must win. Actor 0 = room-level, never a player — skipped.
+    master), so target must win. Actor 0 = room-level, never a player -skipped.
     Dict keys are opaque slot ids, never actor numbers: match the Player.actor_nr
     field (or the actor_map name), never the dict key."""
     for nr in (target, actor):
@@ -534,7 +534,7 @@ def _find_player(room, actor=None, target=None, name=None):
     return None, None
 
 def _is_valid_pid(v: str | None) -> str | None:
-    """Validate 5-char private join code (e.g. PBS05) — rejects ghost 'n'."""
+    """Validate 5-char private join code (e.g. PBS05) -rejects ghost 'n'."""
     if not v:
         return None
     s = str(v).strip()
@@ -548,7 +548,7 @@ def _is_valid_pid(v: str | None) -> str | None:
 
 @dataclass
 class EnginePacket:
-    """Engine-native packet — no photon_api dependency. Built from gpb directly."""
+    """Engine-native packet -no photon_api dependency. Built from gpb directly."""
 
     raw_hex: str = ""
     raw: dict[str, Any] | None = None
@@ -564,7 +564,7 @@ class EnginePacket:
     is_kill: bool = False
     is_knock: bool = False
     is_echo: bool = False  # killfeed parsed from OUTBOUND RaiseEvent (client echo of what
-                           # the server rebroadcasts) — never counted, broadcast is authoritative
+                           # the server rebroadcasts) -never counted, broadcast is authoritative
     is_join: bool = False
     is_leave: bool = False
     is_eliminated: bool = False
@@ -575,8 +575,8 @@ class EnginePacket:
     short_code: str | None = None
     match_version: int | None = None
     room_gm: str | None = None
-    actor_nr: int | None = None       # sender actor (params.ActorNr) — original value
-    target_actor_nr: int | None = None  # subject actor (params.TargetActorNr) — original value
+    actor_nr: int | None = None       # sender actor (params.ActorNr) -original value
+    target_actor_nr: int | None = None  # subject actor (params.TargetActorNr) -original value
     dir: str | None = None            # capture direction: "out" = own client sent it
 
     def to_dict(self) -> dict:
@@ -624,7 +624,7 @@ class Engine:
     
     Holds many SessionViews, each keyed by session_id.
     Feed it hex, it mutates that session's Player/Room/Party/Zone live.
-    No DB writes, no win math — you decide.
+    No DB writes, no win math -you decide.
     """
 
     def __init__(self):
@@ -633,7 +633,7 @@ class Engine:
         self._pending_gm: dict[str, tuple] = {}  # session_id -> (gm, source_op, ts);
         # gm stashed from a room-less op (JoinRandomRoom filter, or an
         # explicit CreateRoom mode incl. DF) for the next real room. DF is
-        # only ever stashed from CreateRoom — everywhere else it is the
+        # only ever stashed from CreateRoom -everywhere else it is the
         # client default placeholder and must not pollute the next room.
         # Timestamped: reconnect batches routinely flush out of order, so a
         # late/duplicate stash must expire instead of stamping a later room.
@@ -647,7 +647,7 @@ class Engine:
         """Adopt session identity from an outbound killfeed echo. Unit-tested.
 
         An OUTBOUND RaiseEvent carrying killfeed text is, by definition, this
-        client's own traffic — when view.me never resolved (join props arrived
+        client's own traffic -when view.me never resolved (join props arrived
         without a 255 username), the killer named here is us. Adopts ONLY when
         me is currently None (never overwrites), leaves usernameChangeCount
         alone so a later real join still corrects the name via the first-join
@@ -769,7 +769,7 @@ class Engine:
     def _heal_ghost_room(self, view, session_id: str, now: float | None = None) -> bool:
         """Park a silent MATCH room back to lobby. Unit-tested.
 
-        A MATCH exit normally needs auth or leave_self — but leave_self
+        A MATCH exit normally needs auth or leave_self -but leave_self
         requires resolving to me, so a null-identity session (or a missed
         leave op) freezes the drawer, presence and room tag on a dead match
         forever. A live match always has packet traffic well inside 90s
@@ -841,7 +841,7 @@ class Engine:
                 # still advance, or the processor `match_version > 0` gate
                 # blocks the drain forever. The lobby pseudo-room never bumps.
                 if str(getattr(room, "room_id", "") or "") != "lobby":
-                    # bump version for next match — Processor checks stG==3 to calculate win/defeat
+                    # bump version for next match -Processor checks stG==3 to calculate win/defeat
                     # (per-life flags are left untouched: the ended match's
                     # drain still needs them; they reset on next stG=1)
                     room.match_version += 1
@@ -866,13 +866,13 @@ class Engine:
                 except Exception:
                     pass
                 return False
-            # else: timer ticking down through 3 — leave flag untouched
+            # else: timer ticking down through 3 -leave flag untouched
             return False
         except Exception:
             return False
 
     def feed(self, session_id: str, hex_string: str, direction: str | None = None) -> EnginePacket:
-        """Feed one hex packet for a session — decrypts, updates SessionView/RoomView, returns EnginePacket.
+        """Feed one hex packet for a session -decrypts, updates SessionView/RoomView, returns EnginePacket.
 
         Rooms are scoped: CreateRoom/JoinRoom/JoinRandomRoom with RoomName creates a new RoomView;
         all subsequent JOIN/LEAVE/ALIVE/KILL/zone/state events are scoped to that room.
@@ -939,11 +939,11 @@ class Engine:
                     log_engine("room", session_id[:13], action="switched", room=room_id[:8])
                 # The lobby pseudo-room is not a real room: scrub it only when
                 # STALE (restored snapshot / dead bucket leaking gm=zw_lg into
-                # lobby fallbacks). A fresh lobby is live play — a game running
+                # lobby fallbacks). A fresh lobby is live play -a game running
                 # in the lobby bucket because its CreateRoom response was lost
-                # in a reconnect — and scrubbing it per-packet would erase the
+                # in a reconnect -and scrubbing it per-packet would erase the
                 # mode scene repair just set. Matchmaking mm-* rooms stay
-                # codeless unconditionally (ranked/comp are code-gated — a code
+                # codeless unconditionally (ranked/comp are code-gated -a code
                 # here false-binds pubs to ranked).
                 try:
                     _ret = view.rooms[room_id]
@@ -955,9 +955,9 @@ class Engine:
                 except Exception:
                     pass
                 return view.rooms[room_id]
-            # no room_id — strict: route to current MATCH room if exists, else current, else lobby
+            # no room_id -strict: route to current MATCH room if exists, else current, else lobby
             # this stops killfeeds (no RoomName) from landing in a throwaway lobby room
-            # when user is in-game — fixes gm:null / room:lobby bug
+            # when user is in-game -fixes gm:null / room:lobby bug
             cur = view.rooms.get(view.current_room_id) if view.current_room_id else None
             if cur and cur.state == State.MATCH:
                 return cur
@@ -971,7 +971,7 @@ class Engine:
             # after a death-leave current==lobby, so stG=3 would arm lobby (its
             # version never bumps, the drain always skips it) and the win is
             # silently lost while the drawer flaps lobby->match on the next
-            # kill. Re-home to the last live match room instead — wins drain
+            # kill. Re-home to the last live match room instead -wins drain
             # regardless of lobby/match state; leaver/death guards downstream
             # still deny false wins. Only stG is re-homed (kills already count
             # from anywhere; alv/scene keep their routing for defeat semantics).
@@ -1023,7 +1023,7 @@ class Engine:
                 room_name = None
 
         is_first_join = gpb and gpb.get("opName") in ("CreateRoom", "JoinRoom", "JoinRandomRoom")
-        # Prefer packet's room_id (e.g., 5c02c34a...) for curScn/zone packets which have no RoomName — fixes scene detection
+        # Prefer packet's room_id (e.g., 5c02c34a...) for curScn/zone packets which have no RoomName -fixes scene detection
         pkt_room_hint = getattr(packet, "room_id", None) or getattr(packet, "room_code", None)
         if not pkt_room_hint and packet.raw and isinstance(packet.raw, dict):
             try:
@@ -1035,7 +1035,7 @@ class Engine:
         # the server picks the room. Without this, every packet of a
         # matchmaking match lands in the lobby pseudo-room, where wins can
         # never drain (lobby is always skipped) while kills/deaths/defeats
-        # record fine — the "wins stuck, everything else works" symptom.
+        # record fine -the "wins stuck, everything else works" symptom.
         # Open one stable per-session matchmaking room instead; stG versions
         # still separate matches, and the lack of short_code keeps ranked +
         # comp (both code-gated) away from it.
@@ -1059,7 +1059,7 @@ class Engine:
 
         # Created-by-me marker: CreateRoom is client→server only, so any such
         # op in our feed is our own creation (vs Join* into others' rooms).
-        # Drives the ranked auto-tag — never tag a room we merely joined.
+        # Drives the ranked auto-tag -never tag a room we merely joined.
         # Guarded to a real named room so a nameless packet can never mark
         # the lobby pseudo-room (or a routed-to MATCH room) by accident.
         try:
@@ -1077,7 +1077,7 @@ class Engine:
         except Exception:
             pass
 
-        # Playtime tick — account elapsed since last packet (session + per-room)
+        # Playtime tick -account elapsed since last packet (session + per-room)
         import time as _t
         now = _t.time()
         try:
@@ -1136,16 +1136,16 @@ class Engine:
         actor_name = _resolve_actor(room, actor_nr)
         target_name = _resolve_actor(room, target_actor_nr)
         # Stamp ORIGINAL actor numbers on the packet for the processor (the locals
-        # may be reassigned below, e.g. alv TargetActorNr routing — processor re-resolves)
+        # may be reassigned below, e.g. alv TargetActorNr routing -processor re-resolves)
         packet.actor_nr = actor_nr
         packet.target_actor_nr = target_actor_nr
         # Log actorNr + TargetActorNr for every packet with gpb (debug actor routing)
-        # Target shown only when present (Join has actor only — no target to misuse)
+        # Target shown only when present (Join has actor only -no target to misuse)
         if gpb and (actor_nr is not None or target_actor_nr is not None):
             tgt_part = f" targetActorNr={target_actor_nr} ({target_name})" if target_actor_nr is not None else ""
             log_engine("actor", session_id[:13], msg=f"actorNr={actor_nr} ({actor_name}){tgt_part} ev={gpb.get('evName')}/{gpb.get('opName')} type={packet.packet_type.value} room={room.room_id[:8]}", room=room.room_id[:8], actor=actor_nr, actor_name=actor_name, target=target_actor_nr, target_name=target_name)
 
-        # Log PropertiesChanged packets (evCode 253) — key events for debugging
+        # Log PropertiesChanged packets (evCode 253) -key events for debugging
         if gpb and gpb.get("evName") == "PropertiesChanged":
             props = gpb.get("properties", {})
             actor_str = f" actor={actor_nr} ({actor_name}) target={target_actor_nr} ({target_name})"
@@ -1182,7 +1182,7 @@ class Engine:
             return skid, pid, pfid, pt
 
         def _rebuild_teams(_room):
-            # Group players by pt for duo modes (wwzw/BF2V2/DF duo) — _pt ties to actorNr/TargetActorNr
+            # Group players by pt for duo modes (wwzw/BF2V2/DF duo) -_pt ties to actorNr/TargetActorNr
             try:
                 grouped: dict[str, list[str]] = {}
                 for pl in _room.players.values():
@@ -1208,7 +1208,7 @@ class Engine:
             new_name = _clean_username(gpb["playerProps"].get("255"))
             new_gid = gpb["playerProps"].get("pfid")
 
-        # First join for this session — set up me (session-scoped)
+        # First join for this session -set up me (session-scoped)
         if is_first_join and new_name and (view.usernameChangeCount or 0) == 0:
             if view.me and str(new_name) != str(view.me.username):
                 log_engine("name_change", session_id[:13], old=view.me.username, new=new_name)
@@ -1233,7 +1233,7 @@ class Engine:
                 _pt_first = gpb["playerProps"].get("_pt") or gpb["playerProps"].get("pt")
                 if _pt_first:
                     view.me.pt = str(_pt_first)
-            # Seed players_count — only for JoinRandomRoom (public), not CreateRoom (private)
+            # Seed players_count -only for JoinRandomRoom (public), not CreateRoom (private)
             is_random = gpb.get("opName") == "JoinRandomRoom"
             max_p = None
             if is_random and gpb.get("params", {}).get("GameProperties"):
@@ -1262,7 +1262,7 @@ class Engine:
             room.players[me_key] = view.me
             room.me = view.me  # per-room me
             log_engine("join", session_id[:13], name=new_name, skin=view.me.skin, gm=packet.game_mode.value if packet.game_mode else "?", max=room.max_players, count=room.players_count, room=room.room_id[:8])
-            # Fill blank gm only (None/UNKNOWN) — DF is the client default placeholder
+            # Fill blank gm only (None/UNKNOWN) -DF is the client default placeholder
             # and must not lock the room; scene packets repair it via adopt_game_mode.
             # Lobby pseudo-room excluded: it is not a match and must stay gm=None.
             if packet.game_mode and room.game_mode in (None, GameMode.UNKNOWN) and str(getattr(room, "room_id", "") or "") != "lobby":
@@ -1274,12 +1274,12 @@ class Engine:
             _op = str((gpb.get("opName") if isinstance(gpb, dict) else "") or "")
         except Exception:
             _op = ""
-        # Party — from ANY room join carrying Party info, not just the session's
+        # Party -from ANY room join carrying Party info, not just the session's
         # first join: a player joining a friend's party mid-session must still get
         # the flag (drawer "In Party" depends on it). RoomName-gated so room-less
         # matchmaking packets can never clear/set the current room's flag.
         # CreateRoom requests carry Party but no RoomName (the response births
-        # the room without Party) — stash it so the born room still gets the
+        # the room without Party) -stash it so the born room still gets the
         # flag instead of reading as a pub in presence Context.
         if is_first_join and room_name:
             try:
@@ -1314,7 +1314,7 @@ class Engine:
             except Exception:
                 pass
 
-        # pID — 5-char code players type to join private room (validated len==5) — handles any packet, not just first join
+        # pID -5-char code players type to join private room (validated len==5) -handles any packet, not just first join
         # e.g. JoinRandomRoom with pID DBSXH but no RoomName → pending, next JoinRoom with RoomName 004784f4 → assign
         try:
             pID_val2 = None
@@ -1333,7 +1333,7 @@ class Engine:
             # code on it would serve a ghost BLOCK (v=0, no warnings) while
             # the player sits in MainLobby matchmaking. Matchmaking mm-*
             # rooms are likewise codeless by design (ranked + comp are both
-            # code-gated) — a stale pending pID must never bind a pub.
+            # code-gated) -a stale pending pID must never bind a pub.
             _is_mm_room = str(getattr(room, "room_id", "") or "").startswith("mm-")
             if valid2 and not room.short_code and room.room_id != "lobby" and not _is_mm_room:
                 room.short_code = valid2
@@ -1347,7 +1347,7 @@ class Engine:
                 log_engine("debug", session_id[:13], msg=f"pending pID {valid2} for next room", room=room.room_id[:8])
             elif room_name and str(room_name).startswith("mm-") and session_id in self._pending_pid:
                 # Matchmaking rooms stay codeless: a code pending while
-                # entering matchmaking predates it — drop, never inherit.
+                # entering matchmaking predates it -drop, never inherit.
                 try:
                     _dropped, _ = self._pending_pid.pop(session_id, (None, 0.0))
                     log_engine("debug", session_id[:13], msg=f"pending pID {_dropped} dropped for matchmaking room", room=room.room_id[:8])
@@ -1369,7 +1369,7 @@ class Engine:
             # mix, public zw_lg -> JoinRoom flow; a synthetic mm-* room_name
             # counts as "no real room" so the following real JoinRoom (gm=?)
             # can inherit it) and explicit CreateRoom modes. Only concrete
-            # modes are stashed — EXCEPT CreateRoom, whose gm is authoritative
+            # modes are stashed -EXCEPT CreateRoom, whose gm is authoritative
             # (the room the user just configured, DF included): it must survive
             # the request→response hop, whose response carries no GameProperties.
             # DF from anywhere else stays a placeholder and is never stashed.
@@ -1385,7 +1385,7 @@ class Engine:
             elif room_name and not _is_mm_name and room.game_mode in (None, GameMode.UNKNOWN) and session_id in self._pending_gm:
                 # Private creations start fresh: a stale matchmaking gm (e.g.
                 # zw_lg from the previous public match) must not stamp a new
-                # private room — except the room's OWN CreateRoom request,
+                # private room -except the room's OWN CreateRoom request,
                 # stashed seconds earlier on the request→response hop.
                 if _op == "CreateRoom":
                     _stored = self._pending_gm.pop(session_id, None)
@@ -1413,7 +1413,7 @@ class Engine:
                         except Exception:
                             pass
             # Retro-fill: CreateRoom requests routinely arrive AFTER their
-            # response (reconnect batches flush out of order — responses birth
+            # response (reconnect batches flush out of order -responses birth
             # blank rooms, requests land seconds later). Heal the young blank
             # room the earlier response already born with this request's
             # gm/pID/Party instead of leaving it modeless/codeless.
@@ -1425,8 +1425,8 @@ class Engine:
         except Exception:
             pass
 
-        # gv — game variant (solo/duo/...) from Create/Join GameProperties.
-        # Duo modes (duo DF, duo zw_lg) have gv != "solo" — team logic flows via _pt teams.
+        # gv -game variant (solo/duo/...) from Create/Join GameProperties.
+        # Duo modes (duo DF, duo zw_lg) have gv != "solo" -team logic flows via _pt teams.
         # Unknown modes (v-arena, red-vs-blue, boxfight, realistic-1v1): play each once and
         # read the discover line below (gm/gv/max/curScn) to wire up their IDs.
         try:
@@ -1467,7 +1467,7 @@ class Engine:
         except Exception:
             pass
 
-        # Build actor_map from ActorList + PlayerProperties (for alv without 255) — contract: RoomView.actor_map
+        # Build actor_map from ActorList + PlayerProperties (for alv without 255) -contract: RoomView.actor_map
         try:
             # ActorList may be in params (unwrapped) or raw resp
             actor_list = None
@@ -1498,7 +1498,7 @@ class Engine:
                             pp = _uw_pp(p["value"])
                             break
                 # Flat single-player props (Join 255): {'255': name, ...} with scalar
-                # values — this is the JOINER's own props, not an actorNr->props map.
+                # values -this is the JOINER's own props, not an actorNr->props map.
                 # Map this packet's actor directly instead of misreading it as a map.
                 if isinstance(pp, dict) and isinstance(pp.get("255"), str):
                     if actor_nr is not None:
@@ -1521,7 +1521,7 @@ class Engine:
                 added: list = []
                 missing: list = []
                 if pp_norm is None:
-                    actor_list = []  # flat single-player props handled above — nothing to map
+                    actor_list = []  # flat single-player props handled above -nothing to map
                 for a in actor_list:
                     try:
                         # actor_list items may be {"value":2} or int
@@ -1539,7 +1539,7 @@ class Engine:
                             room.actor_map[actor_nr] = uname
                             added.append((actor_nr, uname))
                             # Harvest _pt for teams (late joiners get the full roster
-                            # incl. teams — targeted broadcasts from before capture
+                            # incl. teams -targeted broadcasts from before capture
                             # began are otherwise missed forever, see _apply_roster_pt)
                             try:
                                 _pte = entry.get("_pt", entry.get("pt")) if isinstance(entry, dict) else None
@@ -1571,7 +1571,7 @@ class Engine:
             except Exception:
                 pass
 
-        # GM is locked by FSM on MATCH enter only — do not set here (prevents flicker)
+        # GM is locked by FSM on MATCH enter only -do not set here (prevents flicker)
         # pending_gm plumbing still applies below for JoinRandomRoom without RoomName
 
         # ---- LEAVE attribution: ev 254 carries ActorNr, rarely 255 ----
@@ -1623,8 +1623,8 @@ class Engine:
                     # FRESH lobby is live play in the lobby bucket (its
                     # CreateRoom response was lost in a reconnect) and its
                     # scene repair runs like any real room. from_curscn never
-                    # guesses — MainLobby/Game without a concrete hint map to
-                    # None — so menu scenes can't re-poison it, while MainWorld
+                    # guesses -MainLobby/Game without a concrete hint map to
+                    # None -so menu scenes can't re-poison it, while MainWorld
                     # heals the DF the FSM just locked (previously erased on
                     # this very packet, leaving lobby games permanently "—").
                     if str(getattr(room, "room_id", "") or "") == "lobby":
@@ -1646,20 +1646,20 @@ class Engine:
         except Exception as e:
             log_engine("debug", session_id[:13], msg=f"fsm error {e}", room=room.room_id[:8])
 
-        # Zone (room-scoped) — hard 4:59 (299) for zw_lg/wwzw, stG is match marker not zone
+        # Zone (room-scoped) -hard 4:59 (299) for zw_lg/wwzw, stG is match marker not zone
         def _valid_zone_time(v):
             try:
                 iv = int(float(v))
                 return iv if 0 <= iv <= 600 else None
             except Exception:
                 return None
-        # stG handling — match start/end marker (1=start, 3=end), NOT zone timer.
+        # stG handling -match start/end marker (1=start, 3=end), NOT zone timer.
         # Timer-flavored stG (e.g. 30s countdowns) also passes here: only a 3 arriving
         # from below (None/0/1/2) counts as phase end. A 3 ticking down from above (4->3)
         # is a timer and must not bump versions or arm wins. Must run before zone handling.
         # Edge-triggered: once armed, the flag stays until the processor drain consumes
         # it (win/defeat written) or a new match begins. It is NOT cleared when stG
-        # moves to 2/1 — a batch containing [3,2] must still drain the phase end,
+        # moves to 2/1 -a batch containing [3,2] must still drain the phase end,
         # otherwise wins/defeats are silently missed.
         _STG_PHASE_MODES = (GameMode.ZW_LG, GameMode.ZW, GameMode.WWZW, GameMode.WW, GameMode.BF2V2, GameMode.BF, GameMode.VA, GameMode.RVB, GameMode.R1V1)
         is_stg_packet = gpb and gpb.get("properties") and "stG" in gpb["properties"]
@@ -1669,7 +1669,7 @@ class Engine:
                 # Log every stG change (match progress 1→2→3) like KILL lines
                 if stg != room.last_stg:
                     log_engine("stg", session_id[:13], stg=stg, gm=room.game_mode.value if room.game_mode else None, room=room.room_id[:8])
-                # MATCH START / MATCH END — the two boundaries every scoring
+                # MATCH START / MATCH END -the two boundaries every scoring
                 # consumer keys on (wager seals, ranked, phase drains). Logged
                 # loudly and once per transition so a missing match is
                 # diagnosable straight from the console.
@@ -1717,7 +1717,7 @@ class Engine:
                         room.stg3_armed = True
                     except Exception:
                         pass
-                # stG=3: match end marker — Processor handles win/defeat calculation.
+                # stG=3: match end marker -Processor handles win/defeat calculation.
                 # Repair a missing gm from pending first: public JoinRoom rooms
                 # (gm=?) would otherwise ignore stG=3 entirely and lose the win.
                 if stg == 3 and room.last_stg != 3 and room.game_mode is None:
@@ -1735,7 +1735,7 @@ class Engine:
                 room.last_stg = stg
             except Exception:
                 pass
-        # Zone timer — only from bz_* (not stG) for zw_lg/wwzw, hard 4:59
+        # Zone timer -only from bz_* (not stG) for zw_lg/wwzw, hard 4:59
         # So packet.zone_time that came from stG should be ignored for zw_lg
         is_zone_packet = gpb and gpb.get("properties") and any(k in gpb["properties"] for k in ("bz_phase_start", "bz_zone", "bz_phase", "bz_pattern", "bz_enabled"))
         # Skip stG as zone for zw_lg/wwzw
@@ -1773,7 +1773,7 @@ class Engine:
                 room.zone.set_time(room.zone.time, str(props.get("bz_zone") or props.get("bz_phase")))
             if "bz_pattern" in props:
                 room.zone.pattern = str(props["bz_pattern"])
-            # pID update for existing room (private join code) — validated len==5.
+            # pID update for existing room (private join code) -validated len==5.
             # Lobby pseudo-room excluded (see above: ghost BLOCK otherwise).
             if "pID" in props and not room.short_code and room.room_id != "lobby":
                 valid = _is_valid_pid(props["pID"])
@@ -1782,7 +1782,7 @@ class Engine:
                     log_engine("room", session_id[:13], action="pID", code=room.short_code, room=room.room_id[:8])
                 elif props["pID"]:
                     log_engine("debug", session_id[:13], msg=f"pID ghost ignored {props['pID']!r}", room=room.room_id[:8])
-        # pID from GameProperties (CreateRoom with pID PBS05) — validated.
+        # pID from GameProperties (CreateRoom with pID PBS05) -validated.
         # Lobby pseudo-room excluded (see above).
         if not room.short_code and room.room_id != "lobby" and gpb and gpb.get("params", {}).get("GameProperties"):
             try:
@@ -1799,7 +1799,7 @@ class Engine:
             except Exception:
                 pass
 
-        # zone bookend wins disabled per user — only stG==3 for wins/defeats
+        # zone bookend wins disabled per user -only stG==3 for wins/defeats
         if room.state == State.LOBBY:
             room.zone_match_active = False
             room.last_zone_hex = None
@@ -1887,7 +1887,7 @@ class Engine:
                         pt = room.pending_pt.pop(key)
                         log_engine("team_pt", session_id[:13], team=pt, target=key, player=join_name, via="pending apply on join", room=room.room_id[:8])
                     room.players[key] = Player(
-                        # dict key may be bumped on collision — the actor_nr
+                        # dict key may be bumped on collision -the actor_nr
                         # field must stay the REAL number (or -1), never the
                         # slot key, or later actor lookups hit the wrong row.
                         actor_nr=int(p_actor) if p_actor is not None else -1,
@@ -1901,7 +1901,7 @@ class Engine:
                         late_join=(room.state == State.MATCH),
                     )
                     if pt: _rebuild_teams(room)
-                    # Increment count for private rooms (CreateRoom) — for random rooms count is seeded from max, don't increment
+                    # Increment count for private rooms (CreateRoom) -for random rooms count is seeded from max, don't increment
                     if room.max_players is None or room.players_count < room.max_players or gpb.get("opName") == "CreateRoom":
                         room.players_count += 1
                     log_engine("join", session_id[:13], name=join_name, status="new", count=room.players_count, room=room.room_id[:8])
@@ -1909,7 +1909,7 @@ class Engine:
             if not packet.player_name and join_name:
                 log_engine("debug", session_id[:13], msg=f"JOIN fallback used gpb playerProps {join_name} type={packet.packet_type.value}", room=room.room_id[:8])
         elif packet.packet_type == PacketType.JOIN and not packet.player_name:
-            # Debug: JOIN packet without name — log gpb keys to trace
+            # Debug: JOIN packet without name -log gpb keys to trace
             gpb_keys = list(gpb.keys()) if gpb else []
             props_keys = list(gpb.get("properties", {}).keys()) if gpb and gpb.get("properties") else []
             pp_keys = list(gpb.get("playerProps", {}).keys()) if gpb and gpb.get("playerProps") else []
@@ -1953,7 +1953,7 @@ class Engine:
                         # The exited room is dead to this session: drop its
                         # short_code so stats never serves a ghost block for
                         # it. A rejoin rebinds the code from pID packets.
-                        # (DB row untouched — ranked sessions intentionally
+                        # (DB row untouched -ranked sessions intentionally
                         # survive Photon room changes; see version align.)
                         try:
                             _exited = view.rooms.get(view.current_room_id) or room
@@ -1967,13 +1967,13 @@ class Engine:
             pass
 
         # Fresh authenticate USUALLY means "in no room yet" (reload, disconnect,
-        # back to menu) — drop the stale current room the same way, or stats
+        # back to menu) -drop the stale current room the same way, or stats
         # keeps serving the previous (possibly ranked) room as live.
         # BUT Photon re-authenticates on every game-server reconnect, including
         # the handshake that follows a Create/Join (new connection, SAME room:
         # the CLOSE/OPEN pair in the logs). Yanking there strands the newborn
         # room (current=lobby, code cleared) and every later gameplay packet
-        # lands in the lobby bucket — real rooms sit ver=0 forever while duel
+        # lands in the lobby bucket -real rooms sit ver=0 forever while duel
         # seals and ranked drains starve. So keep current when a room is
         # nascent (born seconds ago, handshake in flight) or live (MATCH with
         # fresh packets, mid-match reconnect); the join/create/scene burst
@@ -2028,7 +2028,7 @@ class Engine:
         # SetProperties with no TargetActorNr and no 255 (Photon targets self by
         # default). Broadcasts always carry TargetActorNr, so this can never steal
         # another player's alv. Needed when the actor map has no entry (fresh rooms,
-        # serverless gaps) — revive resets depend on resolving to me.
+        # serverless gaps) -revive resets depend on resolving to me.
         try:
             if (not packet.player_name
                     and packet.packet_type in (PacketType.ALIVE, PacketType.ELIMINATED)
@@ -2048,7 +2048,7 @@ class Engine:
             target_key = None
             alv_via = "unknown"
             # Name first (fresh 255/map name beats a possibly-stale number),
-            # then the Player.actor_nr field — never the opaque dict key.
+            # then the Player.actor_nr field -never the opaque dict key.
             # Both candidates are compared: when they name DIFFERENT known
             # players the stored number is stale (rejoin under a new number)
             # and the name wins.
@@ -2082,7 +2082,7 @@ class Engine:
                 # stale-number misattribution caught red-handed: heal the
                 # stale field + map so it can never fire again, and log it.
                 try:
-                    log_engine("warn", session_id[:13], msg=f"alv subject mismatch name={_name_hit[1].username} field-player={_field_hit[1].username} actor={actor_nr} target={target_actor_nr} — trusting name, healing field", room=room.room_id[:8])
+                    log_engine("warn", session_id[:13], msg=f"alv subject mismatch name={_name_hit[1].username} field-player={_field_hit[1].username} actor={actor_nr} target={target_actor_nr} -trusting name, healing field", room=room.room_id[:8])
                 except Exception:
                     pass
                 try:
@@ -2192,7 +2192,7 @@ class Engine:
                         room.me.is_alive = target.is_alive
                         if target.skin: room.me.skin = target.skin
         # ---- SKIN / PICKAXE / GAME_ID / _pt via PropertiesChanged without alv (room-scoped) ----
-        # Other players skins often arrive as type 4 code 253 with skid/pid but no alv — also _pt for duos via actorNr/TargetActorNr
+        # Other players skins often arrive as type 4 code 253 with skid/pid but no alv -also _pt for duos via actorNr/TargetActorNr
         if gpb and gpb.get("properties") and packet.packet_type not in (PacketType.ALIVE, PacketType.ELIMINATED):
             props = gpb["properties"]
             if any(k in props for k in ("skid", "pid", "pfid", "BPid", "_pt", "pt")):
@@ -2207,7 +2207,7 @@ class Engine:
                         _rebuild_teams(room)
                         log_engine("team_pt", session_id[:13], team=pt, target=_tk, player=tgt.username, via="props", room=room.room_id[:8])
                     # Refresh (not fill-only): players change skins/picks mid
-                    # session, and first-join often arrives without them — a
+                    # session, and first-join often arrives without them -a
                     # fill-once policy froze them at None forever.
                     if skid and tgt.skin != skid:
                         tgt.skin = skid
@@ -2218,7 +2218,7 @@ class Engine:
                     if pfid and tgt.game_id != pfid:
                         tgt.game_id = pfid
                     # Propagate to the session/room self refs when this row is
-                    # me — otherwise view.me keeps the stale first-join copy
+                    # me -otherwise view.me keeps the stale first-join copy
                     # while the roster already knows better.
                     try:
                         if view.me and _names_equal(tgt.username, view.me.username):
@@ -2247,7 +2247,7 @@ class Engine:
                     except Exception:
                         pass
 
-        # ---- KILLFEED (room-scoped) — dedup on content+time, echo never appends ----
+        # ---- KILLFEED (room-scoped) -dedup on content+time, echo never appends ----
         # Same kill can arrive twice with different Photon framing (client RaiseEvent
         # echo + server broadcast ~0.5s apart, or reliable repackaging). Byte compare
         # misses those, so dedup on (killer, victim, kind) within a short window.
@@ -2260,7 +2260,7 @@ class Engine:
             # (Create/Join carry no curScn): enter MATCH so the drawer and
             # drains stop starving. Idempotent, roster-preserving.
             # Fall back to stashed pending gm (public JoinRandom gm) when the
-            # kill packet itself carries none — otherwise the room stays gm=None
+            # kill packet itself carries none -otherwise the room stays gm=None
             # and the win drain skips it.
             try:
                 _cgm = getattr(packet, "game_mode", None)
@@ -2309,7 +2309,7 @@ class Engine:
                     if len(room.recent_kills) > 100:
                         room.recent_kills = room.recent_kills[-10:]
 
-                    # Late join via killfeed — only for valid deduped kills
+                    # Late join via killfeed -only for valid deduped kills
                     for name, is_target in [(killer, False), (victim, True)]:
                         if name:
                             existing = any(_names_equal(p.username, name) for p in room.players.values())
@@ -2352,7 +2352,7 @@ class Engine:
                     room.recent_knocks.append(KillInfo(instigator=str(packet.killer), instigated=str(packet.victim), event_type="knocked", t=_now2, hx=packet.raw_hex))
                     if len(room.recent_knocks) > 100:
                         room.recent_knocks = room.recent_knocks[-100:]
-        # ---- Kill victim: mark player dead — Processor handles defeat calculation ----
+        # ---- Kill victim: mark player dead -Processor handles defeat calculation ----
         if packet.is_kill and packet.victim and room.state == State.MATCH:
             # Mark victim as dead in room state
             for p in room.players.values():
@@ -2436,7 +2436,7 @@ class Engine:
 
         The request carries everything the response lacks (gm incl. DF, pID,
         Party) but reconnect batches routinely deliver it AFTER the response
-        that already birthed the room — sometimes seconds later. Without this
+        that already birthed the room -sometimes seconds later. Without this
         the room stays modeless/codeless (presence "—"/"Pub") until a scene
         repairs it. Fills only blank fields on the freshest created room
         missing something; consumes matching pending entries so they can't
@@ -2556,7 +2556,7 @@ class Engine:
         return None
 
     def _gpb_to_abstract(self, hex_string: str, gpb: dict | None) -> EnginePacket:
-        """Build EnginePacket directly from gpb — no photon_api, only gpbinary."""
+        """Build EnginePacket directly from gpb -no photon_api, only gpbinary."""
 
         pkt = EnginePacket(raw_hex=hex_string, raw=gpb)
         if not gpb:
@@ -2576,7 +2576,7 @@ class Engine:
                     from .enums import GameMode as GM2
 
                     inferred = GM2.from_curscn(str(cur)) if hasattr(GM2, "from_curscn") else None
-                    # Fallback import from photon_api enum if needed — GameMode has no from_curscn in engine enums
+                    # Fallback import from photon_api enum if needed -GameMode has no from_curscn in engine enums
                     if not inferred:
                         # engine GameMode is simple; try substring match
                         low = str(cur).lower()
@@ -2623,7 +2623,7 @@ class Engine:
                 pkt.victim = parsed["victim"]
             # Outbound RaiseEvent carrying killfeed text is the client's own echo
             # of the kill (server rebroadcasts it as EventData 101 ~0.5s later).
-            # Only the broadcast counts — echoes would double every kill.
+            # Only the broadcast counts -echoes would double every kill.
             try:
                 if (pkt.is_kill or pkt.is_knock) and gpb.get("opName") == "RaiseEvent":
                     pkt.is_echo = True

@@ -1,4 +1,4 @@
-"""Comp tourney final results — the embeds posted when a tourney is closed.
+"""Comp tourney final results -the embeds posted when a tourney is closed.
 
 `/tourney-stop` ends a comp tourney, and until now the final standings only
 existed in an ephemeral command reply. This module builds the archive post
@@ -66,7 +66,7 @@ def board_lines(board, limit: int = 0) -> list:
             avg = r.get("avg_placement")
             tail = f" ({kills}K, {wins}W" + (f", {avg} avg" if avg is not None else "") + ")"
             prefix = MEDALS[i - 1] if i <= 3 else f"{i}."
-            lines.append(f"{prefix} {who} — {pts} pts{tail}")
+            lines.append(f"{prefix} {who} -{pts} pts{tail}")
     except Exception:
         return lines
     return lines
@@ -83,7 +83,7 @@ def results_embeds(tourney: dict, board, per_embed: int = PER_EMBED) -> list:
 
     Returns [] when there is nothing to show (no sealed matches), so the
     results channel never fills with empty posts. Each spec is
-    {"title", "description", "color", "footer"} — ready for
+    {"title", "description", "color", "footer"} -ready for
     discord.Embed(**spec). Never raises.
     """
     try:
@@ -100,12 +100,12 @@ def results_embeds(tourney: dict, board, per_embed: int = PER_EMBED) -> list:
         tid = t.get("id")
         out = []
         for i, chunk in enumerate(chunks, 1):
-            head = (f"🏆 **{name}** — final standings"
-                    if i == 1 else f"🏆 **{name}** — final standings (cont.)")
+            head = (f"🏆 **{name}** -final standings"
+                    if i == 1 else f"🏆 **{name}** -final standings (cont.)")
             desc = "\n".join([head, ""] + chunk)
             if len(desc) > DESC_LIMIT:
                 desc = desc[:DESC_LIMIT - 1].rstrip() + "…"
-            title = f"🏆 {name} — #{tid}" if tid else f"🏆 {name}"
+            title = f"🏆 {name} -#{tid}" if tid else f"🏆 {name}"
             out.append({
                 "title": str(title)[:TITLE_LIMIT],
                 "description": desc,
@@ -137,7 +137,7 @@ async def post_results(bot, tourney_id, fetch, *, channel_id: str | None = None,
         specs = results_embeds(tourney, data.get("standings") or [],
                               per_embed=per_embed)
         if not specs:
-            return 0, "no sealed matches — nothing to post"
+            return 0, "no sealed matches -nothing to post"
         channel = None
         try:
             channel = bot.get_channel(int(cid))
