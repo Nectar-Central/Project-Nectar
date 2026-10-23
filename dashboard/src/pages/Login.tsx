@@ -3,9 +3,9 @@ import { Alert, Button } from "@/components/ui";
 
 const REASONS: Record<string, string> = {
   cancelled: "You cancelled the Discord login.",
-  state: "The login attempt expired. Please try again.",
-  exchange: "Discord refused the login. Try again in a moment.",
-  discord: "Discord did not return your account. Try again.",
+  state: "That login attempt expired. Please try again.",
+  exchange: "The sign-in provider refused the login. Try again in a moment.",
+  discord: "Your Discord account could not be read. Try again.",
   server: "The server could not create a session. Try again.",
 };
 
@@ -27,8 +27,8 @@ export function LoginPage() {
 
       <h2 className="text-2xl font-semibold tracking-tight">Sign in to manage your server</h2>
       <p className="mt-2 text-sm text-muted">
-        Nectar uses Discord to confirm who you are and which servers you run. We only read your
-        username, avatar and server list — never your messages.
+        Sign-in is handled by Supabase using your Discord account. Nectar only receives your
+        Discord ID, display name and avatar — never your messages, and never your password.
       </p>
 
       {reason ? (

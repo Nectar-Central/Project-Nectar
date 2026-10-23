@@ -63,8 +63,9 @@ You only ever do this once. Running it again just refreshes the details.
 `/setup` replies with a link. Open it, press **Continue with Discord**, and
 approve.
 
-Nectar asks Discord for your username, avatar and server list. It never reads
-your messages and never stores your Discord password.
+Nectar asks Discord for your user ID, display name and avatar — nothing else.
+It never reads your messages, never sees your password, and does not ask for
+your server list.
 
 You will land on a page listing your servers. Press one to open it.
 

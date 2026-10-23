@@ -27,10 +27,9 @@ from fastapi.responses import JSONResponse
 from ..lib import guilds as guilds_mod
 from ..lib.logger import log_err, log_sys
 from ..lib.supabase_client import supabase, db_io, is_transient_error
+from .auth import COOKIE_NAME
 
 router = APIRouter()
-
-COOKIE_NAME = "nectar_session"
 
 DEFAULT_POINTS = {"kill": 1, "win": 3, "placement": [10, 7, 5, 3, 1]}
 
