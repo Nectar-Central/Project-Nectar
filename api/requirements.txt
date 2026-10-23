@@ -1,7 +1,11 @@
 # Python backend for BNGC — clean, spaced, well-logged
+# Keep this in step with server/requirements.txt: the Vercel function imports
+# the same server/ package, so a pin that only exists here is a deploy-only bug.
 fastapi==0.110.0
 uvicorn[standard]==0.29.0
-supabase==2.7.0
+supabase==2.31.0
 redis==5.0.3
 python-dotenv==1.0.1
-pydantic==2.6.0
+pydantic==2.13.5
+pyyaml==6.0.1  # imported by server/lib/logger.py (structured YAML logs)
+httpx==0.27.2  # Discord OAuth exchange in server/routes/auth.py

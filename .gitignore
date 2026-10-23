@@ -19,6 +19,12 @@ downloaded_skins/
 # legacy
 photon-sniffer/captures/
 
+# Dashboard build leftovers: vite writes these on every `npm run build`.
+dashboard/tsconfig.tsbuildinfo
+dashboard/node_modules/
+# Supabase CLI scratch state (project ref, version pings)
+supabase/.temp/
+
 # --- Project-Nectar upstream (Python template) ---
 # Byte-compiled / optimized / DLL files
 *.py[codz]

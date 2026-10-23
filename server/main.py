@@ -1,7 +1,7 @@
 """
-main.py — FastAPI entry point for BNGC Python backend.
+main.py -FastAPI entry point for BNGC Python backend.
 
-Clean, spaced, well-commented — mirrors the old Node app/dev.js
+Clean, spaced, well-commented -mirrors the old Node app/dev.js
 but in Python. Each route is clearly separated, with good logging.
 
 Run locally:
@@ -23,7 +23,7 @@ from starlette.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 
 # ---------------------------------------------------------------------------
-# Environment — load from multiple possible .env locations
+# Environment -load from multiple possible .env locations
 # ---------------------------------------------------------------------------
 
 # Try server/.env, then app/.env, then root .env
@@ -76,6 +76,8 @@ from server.routes.players import router as players_router
 from server.routes.health import router as health_router
 from server.routes.coins import router as coins_router
 from server.routes.bets import router as bets_router
+from server.routes.auth import router as auth_router
+from server.routes.dashboard_api import router as dashboard_router
 
 # ---------------------------------------------------------------------------
 # Health check
@@ -83,7 +85,7 @@ from server.routes.bets import router as bets_router
 
 @app.get("/")
 async def index():
-    """Landing page — keeps root probes (Render, browsers) out of the 404 logs."""
+    """Landing page -keeps root probes (Render, browsers) out of the 404 logs."""
     return {
         "service": "photon-server (python)",
         "health": "/api/health",
@@ -94,7 +96,7 @@ async def index():
 @app.get("/health")
 @app.get("/status")
 async def health():
-    """Simple health check — no auth required."""
+    """Simple health check -no auth required."""
 
     return {
         "ok": True,
@@ -108,7 +110,7 @@ async def health():
 # Include routers
 # ---------------------------------------------------------------------------
 
-# Capture is the main route — all packets go here now
+# Capture is the main route -all packets go here now
 app.include_router(capture_router)
 app.include_router(validate_router)
 app.include_router(session_state_router)
@@ -126,12 +128,45 @@ app.include_router(players_router)
 app.include_router(health_router)
 app.include_router(coins_router)
 app.include_router(bets_router)
+app.include_router(auth_router)
+app.include_router(dashboard_router)
 
 # TODO: Port remaining routes if needed (player_sync, event, playtime are now via capture + engine)
 # For now, GET /api/session/{id}/state is the poll endpoint for the photon-client SDK
 
 # ---------------------------------------------------------------------------
-# Startup — fires under `uvicorn server.main:app` too (not just __main__)
+# React dashboard (built) — served same-origin so cookies just work
+# ---------------------------------------------------------------------------
+# `dashboard/dist` is committed by the build step. When it is absent (fresh
+# clone, or API-only deploy) these routes are no-ops and the old HTML
+# dashboards at /comp/dashboard still work.
+
+_DASH_DIST = Path(__file__).parent.parent / "dashboard" / "dist"
+
+if (_DASH_DIST / "index.html").exists():
+    from fastapi.staticfiles import StaticFiles
+
+    if (_DASH_DIST / "assets").exists():
+        app.mount("/assets", StaticFiles(directory=str(_DASH_DIST / "assets")), name="assets")
+
+    _SPA_RESERVED = {"api", "auth", "docs", "redoc", "openapi.json", "ws",
+                     "capture", "comp", "ranked", "admin", "health", "status"}
+
+    @app.get("/{full_path:path}")
+    async def _spa(full_path: str):
+        """Client-side routes ( /login, /dashboard/123 ) get index.html."""
+        head = full_path.split("/", 1)[0]
+        if head in _SPA_RESERVED:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        try:
+            return Response((_DASH_DIST / "index.html").read_bytes(),
+                            media_type="text/html")
+        except Exception:
+            return JSONResponse({"error": "dashboard not built"}, status_code=503)
+
+
+# ---------------------------------------------------------------------------
+# Startup -fires under `uvicorn server.main:app` too (not just __main__)
 # ---------------------------------------------------------------------------
 
 @app.on_event("startup")
@@ -139,7 +174,7 @@ async def _startup_banner():
     try:
         from server.lib.logger import banner as _banner, log_sys as _lsys
         _banner(int(os.getenv("PORT", "3000")))
-        _lsys("LOGGING VERBOSE — every request / capture / processor / ranked line ON")
+        _lsys("LOGGING VERBOSE -every request / capture / processor / ranked line ON")
     except Exception:
         print("PHOTON SERVER startup (banner failed)", flush=True)
 
@@ -155,7 +190,7 @@ async def head_to_get(request: Request, call_next):
     route 405s. Rewrite to GET for routing, then return the same status +
     headers with an empty body and content-length 0. (A GET-accurate length
     with an empty body would be ideal, but uvicorn enforces
-    bytes-sent == content-length and 500s the response — so 0 it is.
+    bytes-sent == content-length and 500s the response -so 0 it is.
     Probes only ever check the status anyway.)
     HEAD to POST-only routes still 405s (correct: no GET exists there).
     Registered after log_requests so it runs outermost; the logger then
@@ -170,7 +205,7 @@ async def head_to_get(request: Request, call_next):
 
     try:
         # Drain the body iterator so serverless runtimes don't leak it;
-        # the bytes are discarded — HEAD must not carry a body.
+        # the bytes are discarded -HEAD must not carry a body.
         async for _ in response.body_iterator:
             pass
     except Exception:
@@ -184,7 +219,7 @@ async def head_to_get(request: Request, call_next):
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """Log EVERY request with timing, status, query, and body size — nothing quiet."""
+    """Log EVERY request with timing, status, query, and body size -nothing quiet."""
 
     start = time.time()
 
@@ -204,7 +239,7 @@ async def log_requests(request: Request, call_next):
     # Use the same logger as capture for consistency
     from server.lib.logger import log_req, log_ok, log_err
 
-    # log EVERYTHING — no quiet paths (stats/players/capture poll spam included)
+    # log EVERYTHING -no quiet paths (stats/players/capture poll spam included)
     status = response.status_code
     try:
         _qs = f"?{request.url.query}" if request.url.query else ""

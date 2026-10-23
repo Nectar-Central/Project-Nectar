@@ -1,5 +1,5 @@
 """
-comp.py — comp/tourney read API (pure compute + thin endpoints).
+comp.py -comp/tourney read API (pure compute + thin endpoints).
 
   GET /api/comp/tourneys?status=scheduled|running|ended
       -> [{id, code, name, status, series_len, sealed, players, leader, ...}]
@@ -10,7 +10,7 @@ Statuses are DERIVED (never stored beyond scheduled/open/closed):
   closed -> ended; scheduled -> scheduled; open + >=1 sealed match -> running;
   open + 0 matches -> scheduled.
 
-Standings math (shared by bot, dashboard, Events tab — one implementation):
+Standings math (shared by bot, dashboard, Events tab -one implementation):
   per sealed match: kills per discord (kill events, mapped only) +
   win bonus (manual winner_discord_id, else last alive from alv order) +
   placement table by reverse alv-death order (last alive = 1st).
@@ -178,6 +178,63 @@ def standings_for_matches(tourney: dict | None, sealed: list[dict], events_by_ma
     return per_match, board
 
 
+async def load_standings(tourney: dict | None) -> list[dict]:
+    """Final board for a tourney, read through the async DB bridge.
+
+    Same maths as `standings_for_matches`, but with the queries awaited so a
+    request handler never blocks the event loop on a slow BAR.
+    """
+    tid = (tourney or {}).get("id")
+    try:
+        mres = await db_io(lambda: supabase.table("bngc_comp_matches").select(
+            "id,version,status,winner_discord_id,placements,"
+            "removed_discord_ids,point_awards").eq("tourney_id", tid)
+            .order("version").limit(500).execute())
+        sealed = [m for m in (mres.data or [])
+                  if (m or {}).get("status") in ("sealed", "manual")]
+        events_by_match: dict = {}
+        if sealed:
+            ids = [m.get("id") for m in sealed if m.get("id") is not None]
+            eres = await db_io(lambda: supabase.table("bngc_comp_events").select(
+                "match_id,etype,discord_id,actor_name,alive").in_(
+                "match_id", ids).order("id").limit(5000).execute())
+            for ev in (eres.data or []):
+                events_by_match.setdefault((ev or {}).get("match_id"), []).append(ev)
+        adjustments = await db_io(lambda: _tourney_adjustments(tid))
+        _, board = standings_for_matches(tourney, sealed, events_by_match, adjustments)
+        return board or []
+    except Exception as e:
+        log_err(f"COMP standings {tid}: {e}")
+        return []
+
+
+async def load_pr_board(tourney_id) -> list[dict]:
+    """Stored PR rows for a tourney (written when it closed)."""
+    try:
+        res = await db_io(lambda: supabase.table("bngc_comp_pr_history").select(
+            "discord_id,pr").eq("tourney_id", int(tourney_id)).limit(500).execute())
+        return res.data or []
+    except Exception:
+        return []
+
+
+async def bank_tourney(guild_id, tourney: dict | None) -> int:
+    """Fold a closed tourney into its server's scoreboard. Idempotent.
+
+    Shared by the dashboard's Close/Bank buttons and the bot's /tourney-stop,
+    so a tournament can never be banked with two different sets of numbers.
+    Returns the number of players actually updated this call.
+    """
+    tid = (tourney or {}).get("id")
+    if not guild_id or tid is None:
+        return 0
+    board = await load_standings(tourney)
+    pr_board = ([] if (tourney or {}).get("pr_enabled") is False
+                else await load_pr_board(tid))
+    from ..lib.guild_stats import accrue_tourney
+    return await accrue_tourney(int(guild_id), int(tid), board, pr_board)
+
+
 def code_tourney_points(code: str | None, discord_id: str | None) -> dict | None:
     """My live points for the tourney tagged to this room code. For the
     passthrough HUD. Returns {tourney_id, name, points, kills, wins, rank,
@@ -299,10 +356,19 @@ async def list_tourneys(request: Request):
     want = str(request.query_params.get("status") or "all").strip().lower()
     if want not in ("all", "created", "scheduled", "running", "ended"):
         return JSONResponse({"error": "status must be all|created|scheduled|running|ended"}, status_code=400)
+    # Optional server filter. The React dashboard never uses this endpoint
+    # (it has /api/dash/*), but the classic board and the bot do, and both can
+    # now say which server they are looking at. Omitted = every server, which
+    # is the pre-multi-guild behaviour.
+    guild_raw = str(request.query_params.get("guild_id") or "").strip()
+    guild_id = int(guild_raw) if guild_raw.isdigit() else None
     try:
-        tres = supabase.table("bngc_comp_tourneys").select(
+        q = supabase.table("bngc_comp_tourneys").select(
             "id,code,name,status,mode,series_len,scheduled_at,started_at,ended_at,created_at"
-        ).order("created_at", desc=False).limit(100).execute()
+        )
+        if guild_id is not None:
+            q = q.eq("guild_id", guild_id)
+        tres = q.order("created_at", desc=False).limit(100).execute()
         rows = tres.data or []
         tids = [r["id"] for r in rows]
         sealed_by: dict = {}
@@ -358,8 +424,15 @@ async def tourney_detail(request: Request):
         tid = int(request.query_params.get("id"))
     except Exception:
         return JSONResponse({"error": "id required (numeric, from 0)"}, status_code=400)
+    # Optional server guard: a board opened for server A must not render server
+    # B's tournament. Omitted = no check (classic behaviour).
+    guild_raw = str(request.query_params.get("guild_id") or "").strip()
+    guild_id = int(guild_raw) if guild_raw.isdigit() else None
     try:
-        tres = supabase.table("bngc_comp_tourneys").select("*").eq("id", tid).limit(1).execute()
+        q = supabase.table("bngc_comp_tourneys").select("*").eq("id", tid)
+        if guild_id is not None:
+            q = q.eq("guild_id", guild_id)
+        tres = q.limit(1).execute()
         if not tres.data:
             return JSONResponse({"error": "tourney not found"}, status_code=404)
         t = tres.data[0]
@@ -579,7 +652,7 @@ async def comp_match_open(request: Request):
     """Manual blank match (dashboard). Never raises beyond JSON errors.
 
     Manual matches start with started_at set (the dashboard Match Started
-    bookend) and status manual — the bridge never auto-seals or writes to
+    bookend) and status manual -the bridge never auto-seals or writes to
     manual rows, so hosts own them end to end."""
     err = _need()
     if err:
@@ -1065,8 +1138,8 @@ def compute_and_store_tourney_pr_sync(tid: int) -> list[dict]:
     """Compute Tourney PR once at tourney end + store. Idempotent: when
     bngc_comp_pr_history rows exist for the tourney they are returned as-is
     (no recompute). Writes bngc_users.tourney_pr per player, as a high-water
-    mark - see _apply_tourney_pr_ratchet. Sync. Never raises; returns the
-    PR board (possibly empty)."""
+    mark - see _apply_tourney_pr_ratchet. Sync. Never raises; returns the PR
+    board (possibly empty)."""
     try:
         if not supabase:
             return []
@@ -1160,6 +1233,45 @@ async def comp_tourney_pr(request: Request):
         return JSONResponse({"ok": True, "tourney_id": tid, "pr_board": board})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@router.post("/api/comp/tourney/bank")
+async def comp_tourney_bank(request: Request):
+    """Bank a closed tourney into its server's leaderboard. Body: {tourney_id}.
+
+    Idempotent: calling it twice adds nothing the second time. The bot calls
+    this after /tourney-stop so a Discord-side close and a dashboard-side close
+    leave the same numbers behind.
+    """
+    err = _need()
+    if err:
+        return err
+    b = await _json(request)
+    try:
+        tid = int(b.get("tourney_id"))
+    except Exception:
+        return JSONResponse({"error": "tourney_id required"}, status_code=400)
+    try:
+        res = await db_io(lambda: supabase.table("bngc_comp_tourneys").select(
+            "id,guild_id,pr_enabled,status,points_table").eq("id", tid).limit(1).execute())
+        rows = res.data or []
+        if not rows:
+            return JSONResponse({"error": "unknown tourney"}, status_code=404)
+        t = rows[0]
+        gid = t.get("guild_id")
+        if gid is None:
+            # Pre-migration row: nothing to attribute it to. Not an error —
+            # the backfill in add_multi_guild_v263.sql claims these.
+            return JSONResponse({"ok": True, "tourney_id": tid,
+                                 "players_updated": 0,
+                                 "note": "tourney has no server yet"})
+        if str(t.get("status")) != "ended":
+            return JSONResponse({"error": "close the tourney first"}, status_code=409)
+        n = await bank_tourney(int(gid), t)
+        return JSONResponse({"ok": True, "tourney_id": tid,
+                             "guild_id": int(gid), "players_updated": n})
+    except Exception as e:
+        return _db_err(e, f"bank tourney {tid}")
 
 
 @router.post("/api/comp/tourney/pr-override")
@@ -1394,7 +1506,7 @@ async def comp_match_kills(request: Request):
 async def comp_match_elim(request: Request):
     """Hand-adjust a player's eliminations in a match (dashboard elim buttons).
 
-    Positive delta inserts manual alv (alive=False) rows — they join the
+    Positive delta inserts manual alv (alive=False) rows -they join the
     reverse death order for placement like bridge-banked rows. Negative
     removes that many of the player's manual alv rows (newest first).
     Tracked (non-manual) rows are never touched. On bridge-owned open
@@ -1533,11 +1645,14 @@ async def _duo_partner_sync(match: dict, did: str) -> str | None:
 async def comp_match_remove(request: Request):
     """Remove a player from a match roster (left mid-match).
 
-    Body: {match_id, discord_id?, actor_name?}. discord_id preferred; when
-    only actor_name is given the server resolves it via regs/game_username
-    (best effort — the 🚪 leave line still shows regardless). Idempotent:
-    appends to removed_discord_ids. Removed players are ignored in placement
-    and calculations. Never raises beyond JSON errors."""
+    Body: {match_id, discord_id?, actor_name?, opponent_id?, with_partner?}.
+    discord_id preferred; when only actor_name is given the server resolves
+    it via regs/game_username (best effort -the 🚪 leave line still shows
+    regardless). `opponent_id` removes a named second player in the same
+    call; `with_partner` resolves the duo partner from the tourney roster so
+    a team never leaves half of itself in the match. Idempotent: appends to
+    removed_discord_ids. Removed players are ignored in placement and
+    calculations. Never raises beyond JSON errors."""
     err = _need()
     if err:
         return err
@@ -1555,7 +1670,7 @@ async def comp_match_remove(request: Request):
             mres = supabase.table("bngc_comp_matches").select(
                 "id,tourney_id,removed_discord_ids").eq("id", mid).limit(1).execute()
         except Exception:
-            return JSONResponse({"error": "removed_discord_ids column missing — apply add_comp_v237.sql"}, status_code=500)
+            return JSONResponse({"error": "removed_discord_ids column missing -apply add_comp_v237.sql"}, status_code=500)
         if not mres.data:
             return JSONResponse({"error": "match not found"}, status_code=404)
         m = mres.data[0] or {}
@@ -1635,7 +1750,7 @@ async def comp_match_add_back(request: Request):
             mres = supabase.table("bngc_comp_matches").select(
                 "id,tourney_id,removed_discord_ids").eq("id", mid).limit(1).execute()
         except Exception:
-            return JSONResponse({"error": "removed_discord_ids column missing — apply add_comp_v237.sql"}, status_code=500)
+            return JSONResponse({"error": "removed_discord_ids column missing -apply add_comp_v237.sql"}, status_code=500)
         if not mres.data:
             return JSONResponse({"error": "match not found"}, status_code=404)
         m = mres.data[0] or {}
@@ -1856,7 +1971,7 @@ async def comp_match_delete(request: Request):
         except Exception:
             pass
         supabase.table("bngc_comp_matches").delete().eq("id", mid).execute()
-# Retire the version so the bridge treats the slot as consumed and never
+        # Retire the version so the bridge treats the slot as consumed and never
         # re-issues the number (which re-created the match on the next sweep).
         # Best effort: pre-migration column, the delete still stands.
         try:
@@ -2093,7 +2208,7 @@ async def comp_tourney_by_code(request: Request):
     """Tourney carrying this room code (userscript join detection + bridge).
 
     Returns the single non-ended tourney for the code, else {tourney: null}.
-    Ambiguous (2+ open rows, same code) resolves to null — never guess.
+    Ambiguous (2+ open rows, same code) resolves to null -never guess.
     """
     err = _need()
     if err:
@@ -2117,7 +2232,7 @@ async def comp_tourney_by_code(request: Request):
             "status": t.get("status"), "mode": t.get("mode"),
             "series_len": t.get("series_len") or 0}})
     except Exception as e:
-        # Join-detection polls this every few seconds — a pool blip must
+        # Join-detection polls this every few seconds -a pool blip must
         # resolve to null (retry on next poll), never a 500 that the
         # userscript treats as fatal.
         if is_transient_error(e):
