@@ -335,6 +335,12 @@ async def on_ready():
     except Exception as exc:
         print(f"Command sync failed: {exc}")
     print(f"Bot ready as {bot.user} — {len(bot.tree.get_commands())} commands loaded")
+    # Per-server bot nickname: the dashboard writes the setting, this applies
+    # it. Without this the nickname would only change when /setup is re-run.
+    try:
+        bot.loop.create_task(_nickname_sync_loop())
+    except Exception as e:
+        print(f"[nickname] failed to start loop: {e}")
     # persistent comp players button (restart-safe, fixed custom_id)
     try:
         bot.add_view(_CompPlayersView())
@@ -3080,133 +3086,292 @@ def _comp_sb():
     return db.supabase
 
 
-@bot.tree.command(name="tourney-create", description="Create a comp tourney (host). Returns its numeric ID.")
-@app_commands.describe(code="5-letter private room code (optional)",
-                       name="Tourney name", series_len="Match count, 0 = open-ended",
-                       mode="Solo or duo teams", game_mode="Game code, e.g. zw_lg",
-                       region="Region, e.g. EU", rules_channel="Rules channel",
-                       shoot_timer="Shoot timer, e.g. 4:30",
-                       ping_role="Role pinged on open/close",
-                       max_players="Auto-close intake at N accepted players (0 = unlimited)",
-                       host_playing="Host plays too (their kills count)",
-                       coin_give="Coin cup: pay Nectar Coin prizes to top-3 (default False)",
-                       coins_first="1st place coins (coin cup only)",
-                       coins_second="2nd place coins (coin cup only)",
-                       coins_third="3rd place coins (coin cup only)",
-                       start_time="Start time YYYY-MM-DD HH:MM UTC (optional)")
-@app_commands.choices(mode=[app_commands.Choice(name="Solo", value="solo"),
-                            app_commands.Choice(name="Duo", value="duo")])
-@app_commands.choices(game_mode=[
-    app_commands.Choice(name="Late Game Zonewars", value="zw_lg"),
-    app_commands.Choice(name="Zone Wars", value="zw"),
-    app_commands.Choice(name="Duo Wild West", value="wwzw"),
-    app_commands.Choice(name="Solo Wild West", value="ww"),
-    app_commands.Choice(name="Boxfights", value="bf"),
-    app_commands.Choice(name="Boxfights 2v2", value="BF2V2"),
-    app_commands.Choice(name="V-Arena", value="VA"),
-    app_commands.Choice(name="Red Vs Blue", value="tdm_bvr"),
-    app_commands.Choice(name="Realistic 1v1", value="r_1v1"),
-    app_commands.Choice(name="Free Mode", value="df"),
-])
-async def tourney_create_cmd(interaction: discord.Interaction, name: str,
-                             code: str | None = None, series_len: int = 0,
-                             mode: str = "solo", game_mode: str | None = None,
-                             region: str | None = None,
-                             rules_channel: discord.TextChannel | None = None,
-                             shoot_timer: str | None = None,
-                             ping_role: discord.Role | None = None,
-                             max_players: int = 0, host_playing: bool = True,
-                             coin_give: bool = False,
-                             coins_first: int = 0, coins_second: int = 0,
-                             coins_third: int = 0,
-                             start_time: str | None = None):
-    await interaction.response.defer(ephemeral=True)
-    me = await _comp_member(interaction, interaction.user.id)
-    if not _comp_is_host(me):
-        return await interaction.followup.send("Host only.", ephemeral=True)
+# ---------------------------------------------------------------------------
+# Multi-server support (one bot, many Discord servers)
+# ---------------------------------------------------------------------------
+# A server becomes "known" the first time an administrator runs /setup there.
+# Until then the bot leaves it alone: no tourneys, no boards, no nickname
+# changes. That way an accidental invite can never create a half-configured
+# server, and the owner always opts in deliberately.
+#
+# Everything that *configures* a tourney now lives on the dashboard. The
+# slash commands below are deliberately short: they either do one small thing
+# or point at the right dashboard page.
+
+DASHBOARD_URL = (os.getenv("NECTAR_DASHBOARD_URL") or SERVER_URL or "").rstrip("/")
+
+
+def _guild_id_of(interaction) -> int | None:
+    """The Discord server this interaction came from, or None in DMs."""
+    try:
+        g = interaction.guild
+        return int(g.id) if g is not None else None
+    except Exception:
+        return None
+
+
+async def _registered_guild(interaction):
+    """(sb, guild_row) for the server this interaction came from.
+
+    Sends the refusal itself and returns (None, None) when the server has not
+    run /setup yet, so every command can start with the same two lines.
+    """
     sb = _comp_sb()
     if sb is None:
-        return await interaction.followup.send("Supabase not configured.", ephemeral=True)
+        await interaction.followup.send("Database not configured.", ephemeral=True)
+        return None, None
+    gid = _guild_id_of(interaction)
+    if gid is None:
+        await interaction.followup.send(
+            "Run this in a server, not in a DM.", ephemeral=True)
+        return None, None
+    try:
+        res = await db._sb_call(lambda: sb.table("nectar_guilds").select("*")
+                                .eq("id", gid).limit(1).execute())
+        rows = res.data or []
+    except Exception as e:
+        await interaction.followup.send(f"Couldn't read server settings: {e}", ephemeral=True)
+        return None, None
+    if not rows:
+        await interaction.followup.send(
+            "This server isn't connected to Nectar yet. An administrator needs to "
+            "run `/setup` here once — it takes one click.", ephemeral=True)
+        return None, None
+    return sb, rows[0]
+
+
+async def _guild_is_staff(sb, guild_id: int, user_id) -> bool:
+    """True when this Discord user is owner/admin/moderator for the server."""
+    try:
+        res = await db._sb_call(lambda: sb.table("nectar_guild_admins")
+                                .select("role").eq("guild_id", int(guild_id))
+                                .eq("user_id", str(user_id)).limit(1).execute())
+        return bool(res.data)
+    except Exception:
+        return False
+
+
+@bot.tree.command(name="setup",
+                  description="Connect this server to Nectar (administrator, once)")
+@app_commands.describe(bot_name="What the bot should be called in this server (optional)")
+@app_commands.default_permissions(administrator=True)
+async def setup_cmd(interaction: discord.Interaction, bot_name: str | None = None):
+    await interaction.response.defer(ephemeral=True)
+    sb = _comp_sb()
+    if sb is None:
+        return await interaction.followup.send("Database not configured.", ephemeral=True)
+    gid = _guild_id_of(interaction)
+    if gid is None:
+        return await interaction.followup.send("Run this in a server.", ephemeral=True)
+
+    guild = interaction.guild
+    name = str(getattr(guild, "name", "") or "Server")[:100]
+    owner_id = str(getattr(guild, "owner_id", "") or interaction.user.id)
+    icon = getattr(getattr(guild, "icon", None), "url", None)
+    nick = (bot_name or "").strip()[:32] or None
+
+    settings = {"bot_nickname": nick or "Nectar"}
+    row = {
+        "id": gid,
+        "name": name,
+        "owner_id": owner_id,
+        "icon_url": str(icon) if icon else None,
+        "settings": settings,
+    }
+    try:
+        existing = await db._sb_call(lambda: sb.table("nectar_guilds").select("settings")
+                                     .eq("id", gid).limit(1).execute())
+        if existing.data:
+            current = (existing.data[0] or {}).get("settings") or {}
+            if isinstance(current, str):
+                try:
+                    current = json.loads(current)
+                except Exception:
+                    current = {}
+            patch = {"name": name, "icon_url": row["icon_url"]}
+            if nick:
+                # Merge, never replace: a re-run of /setup must not wipe the
+                # accent colour, channels or points table set on the dashboard.
+                patch["settings"] = {**current, "bot_nickname": nick}
+            await db._sb_call(lambda: sb.table("nectar_guilds").update(patch)
+                              .eq("id", gid).execute())
+        else:
+            await db._sb_call(lambda: sb.table("nectar_guilds").insert(row).execute())
+        # The person who runs /setup is the server's first admin. Idempotent.
+        await db._sb_call(lambda: sb.table("nectar_guild_admins").upsert({
+            "guild_id": gid,
+            "user_id": owner_id,
+            "role": "owner",
+            "added_by": str(interaction.user.id),
+        }, on_conflict="guild_id,user_id").execute())
+        if str(owner_id) != str(interaction.user.id):
+            await db._sb_call(lambda: sb.table("nectar_guild_admins").upsert({
+                "guild_id": gid,
+                "user_id": str(interaction.user.id),
+                "role": "admin",
+                "added_by": str(interaction.user.id),
+            }, on_conflict="guild_id,user_id").execute())
+    except Exception as e:
+        return await interaction.followup.send(
+            f"Couldn't save the server: `{e}`. Has `add_multi_guild_v263.sql` been applied?",
+            ephemeral=True)
+
+    if nick:
+        try:
+            await guild.me.edit(nick=nick)
+        except Exception as e:
+            print(f"[setup] nickname failed in {gid}: {e}")
+
+    link = f"{DASHBOARD_URL}/dashboard/{gid}" if DASHBOARD_URL else "/dashboard"
+    return await interaction.followup.send(
+        f"**{name}** is connected. 🎉\n\n"
+        f"Manage everything here: {link}\n"
+        f"Sign in with Discord — you are already the owner of this server in Nectar.\n\n"
+        f"Tournaments are created and configured on that page, not with slash commands. "
+        f"Players still use `/tourney-join` and the signup buttons as before.",
+        ephemeral=True)
+
+
+@bot.tree.command(name="dashboard",
+                  description="Get the link to this server's tournament dashboard")
+async def dashboard_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    sb, grow = await _registered_guild(interaction)
+    if sb is None:
+        return
+    gid = _guild_id_of(interaction)
+    if not await _guild_is_staff(sb, gid, interaction.user.id):
+        return await interaction.followup.send(
+            "Ask a server admin to add you to the staff list from the dashboard.",
+            ephemeral=True)
+    link = f"{DASHBOARD_URL}/dashboard/{gid}" if DASHBOARD_URL else "/dashboard"
+    return await interaction.followup.send(
+        f"Dashboard for **{grow.get('name')}**: {link}", ephemeral=True)
+
+
+async def _nickname_sync_loop():
+    """Keep each server's bot nickname in step with its dashboard setting.
+
+    The dashboard has no Discord token, so it writes `settings.bot_nickname`
+    and this loop applies it. Runs every 5 minutes; a no-op costs one small
+    query per server.
+    """
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            sb = _comp_sb()
+            if sb is not None and bot.guilds:
+                ids = [int(g.id) for g in bot.guilds]
+                res = await db._sb_call(lambda: sb.table("nectar_guilds")
+                                        .select("id,settings").in_("id", ids).execute())
+                want = {}
+                for r in (res.data or []):
+                    s = (r or {}).get("settings") or {}
+                    if isinstance(s, str):
+                        try:
+                            s = json.loads(s)
+                        except Exception:
+                            s = {}
+                    nick = str(s.get("bot_nickname") or "").strip()[:32]
+                    if nick:
+                        want[int(r["id"])] = nick
+                for g in bot.guilds:
+                    nick = want.get(int(g.id))
+                    if not nick:
+                        continue
+                    try:
+                        if g.me and g.me.nick != nick:
+                            await g.me.edit(nick=nick)
+                            print(f"[nickname] {g.id} -> {nick}")
+                    except Exception as e:
+                        print(f"[nickname] {g.id} failed: {e}")
+        except Exception as e:
+            print(f"[nickname] loop: {e}")
+        await asyncio.sleep(300)
+
+
+@bot.tree.command(name="tourney-create",
+                  description="Quick-create a tourney (host). Configure the rest on the dashboard.")
+@app_commands.describe(name="Tourney name",
+                       code="5-letter private room code (optional)",
+                       mode="Solo or duo teams")
+@app_commands.choices(mode=[app_commands.Choice(name="Solo", value="solo"),
+                            app_commands.Choice(name="Duo", value="duo")])
+async def tourney_create_cmd(interaction: discord.Interaction, name: str,
+                             code: str | None = None, mode: str = "solo"):
+    """Deliberately tiny.
+
+    The old version had fourteen options, which is a form pretending to be a
+    chat command. Everything it used to ask for — points table, player limit,
+    schedule, ping role, coin prizes — now lives on the dashboard where it can
+    be seen, changed and explained. This command exists only so a host can get
+    a tourney ID in the middle of a voice call.
+    """
+    await interaction.response.defer(ephemeral=True)
+    sb, grow = await _registered_guild(interaction)
+    if sb is None:
+        return
+    me = await _comp_member(interaction, interaction.user.id)
+    gid = _guild_id_of(interaction)
+    if not _comp_is_host(me) and not await _guild_is_staff(sb, gid, interaction.user.id):
+        return await interaction.followup.send("Host only.", ephemeral=True)
+
     code_c = (code or "").strip().upper() or None
     if code_c and (len(code_c) != 5 or not code_c.isalnum()):
         return await interaction.followup.send("Code must be 5 letters/digits.", ephemeral=True)
     mode_c = "duo" if str(mode or "").lower() == "duo" else "solo"
-    try:
-        series = max(0, int(series_len or 0))
-    except Exception:
-        series = 0
-    try:
-        maxp = max(0, int(max_players or 0))
-    except Exception:
-        maxp = 0
-    if mode_c == "duo" and maxp % 2 == 1:
-        return await interaction.followup.send(
-            "Duo tourneys need an even `max_players` (full teams of 2).", ephemeral=True)
-    try:
-        _p1, _p2, _p3 = max(0, int(coins_first or 0)), max(0, int(coins_second or 0)), max(0, int(coins_third or 0))
-    except Exception:
-        return await interaction.followup.send(
-            "Coin prizes must be whole numbers (0+).", ephemeral=True)
-    _coin_cup = bool(coin_give)
-    if _coin_cup and _p1 <= 0 and _p2 <= 0 and _p3 <= 0:
-        return await interaction.followup.send(
-            "Coin cup needs at least one prize — set `coins_first`, `coins_second` or `coins_third`.",
-            ephemeral=True)
-    sched_iso = None
-    if (start_time or "").strip():
+    clean = str(name or "").strip()[:64]
+    if len(clean) < 2:
+        return await interaction.followup.send("Name needs at least 2 characters.", ephemeral=True)
+
+    settings = grow.get("settings") or {}
+    if isinstance(settings, str):
         try:
-            from datetime import datetime, timezone
-            _dt = datetime.strptime(str(start_time).strip(), "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-            if _dt <= datetime.now(timezone.utc):
-                return await interaction.followup.send("Start time is in the past.", ephemeral=True)
-            sched_iso = _dt.isoformat()
+            settings = json.loads(settings)
         except Exception:
-            return await interaction.followup.send(
-                "Bad start time. Use exactly `YYYY-MM-DD HH:MM` in UTC (e.g. `2026-09-12 18:30`).", ephemeral=True)
+            settings = {}
+    table = settings.get("default_points_table") or {"kill": 1, "win": 3,
+                                                     "placement": [10, 7, 5, 3, 1]}
+
+    _ins = {
+        "guild_id": gid,
+        "code": code_c,
+        "name": clean,
+        "status": "created",
+        "mode": mode_c,
+        "series_len": 0,
+        "points_table": table,
+        "host_playing": True,
+        "pr_enabled": True,
+        "registration_open": True,
+        "reg_channel_id": COMP_REG_CHANNEL_ID or None,
+        "board_channel_id": COMP_BOARD_CHANNEL_ID or None,
+        "player_role_id": COMP_PLAYER_ROLE_ID or None,
+        "created_by": str(interaction.user.id),
+        "hosts": [str(interaction.user.id)],
+    }
     try:
-        _ins = {
-            "code": code_c, "name": str(name or "").strip()[:64] or "Tourney",
-            "status": "created", "mode": mode_c, "series_len": series,
-            "game_mode": (game_mode or "").strip() or None,
-            "region": (region or "").strip()[:16] or "EU",
-            "rules_channel_id": str(rules_channel.id) if rules_channel else None,
-            "shoot_timer": (shoot_timer or "").strip()[:16] or "4:30",
-            "ping_role_id": str(ping_role.id) if ping_role else None,
-            "max_players": maxp,
-            "host_playing": bool(host_playing),
-            "reg_channel_id": COMP_REG_CHANNEL_ID or None,
-            "board_channel_id": COMP_BOARD_CHANNEL_ID or None,
-            "player_role_id": COMP_PLAYER_ROLE_ID or None,
-            "created_by": str(interaction.user.id),
-            "coin_give": _coin_cup,
-            "coins_first": _p1, "coins_second": _p2, "coins_third": _p3,
-        }
-        if sched_iso:
-            _ins["scheduled_at"] = sched_iso
-        try:
-            res = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").insert(_ins).execute())
-        except Exception as e:
-            if "coin_give" in str(e) or "coins_" in str(e):
-                return await interaction.followup.send(
-                    "Database migration pending — ask a host to apply add_comp_v240_coin_cups.sql.",
-                    ephemeral=True)
-            raise
-        row = (res.data or [{}])[0]
-        tail = ""
-        try:
-            if sched_iso:
-                from datetime import datetime
-                tail = f" Starts <t:{int(datetime.fromisoformat(sched_iso).timestamp())}:R>."
-        except Exception:
-            pass
-        return await interaction.followup.send(
-            f"🏆 Tourney **#{row.get('id')} {row.get('name')}** created ({mode_c}, "
-            f"{series or '∞'} matches)."
-            + (f" Coin cup: 1st +{_p1:,} / 2nd +{_p2:,} / 3rd +{_p3:,}." if _coin_cup else "")
-            + f"{tail} Post it: `/tourney-post {row.get('id')}`. "
-            f"Registrations: `/listen-registrations`.", ephemeral=True)
+        res = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").insert(_ins).execute())
     except Exception as e:
-        return await interaction.followup.send(f"Couldn't create: {e}", ephemeral=True)
+        return await interaction.followup.send(f"Couldn't create: `{e}`", ephemeral=True)
+    row = (res.data or [{}])[0]
+
+    # Tag the room so presence and the host capture know which tourney is live.
+    if code_c:
+        try:
+            await db._sb_call(lambda: sb.table("bngc_room_tags").upsert({
+                "code": code_c, "kind": "tourney", "name": clean,
+                "guild_id": gid, "created_by": str(interaction.user.id),
+            }, on_conflict="code").execute())
+        except Exception as e:
+            print(f"[comp] tag {code_c} failed: {e}")
+
+    link = f"{DASHBOARD_URL}/dashboard/{gid}/tourneys/{row.get('id')}" if DASHBOARD_URL else ""
+    return await interaction.followup.send(
+        f"🏆 **#{row.get('id')} {clean}** created ({mode_c}).\n"
+        + (f"Finish the setup here: {link}\n" if link else "")
+        + f"Post it for signups with `/tourney-post {row.get('id')}`.",
+        ephemeral=True)
 
 
 @bot.tree.command(name="tourney-stop", description="Close a comp tourney (host)")
@@ -3215,14 +3380,24 @@ async def tourney_create_cmd(interaction: discord.Interaction, name: str,
 async def tourney_stop_cmd(interaction: discord.Interaction, tourney_id: int,
                            role_to_remove: discord.Role | None = None):
     await interaction.response.defer(ephemeral=True)
+    sb, grow = await _registered_guild(interaction)
+    if sb is None:
+        return
     sb, me = await _comp_require_manager(interaction, tourney_id)
     if sb is None:
         return
+    gid = _guild_id_of(interaction)
     try:
         from datetime import datetime, timezone
         old = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select(
-            "code,player_role_id").eq("id", int(tourney_id)).limit(1).execute())
+            "code,player_role_id,guild_id").eq("id", int(tourney_id)).limit(1).execute())
         old_row = ((old.data or [{}])[0] or {})
+        # A tourney belongs to exactly one server. Refuse a cross-server close
+        # so a host in server A can never end server B's tournament.
+        owner_gid = old_row.get("guild_id")
+        if owner_gid is not None and int(owner_gid) != int(gid):
+            return await interaction.followup.send(
+                "That tournament belongs to a different server.", ephemeral=True)
         old_code = old_row.get("code")
         res = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").update(
             {"status": "ended", "reg_open": False, "ended_at": datetime.now(timezone.utc).isoformat()}
@@ -3281,6 +3456,17 @@ async def tourney_stop_cmd(interaction: discord.Interaction, tourney_id: int,
         except Exception as e:
             print(f"[comp] stop auto-PR failed: {e}")
             tail += " · 📊 PR skipped (server unreachable — run /tourney-pr)"
+        # Fold the result into this server's own leaderboard. Idempotent, so a
+        # later dashboard "Bank results" click changes nothing.
+        try:
+            _bst, _bbody = await _api_post("/api/comp/tourney/bank",
+                                           {"tourney_id": int(tourney_id)})
+            _banked = int((_bbody or {}).get("players_updated") or 0)
+            if _banked:
+                tail += f" · 🧮 {_banked} player{'s' if _banked != 1 else ''} banked"
+        except Exception as e:
+            print(f"[comp] stop bank failed: {e}")
+            tail += " · 🧮 leaderboard not updated (bank it on the dashboard)"
         # opted-in nicknames: Display Name [PR]
         try:
             _renamed = await _comp_apply_pr_nicknames(interaction.guild, pr_board)
@@ -5430,22 +5616,28 @@ async def ranked_board_cmd(interaction: discord.Interaction, limit: int = 25):
                                  _ranked_board_lines(rows))
 
 
-@bot.tree.command(name="tourney-list", description="List comp tourneys (id, status, matches)")
+@bot.tree.command(name="tourney-list", description="List this server's comp tourneys (id, status, matches)")
 async def tourney_list_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
-    sb = _comp_sb()
+    sb, grow = await _registered_guild(interaction)
     if sb is None:
-        return await interaction.followup.send("Supabase not configured.")
+        return
+    gid = _guild_id_of(interaction)
     try:
+        # Scoped to this server: the same bot runs tournaments for several
+        # communities, and a host must never see another server's events.
         res = await db._sb_call(lambda: sb.table("bngc_comp_tourneys").select(
-            "id,code,name,status,mode,series_len").order("id").limit(25).execute())
+            "id,code,name,status,mode,series_len").eq("guild_id", gid)
+            .order("id").limit(25).execute())
         rows = res.data or []
         if not rows:
-            return await interaction.followup.send("No tourneys yet. Hosts: `/tourney-create`.")
+            return await interaction.followup.send(
+                "No tourneys on this server yet. Hosts: `/tourney-create`.")
         lines = [f"**#{r.get('id')}** {r.get('name')} — {r.get('status')} ({r.get('mode')}, "
                  f"{r.get('series_len') or '∞'} matches)" + (f" `{r.get('code')}`" if r.get("code") else "")
                  for r in rows]
-        e = discord.Embed(title="Comp tourneys", color=0x7c3aed, description="\n".join(lines)[:4000])
+        e = discord.Embed(title=f"Comp tourneys — {grow.get('name') or 'this server'}",
+                          color=0x7c3aed, description="\n".join(lines)[:4000])
         return await interaction.followup.send(embed=e)
     except Exception as e:
         return await interaction.followup.send(f"Couldn't list: {e}")
