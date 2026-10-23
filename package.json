@@ -14,6 +14,9 @@
     "obfs": "node scripts/obfuscate.mjs",
     "lite": "node scripts/build-lite.js",
     "competitive": "node scripts/build-lite.js && node scripts/build-competitive.js",
+    "dashboard": "npm --prefix dashboard run dev",
+    "dashboard:build": "npm --prefix dashboard install && npm --prefix dashboard run build",
+    "vercel-build": "npm --prefix dashboard install --no-audit --no-fund && npm --prefix dashboard run build",
     "test": "node test/debug-collector.test.mjs && node test/decoder.test.mjs && node test/detector.test.mjs && node test/sender.test.mjs && node test/bundle.test.mjs"
   },
   "dependencies": {
